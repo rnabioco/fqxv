@@ -19,7 +19,8 @@
 //!   [4] qual_len  (LE)  [ ] qual    (fqxv-fqzcomp)
 //! block payload (reordered): as plain, but after n_reads:
 //!   [ceil(n/8)] flip bitmap        (reads stored reverse-complemented)
-//!   [4] perm_len (LE) [ ] perm     (rANS'd u32 permutation; empty unless kept)
+//!   [4] perm_len (LE) [ ] perm     (byte-plane-split u32 permutation, rANS'd;
+//!                                   empty unless order is kept)
 //!   then names / seq (fqxv-reorder clustered) / qual in clustered order
 //! ```
 //!
@@ -609,8 +610,19 @@ fn compress_block_reordered(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
     );
     let (names_c, seq_c, qual_c) = (names_c?, seq_c?, qual_c?);
     let perm_c = if params.keep_order {
-        let bytes: Vec<u8> = plan.order.iter().flat_map(|x| x.to_le_bytes()).collect();
-        fqxv_rans::encode(&bytes, fqxv_rans::Order::One)?
+        // Byte-plane (SoA) split before entropy coding: all byte-0s, then
+        // byte-1s, 2s, 3s. For a permutation of n < 2^24 reads the upper planes
+        // are near-constant, so per-plane rANS captures them for almost nothing;
+        // interleaved LE bytes, by contrast, are near-uniform and barely
+        // compress (they used to erase much of reorder's sequence saving).
+        let mut planes = vec![0u8; n * 4];
+        for (i, &x) in plan.order.iter().enumerate() {
+            planes[i] = x as u8;
+            planes[n + i] = (x >> 8) as u8;
+            planes[2 * n + i] = (x >> 16) as u8;
+            planes[3 * n + i] = (x >> 24) as u8;
+        }
+        fqxv_rans::encode(&planes, fqxv_rans::Order::One)?
     } else {
         Vec::new()
     };
@@ -813,8 +825,9 @@ fn decode_block_reordered(buf: &[u8], keep_order: bool) -> Result<(u64, Vec<u8>)
         if pb.len() != n * 4 {
             return Err(Error::Malformed("permutation length mismatch"));
         }
-        pb.chunks_exact(4)
-            .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        // Reassemble from the four byte planes written by the SoA split above.
+        (0..n)
+            .map(|i| u32::from_le_bytes([pb[i], pb[n + i], pb[2 * n + i], pb[3 * n + i]]))
             .collect()
     } else {
         Vec::new()
