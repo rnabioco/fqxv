@@ -6,7 +6,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32       # 32 cores, not whole-node --exclusive, so cells
-#SBATCH --mem=90G                # pack onto partially-free nodes and queue faster
+#SBATCH --mem=32G                # pack onto partially-free nodes and queue faster;
+                                 # sized to the worst tool (xz9 ~24G) + headroom
 #SBATCH --time=02:00:00
 #SBATCH --output=fqxv-cell-%A_%a.out
 ## #SBATCH --account=amc-general
