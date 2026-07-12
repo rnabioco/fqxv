@@ -293,7 +293,11 @@ mod tests {
         }
         let bytes = enc.finish();
         // 100k near-deterministic symbols should be tiny.
-        assert!(bytes.len() < 200, "expected strong compression, got {}", bytes.len());
+        assert!(
+            bytes.len() < 200,
+            "expected strong compression, got {}",
+            bytes.len()
+        );
     }
 
     proptest::proptest! {

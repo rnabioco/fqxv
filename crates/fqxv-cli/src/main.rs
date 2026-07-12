@@ -2,11 +2,20 @@
 
 use std::path::PathBuf;
 
+use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand, ValueEnum};
+
+/// Terminal color scheme for `--help` (shared with the rnabioco tooling look):
+/// yellow-bold headings, green-bold literals, cyan value placeholders.
+const STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
+    .usage(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
+    .literal(AnsiColor::Green.on_default().effects(Effects::BOLD))
+    .placeholder(AnsiColor::Cyan.on_default());
 
 /// Reference-free FASTQ archiver for short-read data.
 #[derive(Debug, Parser)]
-#[command(name = "fqxv", version, about, long_about = None)]
+#[command(name = "fqxv", version, about, long_about = None, styles = STYLES)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
