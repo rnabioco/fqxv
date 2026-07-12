@@ -653,6 +653,13 @@ fn compress_reordered_whole<R: Read + Send, W: Write>(
         }
     }
 
+    // Minimizer anchors in clustered order (for shifted-overlap alignment).
+    let cl_anchors: Vec<u32> = plan
+        .order
+        .iter()
+        .map(|&oi| plan.anchor[oi as usize])
+        .collect();
+
     // 4. Moderate blocks (same count for both partitions).
     let bsz = REORDER_BLOCK_READS.max(1);
     let ranges: Vec<(usize, usize)> = if n == 0 {
@@ -669,6 +676,7 @@ fn compress_reordered_whole<R: Read + Send, W: Write>(
                 let refs: Vec<&[u8]> = cl_reads[s..e].iter().map(Vec::as_slice).collect();
                 Ok(fqxv_reorder::encode_clustered(
                     &refs,
+                    &cl_anchors[s..e],
                     params.seq_order as usize,
                 )?)
             })
@@ -920,6 +928,11 @@ fn compress_block_reordered(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
         }
     }
     let read_refs: Vec<&[u8]> = r_reads.iter().map(Vec::as_slice).collect();
+    let r_anchors: Vec<u32> = plan
+        .order
+        .iter()
+        .map(|&oi| plan.anchor[oi as usize])
+        .collect();
 
     // Names and quality: with `keep_order`, code them in ORIGINAL read order —
     // the permutation reunites each clustered sequence with its read, so the
@@ -932,7 +945,13 @@ fn compress_block_reordered(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
             || fqxv_tokenizer::encode(&headers),
             || {
                 rayon::join(
-                    || fqxv_reorder::encode_clustered(&read_refs, params.seq_order as usize),
+                    || {
+                        fqxv_reorder::encode_clustered(
+                            &read_refs,
+                            &r_anchors,
+                            params.seq_order as usize,
+                        )
+                    },
                     || fqxv_fqzcomp::encode(&b.lens, &b.qual, params.quality_binning),
                 )
             },
@@ -959,7 +978,13 @@ fn compress_block_reordered(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
             || fqxv_tokenizer::encode(&r_headers),
             || {
                 rayon::join(
-                    || fqxv_reorder::encode_clustered(&read_refs, params.seq_order as usize),
+                    || {
+                        fqxv_reorder::encode_clustered(
+                            &read_refs,
+                            &r_anchors,
+                            params.seq_order as usize,
+                        )
+                    },
                     || fqxv_fqzcomp::encode(&r_lens, &r_qual, params.quality_binning),
                 )
             },
