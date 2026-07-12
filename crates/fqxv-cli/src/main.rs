@@ -105,6 +105,10 @@ enum Command {
     Info {
         /// Input `.fqxv` file.
         input: PathBuf,
+        /// Emit a single machine-readable TSV line instead of the human
+        /// report (stable columns for the benchmark harness / scripts).
+        #[arg(long)]
+        tsv: bool,
     },
 }
 
@@ -250,15 +254,36 @@ fn main() -> anyhow::Result<()> {
                 t0.elapsed().as_secs_f64()
             );
         }
-        Command::Info { input } => print_info(&input)?,
+        Command::Info { input, tsv } => print_info(&input, tsv)?,
     }
     Ok(())
 }
 
-fn print_info(path: &Path) -> anyhow::Result<()> {
+fn print_info(path: &Path, tsv: bool) -> anyhow::Result<()> {
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let info = fqxv::inspect(File::open(path)?)?;
     let total = info.names_bytes + info.seq_bytes + info.qual_bytes;
+    if tsv {
+        // Stable, tab-separated columns for scripts. Keep field order fixed;
+        // append new fields at the end so existing parsers don't break.
+        println!(
+            "file_size\treads\tblocks\tgroup_size\tseq_order\tquality_binning\treordered\tnames_bytes\tseq_bytes\tqual_bytes"
+        );
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            file_size,
+            info.reads,
+            info.blocks,
+            info.group_size,
+            info.seq_order,
+            info.quality_binning,
+            info.reordered as u8,
+            info.names_bytes,
+            info.seq_bytes,
+            info.qual_bytes,
+        );
+        return Ok(());
+    }
     let pct = |x: u64| {
         if total > 0 {
             100.0 * x as f64 / total as f64
