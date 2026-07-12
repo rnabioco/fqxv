@@ -1,0 +1,29 @@
+[package]
+name = "fqxv"
+description = "Reference-free FASTQ archiver for short-read data — container format library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fqxv-rans.workspace = true
+fqxv-range.workspace = true
+fqxv-fqzcomp.workspace = true
+fqxv-tokenizer.workspace = true
+fqxv-seq.workspace = true
+fqxv-reorder.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+noodles-fastq.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

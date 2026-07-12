@@ -1,0 +1,63 @@
+# fqxv — a Rust FASTQ archiving toolkit.
+# Workspace of one-crate-per-algorithm codecs plus the `fqxv` container/CLI.
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.97"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rnabioco/qxv"
+homepage = "https://github.com/rnabioco/qxv"
+authors = ["Jay Hesselberth <jay.hesselberth@gmail.com>"]
+keywords = ["fastq", "compression", "bioinformatics", "genomics", "rans"]
+categories = ["compression", "science"]
+
+[workspace.dependencies]
+# Internal crates (path + version so they can be published independently).
+fqxv-rans = { path = "crates/fqxv-rans", version = "0.0.0" }
+fqxv-range = { path = "crates/fqxv-range", version = "0.0.0" }
+fqxv-fqzcomp = { path = "crates/fqxv-fqzcomp", version = "0.0.0" }
+fqxv-tokenizer = { path = "crates/fqxv-tokenizer", version = "0.0.0" }
+fqxv-seq = { path = "crates/fqxv-seq", version = "0.0.0" }
+fqxv-reorder = { path = "crates/fqxv-reorder", version = "0.0.0" }
+fqxv = { path = "crates/fqxv", version = "0.0.0" }
+
+# Shared third-party deps, versions pinned once here.
+rayon = "1.10"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+noodles-fastq = "0.20"
+bitstream-io = "4"
+
+# Dev/bench deps.
+proptest = "1"
+criterion = { version = "0.7", features = ["html_reports"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# rANS/range coders are full of intentional wrapping integer arithmetic.
+cast_possible_truncation = "allow"
+# Codec tables are indexed across several parallel arrays by the same position;
+# index loops read clearer than zipped iterators here.
+needless_range_loop = "allow"
+
+# Faster, smaller release artifacts for benchmarking.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# A profile that keeps debug symbols for `perf`/flamegraphs on release-speed code.
+[profile.bench]
+inherits = "release"
+debug = true

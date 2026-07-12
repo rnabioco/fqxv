@@ -1,0 +1,31 @@
+[workspace]
+authors = ["Jay Hesselberth <jay.hesselberth@gmail.com>"]
+channels = ["conda-forge", "bioconda"]
+name = "fqxv-bench"
+platforms = ["linux-64"]
+version = "0.1.0"
+description = "Benchmark environment: FASTQ compression baselines + test-data fetch for fqxv"
+
+[dependencies]
+# Test-data fetch
+sracha = "*"
+
+# General-purpose baselines (compression floor)
+zstd = "*"
+xz = "*"
+pigz = "*"
+
+# FASTQ-specific baseline compressors
+spring = "*"
+fqzcomp = "*"
+
+# FASTQ utilities (quality histograms, subsampling, stats)
+seqkit = "*"
+samtools = "*"
+
+# Harness scripting
+python = ">=3.11"
+
+[tasks]
+# Print quality-score alphabet + basic stats for a FASTQ (binned vs full-range check)
+qstats = { cmd = "seqkit stats -a", description = "Quality/length stats for a FASTQ" }

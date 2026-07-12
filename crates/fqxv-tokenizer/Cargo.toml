@@ -1,0 +1,22 @@
+[package]
+name = "fqxv-tokenizer"
+description = "Positional read-name tokenizer for FASTQ headers — clean-room CRAM 3.1 name codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fqxv-rans.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

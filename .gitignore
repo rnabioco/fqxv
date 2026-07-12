@@ -1,0 +1,21 @@
+/target
+Cargo.lock.orig
+**/*.rs.bk
+
+# pixi (lockfile IS committed for reproducibility; only the env dir is ignored)
+/bench/.pixi
+
+# benchmark data + outputs live on scratch, never in the repo
+/bench/data
+/bench/results
+*.fastq
+*.fastq.gz
+*.fqxv
+
+# editor/OS cruft
+.DS_Store
+*.swp
+/.idea
+/.vscode
+perf.data*
+flamegraph.svg

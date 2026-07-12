@@ -1,0 +1,22 @@
+[package]
+name = "fqxv-fqzcomp"
+description = "fqzcomp-style quality-score context model with opt-in lossy binning — clean-room CRAM 3.1 codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fqxv-range.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
