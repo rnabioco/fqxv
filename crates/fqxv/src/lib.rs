@@ -14,7 +14,9 @@
 
 mod container;
 
-pub use container::{compress, decompress, inspect, Info, Params, Stats};
+pub use container::{
+    compress, compress_multi, decompress, decompress_split, inspect, peek, Info, Params, Stats,
+};
 pub use fqxv_fqzcomp::QualityBinning;
 
 use thiserror::Error;

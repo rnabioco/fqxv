@@ -46,6 +46,29 @@ Every crate is independently publishable to crates.io and dual-licensed
 - **Benchmark-driven.** The CLI ships only codecs that beat the field in the
   `bench/` harness (fqzcomp5, SPRING, PgRC2, zstd -19, gzip baselines).
 
+## Usage
+
+```bash
+# single-end
+fqxv compress reads.fastq.gz -o reads.fqxv          # gzip input auto-detected
+fqxv decompress reads.fqxv -o reads.fastq
+
+# paired-end / single-cell: interleave per-spot files into one archive
+fqxv compress R1.fq.gz R2.fq.gz -o sample.fqxv                 # paired
+fqxv compress R1.fq R2.fq I1.fq I2.fq -o sample.fqxv          # 10x single-cell
+
+# restore the separate files, or stream interleaved to an aligner
+fqxv decompress sample.fqxv --split out                       # out_1.fastq, out_2.fastq, ...
+fqxv decompress sample.fqxv | bwa mem -p ref.fa -             # interleaved to stdout
+
+fqxv info sample.fqxv                                          # layout, reads, per-stream sizes
+```
+
+Combining mates/index reads shrinks the archive (near-identical mate names
+collapse; the sequence model sees a spot's related reads together) and keeps one
+file per sample. `compress`/`decompress` are `rayon`-parallel (`--threads`).
+Lossless by default; `--quality-bin {bin8,bin4,bin2}` opts into lossy quality.
+
 ## Milestones
 
 - **M0** — benchmark harness + baselines (`bench/`)

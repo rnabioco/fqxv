@@ -1,7 +1,7 @@
 //! `fqxv` command-line interface — a thin front-end over the [`fqxv`] library.
 
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -31,10 +31,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Compress a FASTQ file to `.fqxv`.
+    /// Compress FASTQ to `.fqxv`. Give multiple inputs to interleave per-spot
+    /// files (paired mates, or single-cell R1/R2/I1/I2) into one archive.
     Compress {
-        /// Input FASTQ (plain or gzipped; gzip is detected automatically).
-        input: PathBuf,
+        /// Input FASTQ file(s), plain or gzipped (1 = single-end, 2 = paired,
+        /// 3-4 = single-cell). Order is preserved for `--split`.
+        #[arg(num_args = 1..)]
+        inputs: Vec<PathBuf>,
         /// Output `.fqxv` path.
         #[arg(short, long)]
         output: PathBuf,
@@ -51,16 +54,20 @@ enum Command {
         #[arg(long, value_enum, default_value_t = QualityBin::Lossless)]
         quality_bin: QualityBin,
     },
-    /// Decompress a `.fqxv` file back to FASTQ.
+    /// Decompress a `.fqxv` file to FASTQ.
     Decompress {
         /// Input `.fqxv` file.
         input: PathBuf,
-        /// Output FASTQ path.
+        /// Interleaved FASTQ output; omit or use `-` for stdout (pipe to an
+        /// aligner: `fqxv decompress x.fqxv | bwa mem -p ref -`).
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
+        /// Restore separate per-spot files as `<prefix>_1.fastq … _G.fastq`.
+        #[arg(long, conflicts_with = "output")]
+        split: Option<PathBuf>,
     },
-    /// Print the container header and per-stream statistics.
-    Inspect {
+    /// Print `.fqxv` container metadata and per-stream sizes.
+    Info {
         /// Input `.fqxv` file.
         input: PathBuf,
     },
@@ -99,7 +106,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Compress {
-            input,
+            inputs,
             output,
             level,
             reorder,
@@ -110,34 +117,66 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("--reorder (read reordering) is not implemented yet (M4)");
             }
             let _ = keep_order;
+            if inputs.is_empty() {
+                anyhow::bail!("at least one input FASTQ is required");
+            }
             let params = fqxv::Params {
                 seq_order: level_to_order(level),
                 quality_binning: quality_bin.into(),
                 threads: cli.threads,
             };
-            let in_size = std::fs::metadata(&input).map(|m| m.len()).unwrap_or(0);
-            let reader = open_input(&input)?;
+            let in_size: u64 = inputs
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| m.len())
+                .sum();
             let out = File::create(&output)?;
 
             let t0 = Instant::now();
-            let stats = fqxv::compress(reader, out, params)?;
+            let stats = if inputs.len() == 1 {
+                fqxv::compress(open_input(&inputs[0])?, out, params)?
+            } else {
+                let readers: Vec<Box<dyn Read>> = inputs
+                    .iter()
+                    .map(|p| open_input(p))
+                    .collect::<anyhow::Result<_>>()?;
+                fqxv::compress_multi(readers, out, params)?
+            };
             let secs = t0.elapsed().as_secs_f64();
-
             let ratio = if stats.out_bytes > 0 {
                 in_size as f64 / stats.out_bytes as f64
             } else {
                 0.0
             };
             eprintln!(
-                "compressed {} reads in {} block(s) -> {} bytes ({:.2}x vs {} input) in {:.1}s",
-                stats.reads, stats.blocks, stats.out_bytes, ratio, in_size, secs
+                "compressed {} reads ({} input file(s)) in {} block(s) -> {} bytes ({:.2}x) in {:.1}s",
+                stats.reads,
+                inputs.len(),
+                stats.blocks,
+                stats.out_bytes,
+                ratio,
+                secs
             );
         }
-        Command::Decompress { input, output } => {
-            let f = File::open(&input)?;
-            let out = File::create(&output)?;
+        Command::Decompress {
+            input,
+            output,
+            split,
+        } => {
             let t0 = Instant::now();
-            let stats = fqxv::decompress(f, out, cli.threads)?;
+            let stats = if let Some(prefix) = split {
+                let g = fqxv::peek(File::open(&input)?)?.group_size as usize;
+                let mut files: Vec<File> = (1..=g)
+                    .map(|i| File::create(format!("{}_{}.fastq", prefix.display(), i)))
+                    .collect::<io::Result<_>>()?;
+                fqxv::decompress_split(File::open(&input)?, &mut files, cli.threads)?
+            } else {
+                fqxv::decompress(
+                    File::open(&input)?,
+                    open_output(output.as_deref())?,
+                    cli.threads,
+                )?
+            };
             eprintln!(
                 "decompressed {} reads from {} block(s) in {:.1}s",
                 stats.reads,
@@ -145,52 +184,76 @@ fn main() -> anyhow::Result<()> {
                 t0.elapsed().as_secs_f64()
             );
         }
-        Command::Inspect { input } => {
-            let info = fqxv::inspect(File::open(&input)?)?;
-            let total = info.names_bytes + info.seq_bytes + info.qual_bytes;
-            let pct = |x: u64| {
-                if total > 0 {
-                    100.0 * x as f64 / total as f64
-                } else {
-                    0.0
-                }
-            };
-            println!("fqxv container");
-            println!("  reads          {}", info.reads);
-            println!("  blocks         {}", info.blocks);
-            println!("  sequence order {}", info.seq_order);
-            println!("  quality bin    {}", info.quality_binning);
-            println!(
-                "  plus line      {}",
-                if info.plus_normalized {
-                    "normalized"
-                } else {
-                    "verbatim"
-                }
-            );
-            println!(
-                "  names  {:>12} bytes ({:.1}%)",
-                info.names_bytes,
-                pct(info.names_bytes)
-            );
-            println!(
-                "  seq    {:>12} bytes ({:.1}%)",
-                info.seq_bytes,
-                pct(info.seq_bytes)
-            );
-            println!(
-                "  qual   {:>12} bytes ({:.1}%)",
-                info.qual_bytes,
-                pct(info.qual_bytes)
-            );
-            if info.reads > 0 {
-                println!(
-                    "  total  {:>12} bytes ({:.2} bytes/read)",
-                    total,
-                    total as f64 / info.reads as f64
-                );
-            }
+        Command::Info { input } => print_info(&input)?,
+    }
+    Ok(())
+}
+
+fn print_info(path: &Path) -> anyhow::Result<()> {
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let info = fqxv::inspect(File::open(path)?)?;
+    let total = info.names_bytes + info.seq_bytes + info.qual_bytes;
+    let pct = |x: u64| {
+        if total > 0 {
+            100.0 * x as f64 / total as f64
+        } else {
+            0.0
         }
+    };
+    let layout = match info.group_size {
+        1 => "single-end".to_string(),
+        2 => "paired".to_string(),
+        g => format!("grouped x{g} (single-cell)"),
+    };
+    let quality = match info.quality_binning {
+        0 => "lossless",
+        1 => "lossy (Illumina 8-bin)",
+        2 => "lossy (4-bin)",
+        3 => "lossy (2-bin)",
+        _ => "unknown",
+    };
+
+    println!("{}", path.display());
+    println!("  layout         {layout} (group size {})", info.group_size);
+    println!("  reads          {}", info.reads);
+    if info.group_size > 1 {
+        println!(
+            "  spots          {}",
+            info.reads / info.group_size.max(1) as u64
+        );
+    }
+    println!("  blocks         {}", info.blocks);
+    println!("  sequence order {}", info.seq_order);
+    println!("  quality        {quality}");
+    println!(
+        "  plus line      {}",
+        if info.plus_normalized {
+            "normalized"
+        } else {
+            "verbatim"
+        }
+    );
+    println!("  file size      {file_size} bytes");
+    println!(
+        "  names  {:>12} bytes ({:.1}%)",
+        info.names_bytes,
+        pct(info.names_bytes)
+    );
+    println!(
+        "  seq    {:>12} bytes ({:.1}%)",
+        info.seq_bytes,
+        pct(info.seq_bytes)
+    );
+    println!(
+        "  qual   {:>12} bytes ({:.1}%)",
+        info.qual_bytes,
+        pct(info.qual_bytes)
+    );
+    if info.reads > 0 {
+        println!(
+            "  streams total  {total} bytes ({:.2} bytes/read)",
+            total as f64 / info.reads as f64
+        );
     }
     Ok(())
 }
@@ -206,6 +269,14 @@ fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read>> {
         Ok(Box::new(MultiGzDecoder::new(chained)))
     } else {
         Ok(Box::new(chained))
+    }
+}
+
+/// Open an output sink: a file, or stdout when the path is absent or `-`.
+fn open_output(path: Option<&Path>) -> anyhow::Result<Box<dyn Write>> {
+    match path {
+        Some(p) if p.as_os_str() != "-" => Ok(Box::new(File::create(p)?)),
+        _ => Ok(Box::new(io::stdout())),
     }
 }
 
