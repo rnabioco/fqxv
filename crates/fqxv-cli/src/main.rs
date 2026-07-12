@@ -54,8 +54,8 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Number of worker threads (0 = all available cores).
-    #[arg(long, global = true, default_value_t = 0)]
+    /// Number of worker threads, capped at available cores (0 = all cores).
+    #[arg(long, global = true, default_value_t = 16)]
     threads: usize,
 
     /// Increase log verbosity: -v debug, -vv trace, -vvv trace with targets,
