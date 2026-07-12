@@ -13,7 +13,7 @@ fqxv compress reads.fastq.gz -o reads.fqxv
 ```
 
 Tune effort with `--level` (1–9; higher raises the sequence context order) and
-threads with `--threads` (0 = all cores):
+threads with `--threads` (default 16, capped at available cores; 0 = all cores):
 
 ```bash
 fqxv compress reads.fastq.gz -o reads.fqxv --level 7 --threads 16

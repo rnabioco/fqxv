@@ -64,7 +64,7 @@ pub struct Params {
     /// In reorder mode, store a permutation so the original read order is
     /// restored (otherwise reads emerge in clustered order).
     pub keep_order: bool,
-    /// Worker threads (0 = all available cores).
+    /// Worker threads (0 = all available cores); clamped to available cores.
     pub threads: usize,
 }
 
@@ -985,8 +985,19 @@ fn read_block<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
 }
 
 fn build_pool(threads: usize) -> Result<rayon::ThreadPool> {
+    // Resolve the effective worker count: 0 means "all available cores", and any
+    // explicit request is clamped to what physically exists so we never
+    // over-subscribe the pool.
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let n = if threads == 0 {
+        available
+    } else {
+        threads.min(available)
+    };
     rayon::ThreadPoolBuilder::new()
-        .num_threads(threads) // 0 => rayon default (all cores)
+        .num_threads(n)
         .build()
         .map_err(|e| Error::Io(io::Error::other(e.to_string())))
 }
