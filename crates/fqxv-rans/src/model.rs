@@ -28,10 +28,82 @@ pub(crate) struct Model {
     pub(crate) slot2sym: Vec<u8>,
 }
 
+/// Precomputed per-symbol constants for division-free rANS encoding.
+///
+/// The rANS encode map is `x' = (x / f) << SCALE_BITS + (x % f) + c`. The naive
+/// form runs an integer `DIV`+`MOD` per symbol (tens of cycles on the critical
+/// path). We replace `x / f` with an Alverson reciprocal multiply — precompute a
+/// fixed-point reciprocal per symbol and turn the division into a multiply-high
+/// plus shift. This is the ryg_rans `RansEncSymbolInit` construction and yields
+/// output byte-identical to the division form (see the equivalence test below).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EncSym {
+    /// Renormalization bound: emit 16-bit words while state `>= x_max`.
+    pub(crate) x_max: u64,
+    rcp_freq: u32,
+    rcp_shift: u32,
+    bias: u32,
+    cmpl_freq: u32,
+}
+
+impl EncSym {
+    /// Build the reciprocal constants for a symbol with frequency `freq` and
+    /// cumulative start `cum`. Absent symbols (`freq == 0`) are never encoded;
+    /// their constants are harmless placeholders.
+    pub(crate) fn new(freq: u32, cum: u32) -> Self {
+        // Same renorm bound the division form uses: at most one 16-bit word per
+        // step given `RANS_L`'s 16-bit renormalization.
+        let x_max = (u64::from(RANS_L >> SCALE_BITS) << 16) * u64::from(freq);
+        if freq < 2 {
+            // freq == 1 (or 0): the reciprocal degenerates; ryg's bias trick
+            // recovers the exact map, `q = mulhi(x, ~0)` giving `x - 1`.
+            EncSym {
+                x_max,
+                rcp_freq: !0,
+                rcp_shift: 0,
+                bias: cum + (1 << SCALE_BITS) - 1,
+                cmpl_freq: (1u32 << SCALE_BITS).wrapping_sub(freq),
+            }
+        } else {
+            // Smallest `shift` with `2^shift >= freq`.
+            let mut shift = 0u32;
+            while freq > (1u32 << shift) {
+                shift += 1;
+            }
+            let rcp_freq = (1u64 << (shift + 31)).div_ceil(u64::from(freq)) as u32;
+            EncSym {
+                x_max,
+                rcp_freq,
+                rcp_shift: shift - 1,
+                bias: cum,
+                cmpl_freq: (1u32 << SCALE_BITS) - freq,
+            }
+        }
+    }
+
+    /// Apply the rANS symbol map to a renormalized state `v` (`v < 2^32`),
+    /// division-free. Equivalent to `(v / f) << SCALE_BITS + (v % f) + c`.
+    #[inline]
+    pub(crate) fn apply(&self, v: u32) -> u32 {
+        let q = (((u64::from(v) * u64::from(self.rcp_freq)) >> 32) as u32) >> self.rcp_shift;
+        v.wrapping_add(self.bias)
+            .wrapping_add(q.wrapping_mul(self.cmpl_freq))
+    }
+}
+
 impl Model {
     /// Build a model from raw byte counts.
     pub(crate) fn from_counts(counts: &[u32; 256]) -> Self {
         Self::from_freqs(normalize(counts))
+    }
+
+    /// Per-symbol division-free encode constants for this model.
+    pub(crate) fn enc_table(&self) -> [EncSym; 256] {
+        let mut table = [EncSym::new(0, 0); 256];
+        for s in 0..256 {
+            table[s] = EncSym::new(u32::from(self.freq[s]), u32::from(self.cum[s]));
+        }
+        table
     }
 
     /// Build a model from an already-normalized frequency table (decoder path).
@@ -154,5 +226,29 @@ mod tests {
         c[0] = 3;
         c[255] = 1;
         check_sum(&c);
+    }
+
+    #[test]
+    fn reciprocal_matches_division() {
+        // The reciprocal encode map must equal the DIV/MOD form for every valid
+        // frequency and every renormalized state `v < x_max` — that equivalence
+        // is what keeps output byte-identical across the optimization.
+        for freq in [
+            1u32, 2, 3, 4, 7, 15, 16, 17, 255, 256, 1000, 2048, 4095, 4096,
+        ] {
+            let cum = 123u32.min(TOTFREQ - freq); // any legal start
+            let sym = EncSym::new(freq, cum);
+            let x_max = sym.x_max;
+            // Sample states across the renorm interval [x_max>>16, x_max).
+            let lo = (x_max >> 16).max(1);
+            let step = ((x_max - lo) / 997).max(1);
+            let mut v = lo;
+            while v < x_max {
+                let vv = v as u32;
+                let expect = ((vv / freq) << SCALE_BITS) + (vv % freq) + cum;
+                assert_eq!(sym.apply(vv), expect, "freq={freq} v={vv}");
+                v += step;
+            }
+        }
     }
 }
