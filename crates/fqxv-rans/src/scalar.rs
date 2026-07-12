@@ -112,9 +112,10 @@ pub(crate) fn encode_order1(src: &[u8]) -> Vec<u8> {
 
 /// Encode one symbol into state `x`: renormalize down, then apply the rANS map.
 ///
-/// The map itself is division-free ([`EncSym::apply`]); the precomputed `x_max`
-/// bounds renormalization into `[x_max >> 16, x_max)` so the result lands back
-/// in `[RANS_L, RANS_L << 16)`. `x_max` can reach 2^32, hence the u64 compare.
+/// The map ([`EncSym::apply`]) is reciprocal-based where the state is provably
+/// `< 2^31`, exact division otherwise; the precomputed `x_max` bounds
+/// renormalization into `[x_max >> 16, x_max)` so the result lands back in
+/// `[RANS_L, RANS_L << 16)`. `x_max` can reach 2^32, hence the u64 compare.
 #[inline]
 fn encode_symbol(x: &mut u32, sym: &EncSym, renorm: &mut Vec<u16>) {
     let mut v = *x;
