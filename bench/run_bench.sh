@@ -37,8 +37,26 @@ export PATH="$TOOLS_DIR/bin:$PATH"
 export LD_LIBRARY_PATH="$TOOLS_DIR/lib:${LD_LIBRARY_PATH:-}"
 
 mkdir -p "$RESULTS_DIR" "$WORK"
-RESULTS="$RESULTS_DIR/results.tsv"
-META="$RESULTS_DIR/meta.tsv"
+# Execution mode (for the parallel Slurm-array harness — see submit_parallel.sh):
+#   default        one node, all datasets x tools, sequential (clean throughput)
+#   FQXV_PREP_ONLY=1        compute per-dataset meta + input digests only, into
+#                          $RESULTS_DIR/prep/<label>.env, then exit (the shared,
+#                          expensive record-sort done once instead of per cell)
+#   FQXV_PART_TAG=<tag>     one array cell: run FQXV_ONLY_DATASET x FQXV_TOOLS,
+#                          reuse the prep digests, append rows to a private part
+#                          file $RESULTS_DIR/parts/results.<tag>.tsv (no header)
+PREP_ONLY="${FQXV_PREP_ONLY:-0}"
+PART_TAG="${FQXV_PART_TAG:-}"
+if [[ -n "$PART_TAG" ]]; then
+  mkdir -p "$RESULTS_DIR/parts"
+  RESULTS="$RESULTS_DIR/parts/results.$PART_TAG.tsv"
+  META="$RESULTS_DIR/parts/meta.$PART_TAG.tsv"
+  : > "$RESULTS"
+  : > "$META"
+else
+  RESULTS="$RESULTS_DIR/results.tsv"
+  META="$RESULTS_DIR/meta.tsv"
+fi
 
 # GNU time for wall + peak RSS; fall back to bash timing (RSS unknown = -1).
 GNU_TIME=""
@@ -111,14 +129,20 @@ decompress() {  # tool comp out_rt
 
 # results.tsv columns: per-stream sizes are fqxv-only (-1 for other tools);
 # rt_ok is now a *content* multiset check; deterministic is a 1-thread vs
-# N-thread byte-identity check (fqxv only, else n/a).
-echo -e "dataset\ttool\torig_bytes\tcomp_bytes\tratio\tc_secs\td_secs\tc_rss_kb\td_rss_kb\tnames_bytes\tseq_bytes\tqual_bytes\trt_ok\tdeterministic" > "$RESULTS"
-echo -e "dataset\torig_bytes\tn_records\tn_bases" > "$META"
+# N-thread byte-identity check (fqxv only, else n/a). Part files carry no header
+# (the merge step adds one); prep writes meta.tsv but not results.tsv.
+if [[ -z "$PART_TAG" ]]; then
+  echo -e "dataset\torig_bytes\tn_records\tn_bases" > "$META"
+  [[ "$PREP_ONLY" == 1 ]] || echo -e "dataset\ttool\torig_bytes\tcomp_bytes\tratio\tc_secs\td_secs\tc_rss_kb\td_rss_kb\tnames_bytes\tseq_bytes\tqual_bytes\trt_ok\tdeterministic" > "$RESULTS"
+fi
 
 mapfile -t rows < <(grep -v '^#' "$HERE/datasets.tsv" | awk 'NF')
 for row in "${rows[@]}"; do
   acc="$(awk '{print $1}' <<<"$row")"
   label="$(awk '{print $2}' <<<"$row")"
+
+  # Array cells process a single dataset.
+  [[ -n "${FQXV_ONLY_DATASET:-}" && "$label" != "$FQXV_ONLY_DATASET" ]] && continue
 
   # Resolve input (R1, or R1+R2 concatenated).
   r1="$DATA_DIR/${acc}_1.fastq"
@@ -131,16 +155,37 @@ for row in "${rows[@]}"; do
     in="$r1"
   fi
 
-  orig_bytes="$(stat -c %s "$in")"
-  nrec="$(fastq_records "$in")"
-  nbases="$(awk 'NR%4==2{b+=length($0)} END{print b+0}' "$in")"
-  echo -e "${label}\t${orig_bytes}\t${nrec}\t${nbases}" >> "$META"
+  # Meta + reference content digests. The digest is an expensive full-file
+  # record sort, so in the parallel harness it is computed once by the prep
+  # phase and every array cell just sources it. full = with quality (lossless
+  # tools); noqual = names+bases only (lossy-quality tools).
+  prep="$RESULTS_DIR/prep/$label.env"
+  if [[ -z "$PREP_ONLY" || "$PREP_ONLY" != 1 ]] && [[ -f "$prep" ]]; then
+    # shellcheck disable=SC1090
+    source "$prep"
+  else
+    orig_bytes="$(stat -c %s "$in")"
+    nrec="$(fastq_records "$in")"
+    nbases="$(awk 'NR%4==2{b+=length($0)} END{print b+0}' "$in")"
+    in_full="$(record_digest "$in" full)"
+    in_noqual="$(record_digest "$in" noqual)"
+    if [[ "$PREP_ONLY" == 1 ]]; then
+      mkdir -p "$RESULTS_DIR/prep"
+      {
+        printf "in=%q\n" "$in"
+        printf "orig_bytes=%q\n" "$orig_bytes"
+        printf "nrec=%q\n" "$nrec"
+        printf "nbases=%q\n" "$nbases"
+        printf "in_full=%q\n" "$in_full"
+        printf "in_noqual=%q\n" "$in_noqual"
+      } > "$prep"
+    fi
+  fi
+  # meta.tsv is authored by the sequential run or the prep phase, never by cells.
+  [[ -z "$PART_TAG" ]] && echo -e "${label}\t${orig_bytes}\t${nrec}\t${nbases}" >> "$META"
   echo "==> $label  ($(numfmt --to=iec "$orig_bytes"), $nrec reads, $(numfmt --to=iec "$nbases") bases)"
-
-  # Reference content digests for this input (computed once). full = with
-  # quality (lossless tools); noqual = names+bases only (lossy-quality tools).
-  in_full="$(record_digest "$in" full)"
-  in_noqual="$(record_digest "$in" noqual)"
+  # Prep phase stops here — no compression, just the shared digests + meta.
+  [[ "$PREP_ONLY" == 1 ]] && continue
 
   for tool in $TOOLS; do
     # Map tool label -> binary name to probe availability.

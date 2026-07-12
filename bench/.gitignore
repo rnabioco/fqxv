@@ -1,3 +1,6 @@
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# Slurm job logs (%x-%j.out / fqxv-cell-%A_%a.out)
+*.out
