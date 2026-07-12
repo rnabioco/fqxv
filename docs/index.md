@@ -56,3 +56,4 @@ The entropy backends — `fqxv-rans` (rANS Nx16, with an AVX2 path) and
 - [CLI Reference](cli/index.md) — every command and flag
 - [Design](design/index.md) — codecs, container format, and reordering
 - [Benchmarks](benchmarks.md) — how fqxv stacks up against gzip, fqz_comp, SPRING
+- [Acknowledgments](acknowledgments.md) — the prior work fqxv builds on

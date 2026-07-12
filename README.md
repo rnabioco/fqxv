@@ -78,6 +78,32 @@ Lossless by default; `--quality-bin {bin8,bin4,bin2}` opts into lossy quality.
 - **M4** — `fqxv-reorder`
 - **M5** — `fqxv` container + CLI
 
+## Acknowledgments
+
+`fqxv` stands on a large body of prior work. Everything here is a clean-room
+implementation from public specifications and papers — no third-party source is
+vendored — but these projects and their authors made it possible, and we
+cross-checked against several of them for correctness:
+
+- **htscodecs** ([samtools/htscodecs](https://github.com/samtools/htscodecs),
+  James Bonfield / Genome Research Ltd) and the [CRAM 3.1 codecs
+  spec](https://samtools.github.io/hts-specs/CRAMcodecs.pdf) — the reference for
+  our rANS Nx16 coder, fqzcomp quality model, and name tokenizer.
+- **fqzcomp** (James Bonfield) — the quality-score context model our
+  `fqxv-fqzcomp` codec is modeled on.
+- **noodles** ([zaeleus/noodles](https://github.com/zaeleus/noodles),
+  Michael Macias) — Rust CRAM codec implementation we cross-checked test vectors
+  against.
+- **rANS / ryg_rans** — Jarek Duda's asymmetric numeral systems and Fabien
+  Giesen's `ryg_rans` (public domain / CC0), plus Eugene Shelwien's range-coder
+  design, underpin our entropy coders.
+- **SPRING** (Chandak et al., *Bioinformatics* 2019) and **PgRC2** (Kowalski &
+  Grabowski, *Bioinformatics* 2025) — the algorithmic references for the
+  read-reordering engine.
+
+See [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) for licenses and full
+attribution.
+
 ## License
 
 Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
