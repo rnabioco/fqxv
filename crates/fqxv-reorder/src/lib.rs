@@ -219,6 +219,13 @@ const OP_CONTIG: u8 = 1;
 const OP_LITERAL: u8 = 2;
 /// Minimum overlap with the contig to bother placing a read on it.
 const MIN_CONTIG_OVERLAP: usize = 16;
+/// Half-width of the offset search around the anchor-implied placement. The
+/// shared minimizer fixes the offset exactly for substitution errors (an error
+/// inside the minimizer k-mer would move the read to a different cluster), so
+/// this window only has to absorb the small shifts that indels introduce. The
+/// offset is stored explicitly, so widening the search is purely an
+/// encoder-side choice the decoder never sees.
+const OFF_SEARCH: i64 = 8;
 
 fn zigzag(d: i64) -> u64 {
     ((d << 1) ^ (d >> 63)) as u64
@@ -292,16 +299,20 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
             ops.push(OP_MATCH);
             continue;
         }
-        // Offset of `cur` on the contig, from the shared-minimizer anchors.
-        let placed = (!contig.is_empty() && !cur.is_empty())
-            .then(|| {
-                let off = ref_anchor as i64 - anchors[i] as i64;
-                (off >= 0 && off as usize <= contig.len()).then_some(off as usize)
-            })
-            .flatten()
-            .and_then(|off| {
+        // Place `cur` on the contig. The shared-minimizer anchor gives the
+        // structurally-correct offset, which is exact for substitution errors
+        // (an error inside the minimizer k-mer would move the read to another
+        // cluster). Try that offset first — the common path. Only if it fails
+        // acceptance do we search a small window around it to rescue reads an
+        // indel has shifted off the anchor. The chosen offset is stored
+        // explicitly, so the search is invisible to the decoder.
+        let placed = if contig.is_empty() || cur.is_empty() {
+            None
+        } else {
+            let center = ref_anchor as i64 - anchors[i] as i64;
+            let try_off = |off: usize| -> Option<(usize, usize, Vec<usize>)> {
                 let overlap = cur.len().min(contig.len() - off);
-                if overlap < MIN_CONTIG_OVERLAP.min(cur.len()) || overlap == 0 {
+                if overlap == 0 || overlap < MIN_CONTIG_OVERLAP.min(cur.len()) {
                     return None;
                 }
                 // Mismatches vs the CONSENSUS of all reads placed so far.
@@ -312,7 +323,32 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
                 // Cheap enough to be a real overlap, and smaller than a literal.
                 (mism.len() <= overlap / 4 && novel_n + mism.len() * 2 < cur.len())
                     .then_some((off, overlap, mism))
-            });
+            };
+            let anchor_ok = (center >= 0 && center as usize <= contig.len())
+                .then(|| try_off(center as usize))
+                .flatten();
+            anchor_ok.or_else(|| {
+                // Anchor offset was rejected: scan the window for the placement
+                // with the fewest mismatches (ties nearest the anchor).
+                let lo = (center - OFF_SEARCH).max(0);
+                let hi = (center + OFF_SEARCH).min(contig.len() as i64);
+                let mut best: Option<(usize, usize, Vec<usize>)> = None;
+                let mut best_key = (usize::MAX, i64::MAX);
+                for off in lo..=hi {
+                    if off == center {
+                        continue; // already tried
+                    }
+                    if let Some((o, ov, mism)) = try_off(off as usize) {
+                        let key = (mism.len(), (off - center).abs());
+                        if key < best_key {
+                            best_key = key;
+                            best = Some((o, ov, mism));
+                        }
+                    }
+                }
+                best
+            })
+        };
         match placed {
             Some((off, overlap, mism)) => {
                 ops.push(OP_CONTIG);
