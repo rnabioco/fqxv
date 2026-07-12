@@ -1,9 +1,15 @@
 //! Nucleotide sequence coding via an order-k adaptive context model.
 //!
-//! Each base is one of A/C/G/T (2 bits); the model conditions on the previous
-//! `k` bases and is range-coded ([`fqxv_range`]). Non-ACGT bytes (`N`, IUPAC
-//! codes, lowercase) are recorded in an exception list and restored verbatim on
-//! decode, so the codec is byte-exact. Context resets at every read boundary.
+//! Each base is one of A/C/G/T (2 bits) plus a fifth symbol for `N`; the model
+//! conditions on the previous `k` ACGT bases and is range-coded ([`fqxv_range`]).
+//! `N` — overwhelmingly the most common non-ACGT byte, and clustered in runs at
+//! read ends — is coded directly by the model, so an `N` run costs almost
+//! nothing and needs no side data. Rarer non-ACGT bytes (IUPAC codes, lowercase)
+//! are coded as the same fifth symbol and their true byte is restored from a
+//! small exception list, so the codec stays byte-exact. Non-ACGT symbols do
+//! *not* advance the context: they neither pollute the model with a spurious
+//! base nor cost one. Context carries across reads within a block (blocks stay
+//! independent for parallelism).
 //!
 //! This is the sequence path for reads that are *not* reordered; the reordered
 //! path lives in `fqxv-reorder`. Because the model is adaptive it uses the range
@@ -46,9 +52,11 @@ const FORMAT_VERSION: u8 = 0;
 /// Largest context order (4^11 contexts ≈ 4.2M models).
 const MAX_ORDER: usize = 11;
 
-/// byte -> 2-bit symbol, 255 for non-ACGT (an exception).
+/// byte -> 2-bit symbol, 255 for non-ACGT (coded as [`NSYM`]).
 const BASE_LUT: [u8; 256] = base_lut();
 const SYM2BASE: [u8; 4] = *b"ACGT";
+/// The fifth model symbol: `N` (or any non-ACGT byte, restored via exceptions).
+const NSYM: usize = 4;
 
 const fn base_lut() -> [u8; 256] {
     let mut t = [255u8; 256];
@@ -59,20 +67,19 @@ const fn base_lut() -> [u8; 256] {
     t
 }
 
-/// Compact adaptive 4-symbol frequency model driving the range coder.
+/// Compact adaptive 5-symbol frequency model driving the range coder.
 ///
-/// Behaviourally identical to `fqxv_range::SimpleModel::<4>` — same increment,
-/// same halving cap, so it emits the same `(cum, freq, tot)` intervals and the
-/// stream stays byte-exact — but it stores *only* the four frequencies (8 bytes)
-/// instead of also caching the total (12 bytes). The order-k context index walks
-/// this array with a near-random access pattern over up to 4^11 ≈ 4.2M entries,
-/// which the profile shows dominates both encode and decode; shrinking each
-/// entry a third cuts that memory traffic (and keeps entries from straddling
-/// cache lines). The total is a 3-add recompute — far cheaper than the miss it
-/// rides alongside.
+/// The alphabet is A/C/G/T plus a fifth "N/other" symbol ([`NSYM`]). Same
+/// increment and halving cap as `fqxv_range::SimpleModel::<5>`, so it emits the
+/// same `(cum, freq, tot)` intervals and the stream stays byte-exact — but it
+/// stores *only* the five frequencies (10 bytes) instead of also caching the
+/// total. The order-k context index walks this array with a near-random access
+/// pattern over up to 4^11 ≈ 4.2M entries, which the profile shows dominates
+/// both encode and decode; a small entry keeps the memory traffic down. The
+/// total is a 5-add recompute — far cheaper than the miss it rides alongside.
 #[derive(Clone)]
 struct NucModel {
-    freq: [u16; 4],
+    freq: [u16; 5],
 }
 
 impl NucModel {
@@ -83,24 +90,22 @@ impl NucModel {
 
     #[inline]
     fn new() -> Self {
-        NucModel { freq: [1; 4] }
+        NucModel { freq: [1; 5] }
     }
 
     #[inline]
     fn tot(&self) -> u32 {
         let f = &self.freq;
-        u32::from(f[0]) + u32::from(f[1]) + u32::from(f[2]) + u32::from(f[3])
+        u32::from(f[0]) + u32::from(f[1]) + u32::from(f[2]) + u32::from(f[3]) + u32::from(f[4])
     }
 
     #[inline]
     fn encode(&mut self, enc: &mut Encoder, sym: usize) {
         let f = &self.freq;
-        let cum = match sym {
-            0 => 0,
-            1 => u32::from(f[0]),
-            2 => u32::from(f[0]) + u32::from(f[1]),
-            _ => u32::from(f[0]) + u32::from(f[1]) + u32::from(f[2]),
-        };
+        let mut cum = 0u32;
+        for s in 0..sym {
+            cum += u32::from(f[s]);
+        }
         enc.encode(cum, u32::from(f[sym]), self.tot());
         self.update(sym);
     }
@@ -109,22 +114,16 @@ impl NucModel {
     fn decode(&mut self, dec: &mut Decoder<'_>) -> usize {
         let target = dec.freq(self.tot());
         let f = &self.freq;
-        let c1 = u32::from(f[0]);
-        let (sym, cum) = if target < c1 {
-            (0, 0)
-        } else {
-            let c2 = c1 + u32::from(f[1]);
-            if target < c2 {
-                (1, c1)
-            } else {
-                let c3 = c2 + u32::from(f[2]);
-                if target < c3 {
-                    (2, c2)
-                } else {
-                    (3, c3)
-                }
+        let mut cum = 0u32;
+        let mut sym = 0usize;
+        while sym < 4 {
+            let next = cum + u32::from(f[sym]);
+            if target < next {
+                break;
             }
-        };
+            cum = next;
+            sym += 1;
+        }
         dec.decode(cum, u32::from(f[sym]));
         self.update(sym);
         sym
@@ -157,19 +156,29 @@ pub fn encode(lens: &[u32], seq: &[u8], order: usize) -> Result<Vec<u8>> {
     let mut enc = Encoder::new();
     let mut exceptions: Vec<(usize, u8)> = Vec::new();
     let mut idx = 0usize;
+    // Context carries across reads within this block (blocks stay independent).
+    let mut ctx = 0usize;
     for &l in lens {
-        let mut ctx = 0usize;
         for _ in 0..l {
             let byte = seq[idx];
             let raw = BASE_LUT[byte as usize];
-            let sym = if raw == 255 {
-                exceptions.push((idx, byte));
-                0
+            debug_assert!(ctx <= ctx_mask);
+            // SAFETY: `ctx` is masked with `ctx_mask == models.len() - 1` every
+            // iteration (and starts at 0), so it always indexes in bounds.
+            let model = unsafe { models.get_unchecked_mut(ctx) };
+            if raw == 255 {
+                // Non-ACGT: code the N/other symbol. `N` needs no side data;
+                // rarer bytes are recorded for verbatim restore. Context does
+                // not advance — the symbol is transparent to the model.
+                model.encode(&mut enc, NSYM);
+                if byte != b'N' {
+                    exceptions.push((idx, byte));
+                }
             } else {
-                raw as usize
-            };
-            models[ctx].encode(&mut enc, sym);
-            ctx = ((ctx << 2) | sym) & ctx_mask;
+                let sym = raw as usize;
+                model.encode(&mut enc, sym);
+                ctx = ((ctx << 2) | sym) & ctx_mask;
+            }
             idx += 1;
         }
     }
@@ -202,15 +211,23 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     let mut dec = Decoder::new(r.rest());
     let total: usize = lens.iter().map(|&l| l as usize).sum();
     let mut seq = Vec::with_capacity(total);
+    let mut ctx = 0usize;
     for &l in &lens {
-        let mut ctx = 0usize;
         for _ in 0..l {
-            let sym = models[ctx].decode(&mut dec);
-            seq.push(SYM2BASE[sym]);
-            ctx = ((ctx << 2) | sym) & ctx_mask;
+            debug_assert!(ctx <= ctx_mask);
+            // SAFETY: `ctx` is masked with `ctx_mask == models.len() - 1`.
+            let sym = unsafe { models.get_unchecked_mut(ctx) }.decode(&mut dec);
+            if sym == NSYM {
+                // Default the N/other symbol to 'N'; the exception pass below
+                // overwrites the rarer bytes. Context does not advance.
+                seq.push(b'N');
+            } else {
+                seq.push(SYM2BASE[sym]);
+                ctx = ((ctx << 2) | sym) & ctx_mask;
+            }
         }
     }
-    // Restore non-ACGT bytes verbatim.
+    // Restore rarer non-ACGT bytes verbatim (N was already emitted).
     for (pos, byte) in exceptions {
         *seq.get_mut(pos)
             .ok_or(Error::Malformed("exception out of range"))? = byte;
@@ -355,6 +372,32 @@ mod tests {
         for order in [1usize, 2, 4, 8, 11] {
             roundtrip(&[100; 10], &seq, order);
         }
+    }
+
+    #[test]
+    fn n_runs_are_cheap() {
+        // N is coded by the model (not one exception per base) and is
+        // transparent to the context, so a poly-N tail must compress hard —
+        // the whole point of the fifth symbol. 100 reads of ACGT(50) + N(50).
+        let mut seq = Vec::new();
+        let mut lens = Vec::new();
+        for i in 0..100u32 {
+            for j in 0..50 {
+                seq.push(SYM2BASE[((i + j) % 4) as usize]);
+            }
+            seq.extend(std::iter::repeat_n(b'N', 50));
+            lens.push(100);
+        }
+        let enc = encode(&lens, &seq, 8).expect("encode");
+        // 5000 N bases must not cost anywhere near a byte each.
+        assert!(
+            enc.len() < 2_000,
+            "poly-N should be nearly free, got {} bytes for {} bases",
+            enc.len(),
+            seq.len()
+        );
+        let (_, out) = decode(&enc).expect("decode");
+        assert_eq!(out, seq);
     }
 
     #[test]
