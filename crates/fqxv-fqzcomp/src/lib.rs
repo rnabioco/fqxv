@@ -1,11 +1,11 @@
 //! fqzcomp-style quality-score context model.
 //!
 //! Each quality symbol is range-coded ([`fqxv_range`]) under a context built
-//! from the previous two quality values, a running "how noisy has this read been
-//! so far" delta counter, and the position within the read — the dominant
-//! signals in Illumina quality streams (the same features fqz_comp conditions
-//! on). One adaptive model per context. Context resets at every read boundary,
-//! so [`encode`] takes per-read lengths.
+//! from the previous three quality values (`q3` coarsely quantized), a running
+//! "how noisy has this read been so far" delta counter, and the position within
+//! the read — the dominant signals in Illumina quality streams (the same
+//! features fqz_comp conditions on). One adaptive model per context. Context
+//! resets at every read boundary, so [`encode`] takes per-read lengths.
 //!
 //! Lossy quality binning ([`QualityBinning`], Illumina 2/4/8-level) is applied
 //! before modeling; the default is lossless.
@@ -119,11 +119,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Max quality alphabet the model handles.
 const QMAX: usize = 64;
-/// Number of contexts: q1(6) | q2>>2(4) | delta(2) | position-bucket(4) = 16
-/// bits. Same footprint as the old q1|q2|pos layout — `q2` is coarsened by two
-/// bits to make room for the delta counter, which carries more signal than
-/// `q2`'s low bits.
-const N_CTX: usize = 1 << 16;
+/// Number of contexts: q1(6) | q2>>2(4) | delta(2) | q3>>4(2) | pos-bucket(4) =
+/// 18 bits. `q3` (the third-previous quality, coarse) captures more of the local
+/// quality trajectory. Keeping `q2` at 4 bits and growing to 18 bits beat the
+/// 16-bit rebalance (coarsening `q2` to 2 bits lost more than `q3` added on
+/// full-range data), at 4x the quality-model memory (~34 MB/block).
+const N_CTX: usize = 1 << 18;
 /// Saturating cap on the running delta counter (2 bits).
 const DELTA_MAX: u8 = 3;
 const FORMAT_VERSION: u8 = 0;
@@ -140,14 +141,15 @@ fn pos_bucket(pos: usize) -> usize {
     }
 }
 
-/// Build the context index from the previous two symbols, the running delta
+/// Build the context index from the previous three symbols, the running delta
 /// counter, and the position.
 #[inline]
-fn context(q1: u8, q2: u8, delta: u8, pos: usize) -> usize {
+fn context(q1: u8, q2: u8, q3: u8, delta: u8, pos: usize) -> usize {
     (q1 as usize)                       // bits 0..5
-        | ((q2 as usize >> 2) << 6)     // bits 6..9  (q2 coarsened)
+        | ((q2 as usize >> 2) << 6)     // bits 6..9   (q2 coarsened)
         | ((delta as usize) << 10)      // bits 10..11
-        | (pos_bucket(pos) << 12) // bits 12..15
+        | ((q3 as usize >> 4) << 12)    // bits 12..13 (q3 coarse)
+        | (pos_bucket(pos) << 14) // bits 14..17
 }
 
 /// Encode per-read quality strings.
@@ -171,18 +173,19 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
     let mut enc = Encoder::new();
     let mut idx = 0usize;
     for &l in lens {
-        let (mut q1, mut q2) = (0u8, 0u8);
+        let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
         let mut delta = 0u8;
         for pos in 0..l as usize {
             let sym = binned[idx] - qmin;
             idx += 1;
-            let c = context(q1, q2, delta, pos);
+            let c = context(q1, q2, q3, delta, pos);
             debug_assert!(c < N_CTX);
-            // SAFETY: `context` packs into 16 bits, so `c < N_CTX == models.len()`.
+            // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
             unsafe { models.get_unchecked_mut(c) }.encode(&mut enc, sym as usize);
             if pos > 0 && sym != q1 {
                 delta = (delta + 1).min(DELTA_MAX);
             }
+            q3 = q2;
             q2 = q1;
             q1 = sym;
         }
@@ -219,12 +222,12 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     let total: usize = lens.iter().map(|&l| l as usize).sum();
     let mut quals = Vec::with_capacity(total);
     for &l in &lens {
-        let (mut q1, mut q2) = (0u8, 0u8);
+        let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
         let mut delta = 0u8;
         for pos in 0..l as usize {
-            let c = context(q1, q2, delta, pos);
+            let c = context(q1, q2, q3, delta, pos);
             debug_assert!(c < N_CTX);
-            // SAFETY: `context` packs into 16 bits, so `c < N_CTX == models.len()`.
+            // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
             let sym = unsafe { models.get_unchecked_mut(c) }.decode(&mut dec) as u8;
             if sym as usize >= qsize {
                 return Err(Error::Malformed("decoded symbol outside alphabet"));
@@ -233,6 +236,7 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
             if pos > 0 && sym != q1 {
                 delta = (delta + 1).min(DELTA_MAX);
             }
+            q3 = q2;
             q2 = q1;
             q1 = sym;
         }
