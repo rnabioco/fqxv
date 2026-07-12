@@ -1,0 +1,12 @@
+# release-plz configuration.
+#
+# The workspace publishes as a set: release-plz resolves the dependency order
+# (fqxv-rans / fqxv-range → the codecs → fqxv → fqxv-cli) automatically.
+
+[workspace]
+# One GitHub release per version tag; the `Release` workflow builds the CLI
+# binaries for it.
+git_release_enable = true
+git_tag_enable = true
+# Keep crate versions in lockstep so the workspace ships coherently.
+dependencies_update = true
