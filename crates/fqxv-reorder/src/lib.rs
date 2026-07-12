@@ -227,6 +227,42 @@ fn unzigzag(z: u64) -> i64 {
     ((z >> 1) as i64) ^ -((z & 1) as i64)
 }
 
+/// A contig column: per-base A/C/G/T vote counts plus the current consensus
+/// byte (the plurality base, or a first-seen non-ACGT byte until an ACGT wins).
+#[derive(Clone)]
+struct Column {
+    votes: [u32; 4],
+    base: u8,
+}
+
+/// Fold base `b` into a contig column, updating the consensus to the plurality
+/// (ties resolve to the lowest A<C<G<T so encode and decode always agree).
+/// Non-ACGT bytes don't vote, so a column keeps its first-seen byte until an
+/// ACGT base wins — the same rule on both sides keeps the reference in sync.
+#[inline]
+fn cast_vote(col: &mut Column, b: u8) {
+    let c = code(b);
+    if c < 4 {
+        col.votes[c as usize] += 1;
+        // Highest count wins; on a tie the lowest base index wins.
+        let best = (0..4)
+            .max_by_key(|&i| (col.votes[i], std::cmp::Reverse(i)))
+            .unwrap();
+        col.base = b"ACGT"[best];
+    }
+}
+
+/// Seed a fresh contig column from the first read to cover a position.
+#[inline]
+fn seed_column(b: u8) -> Column {
+    let mut col = Column {
+        votes: [0; 4],
+        base: b, // first-seen, until an ACGT vote takes over
+    };
+    cast_vote(&mut col, b);
+    col
+}
+
 /// Assemble reads that are already in clustered, left-to-right order (via
 /// [`plan`]) into contigs and code them against a growing consensus reference.
 ///
@@ -244,10 +280,10 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
     let (mut novel, mut lit_seq, mut lit_lens): (Vec<u8>, Vec<u8>, Vec<u32>) =
         (Vec::new(), Vec::new(), Vec::new());
 
-    // The current contig: a growing consensus reference. `ref_anchor` is the
-    // shared minimizer's position in it (the seed read's anchor). `prev_off` is
-    // the last placed read's offset, for delta-coding offsets.
-    let mut cref: Vec<u8> = Vec::new();
+    // The current contig: a growing plurality-consensus reference (one voting
+    // `Column` per position). `ref_anchor` is the shared minimizer's position in
+    // it (the seed read's anchor); `prev_off` delta-codes offsets.
+    let mut contig: Vec<Column> = Vec::new();
     let mut ref_anchor: u32 = 0;
     let mut prev_off: usize = 0;
 
@@ -257,18 +293,21 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
             continue;
         }
         // Offset of `cur` on the contig, from the shared-minimizer anchors.
-        let placed = (!cref.is_empty() && !cur.is_empty())
+        let placed = (!contig.is_empty() && !cur.is_empty())
             .then(|| {
                 let off = ref_anchor as i64 - anchors[i] as i64;
-                (off >= 0 && off as usize <= cref.len()).then_some(off as usize)
+                (off >= 0 && off as usize <= contig.len()).then_some(off as usize)
             })
             .flatten()
             .and_then(|off| {
-                let overlap = cur.len().min(cref.len() - off);
+                let overlap = cur.len().min(contig.len() - off);
                 if overlap < MIN_CONTIG_OVERLAP.min(cur.len()) || overlap == 0 {
                     return None;
                 }
-                let mism: Vec<usize> = (0..overlap).filter(|&j| cur[j] != cref[off + j]).collect();
+                // Mismatches vs the CONSENSUS of all reads placed so far.
+                let mism: Vec<usize> = (0..overlap)
+                    .filter(|&j| cur[j] != contig[off + j].base)
+                    .collect();
                 let novel_n = cur.len() - overlap;
                 // Cheap enough to be a real overlap, and smaller than a literal.
                 (mism.len() <= overlap / 4 && novel_n + mism.len() * 2 < cur.len())
@@ -287,14 +326,20 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
                     subs.push(cur[m]);
                 }
                 novel.extend_from_slice(&cur[overlap..]);
-                cref.extend_from_slice(&cur[overlap..]); // first-seen consensus
+                // Fold this read into the consensus for the reads that follow.
+                for (j, &b) in cur.iter().enumerate().take(overlap) {
+                    cast_vote(&mut contig[off + j], b);
+                }
+                for &b in &cur[overlap..] {
+                    contig.push(seed_column(b));
+                }
                 prev_off = off;
             }
             None => {
                 ops.push(OP_LITERAL);
                 lit_seq.extend_from_slice(cur);
                 lit_lens.push(cur.len() as u32);
-                cref = cur.to_vec();
+                contig = cur.iter().map(|&b| seed_column(b)).collect();
                 ref_anchor = anchors[i];
                 prev_off = 0;
             }
@@ -353,8 +398,8 @@ pub fn decode_clustered(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     let (mut subs_pos, mut lit_pos, mut lit_idx, mut novel_pos) = (0usize, 0usize, 0usize, 0usize);
     let mut reads: Vec<Vec<u8>> = Vec::with_capacity(n.min(1 << 22));
 
-    // The current contig, replayed identically to the encoder.
-    let mut cref: Vec<u8> = Vec::new();
+    // The current contig, voted identically to the encoder.
+    let mut contig: Vec<Column> = Vec::new();
     let mut prev_off: usize = 0;
 
     for i in 0..n {
@@ -377,23 +422,21 @@ pub fn decode_clustered(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                     .ok_or(Error::Malformed("lit data underrun"))?
                     .to_vec();
                 lit_pos += l;
-                cref = bytes.clone();
+                contig = bytes.iter().map(|&b| seed_column(b)).collect();
                 prev_off = 0;
                 reads.push(bytes);
             }
             OP_CONTIG => {
                 let off = usize::try_from(prev_off as i64 + unzigzag(c_offdelta.varint()?))
                     .map_err(|_| Error::Malformed("bad contig offset"))?;
-                if off > cref.len() {
+                if off > contig.len() {
                     return Err(Error::Malformed("contig offset past reference"));
                 }
                 let cur_len = c_slen.varint()? as usize;
-                let overlap = cur_len.min(cref.len() - off);
+                let overlap = cur_len.min(contig.len() - off);
                 let mut read = vec![0u8; cur_len];
                 for (j, slot) in read.iter_mut().enumerate().take(overlap) {
-                    *slot = *cref
-                        .get(off + j)
-                        .ok_or(Error::Malformed("contig overlap out of range"))?;
+                    *slot = contig[off + j].base; // consensus of prior reads
                 }
                 let m = c_nmis.varint()? as usize;
                 let mut p = 0usize;
@@ -413,7 +456,13 @@ pub fn decode_clustered(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                         .ok_or(Error::Malformed("novel underrun"))?;
                     novel_pos += 1;
                 }
-                cref.extend_from_slice(&read[overlap..]);
+                // Fold this read into the consensus, exactly as the encoder did.
+                for (j, &b) in read.iter().enumerate().take(overlap) {
+                    cast_vote(&mut contig[off + j], b);
+                }
+                for &b in &read[overlap..] {
+                    contig.push(seed_column(b));
+                }
                 prev_off = off;
                 reads.push(read);
             }
