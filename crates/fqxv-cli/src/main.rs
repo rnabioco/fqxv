@@ -102,6 +102,18 @@ fn level_to_order(level: u8) -> u8 {
     (level as usize + 6).clamp(1, 11) as u8
 }
 
+/// Map a 1-9 effort level to reads per block. Larger blocks train the sequence
+/// model on more reads (better ratio) at the cost of parallelism and memory.
+fn level_to_block(level: u8) -> usize {
+    match level {
+        0..=2 => 128 << 10,
+        3..=4 => 256 << 10,
+        5..=6 => 1 << 20,
+        7..=8 => 2 << 20,
+        _ => 4 << 20,
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
@@ -122,6 +134,7 @@ fn main() -> anyhow::Result<()> {
             }
             let params = fqxv::Params {
                 seq_order: level_to_order(level),
+                block_reads: level_to_block(level),
                 quality_binning: quality_bin.into(),
                 threads: cli.threads,
             };

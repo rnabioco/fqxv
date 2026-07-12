@@ -21,3 +21,4 @@ rayon.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 fqxv-seq.workspace = true
+fqxv-rans.workspace = true

@@ -33,8 +33,9 @@ use rayon::prelude::*;
 use crate::{Error, Result, FORMAT_VERSION, MAGIC};
 use fqxv_fqzcomp::QualityBinning;
 
-/// Reads per block. Blocks are the unit of parallelism and random access.
-const BLOCK_READS: usize = 256 * 1024;
+/// Default reads per block. Larger blocks populate the sequence model's contexts
+/// better (higher ratio) but reduce parallelism and raise memory.
+const DEFAULT_BLOCK_READS: usize = 1 << 20;
 const HEADER_LEN: usize = 10;
 const FLAG_PLUS_NORMALIZED: u8 = 0x01;
 
@@ -43,6 +44,9 @@ const FLAG_PLUS_NORMALIZED: u8 = 0x01;
 pub struct Params {
     /// Sequence context-model order (higher = better ratio, more memory).
     pub seq_order: u8,
+    /// Reads per block. Blocks are the unit of parallelism and random access;
+    /// larger blocks give the order-k sequence model more data to train on.
+    pub block_reads: usize,
     /// Quality quantization (lossless by default).
     pub quality_binning: QualityBinning,
     /// Worker threads (0 = all available cores).
@@ -53,6 +57,7 @@ impl Default for Params {
     fn default() -> Self {
         Params {
             seq_order: 11,
+            block_reads: DEFAULT_BLOCK_READS,
             quality_binning: QualityBinning::Lossless,
             threads: 0,
         }
@@ -117,10 +122,11 @@ impl RawBlock {
 
 /// Compress single-end FASTQ from `reader` into a `.fqxv` stream.
 pub fn compress<R: Read, W: Write>(reader: R, writer: W, params: Params) -> Result<Stats> {
+    let block_reads = params.block_reads.max(1);
     let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
     let mut rec = noodles_fastq::Record::default();
     drive(writer, params, 1, |b| {
-        while b.headers.len() < BLOCK_READS {
+        while b.headers.len() < block_reads {
             if fq.read_record(&mut rec)? == 0 {
                 break;
             }
@@ -158,8 +164,10 @@ pub fn compress_multi<'a, W: Write>(
         .collect();
     let mut recs: Vec<_> = (0..g).map(|_| noodles_fastq::Record::default()).collect();
 
+    // Keep whole spots together: round the block target down to a multiple of g.
+    let block_reads = (params.block_reads / g).max(1) * g;
     drive(writer, params, g as u8, |b| {
-        while b.headers.len() < BLOCK_READS {
+        while b.headers.len() < block_reads {
             // Read one record from each input; member 0 EOF ends cleanly.
             let mut got = 0;
             for j in 0..g {
