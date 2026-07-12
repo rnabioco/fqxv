@@ -19,7 +19,7 @@
 //! assert_eq!(out_seq, seq);
 //! ```
 
-use fqxv_range::{Decoder, Encoder, SimpleModel};
+use fqxv_range::{Decoder, Encoder};
 use thiserror::Error;
 
 /// Errors returned by the sequence codec.
@@ -59,6 +59,88 @@ const fn base_lut() -> [u8; 256] {
     t
 }
 
+/// Compact adaptive 4-symbol frequency model driving the range coder.
+///
+/// Behaviourally identical to `fqxv_range::SimpleModel::<4>` — same increment,
+/// same halving cap, so it emits the same `(cum, freq, tot)` intervals and the
+/// stream stays byte-exact — but it stores *only* the four frequencies (8 bytes)
+/// instead of also caching the total (12 bytes). The order-k context index walks
+/// this array with a near-random access pattern over up to 4^11 ≈ 4.2M entries,
+/// which the profile shows dominates both encode and decode; shrinking each
+/// entry a third cuts that memory traffic (and keeps entries from straddling
+/// cache lines). The total is a 3-add recompute — far cheaper than the miss it
+/// rides alongside.
+#[derive(Clone)]
+struct NucModel {
+    freq: [u16; 4],
+}
+
+impl NucModel {
+    /// Total frequency cap; matches `SimpleModel::MAX_TOT`.
+    const MAX_TOT: u32 = 1 << 13;
+    /// Frequency increment applied to the observed symbol.
+    const STEP: u16 = 16;
+
+    #[inline]
+    fn new() -> Self {
+        NucModel { freq: [1; 4] }
+    }
+
+    #[inline]
+    fn tot(&self) -> u32 {
+        let f = &self.freq;
+        u32::from(f[0]) + u32::from(f[1]) + u32::from(f[2]) + u32::from(f[3])
+    }
+
+    #[inline]
+    fn encode(&mut self, enc: &mut Encoder, sym: usize) {
+        let f = &self.freq;
+        let cum = match sym {
+            0 => 0,
+            1 => u32::from(f[0]),
+            2 => u32::from(f[0]) + u32::from(f[1]),
+            _ => u32::from(f[0]) + u32::from(f[1]) + u32::from(f[2]),
+        };
+        enc.encode(cum, u32::from(f[sym]), self.tot());
+        self.update(sym);
+    }
+
+    #[inline]
+    fn decode(&mut self, dec: &mut Decoder<'_>) -> usize {
+        let target = dec.freq(self.tot());
+        let f = &self.freq;
+        let c1 = u32::from(f[0]);
+        let (sym, cum) = if target < c1 {
+            (0, 0)
+        } else {
+            let c2 = c1 + u32::from(f[1]);
+            if target < c2 {
+                (1, c1)
+            } else {
+                let c3 = c2 + u32::from(f[2]);
+                if target < c3 {
+                    (2, c2)
+                } else {
+                    (3, c3)
+                }
+            }
+        };
+        dec.decode(cum, u32::from(f[sym]));
+        self.update(sym);
+        sym
+    }
+
+    #[inline]
+    fn update(&mut self, sym: usize) {
+        self.freq[sym] += Self::STEP;
+        if self.tot() > Self::MAX_TOT {
+            for x in &mut self.freq {
+                *x = (*x + 1) >> 1; // halve, keep >= 1
+            }
+        }
+    }
+}
+
 /// Encode per-read sequences with an order-`order` context model.
 pub fn encode(lens: &[u32], seq: &[u8], order: usize) -> Result<Vec<u8>> {
     let total: usize = lens.iter().map(|&l| l as usize).sum();
@@ -71,7 +153,7 @@ pub fn encode(lens: &[u32], seq: &[u8], order: usize) -> Result<Vec<u8>> {
     let k = order.clamp(1, MAX_ORDER);
     let ctx_mask = (1usize << (2 * k)) - 1;
 
-    let mut models = vec![SimpleModel::<4>::new(); ctx_mask + 1];
+    let mut models = vec![NucModel::new(); ctx_mask + 1];
     let mut enc = Encoder::new();
     let mut exceptions: Vec<(usize, u8)> = Vec::new();
     let mut idx = 0usize;
@@ -116,7 +198,7 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     let lens = read_lens(&mut r)?;
     let exceptions = read_exceptions(&mut r)?;
 
-    let mut models = vec![SimpleModel::<4>::new(); ctx_mask + 1];
+    let mut models = vec![NucModel::new(); ctx_mask + 1];
     let mut dec = Decoder::new(r.rest());
     let total: usize = lens.iter().map(|&l| l as usize).sum();
     let mut seq = Vec::with_capacity(total);

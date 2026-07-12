@@ -150,7 +150,7 @@ fn main() -> anyhow::Result<()> {
             let stats = if inputs.len() == 1 {
                 fqxv::compress(open_input(&inputs[0])?, out, params)?
             } else {
-                let readers: Vec<Box<dyn Read>> = inputs
+                let readers: Vec<Box<dyn Read + Send>> = inputs
                     .iter()
                     .map(|p| open_input(p))
                     .collect::<anyhow::Result<_>>()?;
@@ -277,7 +277,7 @@ fn print_info(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Open a FASTQ input, transparently decoding gzip (detected by magic bytes).
-fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read>> {
+fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
     let mut f = File::open(path)?;
     let mut magic = [0u8; 2];
     let n = read_up_to(&mut f, &mut magic)?;

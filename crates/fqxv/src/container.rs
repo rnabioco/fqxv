@@ -116,9 +116,14 @@ pub struct Info {
     pub qual_bytes: u64,
 }
 
+/// One block of parsed FASTQ records. Header text is packed into a single arena
+/// (`header_buf` + cumulative `header_ends`) rather than a `Vec` per record — the
+/// parse loop is single-threaded and feeds the parallel compressors, so avoiding
+/// a per-read allocation keeps that feed from starving the pool.
 #[derive(Default)]
 struct RawBlock {
-    headers: Vec<Vec<u8>>,
+    header_buf: Vec<u8>,
+    header_ends: Vec<u32>,
     lens: Vec<u32>,
     seq: Vec<u8>,
     qual: Vec<u8>,
@@ -126,25 +131,50 @@ struct RawBlock {
 
 impl RawBlock {
     fn push(&mut self, name: &[u8], description: &[u8], seq: &[u8], qual: &[u8]) {
-        let mut h = name.to_vec();
+        self.header_buf.extend_from_slice(name);
         if !description.is_empty() {
-            h.push(b' ');
-            h.extend_from_slice(description);
+            self.header_buf.push(b' ');
+            self.header_buf.extend_from_slice(description);
         }
-        self.headers.push(h);
+        self.header_ends.push(self.header_buf.len() as u32);
         self.lens.push(seq.len() as u32);
         self.seq.extend_from_slice(seq);
         self.qual.extend_from_slice(qual);
     }
+
+    /// Number of records in the block.
+    fn n_reads(&self) -> usize {
+        self.header_ends.len()
+    }
+
+    /// The `i`th record's header bytes.
+    fn header(&self, i: usize) -> &[u8] {
+        let start = if i == 0 { 0 } else { self.header_ends[i - 1] as usize };
+        &self.header_buf[start..self.header_ends[i] as usize]
+    }
+
+    /// Borrowed slices for every header, in record order.
+    fn header_refs(&self) -> Vec<&[u8]> {
+        let mut refs = Vec::with_capacity(self.header_ends.len());
+        let mut start = 0usize;
+        for &end in &self.header_ends {
+            refs.push(&self.header_buf[start..end as usize]);
+            start = end as usize;
+        }
+        refs
+    }
 }
 
 /// Compress single-end FASTQ from `reader` into a `.fqxv` stream.
-pub fn compress<R: Read, W: Write>(reader: R, writer: W, params: Params) -> Result<Stats> {
+///
+/// `reader` must be `Send`: parsing runs on a dedicated thread so it overlaps
+/// compression (see [`drive`]).
+pub fn compress<R: Read + Send, W: Write>(reader: R, writer: W, params: Params) -> Result<Stats> {
     let block_reads = params.block_reads.max(1);
     let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
     let mut rec = noodles_fastq::Record::default();
     drive(writer, params, 1, |b| {
-        while b.headers.len() < block_reads {
+        while b.n_reads() < block_reads {
             if fq.read_record(&mut rec)? == 0 {
                 break;
             }
@@ -155,7 +185,7 @@ pub fn compress<R: Read, W: Write>(reader: R, writer: W, params: Params) -> Resu
                 rec.quality_scores(),
             );
         }
-        Ok(b.headers.len())
+        Ok(b.n_reads())
     })
 }
 
@@ -165,7 +195,7 @@ pub fn compress<R: Read, W: Write>(reader: R, writer: W, params: Params) -> Resu
 /// Readers are consumed in lockstep; unequal read counts are an error. Restore
 /// with [`decompress_split`], or stream interleaved with [`decompress`].
 pub fn compress_multi<'a, W: Write>(
-    readers: Vec<Box<dyn Read + 'a>>,
+    readers: Vec<Box<dyn Read + Send + 'a>>,
     writer: W,
     params: Params,
 ) -> Result<Stats> {
@@ -190,13 +220,13 @@ pub fn compress_multi<'a, W: Write>(
     // Keep whole spots together: round the block target down to a multiple of g.
     let block_reads = (params.block_reads / g).max(1) * g;
     drive(writer, params, g as u8, |b| {
-        while b.headers.len() < block_reads {
+        while b.n_reads() < block_reads {
             // Read one record from each input; member 0 EOF ends cleanly.
             let mut got = 0;
             for j in 0..g {
                 if fqs[j].read_record(&mut recs[j])? == 0 {
                     if j == 0 {
-                        return Ok(b.headers.len());
+                        return Ok(b.n_reads());
                     }
                     return Err(Error::Malformed("inputs have unequal read counts"));
                 }
@@ -207,17 +237,23 @@ pub fn compress_multi<'a, W: Write>(
                 b.push(r.name(), r.description(), r.sequence(), r.quality_scores());
             }
         }
-        Ok(b.headers.len())
+        Ok(b.n_reads())
     })
 }
 
 /// Shared block driver: `fill` populates one [`RawBlock`] and returns the number
 /// of reads it added (0 at EOF). Blocks are compressed in parallel, written in
 /// order.
+///
+/// Parsing input (the `fill` calls, single-threaded because the FASTQ stream is
+/// sequential) runs on a dedicated thread and stays a batch ahead via a bounded
+/// channel, so it overlaps the parallel compression of the previous batch
+/// instead of alternating with it — the parse phase was otherwise a serial
+/// stretch that left cores idle and capped utilization.
 fn drive<W, F>(writer: W, params: Params, group_size: u8, mut fill: F) -> Result<Stats>
 where
     W: Write,
-    F: FnMut(&mut RawBlock) -> Result<usize>,
+    F: FnMut(&mut RawBlock) -> Result<usize> + Send,
 {
     let pool = build_pool(params.threads)?;
     let batch = pool.current_num_threads().max(1);
@@ -240,38 +276,87 @@ where
     ])?;
 
     let mut stats = Stats::default();
-    let mut done = false;
-    while !done {
-        let mut blocks: Vec<RawBlock> = Vec::with_capacity(batch);
-        for _ in 0..batch {
-            let mut b = RawBlock::default();
-            if fill(&mut b)? == 0 {
-                done = true;
+    // One batch of buffering: the reader parses the next batch while this thread
+    // compresses and writes the current one.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<RawBlock>>>(1);
+    std::thread::scope(|scope| -> Result<()> {
+        let reader = scope.spawn(move || {
+            loop {
+                let mut blocks: Vec<RawBlock> = Vec::with_capacity(batch);
+                let mut eof = false;
+                for _ in 0..batch {
+                    let mut b = RawBlock::default();
+                    match fill(&mut b) {
+                        Ok(0) => {
+                            eof = true;
+                            break;
+                        }
+                        Ok(_) => blocks.push(b),
+                        // Surface the parse error to the consumer, then stop.
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            return;
+                        }
+                    }
+                }
+                if !blocks.is_empty() && tx.send(Ok(blocks)).is_err() {
+                    return; // consumer went away (write/compress error)
+                }
+                if eof {
+                    return;
+                }
+            }
+        });
+
+        // Consume batches; funnel every error through `result` so the receiver
+        // is always dropped before the scope joins the reader (a reader blocked
+        // on `send` would otherwise deadlock the join).
+        let mut result = Ok(());
+        for msg in &rx {
+            let blocks = match msg {
+                Ok(blocks) => blocks,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            let compressed: Vec<Result<Vec<u8>>> = pool.install(|| {
+                blocks
+                    .par_iter()
+                    .map(|b| compress_block(b, &params))
+                    .collect()
+            });
+            if let Err(e) = write_blocks(&mut w, &blocks, compressed, &mut stats) {
+                result = Err(e);
                 break;
             }
-            blocks.push(b);
         }
-        if blocks.is_empty() {
-            break;
-        }
-        let compressed: Vec<Result<Vec<u8>>> = pool.install(|| {
-            blocks
-                .par_iter()
-                .map(|b| compress_block(b, &params))
-                .collect()
-        });
-        for (b, payload) in blocks.iter().zip(compressed) {
-            let payload = payload?;
-            w.write_all(&(payload.len() as u64).to_le_bytes())?;
-            w.write_all(&payload)?;
-            stats.reads += b.headers.len() as u64;
-            stats.blocks += 1;
-            stats.out_bytes += 8 + payload.len() as u64;
-        }
-    }
+        drop(rx);
+        reader.join().expect("reader thread panicked");
+        result
+    })?;
+
     w.flush()?;
     stats.out_bytes += HEADER_LEN as u64;
     Ok(stats)
+}
+
+/// Write a batch's compressed payloads in order, updating `stats`.
+fn write_blocks<W: Write>(
+    w: &mut W,
+    blocks: &[RawBlock],
+    compressed: Vec<Result<Vec<u8>>>,
+    stats: &mut Stats,
+) -> Result<()> {
+    for (b, payload) in blocks.iter().zip(compressed) {
+        let payload = payload?;
+        w.write_all(&(payload.len() as u64).to_le_bytes())?;
+        w.write_all(&payload)?;
+        stats.reads += b.n_reads() as u64;
+        stats.blocks += 1;
+        stats.out_bytes += 8 + payload.len() as u64;
+    }
+    Ok(())
 }
 
 fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
@@ -283,13 +368,25 @@ fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
 }
 
 fn compress_block_plain(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
-    let header_refs: Vec<&[u8]> = b.headers.iter().map(Vec::as_slice).collect();
-    let names_c = fqxv_tokenizer::encode(&header_refs)?;
-    let seq_c = fqxv_seq::encode(&b.lens, &b.seq, params.seq_order as usize)?;
-    let qual_c = fqxv_fqzcomp::encode(&b.lens, &b.qual, params.quality_binning)?;
+    let header_refs = b.header_refs();
+    // The three streams are independent; code them concurrently so a block's
+    // wall time is its slowest stream, not their sum. Nested inside the
+    // per-block `par_iter`, these joins simply fill cores left idle when there
+    // are fewer blocks than threads (and are near-free when every worker is
+    // already busy).
+    let (names_c, (seq_c, qual_c)) = rayon::join(
+        || fqxv_tokenizer::encode(&header_refs),
+        || {
+            rayon::join(
+                || fqxv_seq::encode(&b.lens, &b.seq, params.seq_order as usize),
+                || fqxv_fqzcomp::encode(&b.lens, &b.qual, params.quality_binning),
+            )
+        },
+    );
+    let (names_c, seq_c, qual_c) = (names_c?, seq_c?, qual_c?);
 
     let mut out = Vec::with_capacity(16 + names_c.len() + seq_c.len() + qual_c.len());
-    out.extend_from_slice(&(b.headers.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(b.n_reads() as u32).to_le_bytes());
     for stream in [&names_c, &seq_c, &qual_c] {
         out.extend_from_slice(&(stream.len() as u32).to_le_bytes());
         out.extend_from_slice(stream);
@@ -302,7 +399,7 @@ fn compress_block_plain(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
 /// (fqzcomp) in the clustered order. A flip bitmap (always) and a permutation
 /// (only with `keep_order`) let decode restore the reads.
 fn compress_block_reordered(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
-    let n = b.headers.len();
+    let n = b.n_reads();
     let mut offs = Vec::with_capacity(n + 1);
     let mut acc = 0usize;
     for &l in &b.lens {
@@ -322,7 +419,7 @@ fn compress_block_reordered(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
         let oi = oi as usize;
         let s = &b.seq[offs[oi]..offs[oi + 1]];
         let q = &b.qual[offs[oi]..offs[oi + 1]];
-        r_headers.push(&b.headers[oi]);
+        r_headers.push(b.header(oi));
         r_lens.push(b.lens[oi]);
         if plan.flip[oi] {
             flip_bits[j / 8] |= 1 << (j % 8);
@@ -336,10 +433,17 @@ fn compress_block_reordered(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
         }
     }
 
-    let names_c = fqxv_tokenizer::encode(&r_headers)?;
     let read_refs: Vec<&[u8]> = r_reads.iter().map(Vec::as_slice).collect();
-    let seq_c = fqxv_reorder::encode_clustered(&read_refs, params.seq_order as usize)?;
-    let qual_c = fqxv_fqzcomp::encode(&r_lens, &r_qual, params.quality_binning)?;
+    let (names_c, (seq_c, qual_c)) = rayon::join(
+        || fqxv_tokenizer::encode(&r_headers),
+        || {
+            rayon::join(
+                || fqxv_reorder::encode_clustered(&read_refs, params.seq_order as usize),
+                || fqxv_fqzcomp::encode(&r_lens, &r_qual, params.quality_binning),
+            )
+        },
+    );
+    let (names_c, seq_c, qual_c) = (names_c?, seq_c?, qual_c?);
     let perm_c = if params.keep_order {
         let bytes: Vec<u8> = plan.order.iter().flat_map(|x| x.to_le_bytes()).collect();
         fqxv_rans::encode(&bytes, fqxv_rans::Order::One)?
@@ -473,9 +577,21 @@ type BlockParts = (usize, Vec<Vec<u8>>, Vec<u32>, Vec<u8>, Vec<u8>);
 fn decode_block_parts(buf: &[u8]) -> Result<BlockParts> {
     let mut c = Cursor::new(buf);
     let n_reads = c.u32()? as usize;
-    let names = fqxv_tokenizer::decode(c.slice_u32()?)?;
-    let (seq_lens, seq) = fqxv_seq::decode(c.slice_u32()?)?;
-    let (_qlens, qual) = fqxv_fqzcomp::decode(c.slice_u32()?)?;
+    // Slice out the three compressed streams (cheap, sequential), then decode
+    // them concurrently — same rationale as the encode side.
+    let (names_s, seq_s, qual_s) = (c.slice_u32()?, c.slice_u32()?, c.slice_u32()?);
+    let (names, (seq_r, qual_r)) = rayon::join(
+        || fqxv_tokenizer::decode(names_s),
+        || {
+            rayon::join(
+                || fqxv_seq::decode(seq_s),
+                || fqxv_fqzcomp::decode(qual_s),
+            )
+        },
+    );
+    let names = names?;
+    let (seq_lens, seq) = seq_r?;
+    let (_qlens, qual) = qual_r?;
     if names.len() != n_reads || seq_lens.len() != n_reads {
         return Err(Error::Malformed("block stream length disagreement"));
     }
@@ -514,9 +630,19 @@ fn decode_block_reordered(buf: &[u8], keep_order: bool) -> Result<(u64, Vec<u8>)
     let n = c.u32()? as usize;
     let flip_bits = c.take(n.div_ceil(8))?.to_vec();
     let perm_c = c.slice_u32()?;
-    let names = fqxv_tokenizer::decode(c.slice_u32()?)?;
-    let reads = fqxv_reorder::decode_clustered(c.slice_u32()?)?;
-    let (r_lens, r_qual) = fqxv_fqzcomp::decode(c.slice_u32()?)?;
+    let (names_s, reads_s, qual_s) = (c.slice_u32()?, c.slice_u32()?, c.slice_u32()?);
+    let (names, (reads_r, qual_r)) = rayon::join(
+        || fqxv_tokenizer::decode(names_s),
+        || {
+            rayon::join(
+                || fqxv_reorder::decode_clustered(reads_s),
+                || fqxv_fqzcomp::decode(qual_s),
+            )
+        },
+    );
+    let names = names?;
+    let reads = reads_r?;
+    let (r_lens, r_qual) = qual_r?;
     if names.len() != n || reads.len() != n || r_lens.len() != n {
         return Err(Error::Malformed(
             "reordered block stream length disagreement",
@@ -755,8 +881,8 @@ NNGGCCTA\n\
         let r1 = make_reads("a", 3);
         let r2 = make_reads("b", 3);
         let mut archive = Vec::new();
-        let readers: Vec<Box<dyn Read>> =
-            vec![Box::new(&r1[..]) as Box<dyn Read>, Box::new(&r2[..])];
+        let readers: Vec<Box<dyn Read + Send>> =
+            vec![Box::new(&r1[..]) as Box<dyn Read + Send>, Box::new(&r2[..])];
         let s = compress_multi(readers, &mut archive, Params::default()).unwrap();
         assert_eq!(s.reads, 6);
         assert_eq!(peek(&archive[..]).unwrap().group_size, 2);
@@ -778,9 +904,9 @@ NNGGCCTA\n\
             .map(|t| make_reads(t, 5))
             .collect();
         let mut archive = Vec::new();
-        let readers: Vec<Box<dyn Read>> = files
+        let readers: Vec<Box<dyn Read + Send>> = files
             .iter()
-            .map(|f| Box::new(&f[..]) as Box<dyn Read>)
+            .map(|f| Box::new(&f[..]) as Box<dyn Read + Send>)
             .collect();
         compress_multi(readers, &mut archive, Params::default()).unwrap();
         assert_eq!(peek(&archive[..]).unwrap().group_size, 4);
@@ -795,8 +921,8 @@ NNGGCCTA\n\
         let r1 = b"@r.1 a\nACGT\n+\nIIII\n";
         let r2 = b"@r.1 b\nGGGG\n+\n####\n";
         let mut archive = Vec::new();
-        let readers: Vec<Box<dyn Read>> =
-            vec![Box::new(&r1[..]) as Box<dyn Read>, Box::new(&r2[..])];
+        let readers: Vec<Box<dyn Read + Send>> =
+            vec![Box::new(&r1[..]) as Box<dyn Read + Send>, Box::new(&r2[..])];
         compress_multi(readers, &mut archive, Params::default()).unwrap();
         let mut out = Vec::new();
         decompress(&archive[..], &mut out, 1).unwrap();
@@ -807,8 +933,8 @@ NNGGCCTA\n\
     fn unequal_mate_counts_error() {
         let r1 = make_reads("a", 2);
         let r2 = make_reads("b", 1);
-        let readers: Vec<Box<dyn Read>> =
-            vec![Box::new(&r1[..]) as Box<dyn Read>, Box::new(&r2[..])];
+        let readers: Vec<Box<dyn Read + Send>> =
+            vec![Box::new(&r1[..]) as Box<dyn Read + Send>, Box::new(&r2[..])];
         let err = compress_multi(readers, &mut Vec::new(), Params::default());
         assert!(matches!(err, Err(Error::Malformed(_))));
     }
@@ -900,7 +1026,7 @@ NNGGCCTA\n\
             reorder: true,
             ..Params::default()
         };
-        let readers: Vec<Box<dyn Read>> = vec![Box::new(r), Box::new(r)];
+        let readers: Vec<Box<dyn Read + Send>> = vec![Box::new(r), Box::new(r)];
         let err = compress_multi(readers, &mut Vec::new(), params);
         assert!(matches!(err, Err(Error::Malformed(_))));
     }
