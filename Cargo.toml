@@ -32,6 +32,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 noodles-fastq = "0.23"
 bitstream-io = "4"
+flate2 = "1"
 
 # Dev/bench deps.
 proptest = "1"

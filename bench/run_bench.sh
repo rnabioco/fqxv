@@ -18,8 +18,10 @@ DATA_DIR="${FQXV_DATA_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/data}"
 RESULTS_DIR="${FQXV_RESULTS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/results}"
 THREADS="${FQXV_THREADS:-$(nproc)}"
 INPUT_MODE="${FQXV_INPUT:-r1}"
-ALL_TOOLS="gzip zstd19 xz9 fqz_comp fqzcomp5 spring"
+ALL_TOOLS="fqxv gzip zstd19 xz9 fqz_comp fqzcomp5 spring"
 TOOLS="${FQXV_TOOLS:-$ALL_TOOLS}"
+# The fqxv binary (built with `cargo build --release`).
+FQXV_BIN="${FQXV_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/fqxv}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$RESULTS_DIR/work"
 
@@ -61,6 +63,7 @@ fastq_records() { echo $(( $(wc -l < "$1") / 4 )); }
 compress() {  # tool input out_prefix
   local tool="$1" in="$2" pfx="$3"
   case "$tool" in
+    fqxv)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --threads "$THREADS" ;;
     gzip)     COMP="$pfx.gz";  measure bash -c "pigz -p $THREADS -6 -c '$in' > '$COMP'" ;;
     zstd19)   COMP="$pfx.zst"; measure bash -c "zstd -19 --long=27 -T$THREADS -q -f -o '$COMP' '$in'" ;;
     xz9)      COMP="$pfx.xz";  measure bash -c "xz -9 -T$THREADS -c '$in' > '$COMP'" ;;
