@@ -24,6 +24,8 @@
 //! assert_eq!(out, names);
 //! ```
 
+use std::borrow::Cow;
+
 use fqxv_rans::Order;
 use thiserror::Error;
 
@@ -55,10 +57,13 @@ const MAX_NUM_DIGITS: usize = 18;
 // this cap, so each column (tile / x / y …) is modeled on its own distribution.
 const MAX_COL: usize = 63;
 
+/// One name token. On the encode path `bytes` borrows a slice of the input name
+/// (no per-token allocation for millions of names); on decode it owns rebuilt
+/// bytes. `Cow` lets one type serve both without copying on encode.
 #[derive(Clone)]
-struct Tok {
+struct Tok<'a> {
     is_num: bool,
-    bytes: Vec<u8>,
+    bytes: Cow<'a, [u8]>,
     value: i64,
 }
 
@@ -172,8 +177,8 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     };
 
     let mut names = Vec::with_capacity(n_records.min(1 << 20));
-    let mut prev: Vec<Tok> = Vec::new();
-    let mut cur: Vec<Tok> = Vec::new();
+    let mut prev: Vec<Tok<'static>> = Vec::new();
+    let mut cur: Vec<Tok<'static>> = Vec::new();
 
     for &op in &ops {
         match op {
@@ -198,7 +203,7 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                 str_pos += len;
                 cur.push(Tok {
                     is_num: false,
-                    bytes,
+                    bytes: Cow::Owned(bytes),
                     value: 0,
                 });
             }
@@ -223,8 +228,9 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(names)
 }
 
-/// Split a name into maximal digit / non-digit runs.
-fn tokenize(name: &[u8]) -> Vec<Tok> {
+/// Split a name into maximal digit / non-digit runs. Tokens borrow slices of
+/// `name`, so the common encode path allocates nothing per token.
+fn tokenize(name: &[u8]) -> Vec<Tok<'_>> {
     let mut toks = Vec::new();
     let mut i = 0;
     while i < name.len() {
@@ -233,11 +239,11 @@ fn tokenize(name: &[u8]) -> Vec<Tok> {
         while i < name.len() && name[i].is_ascii_digit() == is_digit {
             i += 1;
         }
-        let bytes = name[start..i].to_vec();
+        let bytes = &name[start..i];
         // Only treat as numeric (for delta) if it fits i64.
         let is_num = is_digit && bytes.len() <= MAX_NUM_DIGITS;
         let value = if is_num {
-            std::str::from_utf8(&bytes)
+            std::str::from_utf8(bytes)
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .unwrap_or(0)
@@ -246,7 +252,7 @@ fn tokenize(name: &[u8]) -> Vec<Tok> {
         };
         toks.push(Tok {
             is_num,
-            bytes,
+            bytes: Cow::Borrowed(bytes),
             value,
         });
     }
@@ -254,7 +260,7 @@ fn tokenize(name: &[u8]) -> Vec<Tok> {
 }
 
 /// Reconstruct a numeric token's bytes, zero-padded to its original width.
-fn num_tok(value: i64, width: usize) -> Tok {
+fn num_tok(value: i64, width: usize) -> Tok<'static> {
     let s = value.to_string();
     let bytes = if s.len() >= width {
         s.into_bytes()
@@ -265,7 +271,7 @@ fn num_tok(value: i64, width: usize) -> Tok {
     };
     Tok {
         is_num: true,
-        bytes,
+        bytes: Cow::Owned(bytes),
         value,
     }
 }
