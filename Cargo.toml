@@ -30,7 +30,7 @@ rayon = "1.10"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-noodles-fastq = "0.20"
+noodles-fastq = "0.23"
 bitstream-io = "4"
 
 # Dev/bench deps.
