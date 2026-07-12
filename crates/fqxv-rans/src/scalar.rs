@@ -19,7 +19,7 @@
 //!   [u16 renorm words ...]
 //! ```
 
-use crate::model::{Model, N_STATES, RANS_L, SCALE_BITS, TOTFREQ};
+use crate::model::{EncSym, Model, N_STATES, RANS_L, SCALE_BITS, TOTFREQ};
 use crate::{Error, Result};
 
 const ORDER0: u8 = 0;
@@ -32,18 +32,14 @@ pub(crate) fn encode_order0(src: &[u8]) -> Vec<u8> {
         counts[b as usize] += 1;
     }
     let model = Model::from_counts(&counts);
+    let enc = model.enc_table();
 
     let mut states = [RANS_L; N_STATES];
-    let mut renorm: Vec<u16> = Vec::new();
+    let mut renorm: Vec<u16> = Vec::with_capacity(src.len());
     for i in (0..src.len()).rev() {
         let s = src[i] as usize;
         let x = &mut states[i % N_STATES];
-        encode_symbol(
-            x,
-            u32::from(model.freq[s]),
-            u32::from(model.cum[s]),
-            &mut renorm,
-        );
+        encode_symbol(x, &enc[s], &mut renorm);
     }
 
     let mut out = Vec::new();
@@ -72,20 +68,25 @@ pub(crate) fn encode_order1(src: &[u8]) -> Vec<u8> {
     }
 
     let mut models: Vec<Option<Model>> = (0..256).map(|_| None).collect();
+    // Division-free encode constants per present context (boxed so the 8 KiB
+    // table per context doesn't bloat the `Option` layout).
+    let mut enc: Vec<Option<Box<[EncSym; 256]>>> = (0..256).map(|_| None).collect();
     for ctx in 0..256 {
         if counts[ctx].iter().any(|&c| c != 0) {
-            models[ctx] = Some(Model::from_counts(&counts[ctx]));
+            let m = Model::from_counts(&counts[ctx]);
+            enc[ctx] = Some(Box::new(m.enc_table()));
+            models[ctx] = Some(m);
         }
     }
 
     let mut states = [RANS_L; N_STATES];
-    let mut renorm: Vec<u16> = Vec::new();
+    let mut renorm: Vec<u16> = Vec::with_capacity(n);
     for i in (0..n).rev() {
         let ctx = if i == 0 { 0 } else { src[i - 1] } as usize;
-        let m = models[ctx].as_ref().expect("context counted during encode");
+        let e = enc[ctx].as_ref().expect("context counted during encode");
         let s = src[i] as usize;
         let x = &mut states[i % N_STATES];
-        encode_symbol(x, u32::from(m.freq[s]), u32::from(m.cum[s]), &mut renorm);
+        encode_symbol(x, &e[s], &mut renorm);
     }
 
     let mut out = Vec::new();
@@ -110,17 +111,19 @@ pub(crate) fn encode_order1(src: &[u8]) -> Vec<u8> {
 }
 
 /// Encode one symbol into state `x`: renormalize down, then apply the rANS map.
+///
+/// The map ([`EncSym::apply`]) is reciprocal-based where the state is provably
+/// `< 2^31`, exact division otherwise; the precomputed `x_max` bounds
+/// renormalization into `[x_max >> 16, x_max)` so the result lands back in
+/// `[RANS_L, RANS_L << 16)`. `x_max` can reach 2^32, hence the u64 compare.
 #[inline]
-fn encode_symbol(x: &mut u32, f: u32, c: u32, renorm: &mut Vec<u16>) {
-    // Renormalize into [x_max >> 16, x_max) so the map lands back in
-    // [RANS_L, RANS_L << 16). x_max can reach 2^32, so compute it in u64.
-    let x_max = (u64::from(RANS_L >> SCALE_BITS) << 16) * u64::from(f);
+fn encode_symbol(x: &mut u32, sym: &EncSym, renorm: &mut Vec<u16>) {
     let mut v = *x;
-    while u64::from(v) >= x_max {
+    while u64::from(v) >= sym.x_max {
         renorm.push((v & 0xffff) as u16);
         v >>= 16;
     }
-    *x = ((v / f) << SCALE_BITS) + (v % f) + c;
+    *x = sym.apply(v);
 }
 
 /// Write the final states and the (reversed) renorm words.

@@ -34,7 +34,11 @@ def main() -> None:
     for row in results:
         by_ds[row["dataset"]].append(row)
 
-    hdr = f"{'tool':<10} {'comp_size':>10} {'ratio':>7} {'vs_gzip':>8} {'bits/base':>10} {'c_MB/s':>8} {'d_MB/s':>8} {'c_RSS':>8} {'rt':>4}"
+    hdr = (
+        f"{'tool':<13} {'comp_size':>10} {'ratio':>7} {'vs_gzip':>8} "
+        f"{'bits/base':>10} {'c_MB/s':>8} {'d_MB/s':>8} {'c_RSS':>8} "
+        f"{'rt':>4} {'det':>4}"
+    )
     for ds, rows in by_ds.items():
         m = meta.get(ds, {})
         nbases = int(m.get("n_bases", 0) or 0)
@@ -51,11 +55,23 @@ def main() -> None:
             c_mb = (orig / 1e6) / float(r["c_secs"]) if float(r["c_secs"] or 0) else 0.0
             d_mb = (orig / 1e6) / float(r["d_secs"]) if float(r["d_secs"] or 0) else 0.0
             rss = int(r["c_rss_kb"])
+            det = r.get("deterministic", "n/a")
             print(
-                f"{r['tool']:<10} {fmt_bytes(cb):>10} {r['ratio']:>7} "
+                f"{r['tool']:<13} {fmt_bytes(cb):>10} {r['ratio']:>7} "
                 f"{vs_gzip:>7.2f}x {bpb:>10.3f} {c_mb:>8.1f} {d_mb:>8.1f} "
-                f"{(fmt_bytes(rss*1024) if rss>=0 else 'n/a'):>8} {r['rt_ok']:>4}"
+                f"{(fmt_bytes(rss*1024) if rss>=0 else 'n/a'):>8} "
+                f"{r['rt_ok']:>4} {det:>4}"
             )
+            # Per-stream breakdown (fqxv rows carry names/seq/qual bytes; other
+            # tools store -1). Shows where the bits go — the lever for tuning.
+            nb, sb, qb = (int(r.get(k, -1) or -1) for k in ("names_bytes", "seq_bytes", "qual_bytes"))
+            if nb >= 0 and sb >= 0 and qb >= 0 and (nb + sb + qb) > 0:
+                tot = nb + sb + qb
+                print(
+                    f"{'':<13} └─ names {fmt_bytes(nb)} ({100*nb/tot:.0f}%)  "
+                    f"seq {fmt_bytes(sb)} ({100*sb/tot:.0f}%)  "
+                    f"qual {fmt_bytes(qb)} ({100*qb/tot:.0f}%)"
+                )
 
 
 def fmt_bytes(n: int) -> str:

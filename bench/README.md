@@ -54,7 +54,22 @@ pixi run python report.py
 
 `vs_gzip` is how many times smaller than plain `.fastq.gz` a tool is — the number
 that actually matters for an archive. `bits/base` is the size normalized to
-sequence length; `rt` is a round-trip record-count sanity check.
+sequence length.
+
+`rt` is a **content** round-trip check, not just a record count: the decompressed
+output is reduced to a sorted multiset of `name / sequence / quality` tuples and
+hashed against the input, so any corrupted base or quality fails it. It is
+order-independent (SPRING and `fqxv --reorder` reorder reads), and it excludes
+the `+` line (fqxv normalizes it — the one documented lossy-by-design deviation).
+Lossy-quality tools (`fqxv-bin4`) are checked on names + bases only. `det` is
+fqxv's thread-determinism check: the archive built with `--threads 1` must be
+byte-identical to the many-threaded one (a core invariant).
+
+The fqxv rows also print a per-stream breakdown (`names / seq / qual` bytes, from
+`fqxv info --tsv`) so you can see which stream to invest in. The matrix runs
+several fqxv points — `fqxv` (level 5), `fqxv9` (level 9), `fqxv-reorder`
+(`--reorder --keep-order`), and `fqxv-bin4` (lossy 4-bin quality) — plus a
+`fqxv-paired` self-check that compresses R1+R2 as one spot-interleaved archive.
 
 ## Baselines
 

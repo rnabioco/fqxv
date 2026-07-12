@@ -1,6 +1,6 @@
 [package]
 name = "fqxv-seq"
-description = "Nucleotide sequence packing (2-bit / variable-length) and order-k context modeling for the fqxv FASTQ toolkit"
+description = "Order-k adaptive context modeling of nucleotide sequences (2-bit ACGT symbols, range-coded) for the fqxv FASTQ toolkit"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
