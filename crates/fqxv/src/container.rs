@@ -149,7 +149,11 @@ impl RawBlock {
 
     /// The `i`th record's header bytes.
     fn header(&self, i: usize) -> &[u8] {
-        let start = if i == 0 { 0 } else { self.header_ends[i - 1] as usize };
+        let start = if i == 0 {
+            0
+        } else {
+            self.header_ends[i - 1] as usize
+        };
         &self.header_buf[start..self.header_ends[i] as usize]
     }
 
@@ -582,12 +586,7 @@ fn decode_block_parts(buf: &[u8]) -> Result<BlockParts> {
     let (names_s, seq_s, qual_s) = (c.slice_u32()?, c.slice_u32()?, c.slice_u32()?);
     let (names, (seq_r, qual_r)) = rayon::join(
         || fqxv_tokenizer::decode(names_s),
-        || {
-            rayon::join(
-                || fqxv_seq::decode(seq_s),
-                || fqxv_fqzcomp::decode(qual_s),
-            )
-        },
+        || rayon::join(|| fqxv_seq::decode(seq_s), || fqxv_fqzcomp::decode(qual_s)),
     );
     let names = names?;
     let (seq_lens, seq) = seq_r?;
