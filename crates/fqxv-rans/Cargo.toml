@@ -1,6 +1,6 @@
 [package]
 name = "fqxv-rans"
-description = "rANS Nx16 entropy coder (scalar + SSE4.2 + AVX2, runtime dispatch) — a clean-room implementation of the CRAM 3.1 codec"
+description = "rANS Nx16 entropy coder (scalar + AVX2 order-0 decode, runtime dispatch) — a clean-room implementation of the CRAM 3.1 codec"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

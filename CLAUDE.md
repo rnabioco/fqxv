@@ -41,10 +41,13 @@ The crates form a strict dependency DAG; lower layers never depend on higher
 ones. Build understanding bottom-up:
 
 - **`fqxv-rans`** — rANS Nx16 entropy coder (CRAM 3.1). 32 interleaved states;
-  order-0/order-1 models. Backends (scalar / SSE4.2 / AVX2) live behind one API
-  and are chosen at runtime via `is_x86_feature_detected!`; **scalar is the
-  correctness reference and every backend must produce byte-identical output.**
-  The `bench` feature exposes internal entry points for microbenchmarks only.
+  order-0/order-1 models. Backends live behind one API and are chosen at runtime
+  via `is_x86_feature_detected!`: **scalar** (all orders, the correctness
+  reference) and **AVX2** (order-0 decode only). SSE4.2 and vectorized
+  order-1/encode are unimplemented — `Backend` reports the detected CPU tier but
+  anything past AVX2 order-0 decode runs the scalar path. **Every backend must
+  produce byte-identical output.** The `bench` feature exposes internal entry
+  points for microbenchmarks only.
 - **`fqxv-range`** — serial binary range coder + adaptive bit models. The
   arithmetic-coding primitive that `fqxv-fqzcomp` and `fqxv-seq` build on.
 - **`fqxv-fqzcomp`** (→ range) — quality-score context model; owns
@@ -52,8 +55,9 @@ ones. Build understanding bottom-up:
   `fqxv::QualityBinning`.
 - **`fqxv-tokenizer`** (→ rans) — positional read-name tokenizer with per-column
   delta bucketing; entropy backend is rANS.
-- **`fqxv-seq`** (→ range) — 2-bit / variable-length base packing with an
-  order-k context model.
+- **`fqxv-seq`** (→ range) — order-k adaptive context model over 2-bit ACGT
+  symbols (range-coded, variable read lengths); non-ACGT bytes go to an
+  exception list. Not a raw 2-bit *packing* path — every base is context-coded.
 - **`fqxv-reorder`** (→ rans, seq) — PgRC2/SPRING-class read reordering
   (minimizer clustering, reverse-complement aware) for cross-read redundancy.
 - **`fqxv`** — the `.fqxv` container format; composes all codec crates into
