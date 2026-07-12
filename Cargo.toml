@@ -7,7 +7,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.97"
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/rnabioco/fqxv"
 homepage = "https://github.com/rnabioco/fqxv"
@@ -30,12 +30,12 @@ rayon = "1.10"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-noodles-fastq = "0.20"
+noodles-fastq = "0.23"
 bitstream-io = "4"
 
 # Dev/bench deps.
 proptest = "1"
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "forbid"
