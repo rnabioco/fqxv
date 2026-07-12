@@ -19,25 +19,32 @@ byte-identical after orientation.
 name/sequence/quality streams accordingly and stores a permutation to restore
 the original order.
 
-## An honest finding
+## The pairing matters
 
-On real duplicate-rich RNA-seq (1M × 101 bp), reordering ahead of the order-11
-`fqxv-seq` model gave:
+Feeding reordered reads straight into the order-k context model barely helps —
+the model already captures much of the redundancy, so clustering double-counts
+it (a naïve reorder gave only ~9% on RNA-seq, negated by the permutation cost).
 
-| variant | bits/base |
-| --- | --- |
-| baseline (no reorder) | 1.247 |
-| reordered (order not preserved) | 1.139 (**−8.7%**) |
-| reordered + permutation (order preserved) | 1.770 (net **loss**) |
+The win comes from **explicit differential coding** on the clustered reads —
+SPRING's actual mechanism. Each read is coded relative to the previous read in
+the reordered stream:
 
-The reordering works, but the gain is modest and the permutation needed to
-restore the original order costs more than it saves. The reason: `fqxv`'s
-**high-order context model already captures most cross-read redundancy**, so
-adding reordering double-counts it. SPRING and PgRC get large reordering gains
-by pairing clustering with a *cheap* coder that can't see that redundancy on its
-own.
+- **MATCH** — identical to the previous read (nearly free),
+- **DELTA** — same length, a few mismatches: store the mismatch positions + bases,
+- **LITERAL** — everything else, coded with the `fqxv-seq` context model.
 
-So reordering ships as a library primitive rather than a default. The promising
-directions are (1) an opt-in reorder-free mode for workflows that don't need the
-original order, and (2) pairing the clustering with a lightweight
-differential/assembly coder — future work.
+Duplicates collapse to a single op; the unique reads still get the context
+model. Measured on the sequence stream:
+
+| dataset | `fqxv-seq` order-11 | reorder + delta + ctx-literals | gain |
+| --- | --- | --- | --- |
+| E. coli, ~119× coverage | 1.344 bits/base | **0.737** | **−45%** |
+| RNA-seq, shallow | 1.247 bits/base | **0.949** | **−24%** |
+
+The gain scales with coverage depth (how many reads are matchable) but is large
+even on shallow data. It is big enough to stay net-positive after storing the
+permutation needed to restore the original read order.
+
+Productionizing this as a container mode — dedup coding, context-model literals,
+and a compact permutation for order-preserving output — is the path to the
+SPRING/PgRC tier.
