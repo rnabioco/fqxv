@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=fqxv-prep
+#SBATCH --comment=fqxv-prep
 #SBATCH --partition=amilan
 #SBATCH --qos=normal
 #SBATCH --nodes=1

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=fqxv-cell
+#SBATCH --comment=fqxv-cell
 #SBATCH --partition=amilan
 #SBATCH --qos=normal
 #SBATCH --nodes=1

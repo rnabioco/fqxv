@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=fqxv-merge
+#SBATCH --comment=fqxv-merge
 #SBATCH --partition=amilan
 #SBATCH --qos=normal
 #SBATCH --nodes=1

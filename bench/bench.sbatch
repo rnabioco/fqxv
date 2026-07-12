@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=fqxv-bench
+#SBATCH --comment=fqxv-bench
 #SBATCH --partition=amilan          # AMD EPYC 7713P; renamed 'acpu' after 2026-08-05
 #SBATCH --qos=normal                # renamed 'cpu-normal' after 2026-08-05
 #SBATCH --nodes=1
