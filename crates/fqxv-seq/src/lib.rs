@@ -11,6 +11,11 @@
 //! base nor cost one. Context carries across reads within a block (blocks stay
 //! independent for parallelism).
 //!
+//! While an order-`k` context is still cold (few observations), the coder
+//! escapes to a warm order-`k/2` model instead — most high-order contexts are
+//! seen only a handful of times, so this cuts the cold-start tax. Both models
+//! observe every symbol, so the decoder replays the same escape decisions.
+//!
 //! This is the sequence path for reads that are *not* reordered; the reordered
 //! path lives in `fqxv-reorder`. Because the model is adaptive it uses the range
 //! coder, not rANS (whose reverse encode can't carry adaptive state).
@@ -51,6 +56,21 @@ pub type Result<T> = std::result::Result<T, Error>;
 const FORMAT_VERSION: u8 = 0;
 /// Largest context order (4^11 contexts ≈ 4.2M models).
 const MAX_ORDER: usize = 11;
+/// Escape threshold: use the order-k model once its context total reaches this,
+/// else fall back to the warm low-order model. A `NucModel` starts at `tot == 5`
+/// and gains `STEP == 16` per observation, so this fires after ~4 observations —
+/// below that the high-order context is too cold and the low-order model
+/// predicts better. 69 was the sweep optimum across MiSeq/GAIIx/NovaSeq heads
+/// (helps RNA-seq's many cold high-order contexts without over-escaping on
+/// ultra-deep data). Tunable ratio knob.
+const SEQ_ESCAPE_TOT: u32 = 69;
+
+/// Order of the low-order fallback model, derived from the primary order so the
+/// decoder reconstructs it from the stored `k` (no extra header byte).
+#[inline]
+fn lo_order(k: usize) -> usize {
+    (k / 2).max(1)
+}
 
 /// byte -> 2-bit symbol, 255 for non-ACGT (coded as [`NSYM`]).
 const BASE_LUT: [u8; 256] = base_lut();
@@ -150,9 +170,12 @@ pub fn encode(lens: &[u32], seq: &[u8], order: usize) -> Result<Vec<u8>> {
         });
     }
     let k = order.clamp(1, MAX_ORDER);
+    let klo = lo_order(k);
     let ctx_mask = (1usize << (2 * k)) - 1;
+    let lo_mask = (1usize << (2 * klo)) - 1;
 
-    let mut models = vec![NucModel::new(); ctx_mask + 1];
+    let mut hi = vec![NucModel::new(); ctx_mask + 1];
+    let mut lo = vec![NucModel::new(); lo_mask + 1];
     let mut enc = Encoder::new();
     let mut exceptions: Vec<(usize, u8)> = Vec::new();
     let mut idx = 0usize;
@@ -162,21 +185,30 @@ pub fn encode(lens: &[u32], seq: &[u8], order: usize) -> Result<Vec<u8>> {
         for _ in 0..l {
             let byte = seq[idx];
             let raw = BASE_LUT[byte as usize];
-            debug_assert!(ctx <= ctx_mask);
-            // SAFETY: `ctx` is masked with `ctx_mask == models.len() - 1` every
-            // iteration (and starts at 0), so it always indexes in bounds.
-            let model = unsafe { models.get_unchecked_mut(ctx) };
+            let sym = if raw == 255 { NSYM } else { raw as usize };
+            let lc = ctx & lo_mask;
+            debug_assert!(ctx <= ctx_mask && lc <= lo_mask);
+            // SAFETY: `ctx` is masked to `ctx_mask == hi.len()-1`; `lc` to
+            // `lo_mask == lo.len()-1`. Escape to the warm low-order model while
+            // the high-order context is still cold; both models observe every
+            // symbol so they stay in sync for the decoder.
+            let use_hi = unsafe { hi.get_unchecked(ctx) }.tot() >= SEQ_ESCAPE_TOT;
+            unsafe {
+                if use_hi {
+                    hi.get_unchecked_mut(ctx).encode(&mut enc, sym);
+                    lo.get_unchecked_mut(lc).update(sym);
+                } else {
+                    lo.get_unchecked_mut(lc).encode(&mut enc, sym);
+                    hi.get_unchecked_mut(ctx).update(sym);
+                }
+            }
             if raw == 255 {
-                // Non-ACGT: code the N/other symbol. `N` needs no side data;
-                // rarer bytes are recorded for verbatim restore. Context does
-                // not advance — the symbol is transparent to the model.
-                model.encode(&mut enc, NSYM);
+                // Non-ACGT: `N` needs no side data; rarer bytes are recorded for
+                // verbatim restore. Context does not advance — N is transparent.
                 if byte != b'N' {
                     exceptions.push((idx, byte));
                 }
             } else {
-                let sym = raw as usize;
-                model.encode(&mut enc, sym);
                 ctx = ((ctx << 2) | sym) & ctx_mask;
             }
             idx += 1;
@@ -203,20 +235,35 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     if !(1..=MAX_ORDER).contains(&k) {
         return Err(Error::Malformed("order out of range"));
     }
+    let klo = lo_order(k);
     let ctx_mask = (1usize << (2 * k)) - 1;
+    let lo_mask = (1usize << (2 * klo)) - 1;
     let lens = read_lens(&mut r)?;
     let exceptions = read_exceptions(&mut r)?;
 
-    let mut models = vec![NucModel::new(); ctx_mask + 1];
+    let mut hi = vec![NucModel::new(); ctx_mask + 1];
+    let mut lo = vec![NucModel::new(); lo_mask + 1];
     let mut dec = Decoder::new(r.rest());
     let total: usize = lens.iter().map(|&l| l as usize).sum();
     let mut seq = Vec::with_capacity(total);
     let mut ctx = 0usize;
     for &l in &lens {
         for _ in 0..l {
-            debug_assert!(ctx <= ctx_mask);
-            // SAFETY: `ctx` is masked with `ctx_mask == models.len() - 1`.
-            let sym = unsafe { models.get_unchecked_mut(ctx) }.decode(&mut dec);
+            let lc = ctx & lo_mask;
+            debug_assert!(ctx <= ctx_mask && lc <= lo_mask);
+            // SAFETY: `ctx <= ctx_mask == hi.len()-1`, `lc <= lo_mask ==
+            // lo.len()-1`. Mirror the encoder's escape decision exactly.
+            let sym = unsafe {
+                if hi.get_unchecked(ctx).tot() >= SEQ_ESCAPE_TOT {
+                    let s = hi.get_unchecked_mut(ctx).decode(&mut dec);
+                    lo.get_unchecked_mut(lc).update(s);
+                    s
+                } else {
+                    let s = lo.get_unchecked_mut(lc).decode(&mut dec);
+                    hi.get_unchecked_mut(ctx).update(s);
+                    s
+                }
+            };
             if sym == NSYM {
                 // Default the N/other symbol to 'N'; the exception pass below
                 // overwrites the rarer bytes. Context does not advance.
