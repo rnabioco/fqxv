@@ -33,6 +33,8 @@ clap = { version = "4", features = ["derive"] }
 noodles-fastq = "0.23"
 bitstream-io = "4"
 flate2 = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Dev/bench deps.
 proptest = "1"
