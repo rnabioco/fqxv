@@ -127,6 +127,67 @@ fn read_cols(r: &mut Cursor<'_>) -> Result<Vec<Vec<u8>>> {
     Ok(cols)
 }
 
+/// RLE-encode the op columns into (per-column run counts, run symbols, run
+/// lengths), each its own best-order stream. Op columns are near-periodic —
+/// paired mates share x/y coordinates, so a coordinate column alternates
+/// MATCH/DELTA — so a handful of run symbols and small run lengths carry the
+/// whole thing, an order of magnitude below coding the raw ops.
+fn push_op_rle(out: &mut Vec<u8>, cols: &[Vec<u8>]) -> Result<()> {
+    let mut counts = Vec::new();
+    let mut syms = Vec::new();
+    let mut lens = Vec::new();
+    for col in cols {
+        let mut runs = 0u64;
+        let mut i = 0;
+        while i < col.len() {
+            let s = col[i];
+            let mut run = 1u64;
+            while i + (run as usize) < col.len() && col[i + run as usize] == s {
+                run += 1;
+            }
+            syms.push(s);
+            write_varint(&mut lens, run);
+            runs += 1;
+            i += run as usize;
+        }
+        write_varint(&mut counts, runs);
+    }
+    push_stream(out, &counts)?;
+    push_stream(out, &syms)?;
+    push_stream(out, &lens)?;
+    Ok(())
+}
+
+/// Inverse of [`push_op_rle`]. `n_records` bounds each column's length (a column
+/// holds at most one op per record), guarding a corrupt run length from
+/// allocating unboundedly.
+fn read_op_rle(r: &mut Cursor<'_>, n_records: usize) -> Result<Vec<Vec<u8>>> {
+    let counts = read_stream(r)?;
+    let syms = read_stream(r)?;
+    let lens = read_stream(r)?;
+    let mut c_counts = Cursor::new(&counts);
+    let mut c_lens = Cursor::new(&lens);
+    let mut sym_pos = 0usize;
+    let mut cols = Vec::with_capacity(MAX_COL + 1);
+    for _ in 0..=MAX_COL {
+        let n_runs = c_counts.varint()?;
+        let mut col = Vec::new();
+        for _ in 0..n_runs {
+            let s = *syms
+                .get(sym_pos)
+                .ok_or(Error::Malformed("op sym underrun"))?;
+            sym_pos += 1;
+            let run = c_lens.varint()? as usize;
+            if col.len() + run > n_records {
+                return Err(Error::Malformed("op run too long"));
+            }
+            col.resize(col.len() + run, s);
+        }
+        cols.push(col);
+    }
+    Ok(cols)
+}
+
 /// Number of decimal digits in a non-negative numeric token's canonical form,
 /// used to derive a token's width from its value (only genuine leading-zero
 /// padding then needs to be stored).
@@ -193,8 +254,9 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
     push_stream(&mut out, &str_data)?;
     push_stream(&mut out, &num_vals)?;
     push_stream(&mut out, &pads)?;
-    // Then the per-column op and delta buckets.
-    push_cols(&mut out, &op_cols)?;
+    // Ops are RLE'd (near-periodic runs); deltas keep their raw per-column
+    // coding (they carry the genuine coordinate entropy, not runs).
+    push_op_rle(&mut out, &op_cols)?;
     push_cols(&mut out, &delta_cols)?;
     Ok(out)
 }
@@ -212,7 +274,7 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     let str_data = read_stream(&mut r)?;
     let num_vals = read_stream(&mut r)?;
     let pads = read_stream(&mut r)?;
-    let op_data = read_cols(&mut r)?;
+    let op_data = read_op_rle(&mut r, n_records)?;
     let delta_data = read_cols(&mut r)?;
 
     let mut op_cursors: Vec<Cursor> = op_data.iter().map(|v| Cursor::new(v)).collect();
