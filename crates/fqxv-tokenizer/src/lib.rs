@@ -8,14 +8,16 @@
 //! - otherwise a literal string or number.
 //!
 //! Tokens are split into separate role streams (per-record token counts,
-//! per-column ops, string lengths, string bytes, numeric literals, token widths,
-//! numeric deltas), each entropy-coded with [`fqxv_rans`] so every stream models
-//! a clean distribution. The ops and numeric deltas are bucketed **by token
-//! column**: the op and delta at a given column are near-constant across records
-//! (column 3 is always DELTA, the x-coordinate delta is always small), so each
-//! bucket collapses to almost nothing — far better than one mixed op stream,
-//! where order-1 can't see the record-periodic structure. Round-trips are
-//! byte-exact.
+//! per-column ops, string lengths, string bytes, numeric literals, numeric
+//! paddings, numeric deltas), each entropy-coded with [`fqxv_rans`] so every
+//! stream models a clean distribution. The ops and numeric deltas are coded
+//! **one rANS stream per token column**: the op and delta at a given column are
+//! near-constant across records (column 3 is always DELTA, the x-coordinate
+//! delta is always small), so each column collapses to almost nothing — far
+//! better than one mixed stream, where the entropy coder can't see the
+//! record-periodic structure. Every stream is compressed at both rANS orders
+//! and the smaller kept (the order is self-describing in the stream header, so
+//! the decoder needs no side channel). Round-trips are byte-exact.
 //!
 //! ```
 //! use fqxv_tokenizer::{encode, decode};
@@ -48,7 +50,7 @@ pub enum Error {
 /// The result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-const FORMAT_VERSION: u8 = 0;
+const FORMAT_VERSION: u8 = 1;
 // Op codes. Ops are bucketed per token column, and a per-record token count
 // delimits records, so no in-band end-of-record marker is needed.
 const MATCH: u8 = 0;
@@ -57,7 +59,7 @@ const NUM: u8 = 2;
 const DELTA: u8 = 3;
 // Numeric runs longer than this don't fit i64; encode them as string literals.
 const MAX_NUM_DIGITS: usize = 18;
-// Delta values are bucketed by token column (position within the name) up to
+// Ops and deltas are coded per token column (position within the name) up to
 // this cap, so each column (tile / x / y …) is modeled on its own distribution.
 const MAX_COL: usize = 63;
 
@@ -71,20 +73,84 @@ struct Tok<'a> {
     value: i64,
 }
 
+/// Compress `stream` at both rANS orders and return the smaller encoding. The
+/// order is recorded in the rANS stream header, so [`fqxv_rans::decode`]
+/// recovers it without any side channel — picking the best order per stream is
+/// therefore free on the decode side.
+fn encode_best(stream: &[u8]) -> Result<Vec<u8>> {
+    let o0 = fqxv_rans::encode(stream, Order::Zero)?;
+    let o1 = fqxv_rans::encode(stream, Order::One)?;
+    Ok(if o1.len() < o0.len() { o1 } else { o0 })
+}
+
+/// Append a flat stream as `[varint comp_len, comp_bytes]`, best order.
+fn push_stream(out: &mut Vec<u8>, stream: &[u8]) -> Result<()> {
+    let c = encode_best(stream)?;
+    write_varint(out, c.len() as u64);
+    out.extend_from_slice(&c);
+    Ok(())
+}
+
+/// Read one flat `[varint comp_len, comp_bytes]` stream and rANS-decode it.
+fn read_stream(r: &mut Cursor<'_>) -> Result<Vec<u8>> {
+    let len = r.varint()? as usize;
+    Ok(fqxv_rans::decode(r.take(len)?)?)
+}
+
+/// Append the per-column buckets, each as its own `[varint comp_len, bytes]`
+/// stream (empty columns collapse to a single `0` byte). Coding each column
+/// separately lets its near-constant run compress to almost nothing.
+fn push_cols(out: &mut Vec<u8>, cols: &[Vec<u8>]) -> Result<()> {
+    for col in cols {
+        if col.is_empty() {
+            write_varint(out, 0);
+        } else {
+            let c = encode_best(col)?;
+            write_varint(out, c.len() as u64);
+            out.extend_from_slice(&c);
+        }
+    }
+    Ok(())
+}
+
+/// Inverse of [`push_cols`]: decode `MAX_COL + 1` per-column buckets.
+fn read_cols(r: &mut Cursor<'_>) -> Result<Vec<Vec<u8>>> {
+    let mut cols = Vec::with_capacity(MAX_COL + 1);
+    for _ in 0..=MAX_COL {
+        let len = r.varint()? as usize;
+        if len == 0 {
+            cols.push(Vec::new());
+        } else {
+            cols.push(fqxv_rans::decode(r.take(len)?)?);
+        }
+    }
+    Ok(cols)
+}
+
+/// Number of decimal digits in a non-negative numeric token's canonical form,
+/// used to derive a token's width from its value (only genuine leading-zero
+/// padding then needs to be stored).
+fn natural_digits(value: i64) -> usize {
+    value.to_string().len()
+}
+
 /// Encode a list of read names.
 ///
-/// Tokens are split into separate role streams — ops, string lengths, string
-/// bytes, numeric literals, token widths, and numeric deltas — each entropy
-/// coded on its own so rANS models a clean distribution per stream (in
-/// particular the incrementing x/y-coordinate deltas compress far better apart
-/// from string bytes).
+/// Tokens are split into separate role streams — per-column ops, string lengths,
+/// string bytes, numeric literals, leading-zero paddings, and per-column numeric
+/// deltas — each entropy coded on its own so rANS models a clean distribution
+/// per stream (in particular the incrementing x/y-coordinate deltas compress far
+/// better apart from string bytes, and per column rather than mixed together).
 pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
     let mut counts: Vec<u8> = Vec::new();
     let mut op_cols: Vec<Vec<u8>> = vec![Vec::new(); MAX_COL + 1];
     let mut str_lens: Vec<u8> = Vec::new();
     let mut str_data: Vec<u8> = Vec::new();
     let mut num_vals: Vec<u8> = Vec::new();
-    let mut widths: Vec<u8> = Vec::new();
+    // Leading-zero padding per numeric token: width minus the token's natural
+    // digit count. Almost always 0 (names rarely zero-pad), so this stream is
+    // near-degenerate — far cheaper than storing the full width.
+    let mut pads: Vec<u8> = Vec::new();
     let mut delta_cols: Vec<Vec<u8>> = vec![Vec::new(); MAX_COL + 1];
     let mut prev: Vec<Tok> = Vec::new();
 
@@ -93,22 +159,21 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
         for (i, t) in toks.iter().enumerate() {
             // Ops go in a per-column bucket: the op at a given column is almost
             // always the same across records (col 3 is always DELTA, …), so each
-            // bucket collapses to near-nothing — far better than one mixed op
-            // stream where order-1 can't see the record-periodic structure.
+            // column collapses to near-nothing once coded on its own.
             let col = i.min(MAX_COL);
             let p = prev.get(i);
             if p.is_some_and(|p| p.bytes == t.bytes) {
                 op_cols[col].push(MATCH);
             } else if t.is_num {
+                let pad = t.bytes.len() - natural_digits(t.value);
                 if let Some(p) = p.filter(|p| p.is_num) {
                     op_cols[col].push(DELTA);
                     write_varint(&mut delta_cols[col], zigzag(t.value - p.value));
-                    widths.push(t.bytes.len() as u8);
                 } else {
                     op_cols[col].push(NUM);
                     write_varint(&mut num_vals, t.value as u64);
-                    widths.push(t.bytes.len() as u8);
                 }
+                pads.push(pad as u8);
             } else {
                 op_cols[col].push(STR);
                 write_varint(&mut str_lens, t.bytes.len() as u64);
@@ -119,49 +184,19 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
         prev = toks;
     }
 
-    // Serialize the per-column op and delta buckets: [len, bytes] per column.
-    let op_ser = serialize_cols(&op_cols);
-    let delta_ser = serialize_cols(&delta_cols);
-
     let mut out = Vec::new();
     out.push(FORMAT_VERSION);
     write_varint(&mut out, names.len() as u64);
-    // Stream order must match `decode`; text-like streams use order-1.
-    for (stream, order) in [
-        (&counts, Order::Zero),
-        (&op_ser, Order::Zero),
-        (&str_lens, Order::Zero),
-        (&str_data, Order::One),
-        (&num_vals, Order::Zero),
-        (&widths, Order::Zero),
-        (&delta_ser, Order::Zero),
-    ] {
-        let c = fqxv_rans::encode(stream, order)?;
-        write_varint(&mut out, c.len() as u64);
-        out.extend_from_slice(&c);
-    }
+    // Flat streams first; order must match `decode`.
+    push_stream(&mut out, &counts)?;
+    push_stream(&mut out, &str_lens)?;
+    push_stream(&mut out, &str_data)?;
+    push_stream(&mut out, &num_vals)?;
+    push_stream(&mut out, &pads)?;
+    // Then the per-column op and delta buckets.
+    push_cols(&mut out, &op_cols)?;
+    push_cols(&mut out, &delta_cols)?;
     Ok(out)
-}
-
-/// Serialize per-column buckets as `[varint len, bytes]` per column.
-fn serialize_cols(cols: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for col in cols {
-        write_varint(&mut out, col.len() as u64);
-        out.extend_from_slice(col);
-    }
-    out
-}
-
-/// Split a `[varint len, bytes]`-per-column blob into one cursor per column.
-fn split_cols(ser: &[u8]) -> Result<Vec<Cursor<'_>>> {
-    let mut slices: Vec<&[u8]> = Vec::with_capacity(MAX_COL + 1);
-    let mut dc = Cursor::new(ser);
-    for _ in 0..=MAX_COL {
-        let len = dc.varint()? as usize;
-        slices.push(dc.take(len)?);
-    }
-    Ok(slices.into_iter().map(Cursor::new).collect())
 }
 
 /// Decode a stream produced by [`encode`], returning the read names.
@@ -171,33 +206,25 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
         return Err(Error::Malformed("unsupported version"));
     }
     let n_records = r.varint()? as usize;
-    let mut stream = || -> Result<Vec<u8>> {
-        let len = r.varint()? as usize;
-        Ok(fqxv_rans::decode(r.take(len)?)?)
-    };
-    let counts = stream()?;
-    let op_ser = stream()?;
-    let str_lens = stream()?;
-    let str_data = stream()?;
-    let num_vals = stream()?;
-    let widths = stream()?;
-    let delta_ser = stream()?;
 
-    // Split the per-column op and delta buckets back out.
-    let mut op_cursors = split_cols(&op_ser)?;
-    let mut delta_cursors = split_cols(&delta_ser)?;
+    let counts = read_stream(&mut r)?;
+    let str_lens = read_stream(&mut r)?;
+    let str_data = read_stream(&mut r)?;
+    let num_vals = read_stream(&mut r)?;
+    let pads = read_stream(&mut r)?;
+    let op_data = read_cols(&mut r)?;
+    let delta_data = read_cols(&mut r)?;
 
+    let mut op_cursors: Vec<Cursor> = op_data.iter().map(|v| Cursor::new(v)).collect();
+    let mut delta_cursors: Vec<Cursor> = delta_data.iter().map(|v| Cursor::new(v)).collect();
     let mut c_counts = Cursor::new(&counts);
     let mut c_str_lens = Cursor::new(&str_lens);
     let mut c_num = Cursor::new(&num_vals);
-    let mut str_pos = 0usize;
-    let mut w_pos = 0usize;
-    let next_width = |w_pos: &mut usize| -> Result<usize> {
-        let w = *widths
-            .get(*w_pos)
-            .ok_or(Error::Malformed("width underrun"))?;
-        *w_pos += 1;
-        Ok(w as usize)
+    let (mut str_pos, mut pad_pos) = (0usize, 0usize);
+    let next_pad = |pad_pos: &mut usize| -> Result<usize> {
+        let p = *pads.get(*pad_pos).ok_or(Error::Malformed("pad underrun"))?;
+        *pad_pos += 1;
+        Ok(p as usize)
     };
 
     let mut names = Vec::with_capacity(n_records.min(1 << 20));
@@ -232,17 +259,18 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                 }
                 NUM => {
                     let value = c_num.varint()? as i64;
-                    let width = next_width(&mut w_pos)?;
+                    let width = natural_digits(value) + next_pad(&mut pad_pos)?;
                     cur.push(num_tok(value, width));
                 }
                 DELTA => {
                     let d = unzigzag(delta_cursors[col].varint()?);
-                    let width = next_width(&mut w_pos)?;
                     let p = prev
                         .get(cur.len())
                         .filter(|p| p.is_num)
                         .ok_or(Error::Malformed("DELTA without numeric prior"))?;
-                    cur.push(num_tok(p.value + d, width));
+                    let value = p.value + d;
+                    let width = natural_digits(value) + next_pad(&mut pad_pos)?;
+                    cur.push(num_tok(value, width));
                 }
                 _ => return Err(Error::Malformed("unknown op")),
             }
@@ -395,6 +423,18 @@ mod tests {
         roundtrip(&[
             b"SRR453566.1 HWI-ST167:4:1101:0042:1986 length=101",
             b"SRR453566.2 HWI-ST167:4:1101:0043:1990 length=101",
+        ]);
+    }
+
+    #[test]
+    fn roundtrip_leading_zero_widths() {
+        // Zero-padded numerics of differing widths must survive exactly, since
+        // width is derived from value + stored padding.
+        roundtrip(&[
+            b"X:007:0000:5",
+            b"X:008:0001:5",
+            b"X:009:0002:5",
+            b"X:010:1000:5",
         ]);
     }
 
