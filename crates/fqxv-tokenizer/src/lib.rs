@@ -7,11 +7,15 @@
 //! - numeric vs. a previous numeric -> `DELTA` (incrementing x/y coordinates),
 //! - otherwise a literal string or number.
 //!
-//! Tokens are split into separate role streams (ops, string lengths, string
-//! bytes, numeric literals, token widths, numeric deltas), each entropy-coded
-//! with [`fqxv_rans`] so every stream models a clean distribution — the
-//! incrementing coordinate deltas in particular compress far better on their
-//! own than mixed with string bytes. Round-trips are byte-exact.
+//! Tokens are split into separate role streams (per-record token counts,
+//! per-column ops, string lengths, string bytes, numeric literals, token widths,
+//! numeric deltas), each entropy-coded with [`fqxv_rans`] so every stream models
+//! a clean distribution. The ops and numeric deltas are bucketed **by token
+//! column**: the op and delta at a given column are near-constant across records
+//! (column 3 is always DELTA, the x-coordinate delta is always small), so each
+//! bucket collapses to almost nothing — far better than one mixed op stream,
+//! where order-1 can't see the record-periodic structure. Round-trips are
+//! byte-exact.
 //!
 //! ```
 //! use fqxv_tokenizer::{encode, decode};
@@ -45,12 +49,12 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 const FORMAT_VERSION: u8 = 0;
-// Op codes.
+// Op codes. Ops are bucketed per token column, and a per-record token count
+// delimits records, so no in-band end-of-record marker is needed.
 const MATCH: u8 = 0;
 const STR: u8 = 1;
 const NUM: u8 = 2;
 const DELTA: u8 = 3;
-const REC_END: u8 = 4;
 // Numeric runs longer than this don't fit i64; encode them as string literals.
 const MAX_NUM_DIGITS: usize = 18;
 // Delta values are bucketed by token column (position within the name) up to
@@ -75,7 +79,8 @@ struct Tok<'a> {
 /// particular the incrementing x/y-coordinate deltas compress far better apart
 /// from string bytes).
 pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
-    let mut ops: Vec<u8> = Vec::new();
+    let mut counts: Vec<u8> = Vec::new();
+    let mut op_cols: Vec<Vec<u8>> = vec![Vec::new(); MAX_COL + 1];
     let mut str_lens: Vec<u8> = Vec::new();
     let mut str_data: Vec<u8> = Vec::new();
     let mut num_vals: Vec<u8> = Vec::new();
@@ -86,42 +91,45 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
     for name in names {
         let toks = tokenize(name);
         for (i, t) in toks.iter().enumerate() {
+            // Ops go in a per-column bucket: the op at a given column is almost
+            // always the same across records (col 3 is always DELTA, …), so each
+            // bucket collapses to near-nothing — far better than one mixed op
+            // stream where order-1 can't see the record-periodic structure.
+            let col = i.min(MAX_COL);
             let p = prev.get(i);
             if p.is_some_and(|p| p.bytes == t.bytes) {
-                ops.push(MATCH);
+                op_cols[col].push(MATCH);
             } else if t.is_num {
                 if let Some(p) = p.filter(|p| p.is_num) {
-                    ops.push(DELTA);
-                    write_varint(&mut delta_cols[i.min(MAX_COL)], zigzag(t.value - p.value));
+                    op_cols[col].push(DELTA);
+                    write_varint(&mut delta_cols[col], zigzag(t.value - p.value));
                     widths.push(t.bytes.len() as u8);
                 } else {
-                    ops.push(NUM);
+                    op_cols[col].push(NUM);
                     write_varint(&mut num_vals, t.value as u64);
                     widths.push(t.bytes.len() as u8);
                 }
             } else {
-                ops.push(STR);
+                op_cols[col].push(STR);
                 write_varint(&mut str_lens, t.bytes.len() as u64);
                 str_data.extend_from_slice(&t.bytes);
             }
         }
-        ops.push(REC_END);
+        write_varint(&mut counts, toks.len() as u64);
         prev = toks;
     }
 
-    // Serialize the per-column delta buckets: [len, bytes] per column.
-    let mut delta_ser = Vec::new();
-    for col in &delta_cols {
-        write_varint(&mut delta_ser, col.len() as u64);
-        delta_ser.extend_from_slice(col);
-    }
+    // Serialize the per-column op and delta buckets: [len, bytes] per column.
+    let op_ser = serialize_cols(&op_cols);
+    let delta_ser = serialize_cols(&delta_cols);
 
     let mut out = Vec::new();
     out.push(FORMAT_VERSION);
     write_varint(&mut out, names.len() as u64);
     // Stream order must match `decode`; text-like streams use order-1.
     for (stream, order) in [
-        (&ops, Order::One),
+        (&counts, Order::Zero),
+        (&op_ser, Order::Zero),
         (&str_lens, Order::Zero),
         (&str_data, Order::One),
         (&num_vals, Order::Zero),
@@ -135,6 +143,27 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Serialize per-column buckets as `[varint len, bytes]` per column.
+fn serialize_cols(cols: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for col in cols {
+        write_varint(&mut out, col.len() as u64);
+        out.extend_from_slice(col);
+    }
+    out
+}
+
+/// Split a `[varint len, bytes]`-per-column blob into one cursor per column.
+fn split_cols(ser: &[u8]) -> Result<Vec<Cursor<'_>>> {
+    let mut slices: Vec<&[u8]> = Vec::with_capacity(MAX_COL + 1);
+    let mut dc = Cursor::new(ser);
+    for _ in 0..=MAX_COL {
+        let len = dc.varint()? as usize;
+        slices.push(dc.take(len)?);
+    }
+    Ok(slices.into_iter().map(Cursor::new).collect())
+}
+
 /// Decode a stream produced by [`encode`], returning the read names.
 pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut r = Cursor::new(src);
@@ -146,24 +175,19 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
         let len = r.varint()? as usize;
         Ok(fqxv_rans::decode(r.take(len)?)?)
     };
-    let ops = stream()?;
+    let counts = stream()?;
+    let op_ser = stream()?;
     let str_lens = stream()?;
     let str_data = stream()?;
     let num_vals = stream()?;
     let widths = stream()?;
     let delta_ser = stream()?;
 
-    // Split the per-column delta buckets back out.
-    let mut delta_cursors: Vec<Cursor> = {
-        let mut slices: Vec<&[u8]> = Vec::with_capacity(MAX_COL + 1);
-        let mut dc = Cursor::new(&delta_ser);
-        for _ in 0..=MAX_COL {
-            let len = dc.varint()? as usize;
-            slices.push(dc.take(len)?);
-        }
-        slices.into_iter().map(Cursor::new).collect()
-    };
+    // Split the per-column op and delta buckets back out.
+    let mut op_cursors = split_cols(&op_ser)?;
+    let mut delta_cursors = split_cols(&delta_ser)?;
 
+    let mut c_counts = Cursor::new(&counts);
     let mut c_str_lens = Cursor::new(&str_lens);
     let mut c_num = Cursor::new(&num_vals);
     let mut str_pos = 0usize;
@@ -180,50 +204,52 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut prev: Vec<Tok<'static>> = Vec::new();
     let mut cur: Vec<Tok<'static>> = Vec::new();
 
-    for &op in &ops {
-        match op {
-            REC_END => {
-                let name = cur.iter().flat_map(|t| t.bytes.iter().copied()).collect();
-                names.push(name);
-                prev = std::mem::take(&mut cur);
+    for _ in 0..n_records {
+        let n_toks = c_counts.varint()? as usize;
+        for _ in 0..n_toks {
+            let col = cur.len().min(MAX_COL);
+            let op = op_cursors[col].u8()?;
+            match op {
+                MATCH => {
+                    let t = prev
+                        .get(cur.len())
+                        .ok_or(Error::Malformed("MATCH without prior token"))?
+                        .clone();
+                    cur.push(t);
+                }
+                STR => {
+                    let len = c_str_lens.varint()? as usize;
+                    let bytes = str_data
+                        .get(str_pos..str_pos + len)
+                        .ok_or(Error::Malformed("string data underrun"))?
+                        .to_vec();
+                    str_pos += len;
+                    cur.push(Tok {
+                        is_num: false,
+                        bytes: Cow::Owned(bytes),
+                        value: 0,
+                    });
+                }
+                NUM => {
+                    let value = c_num.varint()? as i64;
+                    let width = next_width(&mut w_pos)?;
+                    cur.push(num_tok(value, width));
+                }
+                DELTA => {
+                    let d = unzigzag(delta_cursors[col].varint()?);
+                    let width = next_width(&mut w_pos)?;
+                    let p = prev
+                        .get(cur.len())
+                        .filter(|p| p.is_num)
+                        .ok_or(Error::Malformed("DELTA without numeric prior"))?;
+                    cur.push(num_tok(p.value + d, width));
+                }
+                _ => return Err(Error::Malformed("unknown op")),
             }
-            MATCH => {
-                let t = prev
-                    .get(cur.len())
-                    .ok_or(Error::Malformed("MATCH without prior token"))?
-                    .clone();
-                cur.push(t);
-            }
-            STR => {
-                let len = c_str_lens.varint()? as usize;
-                let bytes = str_data
-                    .get(str_pos..str_pos + len)
-                    .ok_or(Error::Malformed("string data underrun"))?
-                    .to_vec();
-                str_pos += len;
-                cur.push(Tok {
-                    is_num: false,
-                    bytes: Cow::Owned(bytes),
-                    value: 0,
-                });
-            }
-            NUM => {
-                let value = c_num.varint()? as i64;
-                let width = next_width(&mut w_pos)?;
-                cur.push(num_tok(value, width));
-            }
-            DELTA => {
-                let col = cur.len().min(MAX_COL);
-                let d = unzigzag(delta_cursors[col].varint()?);
-                let width = next_width(&mut w_pos)?;
-                let p = prev
-                    .get(cur.len())
-                    .filter(|p| p.is_num)
-                    .ok_or(Error::Malformed("DELTA without numeric prior"))?;
-                cur.push(num_tok(p.value + d, width));
-            }
-            _ => return Err(Error::Malformed("unknown op")),
         }
+        let name = cur.iter().flat_map(|t| t.bytes.iter().copied()).collect();
+        names.push(name);
+        prev = std::mem::take(&mut cur);
     }
     Ok(names)
 }
