@@ -355,6 +355,7 @@ dependencies = [
  "fqxv-reorder",
  "fqxv-seq",
  "fqxv-tokenizer",
+ "memchr",
  "noodles-fastq",
  "proptest",
  "rayon",

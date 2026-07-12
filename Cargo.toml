@@ -31,6 +31,7 @@ thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 noodles-fastq = "0.23"
+memchr = "2"
 bitstream-io = "4"
 flate2 = "1"
 tracing = "0.1"
