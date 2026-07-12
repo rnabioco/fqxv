@@ -41,10 +41,32 @@ model. Measured on the sequence stream:
 | E. coli, ~119× coverage | 1.344 bits/base | **0.737** | **−45%** |
 | RNA-seq, shallow | 1.247 bits/base | **0.949** | **−24%** |
 
-The gain scales with coverage depth (how many reads are matchable) but is large
-even on shallow data. It is big enough to stay net-positive after storing the
-permutation needed to restore the original read order.
+These are *idealized* numbers: fixed read length, sequence stream only, order
+not preserved.
 
-Productionizing this as a container mode — dedup coding, context-model literals,
-and a compact permutation for order-preserving output — is the path to the
-SPRING/PgRC tier.
+## End to end, and the real-world caveats
+
+`fqxv compress --reorder` ships as a single-end container mode (`--keep-order`
+stores a permutation for byte-exact restore; without it, reads emerge clustered).
+It round-trips exactly. But on a **full, real** deep dataset (E. coli, 2.19 M
+variable-length reads) the whole-archive gain is modest:
+
+| mode | size | vs plain |
+| --- | --- | --- |
+| plain | 255.8 MB | — |
+| `--reorder` (order not kept) | 247.4 MB | −3.3% |
+| `--reorder --keep-order` | 253.9 MB | −0.7% |
+
+Three things erode the idealized gain on real data:
+
+1. **Variable read lengths.** `MATCH`/`DELTA` require equal length, so trimmed
+   reads (249/250/251 bp) mostly fall to `LITERAL`. The 45% was measured on a
+   fixed-251bp subset.
+2. **Reordering scrambles read names**, which destroys the tokenizer's
+   match/delta structure — a cost that partly offsets the sequence gain.
+3. **The permutation** for `--keep-order` is expensive at scale.
+
+So the honest state: the mechanism is real and validated, but realizing it on
+everyday data needs variable-length-aware differential coding (align, or allow
+length-changing deltas) and a way to keep names in original order while the
+sequence is reordered. That's the remaining work toward the SPRING/PgRC tier.

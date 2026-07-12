@@ -55,6 +55,12 @@ pub enum Error {
     /// Quality codec failure.
     #[error(transparent)]
     Fqzcomp(#[from] fqxv_fqzcomp::Error),
+    /// Read-reordering codec failure.
+    #[error(transparent)]
+    Reorder(#[from] fqxv_reorder::Error),
+    /// rANS coder failure (permutation stream).
+    #[error(transparent)]
+    Rans(#[from] fqxv_rans::Error),
 }
 
 /// The result type for this crate.

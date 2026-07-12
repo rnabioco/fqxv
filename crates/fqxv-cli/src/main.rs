@@ -125,17 +125,18 @@ fn main() -> anyhow::Result<()> {
             keep_order,
             quality_bin,
         } => {
-            if reorder {
-                anyhow::bail!("--reorder (read reordering) is not implemented yet (M4)");
-            }
-            let _ = keep_order;
             if inputs.is_empty() {
                 anyhow::bail!("at least one input FASTQ is required");
+            }
+            if reorder && inputs.len() > 1 {
+                anyhow::bail!("--reorder is single-end only (would break spot grouping)");
             }
             let params = fqxv::Params {
                 seq_order: level_to_order(level),
                 block_reads: level_to_block(level),
                 quality_binning: quality_bin.into(),
+                reorder,
+                keep_order,
                 threads: cli.threads,
             };
             let in_size: u64 = inputs
@@ -238,6 +239,10 @@ fn print_info(path: &Path) -> anyhow::Result<()> {
     println!("  blocks         {}", info.blocks);
     println!("  sequence order {}", info.seq_order);
     println!("  quality        {quality}");
+    println!(
+        "  reordered      {}",
+        if info.reordered { "yes" } else { "no" }
+    );
     println!(
         "  plus line      {}",
         if info.plus_normalized {
