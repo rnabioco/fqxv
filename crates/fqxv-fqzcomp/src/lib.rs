@@ -119,6 +119,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Max quality alphabet the model handles.
 const QMAX: usize = 64;
+/// Loose upper bound on quality symbols the range coder can emit per compressed
+/// byte, used as a decompression-bomb guard in [`decode`]. The adaptive model
+/// caps its total frequency at `1<<13`, so with 64 symbols the most-skewed
+/// symbol still costs ~0.011 bits (~700 symbols/byte is the true ceiling); this
+/// leaves a wide margin so legitimate streams never trip it.
+const MAX_SYMBOLS_PER_BYTE: usize = 1 << 16;
 /// Number of contexts: q1(6) | q2>>2(4) | delta(2) | q3>>4(2) | pos-bucket(4) =
 /// 18 bits. `q3` (the third-previous quality, coarse) captures more of the local
 /// quality trajectory. Keeping `q2` at 4 bits and growing to 18 bits beat the
@@ -218,9 +224,30 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     let lens = read_lens(&mut r)?;
 
     let mut models = vec![SimpleModel::<QMAX>::new(); N_CTX];
+    let payload_len = r.rest().len();
+    // Checked sum: a malformed stream can declare lengths whose total wraps
+    // `usize`, which would under-allocate `quals` and then over-push.
+    let total = lens
+        .iter()
+        .try_fold(0usize, |acc, &l| acc.checked_add(l as usize))
+        .ok_or(Error::Malformed("total length overflows usize"))?;
+    // Decompression-bomb guard. The range model caps its total frequency at
+    // `1<<13`, so the most-skewed symbol still costs a fraction of a bit and the
+    // coder can emit at most a few hundred quality symbols per compressed byte.
+    // A header that declares far more output than the payload could possibly
+    // encode is malformed — reject it before allocating or looping, so a tiny
+    // stream can't request a terabyte-scale decode.
+    let max_plausible = payload_len
+        .saturating_mul(MAX_SYMBOLS_PER_BYTE)
+        .saturating_add(MAX_SYMBOLS_PER_BYTE);
+    if total > max_plausible {
+        return Err(Error::Malformed("declared length exceeds payload capacity"));
+    }
     let mut dec = Decoder::new(r.rest());
-    let total: usize = lens.iter().map(|&l| l as usize).sum();
-    let mut quals = Vec::with_capacity(total);
+    let mut quals = Vec::new();
+    quals
+        .try_reserve(total)
+        .map_err(|_| Error::Malformed("declared total length too large to allocate"))?;
     for &l in &lens {
         let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
         let mut delta = 0u8;
@@ -282,13 +309,22 @@ fn write_lens(out: &mut Vec<u8>, lens: &[u32]) {
 fn read_lens(r: &mut ByteReader<'_>) -> Result<Vec<u32>> {
     let n = r.varint()? as usize;
     let fixed = r.u8()? != 0;
-    let mut lens = Vec::with_capacity(n);
+    let mut lens = Vec::new();
     if fixed {
+        // The fixed path allocates all `n` entries up front regardless of how
+        // many input bytes remain, so an untrusted `n` must not abort the
+        // process on a hostile allocation — turn it into a clean error.
         if n > 0 {
             let f = r.varint()? as u32;
+            lens.try_reserve_exact(n)
+                .map_err(|_| Error::Malformed("length count too large to allocate"))?;
             lens.resize(n, f);
         }
     } else {
+        // Self-limiting: each length is a varint consuming >= 1 input byte, so
+        // `n` is bounded by the remaining input. Cap the speculative reserve.
+        lens.try_reserve(n.min(1 << 20))
+            .map_err(|_| Error::Malformed("length count too large to allocate"))?;
         for _ in 0..n {
             lens.push(r.varint()? as u32);
         }
@@ -411,6 +447,39 @@ mod tests {
         );
     }
 
+    fn push_varint(out: &mut Vec<u8>, mut v: u64) {
+        loop {
+            let b = (v & 0x7f) as u8;
+            v >>= 7;
+            if v == 0 {
+                out.push(b);
+                break;
+            }
+            out.push(b | 0x80);
+        }
+    }
+
+    // A hostile length header must produce a clean `Err`, never abort the
+    // process on an impossible allocation. Regression for the DoS where a
+    // ~13-byte stream requested hundreds of petabytes via `Vec::with_capacity`.
+    #[test]
+    fn rejects_huge_length_count() {
+        let mut buf = vec![0u8, 0, 0, 1]; // version, binning, qmin, qsize
+        push_varint(&mut buf, u64::MAX >> 8); // n: absurd length count
+        buf.push(1); // fixed = true -> resize(n, f) path
+        push_varint(&mut buf, 100); // f
+        assert!(matches!(decode(&buf), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn rejects_huge_total_length() {
+        let mut buf = vec![0u8, 0, 0, 1];
+        push_varint(&mut buf, 1000); // n reads
+        buf.push(1); // fixed = true
+        push_varint(&mut buf, u32::MAX as u64); // each read u32::MAX long
+        assert!(matches!(decode(&buf), Err(Error::Malformed(_))));
+    }
+
     proptest::proptest! {
         #[test]
         fn roundtrip_arbitrary(
@@ -420,6 +489,12 @@ mod tests {
             let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
             let quals: Vec<u8> = reads.concat();
             roundtrip(&lens, &quals, QualityBinning::Lossless);
+        }
+
+        // Arbitrary bytes must never panic or abort the decoder — only Ok/Err.
+        #[test]
+        fn decode_never_aborts_on_garbage(bytes in proptest::collection::vec(0u8..=255, 0..256)) {
+            let _ = decode(&bytes);
         }
     }
 }
