@@ -51,6 +51,9 @@ const DELTA: u8 = 3;
 const REC_END: u8 = 4;
 // Numeric runs longer than this don't fit i64; encode them as string literals.
 const MAX_NUM_DIGITS: usize = 18;
+// Delta values are bucketed by token column (position within the name) up to
+// this cap, so each column (tile / x / y …) is modeled on its own distribution.
+const MAX_COL: usize = 63;
 
 #[derive(Clone)]
 struct Tok {
@@ -72,7 +75,7 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
     let mut str_data: Vec<u8> = Vec::new();
     let mut num_vals: Vec<u8> = Vec::new();
     let mut widths: Vec<u8> = Vec::new();
-    let mut delta_vals: Vec<u8> = Vec::new();
+    let mut delta_cols: Vec<Vec<u8>> = vec![Vec::new(); MAX_COL + 1];
     let mut prev: Vec<Tok> = Vec::new();
 
     for name in names {
@@ -84,7 +87,7 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
             } else if t.is_num {
                 if let Some(p) = p.filter(|p| p.is_num) {
                     ops.push(DELTA);
-                    write_varint(&mut delta_vals, zigzag(t.value - p.value));
+                    write_varint(&mut delta_cols[i.min(MAX_COL)], zigzag(t.value - p.value));
                     widths.push(t.bytes.len() as u8);
                 } else {
                     ops.push(NUM);
@@ -101,6 +104,13 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
         prev = toks;
     }
 
+    // Serialize the per-column delta buckets: [len, bytes] per column.
+    let mut delta_ser = Vec::new();
+    for col in &delta_cols {
+        write_varint(&mut delta_ser, col.len() as u64);
+        delta_ser.extend_from_slice(col);
+    }
+
     let mut out = Vec::new();
     out.push(FORMAT_VERSION);
     write_varint(&mut out, names.len() as u64);
@@ -111,7 +121,7 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
         (&str_data, Order::One),
         (&num_vals, Order::Zero),
         (&widths, Order::Zero),
-        (&delta_vals, Order::Zero),
+        (&delta_ser, Order::Zero),
     ] {
         let c = fqxv_rans::encode(stream, order)?;
         write_varint(&mut out, c.len() as u64);
@@ -136,11 +146,21 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     let str_data = stream()?;
     let num_vals = stream()?;
     let widths = stream()?;
-    let delta_vals = stream()?;
+    let delta_ser = stream()?;
+
+    // Split the per-column delta buckets back out.
+    let mut delta_cursors: Vec<Cursor> = {
+        let mut slices: Vec<&[u8]> = Vec::with_capacity(MAX_COL + 1);
+        let mut dc = Cursor::new(&delta_ser);
+        for _ in 0..=MAX_COL {
+            let len = dc.varint()? as usize;
+            slices.push(dc.take(len)?);
+        }
+        slices.into_iter().map(Cursor::new).collect()
+    };
 
     let mut c_str_lens = Cursor::new(&str_lens);
     let mut c_num = Cursor::new(&num_vals);
-    let mut c_delta = Cursor::new(&delta_vals);
     let mut str_pos = 0usize;
     let mut w_pos = 0usize;
     let next_width = |w_pos: &mut usize| -> Result<usize> {
@@ -188,7 +208,8 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                 cur.push(num_tok(value, width));
             }
             DELTA => {
-                let d = unzigzag(c_delta.varint()?);
+                let col = cur.len().min(MAX_COL);
+                let d = unzigzag(delta_cursors[col].varint()?);
                 let width = next_width(&mut w_pos)?;
                 let p = prev
                     .get(cur.len())
