@@ -109,7 +109,7 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
         return Err(Error::Malformed("unsupported version"));
     }
     let k = r.u8()? as usize;
-    if k < 1 || k > MAX_ORDER {
+    if !(1..=MAX_ORDER).contains(&k) {
         return Err(Error::Malformed("order out of range"));
     }
     let ctx_mask = (1usize << (2 * k)) - 1;
