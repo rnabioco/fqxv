@@ -26,6 +26,21 @@ samtools = "*"
 # Harness scripting
 python = ">=3.11"
 
+# Build toolchain for from-source baselines (PgRC, fqzcomp5 + its htscodecs).
+cxx-compiler = "*"
+c-compiler = "*"
+cmake = "*"
+make = "*"
+git = "*"
+pkg-config = "*"
+autoconf = "*"
+automake = "*"
+libtool = "*"
+zlib = "*"
+bzip2 = "*"
+
 [tasks]
+# Clone + build the from-source baselines (PgRC, fqzcomp5) into $SCRATCH tools.
+build-tools = { cmd = "bash build_tools.sh", description = "Build PgRC and fqzcomp5 from source" }
 # Print quality-score alphabet + basic stats for a FASTQ (binned vs full-range check)
 qstats = { cmd = "seqkit stats -a", description = "Quality/length stats for a FASTQ" }

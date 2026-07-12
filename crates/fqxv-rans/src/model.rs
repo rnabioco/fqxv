@@ -8,8 +8,11 @@
 pub(crate) const SCALE_BITS: u32 = 12;
 /// The frequency total; every model sums to this.
 pub(crate) const TOTFREQ: u32 = 1 << SCALE_BITS;
-/// Lower bound of the normalized rANS state interval `[RANS_L, RANS_L << 8)`.
-pub(crate) const RANS_L: u32 = 1 << 23;
+/// Lower bound of the normalized rANS state interval `[RANS_L, RANS_L << 16)`.
+///
+/// With 16-bit renormalization this bound guarantees at most one 16-bit word is
+/// emitted/consumed per state per step — the property the SIMD backends rely on.
+pub(crate) const RANS_L: u32 = 1 << 16;
 /// Number of interleaved rANS states (maps to SIMD lanes later).
 pub(crate) const N_STATES: usize = 32;
 

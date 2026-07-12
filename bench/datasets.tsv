@@ -2,6 +2,7 @@
 # Fetched with `sracha` (see fetch.sh). Columns:
 #   accession  label                 platform          layout   quality      approx_gz
 SRR2627175	ecoli_miseq	MiSeq	paired	full-range	876MB
-ERR10213669	human_novaseq_exome	NovaSeq6000	paired	binned	1.6GB
 DRR174812	rnaseq_novaseq	NovaSeq6000	paired	binned	2.1GB
 SRR453566	rnaseq_fullrange	GAIIx	paired	full-range	500MB
+# ERR10213669 dropped: reference-compressed cSRA, not reconstructable by sracha.
+# Add a plain (unaligned) human NovaSeq run here if a binned-human sample is wanted.

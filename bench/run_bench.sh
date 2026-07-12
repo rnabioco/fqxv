@@ -18,10 +18,18 @@ DATA_DIR="${FQXV_DATA_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/data}"
 RESULTS_DIR="${FQXV_RESULTS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/results}"
 THREADS="${FQXV_THREADS:-$(nproc)}"
 INPUT_MODE="${FQXV_INPUT:-r1}"
-ALL_TOOLS="gzip zstd19 xz9 fqz_comp spring"
+ALL_TOOLS="gzip zstd19 xz9 fqz_comp fqzcomp5 spring"
 TOOLS="${FQXV_TOOLS:-$ALL_TOOLS}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$RESULTS_DIR/work"
+
+# From-source baselines (built by build_tools.sh) live here; fqzcomp5 needs its
+# htscodecs shared lib on LD_LIBRARY_PATH. PgRC is built but intentionally NOT
+# in ALL_TOOLS: it is a sequence-only read compressor (drops names, simplifies
+# quality), so it is not comparable to full-FASTQ archivers — see README.
+TOOLS_DIR="${FQXV_TOOLS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/tools}"
+export PATH="$TOOLS_DIR/bin:$PATH"
+export LD_LIBRARY_PATH="$TOOLS_DIR/lib:${LD_LIBRARY_PATH:-}"
 
 mkdir -p "$RESULTS_DIR" "$WORK"
 RESULTS="$RESULTS_DIR/results.tsv"
@@ -57,6 +65,7 @@ compress() {  # tool input out_prefix
     zstd19)   COMP="$pfx.zst"; measure bash -c "zstd -19 --long=27 -T$THREADS -q -f -o '$COMP' '$in'" ;;
     xz9)      COMP="$pfx.xz";  measure bash -c "xz -9 -T$THREADS -c '$in' > '$COMP'" ;;
     fqz_comp) COMP="$pfx.fqz"; measure bash -c "fqz_comp < '$in' > '$COMP'" ;;
+    fqzcomp5) COMP="$pfx.fqz5"; measure bash -c "fqzcomp5 < '$in' > '$COMP'" ;;
     spring)   COMP="$pfx.spring"; mkdir -p "$WORK/spring_c_$$"; measure spring -c -t "$THREADS" -i "$in" -o "$COMP" -w "$WORK/spring_c_$$/" ;;
     *) echo "unknown tool $tool" >&2; return 1 ;;
   esac
@@ -68,6 +77,7 @@ decompress() {  # tool comp out_rt
     zstd19)   measure bash -c "zstd -d -q -f -o '$rt' '$comp'" ;;
     xz9)      measure bash -c "xz -d -T$THREADS -c '$comp' > '$rt'" ;;
     fqz_comp) measure bash -c "fqz_comp -d < '$comp' > '$rt'" ;;
+    fqzcomp5) measure bash -c "fqzcomp5 -d < '$comp' > '$rt'" ;;
     spring)   mkdir -p "$WORK/spring_d_$$"; measure spring -d -t "$THREADS" -i "$comp" -o "$rt" -w "$WORK/spring_d_$$/" ;;
   esac
 }
@@ -98,7 +108,12 @@ for row in "${rows[@]}"; do
   echo "==> $label  ($(numfmt --to=iec "$orig_bytes"), $nrec reads, $(numfmt --to=iec "$nbases") bases)"
 
   for tool in $TOOLS; do
-    command -v "${tool%%[0-9]*}" >/dev/null 2>&1 || { echo "  [miss] $tool"; continue; }
+    # Map tool label -> binary name (labels carry version digits / differ in case).
+    case "$tool" in
+      gzip) bin=pigz ;; zstd19) bin=zstd ;; xz9) bin=xz ;; pgrc) bin=PgRC ;;
+      *) bin="$tool" ;;
+    esac
+    command -v "$bin" >/dev/null 2>&1 || { echo "  [miss] $tool ($bin)"; continue; }
     pfx="$WORK/${label}.${tool}"; rt="$WORK/${label}.${tool}.rt.fastq"
     rm -f "$pfx".* "$rt"
 

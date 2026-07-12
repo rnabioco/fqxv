@@ -32,12 +32,17 @@ for acc in "${accessions[@]}"; do
     continue
   fi
   echo "  [get ] $acc"
-  sracha get "$acc" \
-    --output-dir "$DATA_DIR" \
-    --threads "$THREADS" \
-    --split split-3 \
-    --no-gzip \
-    --no-progress
+  # Per-accession failures (e.g. cSRA archives sracha can't reconstruct) must
+  # not abort the whole batch.
+  if ! sracha get "$acc" \
+      --output-dir "$DATA_DIR" \
+      --threads "$THREADS" \
+      --split split-3 \
+      --no-gzip \
+      --no-progress; then
+    echo "  [FAIL] $acc — skipping" >&2
+    continue
+  fi
 done
 
 echo "==> done. Contents:"

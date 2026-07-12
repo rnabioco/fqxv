@@ -61,7 +61,28 @@ sequence length; `rt` is a round-trip record-count sanity check.
 - **gzip** (`pigz -6`) — the baseline of record.
 - **zstd -19 --long**, **xz -9** — general-purpose strong baselines.
 - **fqz_comp** — FASTQ-specific quality/context coder (htscodecs family).
+- **fqzcomp5** — Bonfield's newer quality/context + LZP coder (built from source).
 - **spring** — reference-free read-reordering archiver.
 
-`pgrc`/`mstcom`/`fqzcomp5` aren't in bioconda; add them here if you build them.
-Once `fqxv` produces output, it joins this table as another tool.
+### From-source tools
+
+`fqzcomp5` and `PgRC` aren't in bioconda; build them with:
+
+```bash
+pixi run build-tools        # clones + compiles into $SCRATCH/fqxv/tools/bin
+```
+
+`fqzcomp5` is a full lossless FASTQ compressor and is in the default tool set.
+
+**PgRC is deliberately *not* in the default tool set.** It is a read/*sequence*
+compressor: by default it drops read names and simplifies quality, and its
+decompressed output is one sequence per line (not FASTQ), so its ratio is not
+comparable to full-FASTQ archivers. It's kept built for sequence-stream
+experiments (relevant to the M4 reordering work):
+
+```bash
+PgRC -o -Q -t 8 -i reads.fastq arch     # compress (‑o keep order, ‑Q lossless qual)
+PgRC -d -t 8 arch                        # -> arch_out (sequences, one per line)
+```
+
+Once `fqxv` produces output, it joins the comparable table as another tool.

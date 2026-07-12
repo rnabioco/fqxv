@@ -14,9 +14,18 @@ categories.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Exposes internal scalar/AVX2 entry points for the benchmark harness only.
+bench = []
+
 [dependencies]
 thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
 criterion.workspace = true
+
+[[bench]]
+name = "rans"
+harness = false
+required-features = ["bench"]

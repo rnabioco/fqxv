@@ -9,8 +9,8 @@ version = "0.0.0"
 edition = "2021"
 rust-version = "1.97"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/rnabioco/qxv"
-homepage = "https://github.com/rnabioco/qxv"
+repository = "https://github.com/rnabioco/fqxv"
+homepage = "https://github.com/rnabioco/fqxv"
 authors = ["Jay Hesselberth <jay.hesselberth@gmail.com>"]
 keywords = ["fastq", "compression", "bioinformatics", "genomics", "rans"]
 categories = ["compression", "science"]
@@ -50,14 +50,36 @@ cast_possible_truncation = "allow"
 # index loops read clearer than zipped iterators here.
 needless_range_loop = "allow"
 
-# Faster, smaller release artifacts for benchmarking.
+# Optimized release build: fat LTO + single codegen unit for maximum performance.
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
+strip = true
+lto = "fat"
 panic = "abort"
+codegen-units = 1
 
-# A profile that keeps debug symbols for `perf`/flamegraphs on release-speed code.
+# Fast dev builds, but with optimized third-party crates so tests/benches run
+# at a reasonable speed.
+[profile.dev.package."*"]
+opt-level = 2
+
+# `cargo bench` uses [profile.bench], which does NOT inherit [profile.release]
+# by default. Pin it so microbenchmarks measure the same codegen (fat LTO,
+# single codegen unit) that ships. strip=false keeps symbols for criterion.
 [profile.bench]
 inherits = "release"
-debug = true
+strip = false
+
+# Release build with symbols preserved — for samply/perf/flamegraph on
+# release-speed code. Debuginfo split into a sidecar so the binary stays small.
+[profile.profiling]
+inherits = "release"
+debug = 2
+split-debuginfo = "packed"
+strip = false
+lto = false
+codegen-units = 16
+
+# Distribution profile used by the release workflow.
+[profile.dist]
+inherits = "release"
