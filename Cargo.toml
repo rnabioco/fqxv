@@ -35,7 +35,7 @@ bitstream-io = "4"
 
 # Dev/bench deps.
 proptest = "1"
-criterion = { version = "0.7", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "forbid"
