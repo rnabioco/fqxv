@@ -631,17 +631,25 @@ fn compress_reordered_whole<R: Read + Send, W: Write>(
     // 2. One global clustering pass over every read.
     let plan = pool.install(|| fqxv_reorder::plan(&all.lens, &all.seq, REORDER_K));
 
-    // 3. Clustered, oriented sequences + flip bitmap (clustered order).
-    let mut cl_reads: Vec<Vec<u8>> = Vec::with_capacity(n);
+    // 3. Clustered, oriented sequences (parallel copy/revcomp) + flip bitmap.
+    let cl_reads: Vec<Vec<u8>> = pool.install(|| {
+        plan.order
+            .par_iter()
+            .map(|&oi| {
+                let oi = oi as usize;
+                let s = &all.seq[offs[oi]..offs[oi + 1]];
+                if plan.flip[oi] {
+                    fqxv_reorder::revcomp(s)
+                } else {
+                    s.to_vec()
+                }
+            })
+            .collect()
+    });
     let mut flip_bits = vec![0u8; n.div_ceil(8)];
     for (j, &oi) in plan.order.iter().enumerate() {
-        let oi = oi as usize;
-        let s = &all.seq[offs[oi]..offs[oi + 1]];
-        if plan.flip[oi] {
+        if plan.flip[oi as usize] {
             flip_bits[j / 8] |= 1 << (j % 8);
-            cl_reads.push(fqxv_reorder::revcomp(s));
-        } else {
-            cl_reads.push(s.to_vec());
         }
     }
 

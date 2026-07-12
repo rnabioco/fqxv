@@ -28,6 +28,7 @@
 //! assert_ne!(p.flip[0], p.flip[1]);
 //! ```
 
+use rayon::prelude::*;
 use thiserror::Error;
 
 /// Errors returned by the reordering engine.
@@ -138,18 +139,36 @@ pub fn plan(lens: &[u32], seq: &[u8], k: usize) -> Plan {
     let k = k.clamp(1, 32);
     let n = lens.len();
 
-    // (canonical minimizer, oriented sequence, original index, flip)
-    let mut keys: Vec<(u64, Vec<u8>, u32, bool)> = Vec::with_capacity(n);
-    let mut off = 0usize;
-    for (i, &l) in lens.iter().enumerate() {
-        let read = &seq[off..off + l as usize];
-        off += l as usize;
-        let (canon, flip) = min_canonical(read, k);
-        let oriented = if flip { revcomp(read) } else { read.to_vec() };
-        keys.push((canon, oriented, i as u32, flip));
+    // Byte offset of each read (so the key build can run in parallel).
+    let mut offs = Vec::with_capacity(n + 1);
+    let mut acc = 0usize;
+    for &l in lens {
+        offs.push(acc);
+        acc += l as usize;
     }
+    offs.push(acc);
 
-    keys.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    // (canonical minimizer, oriented sequence, original index, flip). Building
+    // each key is independent, so it runs across cores.
+    let mut keys: Vec<(u64, Vec<u8>, u32, bool)> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let read = &seq[offs[i]..offs[i + 1]];
+            let (canon, flip) = min_canonical(read, k);
+            let oriented = if flip { revcomp(read) } else { read.to_vec() };
+            (canon, oriented, i as u32, flip)
+        })
+        .collect();
+
+    // Parallel sort. The final tie-break on original index makes the comparator
+    // a TOTAL order, so duplicate reads (equal minimizer + sequence) get one
+    // deterministic ordering regardless of thread count — the byte-identical
+    // output invariant. Clustering quality is unaffected (dups stay adjacent).
+    keys.par_sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
 
     let order = keys.iter().map(|key| key.2).collect();
     let mut flip = vec![false; n];
