@@ -180,12 +180,16 @@ pub fn plan(lens: &[u32], seq: &[u8], k: usize) -> Plan {
         })
         .collect();
 
-    // Parallel sort. The final tie-break on original index makes the comparator
-    // a TOTAL order, so duplicate reads (equal minimizer + sequence) get one
-    // deterministic ordering regardless of thread count — the byte-identical
-    // output invariant. Clustering quality is unaffected (dups stay adjacent).
+    // Parallel sort: cluster by minimizer, then within a cluster order by
+    // anchor DESCENDING. Higher anchor = the shared minimizer sits later in the
+    // read = the read starts earlier on the shared coordinate, so reads emerge
+    // left-to-right and the contig assembler grows a reference rightward without
+    // ever extending left. The oriented-sequence + original-index tie-breaks
+    // make the comparator a TOTAL order, so the output is byte-identical
+    // regardless of thread count (the determinism invariant).
     keys.par_sort_unstable_by(|a, b| {
         a.0.cmp(&b.0)
+            .then_with(|| b.4.cmp(&a.4))
             .then_with(|| a.1.cmp(&b.1))
             .then_with(|| a.2.cmp(&b.2))
     });
@@ -204,16 +208,17 @@ pub fn plan(lens: &[u32], seq: &[u8], k: usize) -> Plan {
     }
 }
 
-// --- clustered differential codec -------------------------------------------
+// --- clustered contig-assembly codec ----------------------------------------
 
+/// Exact duplicate of the previous emitted read.
 const OP_MATCH: u8 = 0;
-const OP_DELTA: u8 = 1;
+/// A member of the current contig: placed at an offset on the growing consensus
+/// reference, storing only the overlap's mismatches and the novel tail bases.
+const OP_CONTIG: u8 = 1;
+/// Seeds a new contig — coded as a literal via the `fqxv_seq` context model.
 const OP_LITERAL: u8 = 2;
-/// Read overlaps the previous read at a non-zero shift (from the shared
-/// minimizer anchor): store the shift, the overlap's mismatches, and only the
-/// non-overlapping ("novel") bases. Captures the shifted overlaps of deep
-/// coverage that same-position `DELTA` cannot.
-const OP_SHIFT: u8 = 3;
+/// Minimum overlap with the contig to bother placing a read on it.
+const MIN_CONTIG_OVERLAP: usize = 16;
 
 fn zigzag(d: i64) -> u64 {
     ((d << 1) ^ (d >> 63)) as u64
@@ -222,80 +227,101 @@ fn unzigzag(z: u64) -> i64 {
     ((z >> 1) as i64) ^ -((z & 1) as i64)
 }
 
-/// Differentially encode reads that are already in clustered order (e.g. via
-/// [`plan`]).
+/// Assemble reads that are already in clustered, left-to-right order (via
+/// [`plan`]) into contigs and code them against a growing consensus reference.
 ///
-/// Each read is coded relative to the previous read: `MATCH` (identical),
-/// `DELTA` (same length, at most ¼ mismatches — stored as position + byte), or
-/// `LITERAL` (coded with the [`fqxv_seq`] context model). Byte-exact, so it
-/// preserves `N` and any other bytes. `seq_order` is the literal model order.
+/// A read is one of: `MATCH` (identical to the previous read); `CONTIG` (it
+/// overlaps the current contig at the shift implied by the shared minimizer
+/// [`Plan::anchor`] — store the overlap's mismatches and the novel tail, which
+/// extends the reference); or `LITERAL` (seeds a new contig, coded with the
+/// [`fqxv_seq`] model). This captures the shifted overlaps of deep coverage —
+/// a read matches the consensus of all reads before it on the contig, not just
+/// its immediate predecessor. Byte-exact.
 pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> Result<Vec<u8>> {
     let mut ops = Vec::with_capacity(reads.len());
+    let (mut offdelta, mut slen) = (Vec::new(), Vec::new());
     let (mut nmis, mut pos, mut subs) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut shift, mut slen, mut novel) = (Vec::new(), Vec::new(), Vec::new());
-    let (mut lit_seq, mut lit_lens): (Vec<u8>, Vec<u32>) = (Vec::new(), Vec::new());
+    let (mut novel, mut lit_seq, mut lit_lens): (Vec<u8>, Vec<u8>, Vec<u32>) =
+        (Vec::new(), Vec::new(), Vec::new());
+
+    // The current contig: a growing consensus reference. `ref_anchor` is the
+    // shared minimizer's position in it (the seed read's anchor). `prev_off` is
+    // the last placed read's offset, for delta-coding offsets.
+    let mut cref: Vec<u8> = Vec::new();
+    let mut ref_anchor: u32 = 0;
+    let mut prev_off: usize = 0;
 
     for (i, &cur) in reads.iter().enumerate() {
-        let prev: &[u8] = if i > 0 { reads[i - 1] } else { &[] };
-        // Same-position mismatch set (the DELTA candidate).
-        let mism = (i > 0 && cur.len() == prev.len()).then(|| {
-            (0..cur.len())
-                .filter(|&j| cur[j] != prev[j])
-                .collect::<Vec<_>>()
-        });
-        if i > 0 && cur == prev {
+        if i > 0 && cur == reads[i - 1] {
             ops.push(OP_MATCH);
-        } else if let Some(mism) = mism.filter(|m| m.len() <= cur.len() / 4) {
-            ops.push(OP_DELTA);
-            write_varint(&mut nmis, mism.len() as u64);
-            let mut last = 0usize;
-            for &m in &mism {
-                write_varint(&mut pos, (m - last) as u64);
-                last = m;
-                subs.push(cur[m]);
-            }
-        } else if let Some((d, mism)) = (i > 0)
-            .then(|| shift_align(cur, prev, anchors[i], anchors[i - 1]))
+            continue;
+        }
+        // Offset of `cur` on the contig, from the shared-minimizer anchors.
+        let placed = (!cref.is_empty() && !cur.is_empty())
+            .then(|| {
+                let off = ref_anchor as i64 - anchors[i] as i64;
+                (off >= 0 && off as usize <= cref.len()).then_some(off as usize)
+            })
             .flatten()
-        {
-            // Shifted overlap: cur[j] aligns to prev[j + d] on the overlap.
-            ops.push(OP_SHIFT);
-            write_varint(&mut shift, zigzag(d));
-            write_varint(&mut slen, cur.len() as u64);
-            write_varint(&mut nmis, mism.len() as u64);
-            let mut last = 0usize;
-            for &m in &mism {
-                write_varint(&mut pos, (m - last) as u64);
-                last = m;
-                subs.push(cur[m]);
-            }
-            let (lo, hi) = overlap_range(cur.len(), prev.len(), d);
-            for (j, &b) in cur.iter().enumerate() {
-                if j < lo || j >= hi {
-                    novel.push(b); // a non-overlapping (novel) base
+            .and_then(|off| {
+                let overlap = cur.len().min(cref.len() - off);
+                if overlap < MIN_CONTIG_OVERLAP.min(cur.len()) || overlap == 0 {
+                    return None;
                 }
+                let mism: Vec<usize> = (0..overlap).filter(|&j| cur[j] != cref[off + j]).collect();
+                let novel_n = cur.len() - overlap;
+                // Cheap enough to be a real overlap, and smaller than a literal.
+                (mism.len() <= overlap / 4 && novel_n + mism.len() * 2 < cur.len())
+                    .then_some((off, overlap, mism))
+            });
+        match placed {
+            Some((off, overlap, mism)) => {
+                ops.push(OP_CONTIG);
+                write_varint(&mut offdelta, zigzag(off as i64 - prev_off as i64));
+                write_varint(&mut slen, cur.len() as u64);
+                write_varint(&mut nmis, mism.len() as u64);
+                let mut last = 0usize;
+                for &m in &mism {
+                    write_varint(&mut pos, (m - last) as u64);
+                    last = m;
+                    subs.push(cur[m]);
+                }
+                novel.extend_from_slice(&cur[overlap..]);
+                cref.extend_from_slice(&cur[overlap..]); // first-seen consensus
+                prev_off = off;
             }
-        } else {
-            ops.push(OP_LITERAL);
-            lit_seq.extend_from_slice(cur);
-            lit_lens.push(cur.len() as u32);
+            None => {
+                ops.push(OP_LITERAL);
+                lit_seq.extend_from_slice(cur);
+                lit_lens.push(cur.len() as u32);
+                cref = cur.to_vec();
+                ref_anchor = anchors[i];
+                prev_off = 0;
+            }
         }
     }
 
     let ops_c = fqxv_rans::encode(&ops, fqxv_rans::Order::One)?;
+    let offdelta_c = fqxv_rans::encode(&offdelta, fqxv_rans::Order::Zero)?;
+    let slen_c = fqxv_rans::encode(&slen, fqxv_rans::Order::Zero)?;
     let nmis_c = fqxv_rans::encode(&nmis, fqxv_rans::Order::Zero)?;
     let pos_c = fqxv_rans::encode(&pos, fqxv_rans::Order::Zero)?;
     let subs_c = fqxv_rans::encode(&subs, fqxv_rans::Order::One)?;
-    let shift_c = fqxv_rans::encode(&shift, fqxv_rans::Order::Zero)?;
-    let slen_c = fqxv_rans::encode(&slen, fqxv_rans::Order::Zero)?;
     let novel_c = fqxv_seq::encode(&[novel.len() as u32], &novel, seq_order)?;
     let lit_c = fqxv_seq::encode(&lit_lens, &lit_seq, seq_order)?;
 
     let mut out = Vec::new();
-    out.push(1u8); // version (1 adds the SHIFT streams)
+    out.push(2u8); // version 2: contig-assembly layout
     write_varint(&mut out, reads.len() as u64);
     for s in [
-        &ops_c, &nmis_c, &pos_c, &subs_c, &shift_c, &slen_c, &novel_c, &lit_c,
+        &ops_c,
+        &offdelta_c,
+        &slen_c,
+        &nmis_c,
+        &pos_c,
+        &subs_c,
+        &novel_c,
+        &lit_c,
     ] {
         write_varint(&mut out, s.len() as u64);
         out.extend_from_slice(s);
@@ -303,141 +329,43 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
     Ok(out)
 }
 
-/// The overlap `[lo, hi)` of `cur` positions when `cur[j]` aligns to
-/// `prev[j + d]` (in `cur` coordinates).
-fn overlap_range(cur_len: usize, prev_len: usize, d: i64) -> (usize, usize) {
-    let lo = (-d).max(0) as usize;
-    let hi = ((prev_len as i64 - d).max(0) as usize).min(cur_len);
-    (lo, hi.max(lo))
-}
-
-/// Try to align `cur` to `prev` at the shift implied by their shared minimizer
-/// anchors. Returns `(d, overlap_mismatch_positions)` when the alignment is
-/// worth a `SHIFT` (substantial cheap overlap, fewer stored bytes than a
-/// literal), else `None`.
-fn shift_align(
-    cur: &[u8],
-    prev: &[u8],
-    anchor_cur: u32,
-    anchor_prev: u32,
-) -> Option<(i64, Vec<usize>)> {
-    let d = anchor_prev as i64 - anchor_cur as i64;
-    let (lo, hi) = overlap_range(cur.len(), prev.len(), d);
-    let overlap = hi.checked_sub(lo)?;
-    // Need a substantial overlap to bother.
-    if overlap < cur.len() / 2 || overlap == 0 {
-        return None;
-    }
-    let mut mism = Vec::new();
-    for j in lo..hi {
-        if cur[j] != prev[(j as i64 + d) as usize] {
-            mism.push(j);
-            // Bail early if the overlap is too noisy to be an overlap.
-            if mism.len() > overlap / 4 {
-                return None;
-            }
-        }
-    }
-    let novel = cur.len() - overlap;
-    // Only worth it if we store materially less than a full literal.
-    if novel + mism.len() * 2 >= cur.len() {
-        return None;
-    }
-    Some((d, mism))
-}
-
 /// Decode a stream produced by [`encode_clustered`], returning the reads in the
 /// same (clustered) order.
 pub fn decode_clustered(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut r = Cursor::new(src);
-    let version = r.u8()?;
-    if version != 1 {
+    if r.u8()? != 2 {
         return Err(Error::Malformed("unsupported version"));
     }
     let n = r.varint()? as usize;
     let ops = fqxv_rans::decode(r.take_stream()?)?;
+    let offdelta = fqxv_rans::decode(r.take_stream()?)?;
+    let slen = fqxv_rans::decode(r.take_stream()?)?;
     let nmis = fqxv_rans::decode(r.take_stream()?)?;
     let pos = fqxv_rans::decode(r.take_stream()?)?;
     let subs = fqxv_rans::decode(r.take_stream()?)?;
-    let shift = fqxv_rans::decode(r.take_stream()?)?;
-    let slen = fqxv_rans::decode(r.take_stream()?)?;
     let (_, novel) = fqxv_seq::decode(r.take_stream()?)?;
     let (lit_lens, lit_seq) = fqxv_seq::decode(r.take_stream()?)?;
 
+    let mut c_offdelta = Cursor::new(&offdelta);
+    let mut c_slen = Cursor::new(&slen);
     let mut c_nmis = Cursor::new(&nmis);
     let mut c_pos = Cursor::new(&pos);
-    let mut c_shift = Cursor::new(&shift);
-    let mut c_slen = Cursor::new(&slen);
     let (mut subs_pos, mut lit_pos, mut lit_idx, mut novel_pos) = (0usize, 0usize, 0usize, 0usize);
     let mut reads: Vec<Vec<u8>> = Vec::with_capacity(n.min(1 << 22));
 
-    // Read the mismatch (count, positions, bases) for a DELTA/SHIFT into `read`.
-    let take_mismatches = |read: &mut [u8],
-                           c_nmis: &mut Cursor,
-                           c_pos: &mut Cursor,
-                           subs_pos: &mut usize|
-     -> Result<()> {
-        let m = c_nmis.varint()? as usize;
-        let mut p = 0usize;
-        for _ in 0..m {
-            p += c_pos.varint()? as usize;
-            let b = *subs
-                .get(*subs_pos)
-                .ok_or(Error::Malformed("subs underrun"))?;
-            *subs_pos += 1;
-            *read
-                .get_mut(p)
-                .ok_or(Error::Malformed("delta position out of range"))? = b;
-        }
-        Ok(())
-    };
+    // The current contig, replayed identically to the encoder.
+    let mut cref: Vec<u8> = Vec::new();
+    let mut prev_off: usize = 0;
 
     for i in 0..n {
         let op = *ops.get(i).ok_or(Error::Malformed("op underrun"))?;
-        let read = match op {
-            OP_MATCH => reads
-                .last()
-                .ok_or(Error::Malformed("MATCH with no previous"))?
-                .clone(),
-            OP_DELTA => {
-                let mut read = reads
+        match op {
+            OP_MATCH => {
+                let read = reads
                     .last()
-                    .ok_or(Error::Malformed("DELTA with no previous"))?
+                    .ok_or(Error::Malformed("MATCH with no previous"))?
                     .clone();
-                take_mismatches(&mut read, &mut c_nmis, &mut c_pos, &mut subs_pos)?;
-                read
-            }
-            OP_SHIFT => {
-                let prev = reads
-                    .last()
-                    .ok_or(Error::Malformed("SHIFT with no previous"))?;
-                let d = unzigzag(c_shift.varint()?);
-                let cur_len = c_slen.varint()? as usize;
-                let (lo, hi) = overlap_range(cur_len, prev.len(), d);
-                let mut read = vec![0u8; cur_len];
-                // Overlap: copy from the previous read at the shift.
-                for (j, slot) in read.iter_mut().enumerate().take(hi).skip(lo) {
-                    let pj = usize::try_from(j as i64 + d)
-                        .ok()
-                        .and_then(|k| prev.get(k))
-                        .ok_or(Error::Malformed("shift overlap out of range"))?;
-                    *slot = *pj;
-                }
-                take_mismatches(&mut read, &mut c_nmis, &mut c_pos, &mut subs_pos)?;
-                // Novel (non-overlapping) bases: head then tail.
-                for slot in read.iter_mut().take(lo) {
-                    *slot = *novel
-                        .get(novel_pos)
-                        .ok_or(Error::Malformed("novel underrun"))?;
-                    novel_pos += 1;
-                }
-                for slot in read.iter_mut().skip(hi) {
-                    *slot = *novel
-                        .get(novel_pos)
-                        .ok_or(Error::Malformed("novel underrun"))?;
-                    novel_pos += 1;
-                }
-                read
+                reads.push(read);
             }
             OP_LITERAL => {
                 let l = *lit_lens
@@ -449,11 +377,48 @@ pub fn decode_clustered(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                     .ok_or(Error::Malformed("lit data underrun"))?
                     .to_vec();
                 lit_pos += l;
-                bytes
+                cref = bytes.clone();
+                prev_off = 0;
+                reads.push(bytes);
+            }
+            OP_CONTIG => {
+                let off = usize::try_from(prev_off as i64 + unzigzag(c_offdelta.varint()?))
+                    .map_err(|_| Error::Malformed("bad contig offset"))?;
+                if off > cref.len() {
+                    return Err(Error::Malformed("contig offset past reference"));
+                }
+                let cur_len = c_slen.varint()? as usize;
+                let overlap = cur_len.min(cref.len() - off);
+                let mut read = vec![0u8; cur_len];
+                for (j, slot) in read.iter_mut().enumerate().take(overlap) {
+                    *slot = *cref
+                        .get(off + j)
+                        .ok_or(Error::Malformed("contig overlap out of range"))?;
+                }
+                let m = c_nmis.varint()? as usize;
+                let mut p = 0usize;
+                for _ in 0..m {
+                    p += c_pos.varint()? as usize;
+                    let b = *subs
+                        .get(subs_pos)
+                        .ok_or(Error::Malformed("subs underrun"))?;
+                    subs_pos += 1;
+                    *read
+                        .get_mut(p)
+                        .ok_or(Error::Malformed("mismatch position out of range"))? = b;
+                }
+                for slot in read.iter_mut().skip(overlap) {
+                    *slot = *novel
+                        .get(novel_pos)
+                        .ok_or(Error::Malformed("novel underrun"))?;
+                    novel_pos += 1;
+                }
+                cref.extend_from_slice(&read[overlap..]);
+                prev_off = off;
+                reads.push(read);
             }
             _ => return Err(Error::Malformed("unknown op")),
-        };
-        reads.push(read);
+        }
     }
     Ok(reads)
 }
