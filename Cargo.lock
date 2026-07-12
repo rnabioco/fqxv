@@ -401,7 +401,6 @@ dependencies = [
 name = "fqxv-reorder"
 version = "0.0.0"
 dependencies = [
- "fqxv-rans",
  "fqxv-seq",
  "proptest",
  "rayon",

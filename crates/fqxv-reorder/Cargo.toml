@@ -15,10 +15,9 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
-fqxv-rans.workspace = true
-fqxv-seq.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+fqxv-seq.workspace = true
