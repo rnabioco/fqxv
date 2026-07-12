@@ -18,11 +18,12 @@ quality), measured on a single CPU node. The harness that produces them lives in
 | --- | --- | --- | --- |
 | Quality | **1.737** bits/byte | `fqz_comp` 1.735 | matches |
 | Sequence | **1.247** bits/base (order-11) | `fqz_comp` 1.474 | beats |
-| Names | 9.2× (6.19 MB) | `fqz_comp` ~18× (3.06 MB) | behind |
+| Names | 10.5× (5.44 MB) | `fqz_comp` ~18× (3.06 MB) | behind |
 
 The sequence model already beats `fqz_comp`'s on this duplicate-rich data; the
-quality model matches it; the name tokenizer is a first version with a clear path
-to close the gap (per-column adaptive models).
+quality model matches it; the name tokenizer splits tokens into per-role streams
+(ops / strings / numbers / coordinate deltas), each coded separately — more of
+the gap to `fqz_comp` closes with per-column numeric models.
 
 ## Whole archive, vs the field
 

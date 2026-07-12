@@ -7,8 +7,11 @@
 //! - numeric vs. a previous numeric -> `DELTA` (incrementing x/y coordinates),
 //! - otherwise a literal string or number.
 //!
-//! The per-token op stream and the payload (literals, deltas) are each
-//! entropy-coded with [`fqxv_rans`]. Round-trips are byte-exact.
+//! Tokens are split into separate role streams (ops, string lengths, string
+//! bytes, numeric literals, token widths, numeric deltas), each entropy-coded
+//! with [`fqxv_rans`] so every stream models a clean distribution — the
+//! incrementing coordinate deltas in particular compress far better on their
+//! own than mixed with string bytes. Round-trips are byte-exact.
 //!
 //! ```
 //! use fqxv_tokenizer::{encode, decode};
@@ -57,9 +60,19 @@ struct Tok {
 }
 
 /// Encode a list of read names.
+///
+/// Tokens are split into separate role streams — ops, string lengths, string
+/// bytes, numeric literals, token widths, and numeric deltas — each entropy
+/// coded on its own so rANS models a clean distribution per stream (in
+/// particular the incrementing x/y-coordinate deltas compress far better apart
+/// from string bytes).
 pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
     let mut ops: Vec<u8> = Vec::new();
-    let mut payload: Vec<u8> = Vec::new();
+    let mut str_lens: Vec<u8> = Vec::new();
+    let mut str_data: Vec<u8> = Vec::new();
+    let mut num_vals: Vec<u8> = Vec::new();
+    let mut widths: Vec<u8> = Vec::new();
+    let mut delta_vals: Vec<u8> = Vec::new();
     let mut prev: Vec<Tok> = Vec::new();
 
     for name in names {
@@ -71,33 +84,39 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
             } else if t.is_num {
                 if let Some(p) = p.filter(|p| p.is_num) {
                     ops.push(DELTA);
-                    write_varint(&mut payload, zigzag(t.value - p.value));
-                    payload.push(t.bytes.len() as u8);
+                    write_varint(&mut delta_vals, zigzag(t.value - p.value));
+                    widths.push(t.bytes.len() as u8);
                 } else {
                     ops.push(NUM);
-                    write_varint(&mut payload, t.value as u64);
-                    payload.push(t.bytes.len() as u8);
+                    write_varint(&mut num_vals, t.value as u64);
+                    widths.push(t.bytes.len() as u8);
                 }
             } else {
                 ops.push(STR);
-                write_varint(&mut payload, t.bytes.len() as u64);
-                payload.extend_from_slice(&t.bytes);
+                write_varint(&mut str_lens, t.bytes.len() as u64);
+                str_data.extend_from_slice(&t.bytes);
             }
         }
         ops.push(REC_END);
         prev = toks;
     }
 
-    let ops_c = fqxv_rans::encode(&ops, Order::One)?;
-    let pay_c = fqxv_rans::encode(&payload, Order::Zero)?;
-
-    let mut out = Vec::with_capacity(16 + ops_c.len() + pay_c.len());
+    let mut out = Vec::new();
     out.push(FORMAT_VERSION);
     write_varint(&mut out, names.len() as u64);
-    write_varint(&mut out, ops_c.len() as u64);
-    out.extend_from_slice(&ops_c);
-    write_varint(&mut out, pay_c.len() as u64);
-    out.extend_from_slice(&pay_c);
+    // Stream order must match `decode`; text-like streams use order-1.
+    for (stream, order) in [
+        (&ops, Order::One),
+        (&str_lens, Order::Zero),
+        (&str_data, Order::One),
+        (&num_vals, Order::Zero),
+        (&widths, Order::Zero),
+        (&delta_vals, Order::Zero),
+    ] {
+        let c = fqxv_rans::encode(stream, order)?;
+        write_varint(&mut out, c.len() as u64);
+        out.extend_from_slice(&c);
+    }
     Ok(out)
 }
 
@@ -108,12 +127,30 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
         return Err(Error::Malformed("unsupported version"));
     }
     let n_records = r.varint()? as usize;
-    let ops_len = r.varint()? as usize;
-    let ops = fqxv_rans::decode(r.take(ops_len)?)?;
-    let pay_len = r.varint()? as usize;
-    let payload = fqxv_rans::decode(r.take(pay_len)?)?;
+    let mut stream = || -> Result<Vec<u8>> {
+        let len = r.varint()? as usize;
+        Ok(fqxv_rans::decode(r.take(len)?)?)
+    };
+    let ops = stream()?;
+    let str_lens = stream()?;
+    let str_data = stream()?;
+    let num_vals = stream()?;
+    let widths = stream()?;
+    let delta_vals = stream()?;
 
-    let mut pr = Cursor::new(&payload);
+    let mut c_str_lens = Cursor::new(&str_lens);
+    let mut c_num = Cursor::new(&num_vals);
+    let mut c_delta = Cursor::new(&delta_vals);
+    let mut str_pos = 0usize;
+    let mut w_pos = 0usize;
+    let next_width = |w_pos: &mut usize| -> Result<usize> {
+        let w = *widths
+            .get(*w_pos)
+            .ok_or(Error::Malformed("width underrun"))?;
+        *w_pos += 1;
+        Ok(w as usize)
+    };
+
     let mut names = Vec::with_capacity(n_records.min(1 << 20));
     let mut prev: Vec<Tok> = Vec::new();
     let mut cur: Vec<Tok> = Vec::new();
@@ -133,8 +170,12 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                 cur.push(t);
             }
             STR => {
-                let len = pr.varint()? as usize;
-                let bytes = pr.take(len)?.to_vec();
+                let len = c_str_lens.varint()? as usize;
+                let bytes = str_data
+                    .get(str_pos..str_pos + len)
+                    .ok_or(Error::Malformed("string data underrun"))?
+                    .to_vec();
+                str_pos += len;
                 cur.push(Tok {
                     is_num: false,
                     bytes,
@@ -142,13 +183,13 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                 });
             }
             NUM => {
-                let value = pr.varint()? as i64;
-                let width = pr.u8()? as usize;
+                let value = c_num.varint()? as i64;
+                let width = next_width(&mut w_pos)?;
                 cur.push(num_tok(value, width));
             }
             DELTA => {
-                let d = unzigzag(pr.varint()?);
-                let width = pr.u8()? as usize;
+                let d = unzigzag(c_delta.varint()?);
+                let width = next_width(&mut w_pos)?;
                 let p = prev
                     .get(cur.len())
                     .filter(|p| p.is_num)
@@ -311,7 +352,8 @@ mod tests {
 
     #[test]
     fn incrementing_names_compress_well() {
-        let names: Vec<Vec<u8>> = (0..5000)
+        // Enough names that the per-stream rANS table overhead amortizes.
+        let names: Vec<Vec<u8>> = (0..20000)
             .map(|i| format!("INST:1:FC:1:1101:{}:{}", 1000 + i, 2000 + i * 2).into_bytes())
             .collect();
         let refs: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
