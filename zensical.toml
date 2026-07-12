@@ -1,0 +1,82 @@
+[project]
+site_name = "fqxv"
+site_description = "A reference-free FASTQ archiver for short-read data, in Rust"
+site_url = "https://rnabioco.github.io/fqxv/"
+repo_url = "https://github.com/rnabioco/fqxv"
+repo_name = "rnabioco/fqxv"
+copyright = "Copyright &copy; 2026 RNA Bioscience Initiative"
+extra_css = ["stylesheets/fqxv.css"]
+
+nav = [
+  { "Home" = "index.md" },
+  { "Getting Started" = [
+    { "Installation" = "getting-started/installation.md" },
+    { "Quick Start" = "getting-started/quickstart.md" },
+  ] },
+  { "CLI Reference" = [
+    { "Overview" = "cli/index.md" },
+    { "compress" = "cli/compress.md" },
+    { "decompress" = "cli/decompress.md" },
+    { "info" = "cli/info.md" },
+  ] },
+  { "Design" = [
+    { "Overview" = "design/index.md" },
+    { "Container Format" = "design/container.md" },
+    { "Read Reordering" = "design/reordering.md" },
+  ] },
+  { "Benchmarks" = "benchmarks.md" },
+]
+
+[project.theme]
+features = [
+  "navigation.sections",
+  "navigation.expand",
+  "navigation.top",
+  "navigation.indexes",
+  "search.suggest",
+  "search.highlight",
+  "content.code.copy",
+  "content.code.annotate",
+]
+
+[[project.theme.palette]]
+scheme = "slate"
+primary = "teal"
+accent = "lime"
+toggle.icon = "material/brightness-4"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+scheme = "default"
+primary = "teal"
+accent = "deep-orange"
+toggle.icon = "material/brightness-7"
+toggle.name = "Switch to dark mode"
+
+[project.markdown_extensions.pymdownx.highlight]
+pygments_lang_class = true
+
+[project.markdown_extensions.pymdownx.inlinehilite]
+
+[project.markdown_extensions.pymdownx.snippets]
+
+[[project.markdown_extensions.pymdownx.superfences.custom_fences]]
+name = "mermaid"
+class = "mermaid"
+format = "pymdownx.superfences.fence_code_format"
+
+[project.markdown_extensions.pymdownx.details]
+
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+
+[project.markdown_extensions.admonition]
+
+[project.markdown_extensions.tables]
+
+[project.markdown_extensions.toc]
+permalink = true
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/rnabioco/fqxv"

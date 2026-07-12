@@ -1,0 +1,58 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'zensical.toml'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+# Pages deploy needs id-token + pages write; the artifact upload only reads the repo.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one docs deploy at a time; cancel a superseded build.
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        # Pin the version so CI doesn't drift to whatever zensical is latest.
+        run: pip install "zensical==0.0.50"
+
+      - name: Build documentation
+        # --clean forces a cold cache; --strict validates links.
+        run: zensical build --clean --strict
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -2,6 +2,10 @@
 Cargo.lock.orig
 **/*.rs.bk
 
+# zensical docs build output
+/site
+/.zensical
+
 # pixi (lockfile IS committed for reproducibility; only the env dir is ignored)
 /bench/.pixi
 

@@ -1,4 +1,4 @@
-# fqxv
+# 🗜️ fqxv
 
 A Rust toolkit for archiving short-read FASTQ, built as a workspace of
 one-crate-per-algorithm codecs plus a container format and CLI.
