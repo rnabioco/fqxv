@@ -57,3 +57,8 @@ repository. Everything is dual-licensed MIT OR Apache-2.0.
   path.
 - **Parallelism is a first-class concern.** Everything blocks and fans out with
   `rayon`; output is deterministic across thread counts.
+
+## See also
+
+- [Testing & Robustness](testing.md) — coverage map, decoder-robustness
+  guarantees, and roadmap drawn from the upstream tools' issue trackers.
