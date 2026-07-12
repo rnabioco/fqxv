@@ -17,9 +17,36 @@ const STYLES: Styles = Styles::styled()
     .literal(AnsiColor::Green.on_default().effects(Effects::BOLD))
     .placeholder(AnsiColor::Cyan.on_default());
 
+/// Worked examples, appended under the top-level `--help`.
+const EXAMPLES: &str = "\
+Examples:
+  # Compress a single-end FASTQ (gzip is auto-detected by magic bytes)
+  fqxv compress reads.fastq.gz -o reads.fqxv
+
+  # Paired-end: mates are interleaved per spot into one archive
+  fqxv compress R1.fastq.gz R2.fastq.gz -o sample.fqxv
+
+  # Squeeze harder: top level plus read reordering (does not preserve order)
+  fqxv compress reads.fastq.gz -o reads.fqxv -l 9 --reorder
+
+  # Decompress to stdout and pipe straight into an aligner
+  fqxv decompress sample.fqxv | bwa mem -p ref.fa -
+
+  # Restore the separate paired files
+  fqxv decompress sample.fqxv --split sample
+
+  # Inspect an archive without decompressing it
+  fqxv info sample.fqxv
+
+  # Download from SRA with sracha (rnabioco/sracha-rs) and archive in one pass,
+  # nothing hitting disk: -Z streams interleaved FASTQ to stdout, '-' reads it,
+  # and paired data is auto-detected as interleaved (override with --interleaved N)
+  sracha get -Z --split interleaved SRR2584863 | fqxv compress - -o SRR2584863.fqxv
+";
+
 /// Reference-free FASTQ archiver for short-read data.
 #[derive(Debug, Parser)]
-#[command(name = "fqxv", version, about, long_about = None, styles = STYLES)]
+#[command(name = "fqxv", version, about, long_about = None, styles = STYLES, after_help = EXAMPLES)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -34,8 +61,9 @@ enum Command {
     /// Compress FASTQ to `.fqxv`. Give multiple inputs to interleave per-spot
     /// files (paired mates, or single-cell R1/R2/I1/I2) into one archive.
     Compress {
-        /// Input FASTQ file(s), plain or gzipped (1 = single-end, 2 = paired,
-        /// 3-4 = single-cell). Order is preserved for `--split`.
+        /// Input FASTQ file(s), plain or gzipped; `-` reads one stream from
+        /// stdin. One file = single-end, 2 = paired, 3-4 = single-cell; multiple
+        /// files are interleaved per spot. Order is preserved for `--split`.
         #[arg(num_args = 1..)]
         inputs: Vec<PathBuf>,
         /// Output `.fqxv` path.
@@ -44,14 +72,21 @@ enum Command {
         /// Compression effort level (1-9); higher raises the sequence order.
         #[arg(short, long, default_value_t = 5)]
         level: u8,
+
+        /// Interleaving of a single input, in members per spot. Auto-detected
+        /// from read names by default; pass to force (1 = single-end, 2 = paired
+        /// as from `sracha get -Z`). Ignored with multiple inputs.
+        #[arg(long, value_name = "N", help_heading = "Advanced")]
+        interleaved: Option<u8>,
         /// Reorder reads to exploit depth redundancy (may not preserve order).
-        #[arg(long)]
+        #[arg(long, help_heading = "Advanced")]
         reorder: bool,
-        /// Preserve exact input read order even when reordering.
-        #[arg(long)]
+        /// With `--reorder`, store a permutation so the original order is
+        /// restored on decompress.
+        #[arg(long, requires = "reorder", help_heading = "Advanced")]
         keep_order: bool,
-        /// Opt-in lossy quality binning.
-        #[arg(long, value_enum, default_value_t = QualityBin::Lossless)]
+        /// Opt-in lossy quality binning (changes the data; default is lossless).
+        #[arg(long, value_enum, default_value_t = QualityBin::Lossless, help_heading = "Advanced")]
         quality_bin: QualityBin,
     },
     /// Decompress a `.fqxv` file to FASTQ.
@@ -121,6 +156,7 @@ fn main() -> anyhow::Result<()> {
             inputs,
             output,
             level,
+            interleaved,
             reorder,
             keep_order,
             quality_bin,
@@ -130,6 +166,10 @@ fn main() -> anyhow::Result<()> {
             }
             if reorder && inputs.len() > 1 {
                 anyhow::bail!("--reorder is single-end only (would break spot grouping)");
+            }
+            let interleaved = interleaved.filter(|_| inputs.len() == 1);
+            if reorder && interleaved.is_some_and(|g| g > 1) {
+                anyhow::bail!("--reorder cannot combine with --interleaved (would break spots)");
             }
             let params = fqxv::Params {
                 seq_order: level_to_order(level),
@@ -148,7 +188,13 @@ fn main() -> anyhow::Result<()> {
 
             let t0 = Instant::now();
             let stats = if inputs.len() == 1 {
-                fqxv::compress(open_input(&inputs[0])?, out, params)?
+                match interleaved {
+                    None => fqxv::compress_auto(open_input(&inputs[0])?, out, params)?,
+                    Some(g) if g > 1 => {
+                        fqxv::compress_interleaved(open_input(&inputs[0])?, out, params, g)?
+                    }
+                    Some(_) => fqxv::compress(open_input(&inputs[0])?, out, params)?,
+                }
             } else {
                 let readers: Vec<Box<dyn Read + Send>> = inputs
                     .iter()
@@ -157,13 +203,19 @@ fn main() -> anyhow::Result<()> {
                 fqxv::compress_multi(readers, out, params)?
             };
             let secs = t0.elapsed().as_secs_f64();
-            let ratio = if stats.out_bytes > 0 {
-                in_size as f64 / stats.out_bytes as f64
+            // Ratio needs the input size; a stdin stream (`-`) has none, so omit it.
+            let ratio = if in_size > 0 && stats.out_bytes > 0 {
+                format!(" ({:.2}x)", in_size as f64 / stats.out_bytes as f64)
             } else {
-                0.0
+                String::new()
+            };
+            let layout = match stats.group_size {
+                0 | 1 => "single-end".to_string(),
+                2 => "paired".to_string(),
+                g => format!("grouped x{g}"),
             };
             eprintln!(
-                "compressed {} reads ({} input file(s)) in {} block(s) -> {} bytes ({:.2}x) in {:.1}s",
+                "compressed {} reads ({layout}, {} input file(s)) in {} block(s) -> {} bytes{} in {:.1}s",
                 stats.reads,
                 inputs.len(),
                 stats.blocks,
@@ -277,12 +329,17 @@ fn print_info(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Open a FASTQ input, transparently decoding gzip (detected by magic bytes).
+/// A path of `-` reads from stdin, so a downloader can pipe straight in.
 fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
-    let mut f = File::open(path)?;
+    let mut src: Box<dyn Read + Send> = if path.as_os_str() == "-" {
+        Box::new(io::stdin())
+    } else {
+        Box::new(File::open(path)?)
+    };
     let mut magic = [0u8; 2];
-    let n = read_up_to(&mut f, &mut magic)?;
+    let n = read_up_to(&mut src, &mut magic)?;
     let head = io::Cursor::new(magic[..n].to_vec());
-    let chained = head.chain(f);
+    let chained = head.chain(src);
     if n == 2 && magic == [0x1f, 0x8b] {
         Ok(Box::new(MultiGzDecoder::new(chained)))
     } else {
