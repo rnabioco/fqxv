@@ -21,7 +21,10 @@
 //!   [ceil(n/8)] flip bitmap        (reads stored reverse-complemented)
 //!   [4] perm_len (LE) [ ] perm     (byte-plane-split u32 permutation, rANS'd;
 //!                                   empty unless order is kept)
-//!   then names / seq (fqxv-reorder clustered) / qual in clustered order
+//!   seq is always fqxv-reorder clustered/differential. With order kept, names
+//!   and qual are coded in ORIGINAL order (the permutation reunites each
+//!   clustered sequence with its read, so their models aren't scrambled);
+//!   without it, names and qual follow the clustered order.
 //! ```
 //!
 //! When `G > 1`, reads are interleaved per spot (`m0₀, m1₀, …, m0₁, m1₁, …`).
@@ -593,40 +596,68 @@ fn compress_block_reordered(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
 
     let plan = fqxv_reorder::plan(&b.lens, &b.seq, REORDER_K);
 
-    let mut r_headers: Vec<&[u8]> = Vec::with_capacity(n);
-    let mut r_lens: Vec<u32> = Vec::with_capacity(n);
+    // Clustered, oriented sequences + flip bitmap — always needed for the
+    // differential sequence coder. Flipping (reverse-complement) is a sequence-
+    // only trick to make an RC-duplicate byte-identical to its partner.
     let mut r_reads: Vec<Vec<u8>> = Vec::with_capacity(n);
-    let mut r_qual: Vec<u8> = Vec::with_capacity(b.qual.len());
     let mut flip_bits = vec![0u8; n.div_ceil(8)];
     for (j, &oi) in plan.order.iter().enumerate() {
         let oi = oi as usize;
         let s = &b.seq[offs[oi]..offs[oi + 1]];
-        let q = &b.qual[offs[oi]..offs[oi + 1]];
-        r_headers.push(b.header(oi));
-        r_lens.push(b.lens[oi]);
         if plan.flip[oi] {
             flip_bits[j / 8] |= 1 << (j % 8);
             r_reads.push(fqxv_reorder::revcomp(s));
-            let mut rq = q.to_vec();
-            rq.reverse();
-            r_qual.extend_from_slice(&rq);
         } else {
             r_reads.push(s.to_vec());
-            r_qual.extend_from_slice(q);
         }
     }
-
     let read_refs: Vec<&[u8]> = r_reads.iter().map(Vec::as_slice).collect();
-    let (names_c, (seq_c, qual_c)) = rayon::join(
-        || fqxv_tokenizer::encode(&r_headers),
-        || {
-            rayon::join(
-                || fqxv_reorder::encode_clustered(&read_refs, params.seq_order as usize),
-                || fqxv_fqzcomp::encode(&r_lens, &r_qual, params.quality_binning),
-            )
-        },
-    );
-    let (names_c, seq_c, qual_c) = (names_c?, seq_c?, qual_c?);
+
+    // Names and quality: with `keep_order`, code them in ORIGINAL read order —
+    // the permutation reunites each clustered sequence with its read, so the
+    // tokenizer keeps its positional-delta structure and the quality model its
+    // per-position structure (clustering by sequence would scramble both).
+    // Without `keep_order`, reads emerge clustered, so names/quality follow.
+    let (names_c, seq_c, qual_c) = if params.keep_order {
+        let headers = b.header_refs();
+        let (n_c, (s_c, q_c)) = rayon::join(
+            || fqxv_tokenizer::encode(&headers),
+            || {
+                rayon::join(
+                    || fqxv_reorder::encode_clustered(&read_refs, params.seq_order as usize),
+                    || fqxv_fqzcomp::encode(&b.lens, &b.qual, params.quality_binning),
+                )
+            },
+        );
+        (n_c?, s_c?, q_c?)
+    } else {
+        let mut r_headers: Vec<&[u8]> = Vec::with_capacity(n);
+        let mut r_lens: Vec<u32> = Vec::with_capacity(n);
+        let mut r_qual: Vec<u8> = Vec::with_capacity(b.qual.len());
+        for &oi in &plan.order {
+            let oi = oi as usize;
+            r_headers.push(b.header(oi));
+            r_lens.push(b.lens[oi]);
+            let q = &b.qual[offs[oi]..offs[oi + 1]];
+            if plan.flip[oi] {
+                let mut rq = q.to_vec();
+                rq.reverse();
+                r_qual.extend_from_slice(&rq);
+            } else {
+                r_qual.extend_from_slice(q);
+            }
+        }
+        let (n_c, (s_c, q_c)) = rayon::join(
+            || fqxv_tokenizer::encode(&r_headers),
+            || {
+                rayon::join(
+                    || fqxv_reorder::encode_clustered(&read_refs, params.seq_order as usize),
+                    || fqxv_fqzcomp::encode(&r_lens, &r_qual, params.quality_binning),
+                )
+            },
+        );
+        (n_c?, s_c?, q_c?)
+    };
     let perm_c = if params.keep_order {
         // Byte-plane (SoA) split before entropy coding: all byte-0s, then
         // byte-1s, 2s, 3s. For a permutation of n < 2^24 reads the upper planes
@@ -870,32 +901,51 @@ fn decode_block_reordered(buf: &[u8], keep_order: bool) -> Result<(u64, Vec<u8>)
         Vec::new()
     };
 
-    // Build each read's FASTQ record (un-flipped), placing it at its original
-    // position when the order is preserved.
-    let mut records: Vec<Vec<u8>> = vec![Vec::new(); n];
-    let mut qoff = 0usize;
-    for j in 0..n {
-        let l = r_lens[j] as usize;
-        let mut seq = reads[j].clone();
-        let mut qual = r_qual
-            .get(qoff..qoff + l)
-            .ok_or(Error::Malformed("quality underrun"))?
-            .to_vec();
-        qoff += l;
-        if flip_bits[j / 8] >> (j % 8) & 1 == 1 {
-            seq = fqxv_reorder::revcomp(&seq);
-            qual.reverse();
+    let mut out = Vec::new();
+    if keep_order {
+        // Names and quality are in original order. Place each clustered sequence
+        // at its original position (un-flipped) via the permutation, then emit
+        // records in original order.
+        let mut seq_orig: Vec<Vec<u8>> = vec![Vec::new(); n];
+        for j in 0..n {
+            let mut s = reads[j].clone();
+            if flip_bits[j / 8] >> (j % 8) & 1 == 1 {
+                s = fqxv_reorder::revcomp(&s);
+            }
+            let dest = perm[j] as usize;
+            *seq_orig
+                .get_mut(dest)
+                .ok_or(Error::Malformed("permutation out of range"))? = s;
         }
-        let mut rec = Vec::with_capacity(seq.len() * 2 + qual.len() + 8);
-        write_record(&mut rec, &names[j], &seq, &qual);
-        let dest = if keep_order { perm[j] as usize } else { j };
-        *records
-            .get_mut(dest)
-            .ok_or(Error::Malformed("permutation out of range"))? = rec;
-    }
-    let mut out = Vec::with_capacity(records.iter().map(Vec::len).sum());
-    for rec in records {
-        out.extend_from_slice(&rec);
+        let mut qoff = 0usize;
+        for i in 0..n {
+            let l = r_lens[i] as usize;
+            let qual = r_qual
+                .get(qoff..qoff + l)
+                .ok_or(Error::Malformed("quality underrun"))?;
+            qoff += l;
+            if seq_orig[i].len() != l {
+                return Err(Error::Malformed("reordered sequence length mismatch"));
+            }
+            write_record(&mut out, &names[i], &seq_orig[i], qual);
+        }
+    } else {
+        // Reads emerge in clustered order; names/quality were coded clustered too.
+        let mut qoff = 0usize;
+        for j in 0..n {
+            let l = r_lens[j] as usize;
+            let mut seq = reads[j].clone();
+            let mut qual = r_qual
+                .get(qoff..qoff + l)
+                .ok_or(Error::Malformed("quality underrun"))?
+                .to_vec();
+            qoff += l;
+            if flip_bits[j / 8] >> (j % 8) & 1 == 1 {
+                seq = fqxv_reorder::revcomp(&seq);
+                qual.reverse();
+            }
+            write_record(&mut out, &names[j], &seq, &qual);
+        }
     }
     Ok((n as u64, out))
 }
