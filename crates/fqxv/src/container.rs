@@ -89,6 +89,9 @@ pub struct Stats {
     pub blocks: u64,
     /// Bytes written to the output.
     pub out_bytes: u64,
+    /// Interleaved members per spot recorded in the archive (1 = single-end,
+    /// 2 = paired). Meaningful for compression; 0 from decompression.
+    pub group_size: u8,
 }
 
 /// Container header + per-stream size summary, from [`inspect`] / [`peek`].
@@ -193,6 +196,160 @@ pub fn compress<R: Read + Send, W: Write>(reader: R, writer: W, params: Params) 
     })
 }
 
+/// How many leading records [`compress_auto`] reads to decide whether a single
+/// stream is interleaved paired data. Four spots' worth is plenty to be
+/// confident while staying cheap for the common single-end case.
+const AUTODETECT_PEEK: usize = 8;
+
+/// Split a read name into its mate-independent base and an optional mate marker.
+/// Handles the two common conventions: a `/1`|`/2` name suffix, and a mate digit
+/// as the first token of the description (`@id 1:N:…` / `@id 2:N:…`).
+fn mate_key(rec: &noodles_fastq::Record) -> (&[u8], Option<u8>) {
+    let name: &[u8] = rec.name().as_ref();
+    if let [base @ .., b'/', m @ (b'1' | b'2')] = name {
+        return (base, Some(*m));
+    }
+    let desc: &[u8] = rec.description().as_ref();
+    let marker = desc.first().copied().filter(|c| matches!(c, b'1' | b'2'));
+    (name, marker)
+}
+
+/// True when `a` and `b` look like the two mates of one spot: same base name and
+/// either explicit, differing mate markers (`/1` vs `/2`) or none at all (a bare
+/// repeated name, as some interleaved dumps emit).
+fn are_mates(a: &noodles_fastq::Record, b: &noodles_fastq::Record) -> bool {
+    let (base_a, mate_a) = mate_key(a);
+    let (base_b, mate_b) = mate_key(b);
+    base_a == base_b
+        && match (mate_a, mate_b) {
+            (Some(x), Some(y)) => x != y,
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+/// Guess the interleaving of a single stream from its leading records. Returns 2
+/// only when every peeked pair looks like paired mates; anything ambiguous falls
+/// back to 1 (single-end), which is always safe to archive. Single-cell (3-4)
+/// interleaving is not auto-detected — pass an explicit group size for that.
+fn detect_group_size(peeked: &[noodles_fastq::Record]) -> u8 {
+    if peeked.len() < 2 {
+        return 1;
+    }
+    let pairs = peeked.len() / 2;
+    for i in 0..pairs {
+        if !are_mates(&peeked[2 * i], &peeked[2 * i + 1]) {
+            return 1;
+        }
+    }
+    2
+}
+
+/// Compress a single FASTQ stream, auto-detecting whether it is interleaved
+/// paired data from the leading read names (see [`detect_group_size`]). This is
+/// what the CLI uses by default for a lone input so `sracha get -Z … | fqxv
+/// compress -` archives paired downloads with the right spot grouping and no
+/// flag. Detection only ever promotes to paired on unambiguous mate names;
+/// otherwise it behaves exactly like [`compress`]. In `reorder` mode the stream
+/// is always treated as single-end (reorder is single-end only).
+pub fn compress_auto<R: Read + Send, W: Write>(
+    reader: R,
+    writer: W,
+    params: Params,
+) -> Result<Stats> {
+    let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
+    let mut peeked: Vec<noodles_fastq::Record> = Vec::with_capacity(AUTODETECT_PEEK);
+    for _ in 0..AUTODETECT_PEEK {
+        let mut rec = noodles_fastq::Record::default();
+        if fq.read_record(&mut rec)? == 0 {
+            break;
+        }
+        peeked.push(rec);
+    }
+    let g = if params.reorder {
+        1
+    } else {
+        detect_group_size(&peeked)
+    } as usize;
+    let block_reads = (params.block_reads / g).max(1) * g;
+    let mut queue = std::collections::VecDeque::from(peeked);
+    drive(writer, params, g as u8, |b| {
+        while b.n_reads() < block_reads {
+            let rec = if let Some(front) = queue.pop_front() {
+                front
+            } else {
+                let mut rec = noodles_fastq::Record::default();
+                if fq.read_record(&mut rec)? == 0 {
+                    if b.n_reads() % g != 0 {
+                        return Err(Error::Malformed(
+                            "interleaved stream ended mid-spot (record count not a multiple of group size)",
+                        ));
+                    }
+                    break;
+                }
+                rec
+            };
+            b.push(
+                rec.name(),
+                rec.description(),
+                rec.sequence(),
+                rec.quality_scores(),
+            );
+        }
+        Ok(b.n_reads())
+    })
+}
+
+/// Compress a single FASTQ stream whose records are *already* interleaved per
+/// spot (`m0₀, m1₀, …, m0₁, m1₁, …`) — e.g. the interleaved paired output of
+/// `sracha get -Z`. Equivalent to [`compress_multi`] but from one reader, so a
+/// download can be archived in one pass with nothing hitting disk.
+///
+/// `group_size` is the number of interleaved members per spot (2 = paired). The
+/// stream's total record count must be a multiple of `group_size`; a trailing
+/// partial spot is an error. Restore with [`decompress_split`], or stream
+/// interleaved with [`decompress`].
+pub fn compress_interleaved<R: Read + Send, W: Write>(
+    reader: R,
+    writer: W,
+    params: Params,
+    group_size: u8,
+) -> Result<Stats> {
+    let g = group_size.max(1) as usize;
+    if g == 1 {
+        return compress(reader, writer, params);
+    }
+    if params.reorder {
+        return Err(Error::Malformed(
+            "reorder is single-end only (would break spot grouping)",
+        ));
+    }
+    // Keep whole spots together: round the block target down to a multiple of g.
+    let block_reads = (params.block_reads / g).max(1) * g;
+    let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
+    let mut rec = noodles_fastq::Record::default();
+    drive(writer, params, g as u8, |b| {
+        while b.n_reads() < block_reads {
+            if fq.read_record(&mut rec)? == 0 {
+                // EOF must land on a spot boundary, or the stream is truncated.
+                if b.n_reads() % g != 0 {
+                    return Err(Error::Malformed(
+                        "interleaved stream ended mid-spot (record count not a multiple of group size)",
+                    ));
+                }
+                break;
+            }
+            b.push(
+                rec.name(),
+                rec.description(),
+                rec.sequence(),
+                rec.quality_scores(),
+            );
+        }
+        Ok(b.n_reads())
+    })
+}
+
 /// Compress `G >= 1` per-spot read files (paired mates, single-cell R1/R2/I1/I2,
 /// …) into one `.fqxv` stream, interleaving them.
 ///
@@ -279,7 +436,10 @@ where
         group_size,
     ])?;
 
-    let mut stats = Stats::default();
+    let mut stats = Stats {
+        group_size,
+        ..Stats::default()
+    };
     // One batch of buffering: the reader parses the next batch while this thread
     // compresses and writes the current one.
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<RawBlock>>>(1);
@@ -926,6 +1086,62 @@ NNGGCCTA\n\
         let mut out = Vec::new();
         decompress(&archive[..], &mut out, 1).unwrap();
         assert_eq!(out, b"@r.1 a\nACGT\n+\nIIII\n@r.1 b\nGGGG\n+\n####\n");
+    }
+
+    // Two paired spots, mates interleaved on one stream with /1 /2 names.
+    const INTERLEAVED: &[u8] = b"\
+@s1/1\nAAAA\n+\nIIII\n\
+@s1/2\nTTTT\n+\nFFFF\n\
+@s2/1\nCCCC\n+\nIIII\n\
+@s2/2\nGGGG\n+\nFFFF\n";
+
+    #[test]
+    fn interleaved_stream_forces_pairing_and_splits() {
+        let mut archive = Vec::new();
+        let s = compress_interleaved(INTERLEAVED, &mut archive, Params::default(), 2).unwrap();
+        assert_eq!(s.reads, 4);
+        assert_eq!(s.group_size, 2);
+        assert_eq!(peek(&archive[..]).unwrap().group_size, 2);
+
+        let (mut o1, mut o2) = (Vec::new(), Vec::new());
+        {
+            let mut outs: Vec<&mut Vec<u8>> = vec![&mut o1, &mut o2];
+            decompress_split(&archive[..], &mut outs, 1).unwrap();
+        }
+        assert_eq!(o1, b"@s1/1\nAAAA\n+\nIIII\n@s2/1\nCCCC\n+\nIIII\n");
+        assert_eq!(o2, b"@s1/2\nTTTT\n+\nFFFF\n@s2/2\nGGGG\n+\nFFFF\n");
+    }
+
+    #[test]
+    fn interleaved_odd_count_errors() {
+        let mut truncated = INTERLEAVED.to_vec();
+        truncated.extend_from_slice(b"@s3/1\nACGT\n+\nIIII\n"); // dangling mate
+        let err = compress_interleaved(&truncated[..], &mut Vec::new(), Params::default(), 2);
+        assert!(matches!(err, Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn auto_detects_interleaved_pairing() {
+        let mut archive = Vec::new();
+        let s = compress_auto(INTERLEAVED, &mut archive, Params::default()).unwrap();
+        assert_eq!(
+            s.group_size, 2,
+            "paired /1 /2 names should auto-detect as paired"
+        );
+        assert_eq!(peek(&archive[..]).unwrap().group_size, 2);
+    }
+
+    #[test]
+    fn auto_leaves_single_end_ungrouped() {
+        // Distinct, unpaired names must not be mistaken for mates.
+        let single = make_reads("x", 6);
+        let mut archive = Vec::new();
+        let s = compress_auto(&single[..], &mut archive, Params::default()).unwrap();
+        assert_eq!(s.group_size, 1);
+
+        let mut out = Vec::new();
+        decompress(&archive[..], &mut out, 1).unwrap();
+        assert_eq!(out, single);
     }
 
     #[test]
