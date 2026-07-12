@@ -1,0 +1,106 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Default read-only; only the publishing job is granted write.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            rustflags: "-C target-cpu=x86-64-v3"
+            use_cross: false
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            rustflags: ""
+            use_cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            rustflags: "-C target-cpu=x86-64-v3"
+            use_cross: false
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            rustflags: ""
+            use_cross: false
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --profile dist --target ${{ matrix.target }} -p fqxv-cli
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Build (cargo)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --profile dist --target ${{ matrix.target }} -p fqxv-cli
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/dist
+          tar czvf ../../../fqxv-${{ github.ref_name }}-${{ matrix.target }}.tar.gz fqxv
+          cd ../../..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: fqxv-${{ matrix.target }}
+          path: fqxv-${{ github.ref_name }}-${{ matrix.target }}.*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum fqxv-* > SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*

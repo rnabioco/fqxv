@@ -118,8 +118,8 @@ pub mod bench_api {
 /// ≈250 MiB/s) because `vpgatherdd` is microcoded — the same reason htscodecs
 /// falls back from gather-heavy SIMD. We therefore dispatch on measured, not
 /// assumed, speed: scalar is the default, and the AVX2 path stays available via
-/// [`bench_api`] / [`Backend`] for micro-architectures with fast gather and for
-/// a future gather-free SIMD design. Order-0 output is byte-identical either way.
+/// [`decode_with`] / [`Backend`] for micro-architectures with fast gather and
+/// for a future gather-free SIMD design. Order-0 output is byte-identical either way.
 pub fn decode(src: &[u8]) -> Result<Vec<u8>> {
     scalar::decode(src)
 }
