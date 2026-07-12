@@ -237,7 +237,8 @@ impl<'a> Reader<'a> {
         Reader { buf, pos: 0 }
     }
     /// Byte offset of the next unread byte (start of the renorm region once the
-    /// header has been parsed).
+    /// header has been parsed). Only the x86_64 AVX2 backend needs it.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn pos(&self) -> usize {
         self.pos
     }

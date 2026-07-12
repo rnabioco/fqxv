@@ -25,6 +25,7 @@ nav = [
     { "Read Reordering" = "design/reordering.md" },
   ] },
   { "Benchmarks" = "benchmarks.md" },
+  { "Acknowledgments" = "acknowledgments.md" },
 ]
 
 [project.theme]

@@ -122,3 +122,39 @@
 [data-md-color-scheme="default"] .md-typeset h3 {
   color: #0e7c72;
 }
+
+/* ===================== Matrix ACTG background (dark only) ================= */
+/* A very light, slowly drifting field of green A/C/T/G glyphs behind the main
+   body. Pure CSS: a fixed pseudo-element paints a tiled, URL-encoded inline SVG
+   (theme teal #3fd6c8 with a few brighter lime #b6f24a "lead" letters). Scoped
+   to the slate scheme; light mode stays plain. */
+[data-md-color-scheme="slate"] .md-main { position: relative; }
+
+[data-md-color-scheme="slate"] .md-main::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;                /* above the flat page bg, below content */
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22%20width=%22240%22%20height=%22240%22%3E%3Cstyle%3Etext%7Bfont-family:monospace;font-size:15px;fill:%233fd6c8%7D.b%7Bfill:%23b6f24a%7D%3C/style%3E%3Ctext%20x=%226%22%20y=%2262%22%3EC%3C/text%3E%3Ctext%20x=%226%22%20y=%2286%22%3EA%3C/text%3E%3Ctext%20x=%2210%22%20y=%22134%22%3EA%3C/text%3E%3Ctext%20x=%226%22%20y=%22158%22%3ET%3C/text%3E%3Ctext%20x=%228%22%20y=%22182%22%3EC%3C/text%3E%3Ctext%20x=%228%22%20y=%22206%22%3EC%3C/text%3E%3Ctext%20x=%2210%22%20y=%2214%22%3EG%3C/text%3E%3Ctext%20x=%2229%22%20y=%2226%22%3ET%3C/text%3E%3Ctext%20x=%2226%22%20y=%2274%22%3EG%3C/text%3E%3Ctext%20x=%2227%22%20y=%22122%22%3EG%3C/text%3E%3Ctext%20x=%2228%22%20y=%22146%22%3ET%3C/text%3E%3Ctext%20x=%2226%22%20y=%22194%22%3EG%3C/text%3E%3Ctext%20x=%2227%22%20y=%22218%22%3EC%3C/text%3E%3Ctext%20x=%2246%22%20y=%2230%22%3EC%3C/text%3E%3Ctext%20x=%2249%22%20y=%2254%22%3EA%3C/text%3E%3Ctext%20x=%2250%22%20y=%2278%22%3EC%3C/text%3E%3Ctext%20x=%2249%22%20y=%22102%22%3EG%3C/text%3E%3Ctext%20x=%2247%22%20y=%22126%22%20class=%22b%22%3ET%3C/text%3E%3Ctext%20x=%2249%22%20y=%22150%22%3EG%3C/text%3E%3Ctext%20x=%2247%22%20y=%22174%22%3ET%3C/text%3E%3Ctext%20x=%2246%22%20y=%22198%22%3EA%3C/text%3E%3Ctext%20x=%2270%22%20y=%2239%22%3EA%3C/text%3E%3Ctext%20x=%2266%22%20y=%2263%22%3EG%3C/text%3E%3Ctext%20x=%2270%22%20y=%2287%22%3EA%3C/text%3E%3Ctext%20x=%2269%22%20y=%22111%22%20class=%22b%22%3EG%3C/text%3E%3Ctext%20x=%2267%22%20y=%22183%22%3EG%3C/text%3E%3Ctext%20x=%2268%22%20y=%22207%22%3EA%3C/text%3E%3Ctext%20x=%2267%22%20y=%22231%22%20class=%22b%22%3EC%3C/text%3E%3Ctext%20x=%2269%22%20y=%2215%22%3EA%3C/text%3E%3Ctext%20x=%2287%22%20y=%2242%22%3EG%3C/text%3E%3Ctext%20x=%2289%22%20y=%2266%22%20class=%22b%22%3EA%3C/text%3E%3Ctext%20x=%2289%22%20y=%2290%22%20class=%22b%22%3EC%3C/text%3E%3Ctext%20x=%2290%22%20y=%22114%22%3EC%3C/text%3E%3Ctext%20x=%2287%22%20y=%22138%22%3EC%3C/text%3E%3Ctext%20x=%2288%22%20y=%22162%22%3ET%3C/text%3E%3Ctext%20x=%2287%22%20y=%22186%22%20class=%22b%22%3ET%3C/text%3E%3Ctext%20x=%22106%22%20y=%2235%22%20class=%22b%22%3EC%3C/text%3E%3Ctext%20x=%22106%22%20y=%2259%22%3EA%3C/text%3E%3Ctext%20x=%22107%22%20y=%2283%22%3EG%3C/text%3E%3Ctext%20x=%22109%22%20y=%22107%22%3ET%3C/text%3E%3Ctext%20x=%22109%22%20y=%22131%22%20class=%22b%22%3EC%3C/text%3E%3Ctext%20x=%22106%22%20y=%22155%22%3ET%3C/text%3E%3Ctext%20x=%22108%22%20y=%22179%22%20class=%22b%22%3EA%3C/text%3E%3Ctext%20x=%22107%22%20y=%22203%22%3EA%3C/text%3E%3Ctext%20x=%22108%22%20y=%22227%22%3EC%3C/text%3E%3Ctext%20x=%22110%22%20y=%2223%22%3EA%3C/text%3E%3Ctext%20x=%22127%22%20y=%2245%22%3EA%3C/text%3E%3Ctext%20x=%22126%22%20y=%2293%22%3EC%3C/text%3E%3Ctext%20x=%22130%22%20y=%22165%22%3ET%3C/text%3E%3Ctext%20x=%22128%22%20y=%22189%22%20class=%22b%22%3ET%3C/text%3E%3Ctext%20x=%22130%22%20y=%22213%22%3EA%3C/text%3E%3Ctext%20x=%22150%22%20y=%2252%22%20class=%22b%22%3EC%3C/text%3E%3Ctext%20x=%22147%22%20y=%22100%22%3EA%3C/text%3E%3Ctext%20x=%22146%22%20y=%22124%22%3EC%3C/text%3E%3Ctext%20x=%22150%22%20y=%22148%22%3ET%3C/text%3E%3Ctext%20x=%22148%22%20y=%22172%22%3EG%3C/text%3E%3Ctext%20x=%22148%22%20y=%22196%22%20class=%22b%22%3ET%3C/text%3E%3Ctext%20x=%22150%22%20y=%22220%22%20class=%22b%22%3EA%3C/text%3E%3Ctext%20x=%22147%22%20y=%2216%22%20class=%22b%22%3EA%3C/text%3E%3Ctext%20x=%22167%22%20y=%2234%22%3EG%3C/text%3E%3Ctext%20x=%22170%22%20y=%2258%22%3EC%3C/text%3E%3Ctext%20x=%22170%22%20y=%2282%22%3EA%3C/text%3E%3Ctext%20x=%22167%22%20y=%22106%22%3EA%3C/text%3E%3Ctext%20x=%22167%22%20y=%22130%22%3EA%3C/text%3E%3Ctext%20x=%22167%22%20y=%22154%22%3EC%3C/text%3E%3Ctext%20x=%22168%22%20y=%22178%22%3EG%3C/text%3E%3Ctext%20x=%22169%22%20y=%22202%22%20class=%22b%22%3EA%3C/text%3E%3Ctext%20x=%22167%22%20y=%22226%22%20class=%22b%22%3EA%3C/text%3E%3Ctext%20x=%22169%22%20y=%2222%22%3EG%3C/text%3E%3Ctext%20x=%22187%22%20y=%2235%22%20class=%22b%22%3EA%3C/text%3E%3Ctext%20x=%22187%22%20y=%2259%22%3EG%3C/text%3E%3Ctext%20x=%22186%22%20y=%2283%22%3EA%3C/text%3E%3Ctext%20x=%22186%22%20y=%22107%22%3EC%3C/text%3E%3Ctext%20x=%22187%22%20y=%22131%22%3ET%3C/text%3E%3Ctext%20x=%22187%22%20y=%22155%22%3EC%3C/text%3E%3Ctext%20x=%22188%22%20y=%22179%22%3EA%3C/text%3E%3Ctext%20x=%22187%22%20y=%22203%22%3ET%3C/text%3E%3Ctext%20x=%22186%22%20y=%22227%22%3EA%3C/text%3E%3Ctext%20x=%22189%22%20y=%2223%22%3EC%3C/text%3E%3Ctext%20x=%22207%22%20y=%2229%22%3EC%3C/text%3E%3Ctext%20x=%22208%22%20y=%2253%22%3EG%3C/text%3E%3Ctext%20x=%22210%22%20y=%2277%22%3ET%3C/text%3E%3Ctext%20x=%22208%22%20y=%22101%22%20class=%22b%22%3EA%3C/text%3E%3Ctext%20x=%22210%22%20y=%22149%22%20class=%22b%22%3EG%3C/text%3E%3Ctext%20x=%22210%22%20y=%22173%22%3EG%3C/text%3E%3Ctext%20x=%22209%22%20y=%22221%22%3EC%3C/text%3E%3Ctext%20x=%22226%22%20y=%2235%22%3EC%3C/text%3E%3Ctext%20x=%22226%22%20y=%2259%22%3EG%3C/text%3E%3Ctext%20x=%22229%22%20y=%2283%22%3EG%3C/text%3E%3Ctext%20x=%22227%22%20y=%22107%22%3EG%3C/text%3E%3Ctext%20x=%22227%22%20y=%22131%22%3ET%3C/text%3E%3Ctext%20x=%22226%22%20y=%22155%22%3EG%3C/text%3E%3Ctext%20x=%22230%22%20y=%22179%22%3EC%3C/text%3E%3Ctext%20x=%22229%22%20y=%22203%22%3EG%3C/text%3E%3Ctext%20x=%22227%22%20y=%22227%22%3ET%3C/text%3E%3Ctext%20x=%22230%22%20y=%2223%22%3EG%3C/text%3E%3C/svg%3E");
+  background-repeat: repeat;
+  opacity: 0.1;              /* tuned — lower toward 0.03 for subtle, raise for bolder */
+  animation: fqxv-actg-rain 60s linear infinite;
+  will-change: background-position;
+}
+
+/* Keep the readable content above the drifting letter field. */
+[data-md-color-scheme="slate"] .md-content,
+[data-md-color-scheme="slate"] .md-sidebar {
+  position: relative;
+  z-index: 1;
+}
+
+@keyframes fqxv-actg-rain {
+  from { background-position: 0 0; }
+  to   { background-position: 0 240px; }   /* one tile height → seamless loop */
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-md-color-scheme="slate"] .md-main::before { animation: none; }
+}

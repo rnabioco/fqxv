@@ -5,9 +5,12 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use anyhow::Context;
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand, ValueEnum};
 use flate2::read::MultiGzDecoder;
+use tracing::info;
+use tracing_subscriber::{fmt, EnvFilter};
 
 /// Terminal color scheme for `--help` (shared with the rnabioco tooling look):
 /// yellow-bold headings, green-bold literals, cyan value placeholders.
@@ -51,9 +54,51 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Number of worker threads (0 = all available cores).
-    #[arg(long, global = true, default_value_t = 0)]
+    /// Number of worker threads, capped at available cores (0 = all cores).
+    #[arg(long, global = true, default_value_t = 16)]
     threads: usize,
+
+    /// Increase log verbosity: -v debug, -vv trace, -vvv trace with targets,
+    /// thread ids, and span timing. Overridden by RUST_LOG if set.
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
+
+    /// Silence all output except warnings and errors (suppresses the summary).
+    #[arg(short, long, global = true, conflicts_with = "verbose")]
+    quiet: bool,
+}
+
+/// Install the `tracing` subscriber. Verbosity comes from `-v/-vv/-vvv` and
+/// `--quiet`; a set `RUST_LOG` overrides the computed level entirely. All output
+/// goes to **stderr** so decompressed FASTQ on stdout stays uncontaminated.
+fn init_tracing(verbose: u8, quiet: bool) {
+    let level = if quiet {
+        "warn"
+    } else {
+        match verbose {
+            0 => "info",
+            1 => "debug",
+            _ => "trace",
+        }
+    };
+    // Scope to our own crates so dependency noise (rayon, noodles) stays out even
+    // at trace; RUST_LOG, when set, takes over completely.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(format!("fqxv={level},fqxv_cli={level}")));
+    let builder = fmt()
+        .with_writer(io::stderr)
+        .with_env_filter(filter)
+        .with_level(true);
+    // -vvv adds the noisy-but-useful detail; lower levels stay terse.
+    if verbose >= 3 {
+        builder
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_span_events(fmt::format::FmtSpan::CLOSE)
+            .init();
+    } else {
+        builder.with_target(false).without_time().init();
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -155,6 +200,7 @@ fn level_to_block(level: u8) -> usize {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    init_tracing(cli.verbose, cli.quiet);
     match cli.command {
         Command::Compress {
             inputs,
@@ -188,7 +234,8 @@ fn main() -> anyhow::Result<()> {
                 .filter_map(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len())
                 .sum();
-            let out = File::create(&output)?;
+            let out = File::create(&output)
+                .with_context(|| format!("creating output {}", output.display()))?;
 
             let t0 = Instant::now();
             let stats = if inputs.len() == 1 {
@@ -218,14 +265,13 @@ fn main() -> anyhow::Result<()> {
                 2 => "paired".to_string(),
                 g => format!("grouped x{g}"),
             };
-            eprintln!(
-                "compressed {} reads ({layout}, {} input file(s)) in {} block(s) -> {} bytes{} in {:.1}s",
-                stats.reads,
-                inputs.len(),
-                stats.blocks,
-                stats.out_bytes,
-                ratio,
-                secs
+            info!(
+                reads = stats.reads,
+                inputs = inputs.len(),
+                blocks = stats.blocks,
+                out_bytes = stats.out_bytes,
+                secs = format_args!("{secs:.1}"),
+                "compressed {layout}{ratio}"
             );
         }
         Command::Decompress {
@@ -233,25 +279,26 @@ fn main() -> anyhow::Result<()> {
             output,
             split,
         } => {
+            let open_in =
+                || File::open(&input).with_context(|| format!("opening input {}", input.display()));
             let t0 = Instant::now();
             let stats = if let Some(prefix) = split {
-                let g = fqxv::peek(File::open(&input)?)?.group_size as usize;
+                let g = fqxv::peek(open_in()?)?.group_size as usize;
                 let mut files: Vec<File> = (1..=g)
-                    .map(|i| File::create(format!("{}_{}.fastq", prefix.display(), i)))
-                    .collect::<io::Result<_>>()?;
-                fqxv::decompress_split(File::open(&input)?, &mut files, cli.threads)?
+                    .map(|i| {
+                        let path = format!("{}_{}.fastq", prefix.display(), i);
+                        File::create(&path).with_context(|| format!("creating output {path}"))
+                    })
+                    .collect::<anyhow::Result<_>>()?;
+                fqxv::decompress_split(open_in()?, &mut files, cli.threads)?
             } else {
-                fqxv::decompress(
-                    File::open(&input)?,
-                    open_output(output.as_deref())?,
-                    cli.threads,
-                )?
+                fqxv::decompress(open_in()?, open_output(output.as_deref())?, cli.threads)?
             };
-            eprintln!(
-                "decompressed {} reads from {} block(s) in {:.1}s",
-                stats.reads,
-                stats.blocks,
-                t0.elapsed().as_secs_f64()
+            info!(
+                reads = stats.reads,
+                blocks = stats.blocks,
+                secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+                "decompressed"
             );
         }
         Command::Info { input, tsv } => print_info(&input, tsv)?,
@@ -261,7 +308,9 @@ fn main() -> anyhow::Result<()> {
 
 fn print_info(path: &Path, tsv: bool) -> anyhow::Result<()> {
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    let info = fqxv::inspect(File::open(path)?)?;
+    let info = fqxv::inspect(
+        File::open(path).with_context(|| format!("opening input {}", path.display()))?,
+    )?;
     let total = info.names_bytes + info.seq_bytes + info.qual_bytes;
     if tsv {
         // Stable, tab-separated columns for scripts. Keep field order fixed;
@@ -359,7 +408,7 @@ fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
     let mut src: Box<dyn Read + Send> = if path.as_os_str() == "-" {
         Box::new(io::stdin())
     } else {
-        Box::new(File::open(path)?)
+        Box::new(File::open(path).with_context(|| format!("opening input {}", path.display()))?)
     };
     let mut magic = [0u8; 2];
     let n = read_up_to(&mut src, &mut magic)?;
@@ -375,7 +424,11 @@ fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
 /// Open an output sink: a file, or stdout when the path is absent or `-`.
 fn open_output(path: Option<&Path>) -> anyhow::Result<Box<dyn Write>> {
     match path {
-        Some(p) if p.as_os_str() != "-" => Ok(Box::new(File::create(p)?)),
+        Some(p) if p.as_os_str() != "-" => {
+            Ok(Box::new(File::create(p).with_context(|| {
+                format!("creating output {}", p.display())
+            })?))
+        }
         _ => Ok(Box::new(io::stdout())),
     }
 }

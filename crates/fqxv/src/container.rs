@@ -34,6 +34,7 @@
 use std::io::{self, BufReader, BufWriter, Read, Write};
 
 use rayon::prelude::*;
+use tracing::{debug, info, instrument, trace};
 
 use crate::{Error, Result, FORMAT_VERSION, MAGIC};
 use fqxv_fqzcomp::QualityBinning;
@@ -64,7 +65,7 @@ pub struct Params {
     /// In reorder mode, store a permutation so the original read order is
     /// restored (otherwise reads emerge in clustered order).
     pub keep_order: bool,
-    /// Worker threads (0 = all available cores).
+    /// Worker threads (0 = all available cores); clamped to available cores.
     pub threads: usize,
 }
 
@@ -177,6 +178,7 @@ impl RawBlock {
 ///
 /// `reader` must be `Send`: parsing runs on a dedicated thread so it overlaps
 /// compression (see [`drive`]).
+#[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, reorder = params.reorder, threads = params.threads))]
 pub fn compress<R: Read + Send, W: Write>(reader: R, writer: W, params: Params) -> Result<Stats> {
     let block_reads = params.block_reads.max(1);
     let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
@@ -253,6 +255,7 @@ fn detect_group_size(peeked: &[noodles_fastq::Record]) -> u8 {
 /// flag. Detection only ever promotes to paired on unambiguous mate names;
 /// otherwise it behaves exactly like [`compress`]. In `reorder` mode the stream
 /// is always treated as single-end (reorder is single-end only).
+#[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, reorder = params.reorder, threads = params.threads))]
 pub fn compress_auto<R: Read + Send, W: Write>(
     reader: R,
     writer: W,
@@ -272,6 +275,7 @@ pub fn compress_auto<R: Read + Send, W: Write>(
     } else {
         detect_group_size(&peeked)
     } as usize;
+    info!(group_size = g, "detected layout");
     let block_reads = (params.block_reads / g).max(1) * g;
     let mut queue = std::collections::VecDeque::from(peeked);
     drive(writer, params, g as u8, |b| {
@@ -310,6 +314,7 @@ pub fn compress_auto<R: Read + Send, W: Write>(
 /// stream's total record count must be a multiple of `group_size`; a trailing
 /// partial spot is an error. Restore with [`decompress_split`], or stream
 /// interleaved with [`decompress`].
+#[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, group_size, threads = params.threads))]
 pub fn compress_interleaved<R: Read + Send, W: Write>(
     reader: R,
     writer: W,
@@ -356,6 +361,7 @@ pub fn compress_interleaved<R: Read + Send, W: Write>(
 ///
 /// Readers are consumed in lockstep; unequal read counts are an error. Restore
 /// with [`decompress_split`], or stream interleaved with [`decompress`].
+#[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, inputs = readers.len(), threads = params.threads))]
 pub fn compress_multi<'a, W: Write>(
     readers: Vec<Box<dyn Read + Send + 'a>>,
     writer: W,
@@ -419,6 +425,12 @@ where
 {
     let pool = build_pool(params.threads)?;
     let batch = pool.current_num_threads().max(1);
+    debug!(
+        threads = pool.current_num_threads(),
+        batch,
+        backend = ?fqxv_rans::Backend::detect(),
+        "compress pool ready"
+    );
     let mut w = BufWriter::new(writer);
 
     let mut flags = FLAG_PLUS_NORMALIZED;
@@ -485,6 +497,7 @@ where
                     break;
                 }
             };
+            debug!(blocks = blocks.len(), "compressing batch");
             let compressed: Vec<Result<Vec<u8>>> = pool.install(|| {
                 blocks
                     .par_iter()
@@ -517,6 +530,11 @@ fn write_blocks<W: Write>(
         let payload = payload?;
         w.write_all(&(payload.len() as u64).to_le_bytes())?;
         w.write_all(&payload)?;
+        trace!(
+            reads = b.n_reads(),
+            payload = payload.len(),
+            "block written"
+        );
         stats.reads += b.n_reads() as u64;
         stats.blocks += 1;
         stats.out_bytes += 8 + payload.len() as u64;
@@ -643,6 +661,7 @@ fn compress_block_reordered(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
 ///
 /// For grouped archives this yields interleaved output — exactly what aligners
 /// that accept interleaved paired reads want (`fqxv decompress x.fqxv | bwa mem -p`).
+#[instrument(skip_all, fields(threads))]
 pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Result<Stats> {
     let pool = build_pool(threads)?;
     let batch = pool.current_num_threads().max(1);
@@ -652,8 +671,16 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
     let keep_order = header.flags & FLAG_KEEP_ORDER != 0;
     let mut w = BufWriter::new(writer);
 
+    debug!(
+        threads = pool.current_num_threads(),
+        batch,
+        reordered,
+        backend = ?fqxv_rans::Backend::detect(),
+        "decompress pool ready"
+    );
     let mut stats = Stats::default();
     for_each_block_batch(&mut r, batch, |raw_blocks| {
+        debug!(blocks = raw_blocks.len(), "decoding batch");
         let decoded: Vec<Result<(u64, Vec<u8>)>> = pool.install(|| {
             raw_blocks
                 .par_iter()
@@ -663,6 +690,7 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
         for d in decoded {
             let (reads, fastq) = d?;
             w.write_all(&fastq)?;
+            trace!(reads, bytes = fastq.len(), "block decoded");
             stats.reads += reads;
             stats.blocks += 1;
             stats.out_bytes += fastq.len() as u64;
@@ -675,6 +703,7 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
 
 /// Decompress a grouped archive, splitting reads back into `G` writers by their
 /// per-spot member. `writers.len()` must equal the archive's group size.
+#[instrument(skip_all, fields(threads, outputs = writers.len()))]
 pub fn decompress_split<R: Read, W: Write>(
     reader: R,
     writers: &mut [W],
@@ -696,8 +725,16 @@ pub fn decompress_split<R: Read, W: Write>(
         ));
     }
 
+    debug!(
+        threads = pool.current_num_threads(),
+        batch,
+        group_size = g,
+        backend = ?fqxv_rans::Backend::detect(),
+        "decompress-split pool ready"
+    );
     let mut stats = Stats::default();
     for_each_block_batch(&mut r, batch, |raw_blocks| {
+        debug!(blocks = raw_blocks.len(), "decoding batch");
         let decoded: Vec<Result<(u64, Vec<Vec<u8>>)>> = pool.install(|| {
             raw_blocks
                 .par_iter()
@@ -961,8 +998,19 @@ fn read_block<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
 }
 
 fn build_pool(threads: usize) -> Result<rayon::ThreadPool> {
+    // Resolve the effective worker count: 0 means "all available cores", and any
+    // explicit request is clamped to what physically exists so we never
+    // over-subscribe the pool.
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let n = if threads == 0 {
+        available
+    } else {
+        threads.min(available)
+    };
     rayon::ThreadPoolBuilder::new()
-        .num_threads(threads) // 0 => rayon default (all cores)
+        .num_threads(n)
         .build()
         .map_err(|e| Error::Io(io::Error::other(e.to_string())))
 }
