@@ -13,10 +13,11 @@
 //! and [`inspect`].
 
 mod container;
+mod crc;
 
 pub use container::{
-    compress, compress_auto, compress_interleaved, compress_multi, decompress, decompress_split,
-    inspect, peek, Info, Params, Stats,
+    compress, compress_auto, compress_interleaved, compress_multi, decompress, decompress_recover,
+    decompress_split, inspect, peek, verify, Info, Params, Recovery, Stats,
 };
 pub use fqxv_fqzcomp::QualityBinning;
 
@@ -28,10 +29,12 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 /// The container format version this build writes.
 ///
 /// v1 appends a footer index (`[u32 n_row_groups]`, per-group `[u64 offset]
-/// [u32 read_count]`, `[u64 total_reads]`) plus an EOF trailer (`[u64
-/// footer_offset]["FQXF"]`) after a zero-length terminator block, so `inspect`
-/// and random access can seek straight to the row-group index. See
-/// `container.rs` for the full layout.
+/// [u32 read_count]`, `[u64 total_reads]`, `[u32 whole_file_crc]`,
+/// `[u32 footer_crc]`) plus an EOF trailer (`[u64 footer_offset]["FQXF"]`) after a
+/// zero-length terminator block, so `inspect` and random access can seek straight
+/// to the row-group index. Every coded payload carries a CRC-32C so corruption is
+/// detected and localized rather than silently decoded; see `container.rs` for
+/// the full layout. Nothing on disk is stable yet (alpha).
 pub const FORMAT_VERSION: u16 = 1;
 
 /// Errors returned by the archiver.
@@ -50,6 +53,13 @@ pub enum Error {
     /// The stream ended in the middle of a block.
     #[error("truncated fqxv stream")]
     Truncated,
+    /// A CRC-32C check failed: the data was corrupted on disk or in transit.
+    /// `what` names the region (e.g. `"block 12"`, `"footer"`).
+    #[error("corrupted fqxv data: {what} (crc mismatch)")]
+    Corrupt {
+        /// Human-readable name of the region whose checksum failed.
+        what: String,
+    },
     /// A block referenced a codec parameter this build doesn't support.
     #[error("malformed fqxv block: {0}")]
     Malformed(&'static str),

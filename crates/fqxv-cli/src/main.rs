@@ -145,6 +145,11 @@ enum Command {
         /// Restore separate per-spot files as `<prefix>_1.fastq … _G.fastq`.
         #[arg(long, conflicts_with = "output")]
         split: Option<PathBuf>,
+        /// Best-effort recovery of a corrupted archive: skip blocks that fail
+        /// their CRC and decode the rest, reporting what was lost. Interleaved
+        /// output only (plain, non-reordered archives).
+        #[arg(long, conflicts_with = "split")]
+        recover: bool,
     },
     /// Print `.fqxv` container metadata and per-stream sizes.
     Info {
@@ -154,6 +159,12 @@ enum Command {
         /// report (stable columns for the benchmark harness / scripts).
         #[arg(long)]
         tsv: bool,
+    },
+    /// Verify archive integrity (CRC checks) without writing any output.
+    /// Exits non-zero if the archive is corrupt.
+    Verify {
+        /// Input `.fqxv` file.
+        input: PathBuf,
     },
 }
 
@@ -310,30 +321,66 @@ fn main() -> anyhow::Result<()> {
             input,
             output,
             split,
+            recover,
         } => {
             let open_in =
                 || File::open(&input).with_context(|| format!("opening input {}", input.display()));
             let t0 = Instant::now();
-            let stats = if let Some(prefix) = split {
-                let g = fqxv::peek(open_in()?)?.group_size as usize;
-                let mut files: Vec<File> = (1..=g)
-                    .map(|i| {
-                        let path = format!("{}_{}.fastq", prefix.display(), i);
-                        File::create(&path).with_context(|| format!("creating output {path}"))
-                    })
-                    .collect::<anyhow::Result<_>>()?;
-                fqxv::decompress_split(open_in()?, &mut files, cli.threads)?
+            if recover {
+                let rec = fqxv::decompress_recover(
+                    open_in()?,
+                    open_output(output.as_deref())?,
+                    cli.threads,
+                )?;
+                if rec.blocks_skipped > 0 {
+                    // User-facing summary on stderr so it shows even when the
+                    // decoded FASTQ is piped from stdout.
+                    eprintln!(
+                        "warning: recovered {} block(s), skipped {} corrupt block(s) — {} read(s) lost",
+                        rec.blocks_recovered, rec.blocks_skipped, rec.reads_lost
+                    );
+                }
+                info!(
+                    reads = rec.stats.reads,
+                    blocks = rec.blocks_recovered,
+                    skipped = rec.blocks_skipped,
+                    reads_lost = rec.reads_lost,
+                    secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+                    "recovered"
+                );
             } else {
-                fqxv::decompress(open_in()?, open_output(output.as_deref())?, cli.threads)?
-            };
-            info!(
-                reads = stats.reads,
-                blocks = stats.blocks,
-                secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
-                "decompressed"
-            );
+                let stats = if let Some(prefix) = split {
+                    let g = fqxv::peek(open_in()?)?.group_size as usize;
+                    let mut files: Vec<File> = (1..=g)
+                        .map(|i| {
+                            let path = format!("{}_{}.fastq", prefix.display(), i);
+                            File::create(&path).with_context(|| format!("creating output {path}"))
+                        })
+                        .collect::<anyhow::Result<_>>()?;
+                    fqxv::decompress_split(open_in()?, &mut files, cli.threads)?
+                } else {
+                    fqxv::decompress(open_in()?, open_output(output.as_deref())?, cli.threads)?
+                };
+                info!(
+                    reads = stats.reads,
+                    blocks = stats.blocks,
+                    secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+                    "decompressed"
+                );
+            }
         }
         Command::Info { input, tsv } => print_info(&input, tsv)?,
+        Command::Verify { input } => {
+            let file =
+                File::open(&input).with_context(|| format!("opening input {}", input.display()))?;
+            match fqxv::verify(file) {
+                Ok(()) => println!("{}: OK", input.display()),
+                Err(e) => {
+                    eprintln!("{}: CORRUPT — {e}", input.display());
+                    std::process::exit(1);
+                }
+            }
+        }
     }
     Ok(())
 }
