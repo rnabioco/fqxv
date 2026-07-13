@@ -18,11 +18,16 @@ of short-read FASTQ. Codecs are clean-room implementations from specs and papers
 
 ### Added
 
-- **`fqxv` container format and library** — the `.fqxv` on-disk layout: a 10-byte
-  header followed by independent, parallel-codable blocks. Each block splits
-  FASTQ into three streams (names, sequence, quality) handled by three codecs.
-  Public API: `compress`, `compress_multi`, `decompress`, `decompress_split`,
-  and `inspect`.
+- **`fqxv` container format and library** — the `.fqxv` on-disk layout: a header
+  followed by independent, parallel-codable **row groups** (blocks), a footer
+  index, and an EOF trailer. Each row group splits FASTQ into three streams
+  (names, sequence, quality) handled by three codecs and is byte-budgeted. The
+  footer index makes `inspect` O(row groups) rather than O(bytes) and enables
+  coarse random access (seek to and decode only the row groups overlapping a read
+  range). The terminator lets the same file serve both a streaming reader and a
+  seeking reader. Public API: `compress`, `compress_auto`, `compress_multi`,
+  `compress_interleaved`, `decompress`, `decompress_split`, `inspect`, `peek`,
+  and the `Info`/`Params`/`Stats` types.
 - **`fqxv` CLI** — clap front-end (`fqxv` binary) with `compress`,
   `decompress`, and `info` subcommands. Reads gzip-compressed or plain FASTQ,
   supports stdin/stdout streaming, and auto-detects interleaved paired streams.
