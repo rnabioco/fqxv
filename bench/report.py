@@ -72,6 +72,17 @@ def main() -> None:
                     f"seq {fmt_bytes(sb)} ({100*sb/tot:.0f}%)  "
                     f"qual {fmt_bytes(qb)} ({100*qb/tot:.0f}%)"
                 )
+            # Quality distortion (lossy rows only; -1 = lossless / not measured).
+            # The fidelity half of the lossy tradeoff: how far the reconstructed
+            # qualities drift from the originals, alongside the ratio above.
+            mae = float(r.get("qual_mae", -1) or -1)
+            if mae >= 0:
+                rmse = float(r.get("qual_rmse", -1) or -1)
+                pct = float(r.get("qual_pct_changed", -1) or -1)
+                print(
+                    f"{'':<13} └─ Δqual  mae {mae:.2f}  rmse {rmse:.2f}  "
+                    f"changed {pct:.1f}% of bases"
+                )
 
 
 def fmt_bytes(n: int) -> str:

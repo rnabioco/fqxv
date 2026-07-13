@@ -1,8 +1,12 @@
 # fqxv benchmark datasets — short-read Illumina, spanning both quality regimes.
 # Fetched with `sracha` (see fetch.sh). Columns:
-#   accession  label                 platform          layout   quality      approx_gz
-SRR2627175	ecoli_miseq	MiSeq	paired	full-range	876MB
-DRR174812	rnaseq_novaseq	NovaSeq6000	paired	binned	2.1GB
-SRR453566	rnaseq_fullrange	GAIIx	paired	full-range	500MB
+#   accession  label  platform  layout  quality  approx_gz  reference
+# `reference` is a genome FASTA URL used only by concordance.sh (the downstream
+# variant-call fidelity check); `-` = no reference (skipped). Only DNA
+# resequencing datasets get one — RNA-seq needs splice-aware calling (out of
+# scope), so those stay `-`.
+SRR2627175	ecoli_miseq	MiSeq	paired	full-range	876MB	https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz
+DRR174812	rnaseq_novaseq	NovaSeq6000	paired	binned	2.1GB	-
+SRR453566	rnaseq_fullrange	GAIIx	paired	full-range	500MB	-
 # ERR10213669 dropped: reference-compressed cSRA, not reconstructable by sracha.
 # Add a plain (unaligned) human NovaSeq run here if a binned-human sample is wanted.

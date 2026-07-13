@@ -19,9 +19,13 @@ DATA_DIR="${FQXV_DATA_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/data}"
 RESULTS_DIR="${FQXV_RESULTS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/results}"
 THREADS="${FQXV_THREADS:-$(nproc)}"
 INPUT_MODE="${FQXV_INPUT:-r1}"
-# fqxv, fqxv9 (level 9), fqxv-reorder (--reorder --keep-order), fqxv-bin4 (lossy
-# 4-bin quality) all share one binary; the rest are external baselines.
-ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-bin4 gzip zstd19 xz9 fqz_comp fqzcomp5 spring"
+# fqxv, fqxv9 (level 9), fqxv-reorder (--reorder --keep-order), and the lossy
+# quality points fqxv-bin8/bin4/bin2 all share one binary; the rest are external
+# baselines. spring-illbin (`-q ill_bin`, Illumina 8-level) and spring-binary
+# (`-q binary`, 2-level) are SPRING's lossy quality modes — the only field tools
+# with Illumina-comparable binning, so they are the like-for-like lossy rivals to
+# fqxv-bin8 and fqxv-bin2 (fqz_comp/fqzcomp5 have no Illumina binning mode).
+ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-bin8 fqxv-bin4 fqxv-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary"
 TOOLS="${FQXV_TOOLS:-$ALL_TOOLS}"
 # The fqxv binary (built with `cargo build --release`).
 FQXV_BIN="${FQXV_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/fqxv}"
@@ -93,9 +97,52 @@ record_digest() {  # file mode(full|noqual)
   ' "$1" | LC_ALL=C sort | md5sum | cut -d' ' -f1
 }
 
+# Like record_digest with quality, but first pass every quality byte through
+# fqxv's bin table `scheme` (bin8|bin4|bin2) — i.e. the *expected* content of a
+# correct lossy round-trip. Must mirror QualityBinning::apply in fqxv-fqzcomp.
+record_digest_binned() {  # file scheme(bin8|bin4|bin2)
+  awk -v scheme="$2" '
+    BEGIN{ for(i=0;i<256;i++) ord[sprintf("%c",i)]=i }
+    function binq(c,   q,b){ q=ord[c]-33
+      if(scheme=="bin8"){ if(q<=1)b=q; else if(q<=9)b=6; else if(q<=19)b=15; else if(q<=24)b=22; else if(q<=29)b=27; else if(q<=34)b=33; else if(q<=39)b=37; else b=40 }
+      else if(scheme=="bin4"){ if(q<=2)b=2; else if(q<=17)b=12; else if(q<=29)b=24; else b=40 }
+      else if(scheme=="bin2"){ if(q<=24)b=15; else b=37 }
+      else b=q
+      return b+33 }
+    NR%4==1{n=$0} NR%4==2{s=$0}
+    NR%4==0{ out=""; L=length($0); for(i=1;i<=L;i++) out=out sprintf("%c", binq(substr($0,i,1))); print n"\t"s"\t"out }
+  ' "$1" | LC_ALL=C sort | md5sum | cut -d' ' -f1
+}
+
+# Per-base quality distortion of a lossy round-trip vs the original: mean absolute
+# error, RMSE, and % of bases whose quality changed. Records are matched by name
+# (order-independent, so it holds for read-reordering tools like SPRING). Prints
+# "mae rmse pct"; "-1 -1 -1" if nothing matched. O(quality bytes) memory, like
+# the digest sort, so only run for lossy tools.
+qual_distortion() {  # orig rt  ->  "mae rmse pct"
+  awk '
+    BEGIN{ for(i=0;i<256;i++) ord[sprintf("%c",i)]=i }
+    NR==FNR{ if(FNR%4==1) name=$0; else if(FNR%4==0) oq[name]=$0; next }
+    { if(FNR%4==1) name=$0
+      else if(FNR%4==0){ o=oq[name]; r=$0; m=length(r); if(length(o)<m)m=length(o)
+        for(i=1;i<=m;i++){ d=ord[substr(r,i,1)]-ord[substr(o,i,1)]; if(d<0)d=-d; sa+=d; sq+=d*d; if(d>0)ch++; n++ } } }
+    END{ if(n==0) print "-1 -1 -1"; else printf "%.4f %.4f %.4f\n", sa/n, sqrt(sq/n), 100.0*ch/n }
+  ' "$1" "$2"
+}
+
 is_fqxv() { [[ "$1" == fqxv || "$1" == fqxv-* || "$1" == fqxv[0-9] ]]; }
-# Lossy tools: content check ignores quality (mode=noqual).
-is_lossy() { [[ "$1" == fqxv-bin* ]]; }
+# Lossy-quality tools (quality changed on purpose).
+is_lossy() { [[ "$1" == fqxv-bin* || "$1" == spring-illbin || "$1" == spring-binary ]]; }
+# The exact fqxv bin table a tool applies, for the binned-expected round-trip;
+# `none` for tools whose internal table we don't assert (the SPRING rivals).
+bin_scheme() {
+  case "$1" in
+    fqxv-bin8) echo bin8 ;;
+    fqxv-bin4) echo bin4 ;;
+    fqxv-bin2) echo bin2 ;;
+    *) echo none ;;
+  esac
+}
 
 # --- per-tool compress/decompress. Each sets COMP (compressed path) then RT. ---
 compress() {  # tool input out_prefix
@@ -104,26 +151,32 @@ compress() {  # tool input out_prefix
     fqxv)          COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --threads "$THREADS" ;;
     fqxv9)         COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" -l 9 --threads "$THREADS" ;;
     fqxv-reorder)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --reorder --keep-order --threads "$THREADS" ;;
+    fqxv-bin8)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin8 --threads "$THREADS" ;;
     fqxv-bin4)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin4 --threads "$THREADS" ;;
+    fqxv-bin2)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin2 --threads "$THREADS" ;;
     gzip)     COMP="$pfx.gz";  measure bash -c "pigz -p $THREADS -6 -c '$in' > '$COMP'" ;;
     zstd19)   COMP="$pfx.zst"; measure bash -c "zstd -19 --long=27 -T$THREADS -q -f -o '$COMP' '$in'" ;;
     xz9)      COMP="$pfx.xz";  measure bash -c "xz -9 -T$THREADS -c '$in' > '$COMP'" ;;
     fqz_comp) COMP="$pfx.fqz"; measure bash -c "fqz_comp < '$in' > '$COMP'" ;;
     fqzcomp5) COMP="$pfx.fqz5"; measure bash -c "fqzcomp5 < '$in' > '$COMP'" ;;
     spring)   COMP="$pfx.spring"; mkdir -p "$WORK/spring_c_$$"; measure spring -c -t "$THREADS" -i "$in" -o "$COMP" -w "$WORK/spring_c_$$/" ;;
+    # spring-illbin: Illumina 8-level binning (like-for-like vs fqxv-bin8).
+    spring-illbin) COMP="$pfx.spring"; mkdir -p "$WORK/spring_c_$$"; measure spring -c -t "$THREADS" -q ill_bin -i "$in" -o "$COMP" -w "$WORK/spring_c_$$/" ;;
+    # spring-binary thr=25 high=37 low=15 mirrors fqxv-bin2 (q<25 -> 15, else 37).
+    spring-binary) COMP="$pfx.spring"; mkdir -p "$WORK/spring_c_$$"; measure spring -c -t "$THREADS" -q binary 25 37 15 -i "$in" -o "$COMP" -w "$WORK/spring_c_$$/" ;;
     *) echo "unknown tool $tool" >&2; return 1 ;;
   esac
 }
 decompress() {  # tool comp out_rt
   local tool="$1" comp="$2" rt="$3"
   case "$tool" in
-    fqxv|fqxv9|fqxv-reorder|fqxv-bin4) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" ;;
+    fqxv|fqxv9|fqxv-reorder|fqxv-bin8|fqxv-bin4|fqxv-bin2) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" ;;
     gzip)     measure bash -c "pigz -d -p $THREADS -c '$comp' > '$rt'" ;;
     zstd19)   measure bash -c "zstd -d -q -f -o '$rt' '$comp'" ;;
     xz9)      measure bash -c "xz -d -T$THREADS -c '$comp' > '$rt'" ;;
     fqz_comp) measure bash -c "fqz_comp -d < '$comp' > '$rt'" ;;
     fqzcomp5) measure bash -c "fqzcomp5 -d < '$comp' > '$rt'" ;;
-    spring)   mkdir -p "$WORK/spring_d_$$"; measure spring -d -t "$THREADS" -i "$comp" -o "$rt" -w "$WORK/spring_d_$$/" ;;
+    spring|spring-illbin|spring-binary)   mkdir -p "$WORK/spring_d_$$"; measure spring -d -t "$THREADS" -i "$comp" -o "$rt" -w "$WORK/spring_d_$$/" ;;
   esac
 }
 
@@ -133,7 +186,7 @@ decompress() {  # tool comp out_rt
 # (the merge step adds one); prep writes meta.tsv but not results.tsv.
 if [[ -z "$PART_TAG" ]]; then
   echo -e "dataset\torig_bytes\tn_records\tn_bases" > "$META"
-  [[ "$PREP_ONLY" == 1 ]] || echo -e "dataset\ttool\torig_bytes\tcomp_bytes\tratio\tc_secs\td_secs\tc_rss_kb\td_rss_kb\tnames_bytes\tseq_bytes\tqual_bytes\trt_ok\tdeterministic" > "$RESULTS"
+  [[ "$PREP_ONLY" == 1 ]] || echo -e "dataset\ttool\torig_bytes\tcomp_bytes\tratio\tc_secs\td_secs\tc_rss_kb\td_rss_kb\tnames_bytes\tseq_bytes\tqual_bytes\trt_ok\tdeterministic\tqual_mae\tqual_rmse\tqual_pct_changed" > "$RESULTS"
 fi
 
 mapfile -t rows < <(grep -v '^#' "$HERE/datasets.tsv" | awk 'NF')
@@ -191,7 +244,8 @@ for row in "${rows[@]}"; do
     # Map tool label -> binary name to probe availability.
     case "$tool" in
       gzip) bin=pigz ;; zstd19) bin=zstd ;; xz9) bin=xz ;; pgrc) bin=PgRC ;;
-      fqxv|fqxv9|fqxv-reorder|fqxv-bin4) bin="$FQXV_BIN" ;;
+      fqxv|fqxv9|fqxv-reorder|fqxv-bin8|fqxv-bin4|fqxv-bin2) bin="$FQXV_BIN" ;;
+      spring-illbin|spring-binary) bin=spring ;;
       *) bin="$tool" ;;
     esac
     if is_fqxv "$tool"; then
@@ -219,12 +273,21 @@ for row in "${rows[@]}"; do
       fi
     fi
 
-    # Content round-trip: order-independent multiset digest. Lossy-quality tools
-    # are checked without quality (names + bases must still be exact).
-    rt_ok="no"
+    # Content round-trip + quality distortion. For fqxv lossy tools we know the
+    # exact bin table, so the round-trip verifies the *full* binned content
+    # (names + bases + input-quality-through-that-table). Competitor lossy tools
+    # (spring-*) are checked on names + bases only — we do not assert their
+    # internal table — but still get distortion metrics vs the original quality.
+    rt_ok="no"; qmae=-1; qrmse=-1; qpct=-1
     if [[ -f "$rt" ]]; then
       if is_lossy "$tool"; then
-        [[ "$(record_digest "$rt" noqual)" == "$in_noqual" ]] && rt_ok="yes"
+        scheme="$(bin_scheme "$tool")"
+        if [[ "$scheme" != none ]]; then
+          [[ "$(record_digest "$rt" full)" == "$(record_digest_binned "$in" "$scheme")" ]] && rt_ok="yes"
+        else
+          [[ "$(record_digest "$rt" noqual)" == "$in_noqual" ]] && rt_ok="yes"
+        fi
+        read -r qmae qrmse qpct < <(qual_distortion "$in" "$rt")
       else
         [[ "$(record_digest "$rt" full)" == "$in_full" ]] && rt_ok="yes"
       fi
@@ -239,16 +302,23 @@ for row in "${rows[@]}"; do
         fqxv)         "$FQXV_BIN" compress "$in" -o "$det1" --threads 1 >/dev/null 2>&1 || true ;;
         fqxv9)        "$FQXV_BIN" compress "$in" -o "$det1" -l 9 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-reorder) "$FQXV_BIN" compress "$in" -o "$det1" --reorder --keep-order --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-bin8)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin4)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-bin2)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;
       esac
       if [[ -f "$det1" ]] && cmp -s "$det1" "$COMP"; then deterministic="yes"; else deterministic="no"; fi
       rm -f "$det1"
     fi
 
     ratio="$(awk -v o="$orig_bytes" -v c="$comp_bytes" 'BEGIN{printf "%.3f", (c>0)?o/c:0}')"
-    printf '  %-13s ratio=%-6s c=%ss d=%ss rss=%sK rt=%s det=%s\n' \
-      "$tool" "$ratio" "$c_secs" "$d_secs" "$c_rss" "$rt_ok" "$deterministic"
-    echo -e "${label}\t${tool}\t${orig_bytes}\t${comp_bytes}\t${ratio}\t${c_secs}\t${d_secs}\t${c_rss}\t${d_rss}\t${names_b}\t${seq_b}\t${qual_b}\t${rt_ok}\t${deterministic}" >> "$RESULTS"
+    if is_lossy "$tool"; then
+      printf '  %-13s ratio=%-6s c=%ss d=%ss rss=%sK rt=%s det=%s  Δq mae=%s rmse=%s chg=%s%%\n' \
+        "$tool" "$ratio" "$c_secs" "$d_secs" "$c_rss" "$rt_ok" "$deterministic" "$qmae" "$qrmse" "$qpct"
+    else
+      printf '  %-13s ratio=%-6s c=%ss d=%ss rss=%sK rt=%s det=%s\n' \
+        "$tool" "$ratio" "$c_secs" "$d_secs" "$c_rss" "$rt_ok" "$deterministic"
+    fi
+    echo -e "${label}\t${tool}\t${orig_bytes}\t${comp_bytes}\t${ratio}\t${c_secs}\t${d_secs}\t${c_rss}\t${d_rss}\t${names_b}\t${seq_b}\t${qual_b}\t${rt_ok}\t${deterministic}\t${qmae}\t${qrmse}\t${qpct}" >> "$RESULTS"
     rm -f "$pfx".* "$rt"
   done
 
@@ -277,7 +347,7 @@ for row in "${rows[@]}"; do
     fi
     ratio="$(awk -v o="$p_orig" -v c="$comp_bytes" 'BEGIN{printf "%.3f", (c>0)?o/c:0}')"
     printf '  %-13s ratio=%-6s c=%ss d=%ss rt=%s (R1+R2 interleaved)\n' "fqxv-paired" "$ratio" "$c_secs" "$d_secs" "$rt_ok"
-    echo -e "${label}-paired\tfqxv-paired\t${p_orig}\t${comp_bytes}\t${ratio}\t${c_secs}\t${d_secs}\t${c_rss}\t${d_rss}\t${names_b}\t${seq_b}\t${qual_b}\t${rt_ok}\tn/a" >> "$RESULTS"
+    echo -e "${label}-paired\tfqxv-paired\t${p_orig}\t${comp_bytes}\t${ratio}\t${c_secs}\t${d_secs}\t${c_rss}\t${d_rss}\t${names_b}\t${seq_b}\t${qual_b}\t${rt_ok}\tn/a\t-1\t-1\t-1" >> "$RESULTS"
     rm -f "$pcat" "$pfx".* "${rt}"_* "${rt}.all"
   fi
 done
