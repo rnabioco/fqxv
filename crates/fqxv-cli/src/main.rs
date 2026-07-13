@@ -480,6 +480,8 @@ fn print_info(path: &Path, tsv: bool) -> anyhow::Result<()> {
             "  read order     {}",
             if info.keep_order {
                 "preserved (permutation stored)"
+            } else if info.regenerated_names {
+                "discarded (reads renumbered, names regenerated)"
             } else {
                 "clustered (not preserved)"
             }

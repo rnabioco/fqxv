@@ -193,6 +193,9 @@ pub struct Info {
     /// stored). Always true for non-reordered archives; for reordered archives it
     /// reflects the keep-order layout choice.
     pub keep_order: bool,
+    /// Whether names were regenerated from a counter template (discard-order,
+    /// reorder-lossy — reads were renumbered) rather than coded per read.
+    pub regenerated_names: bool,
     /// Number of blocks (0 from [`peek`]).
     pub blocks: u64,
     /// Total reads (0 from [`peek`]).
@@ -2000,6 +2003,7 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
         group_size: header.group_size,
         reordered: header.flags & FLAG_REORDERED != 0,
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
+        regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
         ..Info::default()
     })
 }
@@ -2036,16 +2040,19 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         group_size: header.group_size,
         reordered: header.flags & FLAG_REORDERED != 0,
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
+        regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
         ..Info::default()
     };
-    // Whole-file global-cluster layout: [u64 n][flip][perm][u32 n_blocks]
-    // [seq blocks][name+qual blocks]. Permutation overhead is charged to seq.
+    // Whole-file global-cluster layout: [u64 n][flip][perm][name template]
+    // [u32 n_blocks][seq blocks][name+qual blocks]. Permutation is charged to seq;
+    // the name template (non-empty only in discard-order mode) to names.
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
         let mut n8 = [0u8; 8];
         r.read_exact(&mut n8)?;
         info.reads = u64::from_le_bytes(n8);
         skip_framed(&mut r)?; // flip bitmap
         info.seq_bytes += skip_framed(&mut r)? as u64; // permutation
+        info.names_bytes += skip_framed(&mut r)? as u64; // name template (regen mode)
         let mut nb = [0u8; 4];
         r.read_exact(&mut nb)?;
         let n_blocks = u32::from_le_bytes(nb) as usize;
@@ -2757,8 +2764,12 @@ NNGGCCTA\n\
             };
             let mut archive = Vec::new();
             compress(&input[..], &mut archive, params).unwrap();
-            // Discard-order is a non-keep-order layout.
+            // Discard-order is a non-keep-order layout with regenerated names.
             assert!(!peek(&archive[..]).unwrap().keep_order, "threads={threads}");
+            // inspect must skip the name-template frame and report correctly.
+            let info = inspect(io::Cursor::new(&archive[..])).unwrap();
+            assert!(info.regenerated_names, "threads={threads}");
+            assert_eq!(info.reads, 3000, "threads={threads}");
 
             let mut out = Vec::new();
             decompress(&archive[..], &mut out, 1).unwrap();
