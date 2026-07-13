@@ -29,6 +29,7 @@
 //! ```
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use rayon::prelude::*;
 use thiserror::Error;
@@ -279,6 +280,67 @@ fn seed_column(b: u8) -> Column {
     col
 }
 
+/// Decide whether read `cur` (with minimizer `anchor`) can be placed on the
+/// current `contig` (whose seed read sat at `ref_anchor`). Returns
+/// `Some((offset, overlap, mismatch_positions))` when the placement is cheaper
+/// than a literal, else `None`. Pure — no mutation — so both [`encode_clustered`]
+/// and [`op_stats`] share one source of truth for the classification.
+fn place_on_contig(
+    contig: &[Column],
+    cur: &[u8],
+    anchor: u32,
+    ref_anchor: u32,
+) -> Option<(usize, usize, Vec<usize>)> {
+    if contig.is_empty() || cur.is_empty() {
+        return None;
+    }
+    // The shared-minimizer anchor gives the structurally-correct offset, which is
+    // exact for substitution errors (an error inside the minimizer k-mer would
+    // move the read to another cluster). Try that offset first — the common path.
+    // Only if it fails acceptance do we search a small window around it to rescue
+    // reads an indel has shifted off the anchor. The chosen offset is stored
+    // explicitly, so the search is invisible to the decoder.
+    let center = ref_anchor as i64 - anchor as i64;
+    let try_off = |off: usize| -> Option<(usize, usize, Vec<usize>)> {
+        let overlap = cur.len().min(contig.len() - off);
+        if overlap == 0 || overlap < MIN_CONTIG_OVERLAP.min(cur.len()) {
+            return None;
+        }
+        // Mismatches vs the CONSENSUS of all reads placed so far.
+        let mism: Vec<usize> = (0..overlap)
+            .filter(|&j| cur[j] != contig[off + j].base)
+            .collect();
+        let novel_n = cur.len() - overlap;
+        // Cheap enough to be a real overlap, and smaller than a literal.
+        (mism.len() <= overlap / 4 && novel_n + mism.len() * 2 < cur.len())
+            .then_some((off, overlap, mism))
+    };
+    let anchor_ok = (center >= 0 && center as usize <= contig.len())
+        .then(|| try_off(center as usize))
+        .flatten();
+    anchor_ok.or_else(|| {
+        // Anchor offset was rejected: scan the window for the placement with the
+        // fewest mismatches (ties nearest the anchor).
+        let lo = (center - OFF_SEARCH).max(0);
+        let hi = (center + OFF_SEARCH).min(contig.len() as i64);
+        let mut best: Option<(usize, usize, Vec<usize>)> = None;
+        let mut best_key = (usize::MAX, i64::MAX);
+        for off in lo..=hi {
+            if off == center {
+                continue; // already tried
+            }
+            if let Some((o, ov, mism)) = try_off(off as usize) {
+                let key = (mism.len(), (off - center).abs());
+                if key < best_key {
+                    best_key = key;
+                    best = Some((o, ov, mism));
+                }
+            }
+        }
+        best
+    })
+}
+
 /// Assemble reads that are already in clustered, left-to-right order (via
 /// [`plan`]) into contigs and code them against a growing consensus reference.
 ///
@@ -308,56 +370,9 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
             ops.push(OP_MATCH);
             continue;
         }
-        // Place `cur` on the contig. The shared-minimizer anchor gives the
-        // structurally-correct offset, which is exact for substitution errors
-        // (an error inside the minimizer k-mer would move the read to another
-        // cluster). Try that offset first — the common path. Only if it fails
-        // acceptance do we search a small window around it to rescue reads an
-        // indel has shifted off the anchor. The chosen offset is stored
-        // explicitly, so the search is invisible to the decoder.
-        let placed = if contig.is_empty() || cur.is_empty() {
-            None
-        } else {
-            let center = ref_anchor as i64 - anchors[i] as i64;
-            let try_off = |off: usize| -> Option<(usize, usize, Vec<usize>)> {
-                let overlap = cur.len().min(contig.len() - off);
-                if overlap == 0 || overlap < MIN_CONTIG_OVERLAP.min(cur.len()) {
-                    return None;
-                }
-                // Mismatches vs the CONSENSUS of all reads placed so far.
-                let mism: Vec<usize> = (0..overlap)
-                    .filter(|&j| cur[j] != contig[off + j].base)
-                    .collect();
-                let novel_n = cur.len() - overlap;
-                // Cheap enough to be a real overlap, and smaller than a literal.
-                (mism.len() <= overlap / 4 && novel_n + mism.len() * 2 < cur.len())
-                    .then_some((off, overlap, mism))
-            };
-            let anchor_ok = (center >= 0 && center as usize <= contig.len())
-                .then(|| try_off(center as usize))
-                .flatten();
-            anchor_ok.or_else(|| {
-                // Anchor offset was rejected: scan the window for the placement
-                // with the fewest mismatches (ties nearest the anchor).
-                let lo = (center - OFF_SEARCH).max(0);
-                let hi = (center + OFF_SEARCH).min(contig.len() as i64);
-                let mut best: Option<(usize, usize, Vec<usize>)> = None;
-                let mut best_key = (usize::MAX, i64::MAX);
-                for off in lo..=hi {
-                    if off == center {
-                        continue; // already tried
-                    }
-                    if let Some((o, ov, mism)) = try_off(off as usize) {
-                        let key = (mism.len(), (off - center).abs());
-                        if key < best_key {
-                            best_key = key;
-                            best = Some((o, ov, mism));
-                        }
-                    }
-                }
-                best
-            })
-        };
+        // Place `cur` on the contig (shared-minimizer anchor, small indel-rescue
+        // window). See [`place_on_contig`].
+        let placed = place_on_contig(&contig, cur, anchors[i], ref_anchor);
         match placed {
             Some((off, overlap, mism)) => {
                 ops.push(OP_CONTIG);
@@ -417,6 +432,95 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
         out.extend_from_slice(s);
     }
     Ok(out)
+}
+
+/// Op-mix tally from the clustered contig-assembly codec — a diagnostic that
+/// replays [`encode_clustered`]'s classification and consensus updates exactly
+/// (via the shared [`place_on_contig`]) but skips entropy coding, so the counts
+/// reflect what the real encoder does. A high `literals` / `literal_bases` share
+/// is the signal that clustering is leaving cross-read redundancy uncaptured.
+///
+/// Call it per block on the same clustered, oriented slices the container feeds
+/// [`encode_clustered`]; the contig resets at each call, matching the per-block
+/// encoding. Fields are additive across blocks (see [`OpStats::merge`]).
+#[derive(Debug, Default, Clone)]
+pub struct OpStats {
+    /// Reads seen.
+    pub reads: usize,
+    /// Reads coded as `MATCH` (byte-identical to the previous read).
+    pub matches: usize,
+    /// Reads placed on a contig (`CONTIG`).
+    pub contigs: usize,
+    /// Reads that seeded a fresh contig (`LITERAL`) — context-coded from scratch.
+    pub literals: usize,
+    /// Total substitution mismatches across all `CONTIG` reads.
+    pub contig_mismatches: u64,
+    /// Total overlap bases coded differentially (as offset + mismatches).
+    pub contig_overlap_bases: u64,
+    /// Total novel-tail bases (the `CONTIG` overhang past the contig) — these go
+    /// to the `fqxv_seq` context model, so they cost like literal bases.
+    pub novel_tail_bases: u64,
+    /// Total bases in `LITERAL` reads — context-coded from scratch.
+    pub literal_bases: u64,
+    /// Total bases in `MATCH` reads — coded for free (one op symbol).
+    pub match_bases: u64,
+    /// All bases seen (overlap + novel tail + literal + match).
+    pub total_bases: u64,
+}
+
+impl OpStats {
+    /// Add another block's tally into this one.
+    pub fn merge(&mut self, o: &OpStats) {
+        self.reads += o.reads;
+        self.matches += o.matches;
+        self.contigs += o.contigs;
+        self.literals += o.literals;
+        self.contig_mismatches += o.contig_mismatches;
+        self.contig_overlap_bases += o.contig_overlap_bases;
+        self.novel_tail_bases += o.novel_tail_bases;
+        self.literal_bases += o.literal_bases;
+        self.match_bases += o.match_bases;
+        self.total_bases += o.total_bases;
+    }
+}
+
+/// Classify a clustered, oriented block of reads exactly as [`encode_clustered`]
+/// would and return the [`OpStats`] tally — no entropy coding, no output. `reads`
+/// and `anchors` are the same slices the container passes to `encode_clustered`.
+pub fn op_stats(reads: &[&[u8]], anchors: &[u32]) -> OpStats {
+    let mut st = OpStats::default();
+    let mut contig: Vec<Column> = Vec::new();
+    let mut ref_anchor: u32 = 0;
+    for (i, &cur) in reads.iter().enumerate() {
+        st.reads += 1;
+        st.total_bases += cur.len() as u64;
+        if i > 0 && cur == reads[i - 1] {
+            st.matches += 1;
+            st.match_bases += cur.len() as u64;
+            continue;
+        }
+        match place_on_contig(&contig, cur, anchors[i], ref_anchor) {
+            Some((off, overlap, mism)) => {
+                st.contigs += 1;
+                st.contig_mismatches += mism.len() as u64;
+                st.contig_overlap_bases += overlap as u64;
+                st.novel_tail_bases += (cur.len() - overlap) as u64;
+                for (j, &b) in cur.iter().enumerate().take(overlap) {
+                    cast_vote(&mut contig[off + j], b);
+                }
+                for &b in &cur[overlap..] {
+                    contig.push(seed_column(b));
+                }
+            }
+            None => {
+                st.literals += 1;
+                st.literal_bases += cur.len() as u64;
+                contig = cur.iter().map(|&b| seed_column(b)).collect();
+                ref_anchor = anchors[i];
+            }
+        }
+    }
+    st
 }
 
 /// Decode a stream produced by [`encode_clustered`], returning the reads in the
@@ -515,6 +619,377 @@ pub fn decode_clustered(src: &[u8]) -> Result<Vec<Vec<u8>>> {
         }
     }
     Ok(reads)
+}
+
+// --- literal-rescue contig-assembly codec (prototype, version 3) -------------
+//
+// The version-2 codec above keeps a SINGLE active contig: a read that fails to
+// place on it seeds a fresh contig and the old one is discarded. On deep data
+// that strands ~15% of reads as LITERALs (context-coded from scratch) even
+// though they overlap reads on an *earlier* contig — the redundancy SPRING's
+// assembly captures. This codec keeps every contig alive and, before a read
+// becomes a literal, looks it up against a k-mer index of all contigs so it can
+// attach to whichever one it overlaps. The index is ENCODER-ONLY: each CONTIG
+// read stores the contig it landed on (a small back-reference) plus its offset,
+// so the decoder never searches — it just replays votes into the same contigs.
+
+/// k-mer length for the rescue index (matches the clustering minimizer k).
+const RESCUE_K: usize = DEFAULT_K;
+
+/// Forward 2-bit k-mer packed from `seq[start..start+k]`, or `None` if the
+/// window runs off the end or contains a non-ACGT byte. `k <= 32`.
+#[inline]
+fn kmer_at(seq: &[u8], start: usize, k: usize) -> Option<u64> {
+    if start + k > seq.len() {
+        return None;
+    }
+    let mut v = 0u64;
+    for &b in &seq[start..start + k] {
+        let c = code(b);
+        if c >= 4 {
+            return None;
+        }
+        v = (v << 2) | u64::from(c);
+    }
+    Some(v)
+}
+
+/// A chosen placement of a read on a contig.
+struct Placement {
+    ci: usize,
+    off: usize,
+    overlap: usize,
+    mism: Vec<usize>,
+}
+
+/// Multi-contig assembler with an encoder-side k-mer index. Shared by the
+/// rescue encoder and its op-mix diagnostic so both make identical decisions.
+#[derive(Default)]
+struct Assembler {
+    contigs: Vec<Vec<Column>>,
+    ref_anchors: Vec<u32>,
+    /// k-mer -> (contig index, column position); most-recent occurrence wins.
+    index: HashMap<u64, (u32, u32)>,
+}
+
+/// Acceptance test: can `cur` sit on `contig` at `off`? Returns
+/// `(overlap, mismatch_positions)` when it is cheaper than a literal.
+fn try_place(contig: &[Column], cur: &[u8], off: usize) -> Option<(usize, Vec<usize>)> {
+    if off > contig.len() {
+        return None;
+    }
+    let overlap = cur.len().min(contig.len() - off);
+    if overlap == 0 || overlap < MIN_CONTIG_OVERLAP.min(cur.len()) {
+        return None;
+    }
+    let mism: Vec<usize> = (0..overlap).filter(|&j| cur[j] != contig[off + j].base).collect();
+    let novel_n = cur.len() - overlap;
+    (mism.len() <= overlap / 4 && novel_n + mism.len() * 2 < cur.len()).then_some((overlap, mism))
+}
+
+impl Assembler {
+    /// Index every k-mer starting in `[from, to)` of contig `ci`'s consensus.
+    /// Only called on freshly-appended columns, so cost is linear in new bases;
+    /// overlap columns whose consensus later shifts are left stale on purpose —
+    /// the index only proposes candidates, [`try_place`] validates against the
+    /// live consensus, so staleness costs recall, never correctness.
+    fn index_range(&mut self, ci: usize, from: usize, to: usize) {
+        let n = self.contigs[ci].len();
+        let hi = to.min(n.saturating_sub(RESCUE_K - 1));
+        for start in from..hi {
+            let mut v = 0u64;
+            let mut ok = true;
+            for j in 0..RESCUE_K {
+                let c = code(self.contigs[ci][start + j].base);
+                if c >= 4 {
+                    ok = false;
+                    break;
+                }
+                v = (v << 2) | u64::from(c);
+            }
+            if ok {
+                self.index.insert(v, (ci as u32, start as u32));
+            }
+        }
+    }
+
+    /// Best placement of `cur` (minimizer at `anchor`) across all contigs, or
+    /// `None` if it should seed a new one. Candidates come from the most-recent
+    /// contig at the anchor-implied offset (the v2 fast path) plus every contig a
+    /// sampled read k-mer points at. Deterministic: candidates are deduped and
+    /// scored by (mismatches, recency, offset), independent of hash iteration.
+    fn place(&self, cur: &[u8], anchor: u32) -> Option<Placement> {
+        if cur.is_empty() || self.contigs.is_empty() {
+            return None;
+        }
+        let mut cands: Vec<(usize, usize)> = Vec::new();
+        let last = self.contigs.len() - 1;
+        let center = self.ref_anchors[last] as i64 - anchor as i64;
+        if center >= 0 && center as usize <= self.contigs[last].len() {
+            cands.push((last, center as usize));
+        }
+        // Non-overlapping k-mers cover every base, so a read with a few errors
+        // still has clean k-mers to match on.
+        let mut start = 0;
+        while start + RESCUE_K <= cur.len() {
+            if let Some(code) = kmer_at(cur, start, RESCUE_K) {
+                if let Some(&(ci, cpos)) = self.index.get(&code) {
+                    let off = cpos as i64 - start as i64;
+                    if off >= 0 && off as usize <= self.contigs[ci as usize].len() {
+                        cands.push((ci as usize, off as usize));
+                    }
+                }
+            }
+            start += RESCUE_K;
+        }
+        cands.sort_unstable();
+        cands.dedup();
+
+        let mut best: Option<Placement> = None;
+        let mut best_key = (usize::MAX, usize::MAX, usize::MAX);
+        for (ci, off) in cands {
+            if let Some((overlap, mism)) = try_place(&self.contigs[ci], cur, off) {
+                let key = (mism.len(), self.contigs.len() - 1 - ci, off);
+                if key < best_key {
+                    best_key = key;
+                    best = Some(Placement { ci, off, overlap, mism });
+                }
+            }
+        }
+        best
+    }
+
+    /// Fold a placed read into contig `ci`'s consensus, extending it and
+    /// indexing the newly-appended columns.
+    fn commit(&mut self, ci: usize, cur: &[u8], off: usize, overlap: usize) {
+        let old_len = self.contigs[ci].len();
+        for (j, &b) in cur.iter().enumerate().take(overlap) {
+            cast_vote(&mut self.contigs[ci][off + j], b);
+        }
+        for &b in &cur[overlap..] {
+            self.contigs[ci].push(seed_column(b));
+        }
+        let new_len = self.contigs[ci].len();
+        if new_len > old_len {
+            let from = old_len.saturating_sub(RESCUE_K - 1);
+            self.index_range(ci, from, new_len);
+        }
+    }
+
+    /// Seed a fresh contig from a literal read and index all its k-mers.
+    fn seed(&mut self, cur: &[u8], anchor: u32) {
+        let ci = self.contigs.len();
+        self.contigs.push(cur.iter().map(|&b| seed_column(b)).collect());
+        self.ref_anchors.push(anchor);
+        self.index_range(ci, 0, cur.len());
+    }
+}
+
+/// Literal-rescue variant of [`encode_clustered`]: keeps every contig alive and
+/// attaches would-be literals to any contig they overlap (see the module note on
+/// the version-3 codec). Byte-exactly reversible by [`decode_clustered_rescue`].
+pub fn encode_clustered_rescue(
+    reads: &[&[u8]],
+    anchors: &[u32],
+    seq_order: usize,
+) -> Result<Vec<u8>> {
+    let mut ops = Vec::with_capacity(reads.len());
+    let (mut cref, mut offdelta, mut slen) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut nmis, mut pos, mut subs) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut novel, mut lit_seq, mut lit_lens): (Vec<u8>, Vec<u8>, Vec<u32>) =
+        (Vec::new(), Vec::new(), Vec::new());
+
+    let mut asm = Assembler::default();
+    // Per-contig previous offset, for delta-coding offsets within a contig.
+    let mut last_off: Vec<usize> = Vec::new();
+
+    for (i, &cur) in reads.iter().enumerate() {
+        if i > 0 && cur == reads[i - 1] {
+            ops.push(OP_MATCH);
+            continue;
+        }
+        match asm.place(cur, anchors[i]) {
+            Some(p) => {
+                ops.push(OP_CONTIG);
+                // Back-reference: contigs ago (0 = most recent). Small under
+                // clustered order, so it entropy-codes cheaply.
+                write_varint(&mut cref, (asm.contigs.len() - 1 - p.ci) as u64);
+                write_varint(&mut offdelta, zigzag(p.off as i64 - last_off[p.ci] as i64));
+                write_varint(&mut slen, cur.len() as u64);
+                write_varint(&mut nmis, p.mism.len() as u64);
+                let mut last = 0usize;
+                for &m in &p.mism {
+                    write_varint(&mut pos, (m - last) as u64);
+                    last = m;
+                    subs.push(cur[m]);
+                }
+                novel.extend_from_slice(&cur[p.overlap..]);
+                last_off[p.ci] = p.off;
+                asm.commit(p.ci, cur, p.off, p.overlap);
+            }
+            None => {
+                ops.push(OP_LITERAL);
+                lit_seq.extend_from_slice(cur);
+                lit_lens.push(cur.len() as u32);
+                asm.seed(cur, anchors[i]);
+                last_off.push(0);
+            }
+        }
+    }
+
+    let ops_c = fqxv_rans::encode(&ops, fqxv_rans::Order::One)?;
+    let cref_c = fqxv_rans::encode(&cref, fqxv_rans::Order::Zero)?;
+    let offdelta_c = fqxv_rans::encode(&offdelta, fqxv_rans::Order::Zero)?;
+    let slen_c = fqxv_rans::encode(&slen, fqxv_rans::Order::Zero)?;
+    let nmis_c = fqxv_rans::encode(&nmis, fqxv_rans::Order::Zero)?;
+    let pos_c = fqxv_rans::encode(&pos, fqxv_rans::Order::Zero)?;
+    let subs_c = fqxv_rans::encode(&subs, fqxv_rans::Order::One)?;
+    let novel_c = fqxv_seq::encode(&[novel.len() as u32], &novel, seq_order)?;
+    let lit_c = fqxv_seq::encode(&lit_lens, &lit_seq, seq_order)?;
+
+    let mut out = Vec::new();
+    out.push(3u8); // version 3: literal-rescue contig-assembly layout
+    write_varint(&mut out, reads.len() as u64);
+    for s in [
+        &ops_c, &cref_c, &offdelta_c, &slen_c, &nmis_c, &pos_c, &subs_c, &novel_c, &lit_c,
+    ] {
+        write_varint(&mut out, s.len() as u64);
+        out.extend_from_slice(s);
+    }
+    Ok(out)
+}
+
+/// Decode a stream from [`encode_clustered_rescue`], returning the reads in
+/// clustered order. Maintains the same set of contigs the encoder built (no
+/// k-mer index needed — each read carries its contig back-reference and offset).
+pub fn decode_clustered_rescue(src: &[u8]) -> Result<Vec<Vec<u8>>> {
+    let mut r = Cursor::new(src);
+    if r.u8()? != 3 {
+        return Err(Error::Malformed("unsupported version"));
+    }
+    let n = r.varint()? as usize;
+    let ops = fqxv_rans::decode(r.take_stream()?)?;
+    let cref = fqxv_rans::decode(r.take_stream()?)?;
+    let offdelta = fqxv_rans::decode(r.take_stream()?)?;
+    let slen = fqxv_rans::decode(r.take_stream()?)?;
+    let nmis = fqxv_rans::decode(r.take_stream()?)?;
+    let pos = fqxv_rans::decode(r.take_stream()?)?;
+    let subs = fqxv_rans::decode(r.take_stream()?)?;
+    let (_, novel) = fqxv_seq::decode(r.take_stream()?)?;
+    let (lit_lens, lit_seq) = fqxv_seq::decode(r.take_stream()?)?;
+
+    let mut c_cref = Cursor::new(&cref);
+    let mut c_offdelta = Cursor::new(&offdelta);
+    let mut c_slen = Cursor::new(&slen);
+    let mut c_nmis = Cursor::new(&nmis);
+    let mut c_pos = Cursor::new(&pos);
+    let (mut subs_pos, mut lit_pos, mut lit_idx, mut novel_pos) = (0usize, 0usize, 0usize, 0usize);
+    let mut reads: Vec<Vec<u8>> = Vec::with_capacity(n.min(1 << 22));
+
+    let mut contigs: Vec<Vec<Column>> = Vec::new();
+    let mut last_off: Vec<usize> = Vec::new();
+
+    for i in 0..n {
+        let op = *ops.get(i).ok_or(Error::Malformed("op underrun"))?;
+        match op {
+            OP_MATCH => {
+                let read = reads
+                    .last()
+                    .ok_or(Error::Malformed("MATCH with no previous"))?
+                    .clone();
+                reads.push(read);
+            }
+            OP_LITERAL => {
+                let l = *lit_lens
+                    .get(lit_idx)
+                    .ok_or(Error::Malformed("lit len underrun"))? as usize;
+                lit_idx += 1;
+                let bytes = lit_seq
+                    .get(lit_pos..lit_pos + l)
+                    .ok_or(Error::Malformed("lit data underrun"))?
+                    .to_vec();
+                lit_pos += l;
+                contigs.push(bytes.iter().map(|&b| seed_column(b)).collect());
+                last_off.push(0);
+                reads.push(bytes);
+            }
+            OP_CONTIG => {
+                let back = c_cref.varint()? as usize;
+                let ci = contigs
+                    .len()
+                    .checked_sub(1 + back)
+                    .ok_or(Error::Malformed("contig back-reference out of range"))?;
+                let off = usize::try_from(last_off[ci] as i64 + unzigzag(c_offdelta.varint()?))
+                    .map_err(|_| Error::Malformed("bad contig offset"))?;
+                if off > contigs[ci].len() {
+                    return Err(Error::Malformed("contig offset past reference"));
+                }
+                let cur_len = c_slen.varint()? as usize;
+                let overlap = cur_len.min(contigs[ci].len() - off);
+                let mut read = vec![0u8; cur_len];
+                for (j, slot) in read.iter_mut().enumerate().take(overlap) {
+                    *slot = contigs[ci][off + j].base;
+                }
+                let m = c_nmis.varint()? as usize;
+                let mut p = 0usize;
+                for _ in 0..m {
+                    p += c_pos.varint()? as usize;
+                    let b = *subs.get(subs_pos).ok_or(Error::Malformed("subs underrun"))?;
+                    subs_pos += 1;
+                    *read
+                        .get_mut(p)
+                        .ok_or(Error::Malformed("mismatch position out of range"))? = b;
+                }
+                for slot in read.iter_mut().skip(overlap) {
+                    *slot = *novel.get(novel_pos).ok_or(Error::Malformed("novel underrun"))?;
+                    novel_pos += 1;
+                }
+                for (j, &b) in read.iter().enumerate().take(overlap) {
+                    cast_vote(&mut contigs[ci][off + j], b);
+                }
+                for &b in &read[overlap..] {
+                    contigs[ci].push(seed_column(b));
+                }
+                last_off[ci] = off;
+                reads.push(read);
+            }
+            _ => return Err(Error::Malformed("unknown op")),
+        }
+    }
+    Ok(reads)
+}
+
+/// Op-mix tally for the literal-rescue codec — the [`op_stats`] analogue for
+/// [`encode_clustered_rescue`], driving the same [`Assembler`] so the counts
+/// match the encoder. Lets the diagnostic measure how many literals the rescue
+/// pass recovers.
+pub fn op_stats_rescue(reads: &[&[u8]], anchors: &[u32]) -> OpStats {
+    let mut st = OpStats::default();
+    let mut asm = Assembler::default();
+    for (i, &cur) in reads.iter().enumerate() {
+        st.reads += 1;
+        st.total_bases += cur.len() as u64;
+        if i > 0 && cur == reads[i - 1] {
+            st.matches += 1;
+            st.match_bases += cur.len() as u64;
+            continue;
+        }
+        match asm.place(cur, anchors[i]) {
+            Some(p) => {
+                st.contigs += 1;
+                st.contig_mismatches += p.mism.len() as u64;
+                st.contig_overlap_bases += p.overlap as u64;
+                st.novel_tail_bases += (cur.len() - p.overlap) as u64;
+                asm.commit(p.ci, cur, p.off, p.overlap);
+            }
+            None => {
+                st.literals += 1;
+                st.literal_bases += cur.len() as u64;
+                asm.seed(cur, anchors[i]);
+            }
+        }
+    }
+    st
 }
 
 fn write_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -716,7 +1191,57 @@ mod tests {
         assert_eq!(decode_clustered(&enc).unwrap(), expect);
     }
 
+    #[test]
+    fn rescue_roundtrip() {
+        // The same mix the v2 codec round-trips must also round-trip under rescue.
+        let reads: Vec<&[u8]> = vec![
+            b"ACGTACGTACGT",
+            b"ACGTACGTACGT", // match
+            b"ACGTAAGTACGT", // 1 mismatch
+            b"ACGTACGTNCGT", // mismatch incl. N
+            b"TTTTGGGGCCCC", // literal
+            b"",             // empty
+            b"",             // match (empty == empty)
+        ];
+        let enc = encode_clustered_rescue(&reads, &vec![0u32; reads.len()], 4).expect("encode");
+        let dec = decode_clustered_rescue(&enc).expect("decode");
+        let expect: Vec<Vec<u8>> = reads.iter().map(|r| r.to_vec()).collect();
+        assert_eq!(dec, expect);
+    }
+
+    #[test]
+    fn rescue_attaches_to_earlier_contig() {
+        // Two unrelated references interleaved: A, B, A, B, A. After B seeds the
+        // "current" contig, the v2 codec would strand the next A as a LITERAL;
+        // the rescue index lets it re-attach to the earlier A contig. This asserts
+        // the round-trip; op_stats_rescue reports the recovered literal.
+        let a = b"ACGTTGCAACCGGTTACGTAGCTAGCATCGATCGATCGTAGCATGC";
+        let b = b"TTAGGCCATTACAGGTACCATGACATTGGACATTACAGGTTCAAGT";
+        let reads: Vec<&[u8]> = vec![&a[..], &b[..], &a[..], &b[..], &a[..]];
+        let anchors = vec![0u32; reads.len()];
+        let enc = encode_clustered_rescue(&reads, &anchors, 6).expect("encode");
+        let dec = decode_clustered_rescue(&enc).expect("decode");
+        let expect: Vec<Vec<u8>> = reads.iter().map(|r| r.to_vec()).collect();
+        assert_eq!(dec, expect);
+        // The third A (index 2) should be rescued onto A's contig, not stranded:
+        // only the first A and the first B are literals.
+        let st = op_stats_rescue(&reads, &anchors);
+        assert_eq!(st.literals, 2, "expected only the two seeds to be literals");
+    }
+
     proptest::proptest! {
+        #[test]
+        fn rescue_roundtrip_arbitrary(
+            reads in proptest::collection::vec(
+                proptest::collection::vec(proptest::sample::select(b"ACGTN".to_vec()), 0..30),
+                0..50)
+        ) {
+            let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+            let enc = encode_clustered_rescue(&refs, &vec![0u32; refs.len()], 4).expect("encode");
+            let dec = decode_clustered_rescue(&enc).expect("decode");
+            proptest::prop_assert_eq!(dec, reads);
+        }
+
         #[test]
         fn clustered_roundtrip_arbitrary(
             reads in proptest::collection::vec(
