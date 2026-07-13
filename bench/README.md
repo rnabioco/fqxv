@@ -61,15 +61,31 @@ output is reduced to a sorted multiset of `name / sequence / quality` tuples and
 hashed against the input, so any corrupted base or quality fails it. It is
 order-independent (SPRING and `fqxv --reorder` reorder reads), and it excludes
 the `+` line (fqxv normalizes it — the one documented lossy-by-design deviation).
-Lossy-quality tools (`fqxv-bin4`) are checked on names + bases only. `det` is
-fqxv's thread-determinism check: the archive built with `--threads 1` must be
-byte-identical to the many-threaded one (a core invariant).
+For **lossy-quality** tools the check verifies the intended lossy output: the
+fqxv `--quality-bin` rows are hashed against the input passed through that exact
+bin table (a full end-to-end check of names + bases + *binned* quality), while
+the SPRING lossy rows — whose internal tables we don't reproduce — are checked on
+names + bases only. `det` is fqxv's thread-determinism check: the archive built
+with `--threads 1` must be byte-identical to the many-threaded one (a core
+invariant).
+
+Every lossy row also reports a **quality-distortion** line (`Δqual`): the mean
+absolute error, RMSE, and percentage of bases whose quality changed, measured
+against the original qualities (records matched by name, so reordering is fine).
+This is the fidelity half of the lossy tradeoff — read it next to the ratio, not
+instead of it.
 
 The fqxv rows also print a per-stream breakdown (`names / seq / qual` bytes, from
 `fqxv info --tsv`) so you can see which stream to invest in. The matrix runs
 several fqxv points — `fqxv` (level 5), `fqxv9` (level 9), `fqxv-reorder`
-(`--reorder --keep-order`), and `fqxv-bin4` (lossy 4-bin quality) — plus a
-`fqxv-paired` self-check that compresses R1+R2 as one spot-interleaved archive.
+(`--reorder --keep-order`), and the lossy quality sweep `fqxv-bin8` / `fqxv-bin4`
+/ `fqxv-bin2` — plus a `fqxv-paired` self-check that compresses R1+R2 as one
+spot-interleaved archive. For a **like-for-like** lossy comparison the matrix also
+runs SPRING's own binning: `spring-illbin` (`-q ill_bin`, Illumina 8-level —
+compare to `fqxv-bin8`) and `spring-binary` (`-q binary 25 37 15`, 2-level —
+compare to `fqxv-bin2`). SPRING is the only field tool with Illumina-comparable
+binning; `fqz_comp`/`fqzcomp5` have no such mode, so they run lossless only and
+`fqxv-bin4` has no competitor row.
 
 ## Baselines
 
@@ -101,3 +117,30 @@ PgRC -d -t 8 arch                        # -> arch_out (sequences, one per line)
 ```
 
 Once `fqxv` produces output, it joins the comparable table as another tool.
+
+## Downstream fidelity — variant-call concordance (`concordance.sh`)
+
+`run_bench.sh` reports the *rate* of lossy quality binning (ratio) and its raw
+*distortion* (`Δqual`). `concordance.sh` answers the question that actually
+matters for lossy quality: **does binning change variant calls?**
+
+For each dataset with a `reference` genome (the last column of `datasets.tsv`),
+it aligns the lossless reads and each `fqxv --quality-bin` output to the
+reference, calls variants (`bwa mem` → `bcftools mpileup`/`call`), and reports
+SNP and indel **recall** and **precision** of the binned calls against the
+lossless baseline. The binned FASTQ is produced by the real codec (compress
+`--quality-bin` then decompress), so the concordance is exactly what fqxv would
+store. It is **heavy** (alignment + calling) and is *not* part of `run_bench.sh`.
+
+```bash
+# inside an srun/sbatch allocation:
+pixi run bash concordance.sh              # every dataset with a reference
+pixi run bash concordance.sh ecoli_miseq  # just one
+pixi run python -c 'pass'  # results land in $FQXV_RESULTS_DIR/concordance.tsv
+```
+
+Read the concordance next to the ratio — a bin that compresses well but drops
+SNP precision (coarser binning tends to inflate false-positive calls) is not
+free. Only DNA-resequencing datasets carry a reference; RNA-seq needs
+splice-aware calling and is left out (`-` in `datasets.tsv`). Extra pixi deps:
+`bwa`, `bcftools` (`samtools` was already present).

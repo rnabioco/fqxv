@@ -7,8 +7,24 @@
 //! features fqz_comp conditions on). One adaptive model per context. Context
 //! resets at every read boundary, so [`encode`] takes per-read lengths.
 //!
-//! Lossy quality binning ([`QualityBinning`], Illumina 2/4/8-level) is applied
-//! before modeling; the default is lossless.
+//! Lossy quality binning ([`QualityBinning`]) is applied before modeling; the
+//! default is lossless. Three quantization tables are offered (exact ranges in
+//! [`QualityBinning::apply`]):
+//!
+//! - **`Bin8`** — the standard Illumina 8-level scheme (HiSeq 2500/4000 and the
+//!   Illumina "Reducing Whole-Genome Data Storage Footprint" whitepaper).
+//!   Representatives `{6, 15, 22, 27, 33, 37, 40}` with Q0/Q1 preserved.
+//! - **`Bin4`** — Illumina's current *documented* 4-level scheme (NovaSeq X /
+//!   RTA4 control software v1.2): raw `0–2 → 2`, `3–17 → 12`, `18–29 → 24`,
+//!   `30+ → 40`. This is deliberately the RTA4 table; Illumina does not publish
+//!   the older NovaSeq 6000 / RTA3 cut points (whose representatives were
+//!   `{2, 12, 23, 37}`), so Bin4 is *not* a no-op on RTA3-binned NovaSeq 6000
+//!   data — it re-bins `23 → 24` and `37 → 40`.
+//! - **`Bin2`** — a *custom* binary split with no Illumina equivalent: below
+//!   Q25 → Q15, Q25+ → Q37.
+//!
+//! Binning is irreversible: only the binned values are entropy-coded, so decode
+//! returns the binned qualities, never the originals.
 //!
 //! ```
 //! use fqxv_fqzcomp::{encode, decode, QualityBinning};
@@ -29,11 +45,13 @@ pub enum QualityBinning {
     /// No quantization — fully lossless (default).
     #[default]
     Lossless,
-    /// Illumina 8-level binning.
+    /// Standard Illumina 8-level binning (HiSeq); representatives
+    /// `{6, 15, 22, 27, 33, 37, 40}`, Q0/Q1 preserved.
     Bin8,
-    /// Illumina 4-level binning.
+    /// Illumina documented 4-level binning (NovaSeq X / RTA4);
+    /// representatives `{2, 12, 24, 40}`.
     Bin4,
-    /// 2-level (binary) binning.
+    /// Custom 2-level (binary) binning — no Illumina equivalent.
     Bin2,
 }
 
@@ -75,11 +93,12 @@ impl QualityBinning {
                 35..=39 => 37,
                 _ => 40,
             },
+            // NovaSeq X / RTA4 control software v1.2 documented 4-bin table.
             QualityBinning::Bin4 => match q {
-                0..=9 => 6,
-                10..=24 => 18,
-                25..=34 => 30,
-                _ => 37,
+                0..=2 => 2,
+                3..=17 => 12,
+                18..=29 => 24,
+                _ => 40,
             },
             QualityBinning::Bin2 => match q {
                 0..=24 => 15,
@@ -421,6 +440,60 @@ mod tests {
             QualityBinning::Bin2,
         ] {
             roundtrip(&[100, 100, 100], &quals, b);
+        }
+    }
+
+    #[test]
+    fn bin_tables_map_expected_values() {
+        // Phred value q -> Phred+33 byte.
+        let ch = |q: u8| q + 33;
+        // Bin8 (standard Illumina 8-level): Q0/Q1 preserved, then bands.
+        for (q, want) in [
+            (0, 0),
+            (1, 1),
+            (5, 6),
+            (9, 6),
+            (12, 15),
+            (22, 22),
+            (27, 27),
+            (33, 33),
+            (37, 37),
+            (41, 40),
+        ] {
+            assert_eq!(QualityBinning::Bin8.apply(ch(q)), ch(want), "Bin8 q={q}");
+        }
+        // Bin4 (NovaSeq X / RTA4 v1.2): 0-2->2, 3-17->12, 18-29->24, 30+->40.
+        for (q, want) in [
+            (0, 2),
+            (2, 2),
+            (3, 12),
+            (17, 12),
+            (18, 24),
+            (29, 24),
+            (30, 40),
+            (41, 40),
+        ] {
+            assert_eq!(QualityBinning::Bin4.apply(ch(q)), ch(want), "Bin4 q={q}");
+        }
+        // The four RTA4 representatives are fixed points of Bin4.
+        for q in [2, 12, 24, 40] {
+            assert_eq!(
+                QualityBinning::Bin4.apply(ch(q)),
+                ch(q),
+                "Bin4 fixed point q={q}"
+            );
+        }
+        // Bin2 (custom binary): <Q25 -> Q15, Q25+ -> Q37.
+        for (q, want) in [(0, 15), (24, 15), (25, 37), (41, 37)] {
+            assert_eq!(QualityBinning::Bin2.apply(ch(q)), ch(want), "Bin2 q={q}");
+        }
+        // Lossless is the identity.
+        for q in 0..=42 {
+            assert_eq!(
+                QualityBinning::Lossless.apply(ch(q)),
+                ch(q),
+                "Lossless q={q}"
+            );
         }
     }
 

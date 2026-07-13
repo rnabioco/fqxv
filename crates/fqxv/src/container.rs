@@ -21,7 +21,19 @@
 //!   [ceil(n/8)] flip bitmap        (reads stored reverse-complemented)
 //!   [4] perm_len (LE) [ ] perm     (byte-plane-split u32 permutation, rANS'd;
 //!                                   empty unless order is kept)
-//!   then names / seq (fqxv-reorder clustered) / qual in clustered order
+//!   seq is always fqxv-reorder clustered/differential. With order kept, names
+//!   and qual are coded in ORIGINAL order (the permutation reunites each
+//!   clustered sequence with its read, so their models aren't scrambled);
+//!   without it, names and qual follow the clustered order.
+//!
+//! `--reorder --keep-order` instead uses a whole-file, globally-clustered layout
+//! (flag bit3), SPRING-style: all reads are clustered in one pass, then the
+//! clustered sequence and the original-order names/quality are each coded in
+//! independent moderate blocks that fan out across cores. Clustering is global,
+//! so block size is free to be moderate for parallelism without hurting ratio.
+//! Layout after the header: `[8] n  [ ] flip  [ ] perm  [4] n_blocks
+//! [seq block]*n  [ [names][qual] ]*n` (each `[ ]` is a `[u32 len][bytes]` frame;
+//! seq blocks are clustered order, name/qual blocks original order).
 //! ```
 //!
 //! When `G > 1`, reads are interleaved per spot (`m0₀, m1₀, …, m0₁, m1₁, …`).
@@ -46,8 +58,16 @@ const HEADER_LEN: usize = 10;
 const FLAG_PLUS_NORMALIZED: u8 = 0x01;
 const FLAG_REORDERED: u8 = 0x02;
 const FLAG_KEEP_ORDER: u8 = 0x04;
+/// Whole-file, globally-clustered reorder layout (see `compress_reordered_whole`)
+/// as opposed to the older per-block reorder blocks.
+const FLAG_GLOBAL_REORDER: u8 = 0x08;
 /// Minimizer length for clustering in reorder mode.
 const REORDER_K: usize = 15;
+/// Reads per block in whole-file (global-cluster) reorder mode. Moderate, so the
+/// sequence and name/quality blocks fan out across cores. Clustering is global,
+/// so block size no longer trades against ratio — only parallelism and the
+/// per-block model reset (cheap, since clustered duplicates collapse to MATCH).
+const REORDER_BLOCK_READS: usize = 1 << 18;
 
 /// Compression parameters.
 #[derive(Debug, Clone, Copy)]
@@ -197,6 +217,9 @@ pub fn compress<R: Read + Send, W: Write>(
     writer: W,
     params: Params,
 ) -> Result<Stats> {
+    if params.reorder && params.keep_order {
+        return compress_reordered_whole(reader, writer, params);
+    }
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
     compress_buffered(&buf, writer, params, 1)
@@ -264,6 +287,11 @@ pub fn compress_auto<R: Read + Send, W: Write>(
     writer: W,
     params: Params,
 ) -> Result<Stats> {
+    if params.reorder && params.keep_order {
+        // Global-cluster reorder buffers all reads itself; skip peek/autodetect
+        // (reorder is single-end, so there is no group size to detect).
+        return compress_reordered_whole(reader, writer, params);
+    }
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
 
@@ -796,6 +824,297 @@ fn write_blocks<W: Write>(
     Ok(())
 }
 
+/// Write `[u32 len][bytes]`.
+fn write_framed<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
+    w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    w.write_all(bytes)?;
+    Ok(())
+}
+
+/// Read a `[u32 len][bytes]` frame, guarding the length allocation.
+fn read_framed<R: Read>(r: &mut R) -> Result<Vec<u8>> {
+    let mut lb = [0u8; 4];
+    r.read_exact(&mut lb)?;
+    let len = u32::from_le_bytes(lb) as usize;
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len)
+        .map_err(|_| Error::Malformed("framed slice too large to allocate"))?;
+    buf.resize(len, 0);
+    r.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Whole-file reorder with GLOBAL clustering (SPRING-style). Buffers all reads,
+/// clusters them once, then codes the clustered sequence and the ORIGINAL-order
+/// names+quality in independent moderate blocks that fan out across cores. A
+/// global permutation (byte-plane rANS) restores original order. This is the
+/// `--reorder --keep-order` path; clustering is global so block size is free to
+/// be moderate for parallelism without hurting ratio.
+fn compress_reordered_whole<R: Read + Send, W: Write>(
+    reader: R,
+    writer: W,
+    params: Params,
+) -> Result<Stats> {
+    let pool = build_pool(params.threads)?;
+
+    // 1. Buffer every read.
+    let mut all = RawBlock::default();
+    {
+        let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
+        let mut rec = noodles_fastq::Record::default();
+        while fq.read_record(&mut rec)? != 0 {
+            all.push(
+                rec.name(),
+                rec.description(),
+                rec.sequence(),
+                rec.quality_scores(),
+            );
+        }
+    }
+    let n = all.n_reads();
+
+    // Cumulative byte offsets into the concatenated seq/qual.
+    let mut offs = Vec::with_capacity(n + 1);
+    let mut acc = 0usize;
+    for &l in &all.lens {
+        offs.push(acc);
+        acc += l as usize;
+    }
+    offs.push(acc);
+
+    // 2. One global clustering pass over every read.
+    let plan = pool.install(|| fqxv_reorder::plan(&all.lens, &all.seq, REORDER_K));
+
+    // 3. Clustered, oriented sequences (parallel copy/revcomp) + flip bitmap.
+    let cl_reads: Vec<Vec<u8>> = pool.install(|| {
+        plan.order
+            .par_iter()
+            .map(|&oi| {
+                let oi = oi as usize;
+                let s = &all.seq[offs[oi]..offs[oi + 1]];
+                if plan.flip[oi] {
+                    fqxv_reorder::revcomp(s)
+                } else {
+                    s.to_vec()
+                }
+            })
+            .collect()
+    });
+    let mut flip_bits = vec![0u8; n.div_ceil(8)];
+    for (j, &oi) in plan.order.iter().enumerate() {
+        if plan.flip[oi as usize] {
+            flip_bits[j / 8] |= 1 << (j % 8);
+        }
+    }
+
+    // Minimizer anchors in clustered order (for shifted-overlap alignment).
+    let cl_anchors: Vec<u32> = plan
+        .order
+        .iter()
+        .map(|&oi| plan.anchor[oi as usize])
+        .collect();
+
+    // 4. Moderate blocks (same count for both partitions).
+    let bsz = REORDER_BLOCK_READS.max(1);
+    let ranges: Vec<(usize, usize)> = if n == 0 {
+        vec![(0, 0)]
+    } else {
+        (0..n).step_by(bsz).map(|s| (s, (s + bsz).min(n))).collect()
+    };
+
+    // 5a. Sequence — clustered order, differential-coded per block, in parallel.
+    let seq_blocks: Vec<Vec<u8>> = pool.install(|| {
+        ranges
+            .par_iter()
+            .map(|&(s, e)| -> Result<Vec<u8>> {
+                let refs: Vec<&[u8]> = cl_reads[s..e].iter().map(Vec::as_slice).collect();
+                Ok(fqxv_reorder::encode_clustered(
+                    &refs,
+                    &cl_anchors[s..e],
+                    params.seq_order as usize,
+                )?)
+            })
+            .collect::<Result<_>>()
+    })?;
+
+    // 5b. Names + quality — ORIGINAL order, per block, in parallel.
+    let nq_blocks: Vec<(Vec<u8>, Vec<u8>)> = pool.install(|| {
+        ranges
+            .par_iter()
+            .map(|&(s, e)| -> Result<(Vec<u8>, Vec<u8>)> {
+                let headers: Vec<&[u8]> = (s..e).map(|i| all.header(i)).collect();
+                let names = fqxv_tokenizer::encode(&headers)?;
+                let qual = fqxv_fqzcomp::encode(
+                    &all.lens[s..e],
+                    &all.qual[offs[s]..offs[e]],
+                    params.quality_binning,
+                )?;
+                Ok((names, qual))
+            })
+            .collect::<Result<_>>()
+    })?;
+
+    // 6. Global permutation (byte-plane split → rANS).
+    let mut planes = vec![0u8; n * 4];
+    for (i, &x) in plan.order.iter().enumerate() {
+        planes[i] = x as u8;
+        planes[n + i] = (x >> 8) as u8;
+        planes[2 * n + i] = (x >> 16) as u8;
+        planes[3 * n + i] = (x >> 24) as u8;
+    }
+    let perm_c = fqxv_rans::encode(&planes, fqxv_rans::Order::One)?;
+
+    // 7. Write: header, then n / flip / perm / seq blocks / name+qual blocks.
+    let mut w = BufWriter::new(writer);
+    let flags = FLAG_PLUS_NORMALIZED | FLAG_REORDERED | FLAG_KEEP_ORDER | FLAG_GLOBAL_REORDER;
+    w.write_all(&MAGIC)?;
+    w.write_all(&FORMAT_VERSION.to_le_bytes())?;
+    w.write_all(&[
+        params.seq_order,
+        binning_tag(params.quality_binning),
+        flags,
+        1,
+    ])?;
+    w.write_all(&(n as u64).to_le_bytes())?;
+    write_framed(&mut w, &flip_bits)?;
+    write_framed(&mut w, &perm_c)?;
+    w.write_all(&(ranges.len() as u32).to_le_bytes())?;
+    for payload in &seq_blocks {
+        write_framed(&mut w, payload)?;
+    }
+    for (names, qual) in &nq_blocks {
+        write_framed(&mut w, names)?;
+        write_framed(&mut w, qual)?;
+    }
+    w.flush()?;
+
+    let out_bytes = (HEADER_LEN
+        + 8
+        + 4
+        + flip_bits.len()
+        + 4
+        + perm_c.len()
+        + 4
+        + seq_blocks.iter().map(|p| 4 + p.len()).sum::<usize>()
+        + nq_blocks
+            .iter()
+            .map(|(nm, q)| 8 + nm.len() + q.len())
+            .sum::<usize>()) as u64;
+    Ok(Stats {
+        reads: n as u64,
+        blocks: ranges.len() as u64,
+        out_bytes,
+        group_size: 1,
+    })
+}
+
+/// Decode a whole-file globally-clustered reorder archive (see
+/// [`compress_reordered_whole`]). `r` is positioned just past the header.
+fn decode_reordered_whole<R: Read, W: Write>(mut r: R, writer: W, threads: usize) -> Result<Stats> {
+    let pool = build_pool(threads)?;
+    let mut n_buf = [0u8; 8];
+    r.read_exact(&mut n_buf)?;
+    let n = u64::from_le_bytes(n_buf) as usize;
+    let flip = read_framed(&mut r)?;
+    let perm_c = read_framed(&mut r)?;
+    let mut nb = [0u8; 4];
+    r.read_exact(&mut nb)?;
+    let n_blocks = u32::from_le_bytes(nb) as usize;
+
+    let mut seq_payloads: Vec<Vec<u8>> = Vec::with_capacity(n_blocks.min(1 << 20));
+    for _ in 0..n_blocks {
+        seq_payloads.push(read_framed(&mut r)?);
+    }
+    let mut nq_payloads: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(n_blocks.min(1 << 20));
+    for _ in 0..n_blocks {
+        let names = read_framed(&mut r)?;
+        let qual = read_framed(&mut r)?;
+        nq_payloads.push((names, qual));
+    }
+
+    // Global permutation: clustered position j -> original read index.
+    let perm: Vec<u32> = {
+        let pb = fqxv_rans::decode(&perm_c).map_err(|_| Error::Malformed("bad permutation"))?;
+        if pb.len() != n * 4 {
+            return Err(Error::Malformed("permutation length mismatch"));
+        }
+        (0..n)
+            .map(|i| u32::from_le_bytes([pb[i], pb[n + i], pb[2 * n + i], pb[3 * n + i]]))
+            .collect()
+    };
+
+    // Decode both partitions in parallel.
+    let seq_dec: Vec<Vec<Vec<u8>>> = pool.install(|| {
+        seq_payloads
+            .par_iter()
+            .map(|p| -> Result<Vec<Vec<u8>>> { Ok(fqxv_reorder::decode_clustered(p)?) })
+            .collect::<Result<_>>()
+    })?;
+    // Per name+quality block: (decoded names, (per-read lengths, quality bytes)).
+    type NqBlock = (Vec<Vec<u8>>, (Vec<u32>, Vec<u8>));
+    let nq_dec: Vec<NqBlock> = pool.install(|| {
+        nq_payloads
+            .par_iter()
+            .map(|(nm, q)| -> Result<_> {
+                Ok((fqxv_tokenizer::decode(nm)?, fqxv_fqzcomp::decode(q)?))
+            })
+            .collect::<Result<_>>()
+    })?;
+
+    // Flatten: clustered reads (clustered order); names/lens/quals (original).
+    let mut cl_reads: Vec<Vec<u8>> = Vec::with_capacity(n);
+    for blk in seq_dec {
+        cl_reads.extend(blk);
+    }
+    let mut names: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut lens: Vec<u32> = Vec::with_capacity(n);
+    let mut quals: Vec<u8> = Vec::new();
+    for (nm, (ls, qs)) in nq_dec {
+        names.extend(nm);
+        lens.extend(ls);
+        quals.extend(qs);
+    }
+    if cl_reads.len() != n || names.len() != n || lens.len() != n {
+        return Err(Error::Malformed("reordered stream length disagreement"));
+    }
+
+    // Place each clustered sequence at its original position (un-flipped).
+    let mut seq_orig: Vec<Vec<u8>> = vec![Vec::new(); n];
+    for (j, mut s) in cl_reads.into_iter().enumerate() {
+        if flip.get(j / 8).copied().unwrap_or(0) >> (j % 8) & 1 == 1 {
+            s = fqxv_reorder::revcomp(&s);
+        }
+        let dest = perm[j] as usize;
+        *seq_orig
+            .get_mut(dest)
+            .ok_or(Error::Malformed("permutation out of range"))? = s;
+    }
+
+    // Emit records in original order.
+    let mut w = BufWriter::new(writer);
+    let mut qoff = 0usize;
+    for i in 0..n {
+        let l = lens[i] as usize;
+        let qual = quals
+            .get(qoff..qoff + l)
+            .ok_or(Error::Malformed("quality underrun"))?;
+        qoff += l;
+        if seq_orig[i].len() != l {
+            return Err(Error::Malformed("reordered sequence length mismatch"));
+        }
+        let mut rec = Vec::with_capacity(l * 2 + names[i].len() + 8);
+        write_record(&mut rec, &names[i], &seq_orig[i], qual);
+        w.write_all(&rec)?;
+    }
+    w.flush()?;
+    Ok(Stats {
+        reads: n as u64,
+        blocks: n_blocks as u64,
+        out_bytes: 0,
+        group_size: 1,
+    })
+}
+
 fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
     if params.reorder {
         compress_block_reordered(b, params)
@@ -847,40 +1166,85 @@ fn compress_block_reordered(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
 
     let plan = fqxv_reorder::plan(&b.lens, &b.seq, REORDER_K);
 
-    let mut r_headers: Vec<&[u8]> = Vec::with_capacity(n);
-    let mut r_lens: Vec<u32> = Vec::with_capacity(n);
+    // Clustered, oriented sequences + flip bitmap — always needed for the
+    // differential sequence coder. Flipping (reverse-complement) is a sequence-
+    // only trick to make an RC-duplicate byte-identical to its partner.
     let mut r_reads: Vec<Vec<u8>> = Vec::with_capacity(n);
-    let mut r_qual: Vec<u8> = Vec::with_capacity(b.qual.len());
     let mut flip_bits = vec![0u8; n.div_ceil(8)];
     for (j, &oi) in plan.order.iter().enumerate() {
         let oi = oi as usize;
         let s = &b.seq[offs[oi]..offs[oi + 1]];
-        let q = &b.qual[offs[oi]..offs[oi + 1]];
-        r_headers.push(b.header(oi));
-        r_lens.push(b.lens[oi]);
         if plan.flip[oi] {
             flip_bits[j / 8] |= 1 << (j % 8);
             r_reads.push(fqxv_reorder::revcomp(s));
-            let mut rq = q.to_vec();
-            rq.reverse();
-            r_qual.extend_from_slice(&rq);
         } else {
             r_reads.push(s.to_vec());
-            r_qual.extend_from_slice(q);
         }
     }
-
     let read_refs: Vec<&[u8]> = r_reads.iter().map(Vec::as_slice).collect();
-    let (names_c, (seq_c, qual_c)) = rayon::join(
-        || fqxv_tokenizer::encode(&r_headers),
-        || {
-            rayon::join(
-                || fqxv_reorder::encode_clustered(&read_refs, params.seq_order as usize),
-                || fqxv_fqzcomp::encode(&r_lens, &r_qual, params.quality_binning),
-            )
-        },
-    );
-    let (names_c, seq_c, qual_c) = (names_c?, seq_c?, qual_c?);
+    let r_anchors: Vec<u32> = plan
+        .order
+        .iter()
+        .map(|&oi| plan.anchor[oi as usize])
+        .collect();
+
+    // Names and quality: with `keep_order`, code them in ORIGINAL read order —
+    // the permutation reunites each clustered sequence with its read, so the
+    // tokenizer keeps its positional-delta structure and the quality model its
+    // per-position structure (clustering by sequence would scramble both).
+    // Without `keep_order`, reads emerge clustered, so names/quality follow.
+    let (names_c, seq_c, qual_c) = if params.keep_order {
+        let headers = b.header_refs();
+        let (n_c, (s_c, q_c)) = rayon::join(
+            || fqxv_tokenizer::encode(&headers),
+            || {
+                rayon::join(
+                    || {
+                        fqxv_reorder::encode_clustered(
+                            &read_refs,
+                            &r_anchors,
+                            params.seq_order as usize,
+                        )
+                    },
+                    || fqxv_fqzcomp::encode(&b.lens, &b.qual, params.quality_binning),
+                )
+            },
+        );
+        (n_c?, s_c?, q_c?)
+    } else {
+        let mut r_headers: Vec<&[u8]> = Vec::with_capacity(n);
+        let mut r_lens: Vec<u32> = Vec::with_capacity(n);
+        let mut r_qual: Vec<u8> = Vec::with_capacity(b.qual.len());
+        for &oi in &plan.order {
+            let oi = oi as usize;
+            r_headers.push(b.header(oi));
+            r_lens.push(b.lens[oi]);
+            let q = &b.qual[offs[oi]..offs[oi + 1]];
+            if plan.flip[oi] {
+                let mut rq = q.to_vec();
+                rq.reverse();
+                r_qual.extend_from_slice(&rq);
+            } else {
+                r_qual.extend_from_slice(q);
+            }
+        }
+        let (n_c, (s_c, q_c)) = rayon::join(
+            || fqxv_tokenizer::encode(&r_headers),
+            || {
+                rayon::join(
+                    || {
+                        fqxv_reorder::encode_clustered(
+                            &read_refs,
+                            &r_anchors,
+                            params.seq_order as usize,
+                        )
+                    },
+                    || fqxv_fqzcomp::encode(&r_lens, &r_qual, params.quality_binning),
+                )
+            },
+        );
+        (n_c?, s_c?, q_c?)
+    };
     let perm_c = if params.keep_order {
         // Byte-plane (SoA) split before entropy coding: all byte-0s, then
         // byte-1s, 2s, 3s. For a permutation of n < 2^24 reads the upper planes
@@ -921,6 +1285,11 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
     let batch = pool.current_num_threads().max(1);
     let mut r = BufReader::new(reader);
     let header = read_header(&mut r)?;
+    // Whole-file globally-clustered reorder uses a distinct layout (two stream
+    // partitions + a global permutation), not the per-block block loop.
+    if header.flags & FLAG_GLOBAL_REORDER != 0 {
+        return decode_reordered_whole(r, writer, threads);
+    }
     let reordered = header.flags & FLAG_REORDERED != 0;
     let keep_order = header.flags & FLAG_KEEP_ORDER != 0;
     let mut w = BufWriter::new(writer);
@@ -1124,32 +1493,51 @@ fn decode_block_reordered(buf: &[u8], keep_order: bool) -> Result<(u64, Vec<u8>)
         Vec::new()
     };
 
-    // Build each read's FASTQ record (un-flipped), placing it at its original
-    // position when the order is preserved.
-    let mut records: Vec<Vec<u8>> = vec![Vec::new(); n];
-    let mut qoff = 0usize;
-    for j in 0..n {
-        let l = r_lens[j] as usize;
-        let mut seq = reads[j].clone();
-        let mut qual = r_qual
-            .get(qoff..qoff + l)
-            .ok_or(Error::Malformed("quality underrun"))?
-            .to_vec();
-        qoff += l;
-        if flip_bits[j / 8] >> (j % 8) & 1 == 1 {
-            seq = fqxv_reorder::revcomp(&seq);
-            qual.reverse();
+    let mut out = Vec::new();
+    if keep_order {
+        // Names and quality are in original order. Place each clustered sequence
+        // at its original position (un-flipped) via the permutation, then emit
+        // records in original order.
+        let mut seq_orig: Vec<Vec<u8>> = vec![Vec::new(); n];
+        for j in 0..n {
+            let mut s = reads[j].clone();
+            if flip_bits[j / 8] >> (j % 8) & 1 == 1 {
+                s = fqxv_reorder::revcomp(&s);
+            }
+            let dest = perm[j] as usize;
+            *seq_orig
+                .get_mut(dest)
+                .ok_or(Error::Malformed("permutation out of range"))? = s;
         }
-        let mut rec = Vec::with_capacity(seq.len() * 2 + qual.len() + 8);
-        write_record(&mut rec, &names[j], &seq, &qual);
-        let dest = if keep_order { perm[j] as usize } else { j };
-        *records
-            .get_mut(dest)
-            .ok_or(Error::Malformed("permutation out of range"))? = rec;
-    }
-    let mut out = Vec::with_capacity(records.iter().map(Vec::len).sum());
-    for rec in records {
-        out.extend_from_slice(&rec);
+        let mut qoff = 0usize;
+        for i in 0..n {
+            let l = r_lens[i] as usize;
+            let qual = r_qual
+                .get(qoff..qoff + l)
+                .ok_or(Error::Malformed("quality underrun"))?;
+            qoff += l;
+            if seq_orig[i].len() != l {
+                return Err(Error::Malformed("reordered sequence length mismatch"));
+            }
+            write_record(&mut out, &names[i], &seq_orig[i], qual);
+        }
+    } else {
+        // Reads emerge in clustered order; names/quality were coded clustered too.
+        let mut qoff = 0usize;
+        for j in 0..n {
+            let l = r_lens[j] as usize;
+            let mut seq = reads[j].clone();
+            let mut qual = r_qual
+                .get(qoff..qoff + l)
+                .ok_or(Error::Malformed("quality underrun"))?
+                .to_vec();
+            qoff += l;
+            if flip_bits[j / 8] >> (j % 8) & 1 == 1 {
+                seq = fqxv_reorder::revcomp(&seq);
+                qual.reverse();
+            }
+            write_record(&mut out, &names[j], &seq, &qual);
+        }
     }
     Ok((n as u64, out))
 }
@@ -1187,10 +1575,49 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
     })
 }
 
+/// Read a `[u32 len][bytes]` frame's length and skip its bytes without
+/// allocating them (for metadata-only scans).
+fn skip_framed<R: Read>(r: &mut R) -> Result<usize> {
+    let mut lb = [0u8; 4];
+    r.read_exact(&mut lb)?;
+    let len = u32::from_le_bytes(lb) as usize;
+    io::copy(&mut r.by_ref().take(len as u64), &mut io::sink())?;
+    Ok(len)
+}
+
 /// Read the header and per-stream sizes without decoding block payloads.
 pub fn inspect<R: Read>(reader: R) -> Result<Info> {
     let mut r = BufReader::new(reader);
-    let mut info = peek(&mut r)?;
+    let header = read_header(&mut r)?;
+    let mut info = Info {
+        seq_order: header.seq_order,
+        quality_binning: header.quality_binning,
+        plus_normalized: header.flags & FLAG_PLUS_NORMALIZED != 0,
+        group_size: header.group_size,
+        reordered: header.flags & FLAG_REORDERED != 0,
+        ..Info::default()
+    };
+    // Whole-file global-cluster layout: [u64 n][flip][perm][u32 n_blocks]
+    // [seq blocks][name+qual blocks]. Permutation overhead is charged to seq.
+    if header.flags & FLAG_GLOBAL_REORDER != 0 {
+        let mut n8 = [0u8; 8];
+        r.read_exact(&mut n8)?;
+        info.reads = u64::from_le_bytes(n8);
+        skip_framed(&mut r)?; // flip bitmap
+        info.seq_bytes += skip_framed(&mut r)? as u64; // permutation
+        let mut nb = [0u8; 4];
+        r.read_exact(&mut nb)?;
+        let n_blocks = u32::from_le_bytes(nb) as usize;
+        info.blocks = n_blocks as u64;
+        for _ in 0..n_blocks {
+            info.seq_bytes += skip_framed(&mut r)? as u64;
+        }
+        for _ in 0..n_blocks {
+            info.names_bytes += skip_framed(&mut r)? as u64;
+            info.qual_bytes += skip_framed(&mut r)? as u64;
+        }
+        return Ok(info);
+    }
     while let Some(block) = read_block(&mut r)? {
         let mut c = Cursor::new(&block);
         let n = c.u32()? as usize;
@@ -1486,6 +1913,61 @@ NNGGCCTA\n\
         assert_eq!(info.group_size, 1);
         assert!(info.plus_normalized);
         assert!(info.names_bytes > 0 && info.seq_bytes > 0 && info.qual_bytes > 0);
+    }
+
+    // Concatenate every Nth record line (line 4 = quality, line 2 = sequence)
+    // across a FASTQ byte stream, in order.
+    fn record_line(fastq: &[u8], which: usize) -> Vec<u8> {
+        fastq
+            .split(|&b| b == b'\n')
+            .enumerate()
+            .filter(|(i, l)| i % 4 == which && !l.is_empty())
+            .flat_map(|(_, l)| l.iter().copied())
+            .collect()
+    }
+
+    #[test]
+    fn lossy_binning_roundtrips_and_reports_tag() {
+        for (bin, tag) in [
+            (QualityBinning::Bin8, 1u8),
+            (QualityBinning::Bin4, 2),
+            (QualityBinning::Bin2, 3),
+        ] {
+            let params = Params {
+                quality_binning: bin,
+                ..Params::default()
+            };
+            let archive = compress_bytes(SAMPLE, params);
+
+            // The header tag round-trips through inspect.
+            assert_eq!(
+                inspect(&archive[..]).expect("inspect").quality_binning,
+                tag,
+                "info tag for {bin:?}"
+            );
+
+            let mut fastq = Vec::new();
+            decompress(&archive[..], &mut fastq, 1).expect("decompress");
+
+            // Lossy contract: recovered qualities equal the input qualities passed
+            // through the same bin table; bases survive exactly.
+            let want: Vec<u8> = record_line(SAMPLE, 3)
+                .iter()
+                .map(|&b| bin.apply(b))
+                .collect();
+            assert_eq!(record_line(&fastq, 3), want, "binned qualities for {bin:?}");
+            assert_eq!(
+                record_line(&fastq, 1),
+                record_line(SAMPLE, 1),
+                "bases must be exact for {bin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lossless_default_reports_zero_tag() {
+        let archive = compress_bytes(SAMPLE, Params::default());
+        assert_eq!(inspect(&archive[..]).unwrap().quality_binning, 0);
     }
 
     fn dup_rich_input(keep_order_marker: char) -> Vec<u8> {
