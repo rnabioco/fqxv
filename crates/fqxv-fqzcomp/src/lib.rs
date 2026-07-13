@@ -36,6 +36,8 @@
 //! assert_eq!(out_quals, quals);
 //! ```
 
+use std::borrow::Cow;
+
 use fqxv_range::{Decoder, Encoder, SimpleModel};
 use thiserror::Error;
 
@@ -190,8 +192,14 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
         });
     }
 
-    // Apply (optional) lossy binning, then map to a dense 0-based alphabet.
-    let binned: Vec<u8> = quals.iter().map(|&b| binning.apply(b)).collect();
+    // Apply (optional) lossy binning, then map to a dense 0-based alphabet. On
+    // the lossless default `apply` is the identity, so borrow `quals` directly
+    // instead of allocating and copying a block-sized duplicate.
+    let binned: Cow<[u8]> = if binning == QualityBinning::Lossless {
+        Cow::Borrowed(quals)
+    } else {
+        Cow::Owned(quals.iter().map(|&b| binning.apply(b)).collect())
+    };
     let (qmin, qsize) = alphabet(&binned)?;
 
     let mut models = vec![SimpleModel::<QMAX>::new(); N_CTX];
