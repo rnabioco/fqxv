@@ -155,6 +155,22 @@ enum Command {
         #[arg(long)]
         tsv: bool,
     },
+    /// Extract a range of reads by index, decoding only the row groups that
+    /// overlap the range (random access via the footer index). Not supported
+    /// on reordered archives — use `decompress`.
+    Extract {
+        /// Input `.fqxv` file (must be a regular file — extraction seeks).
+        input: PathBuf,
+        /// Read-index range `START..END`, 0-based and half-open. Either side may
+        /// be omitted: `1000..2000`, `1000..` (to the end), `..500` (from the
+        /// start). For a grouped archive the index counts interleaved reads, so
+        /// mates are included.
+        #[arg(long, value_name = "START..END")]
+        range: String,
+        /// FASTQ output; omit or use `-` for stdout.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 /// Lossy quality quantization choices exposed on the CLI.
@@ -179,6 +195,33 @@ impl From<QualityBin> for fqxv::QualityBinning {
             QualityBin::Bin2 => fqxv::QualityBinning::Bin2,
         }
     }
+}
+
+/// Parse a `START..END` read-index range (0-based, half-open). Either side may be
+/// omitted: `..` = all, `A..` = from `A`, `..B` = up to `B`. An omitted end
+/// becomes `u64::MAX`, which [`fqxv::extract`] clamps to the archive's read count.
+fn parse_range(s: &str) -> anyhow::Result<std::ops::Range<u64>> {
+    let (a, b) = s
+        .split_once("..")
+        .with_context(|| format!("invalid range {s:?}: expected START..END"))?;
+    let start = if a.trim().is_empty() {
+        0
+    } else {
+        a.trim()
+            .parse::<u64>()
+            .with_context(|| format!("invalid range start {a:?}"))?
+    };
+    let end = if b.trim().is_empty() {
+        u64::MAX
+    } else {
+        b.trim()
+            .parse::<u64>()
+            .with_context(|| format!("invalid range end {b:?}"))?
+    };
+    if start > end {
+        anyhow::bail!("range start {start} is greater than end {end}");
+    }
+    Ok(start..end)
 }
 
 /// Map a 1-9 effort level to a sequence context order (higher = better ratio).
@@ -327,6 +370,23 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Command::Info { input, tsv } => print_info(&input, tsv)?,
+        Command::Extract {
+            input,
+            range,
+            output,
+        } => {
+            let range = parse_range(&range)?;
+            let t0 = Instant::now();
+            let file =
+                File::open(&input).with_context(|| format!("opening input {}", input.display()))?;
+            let stats = fqxv::extract(file, range, open_output(output.as_deref())?)?;
+            info!(
+                reads = stats.reads,
+                blocks = stats.blocks,
+                secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+                "extracted"
+            );
+        }
     }
     Ok(())
 }

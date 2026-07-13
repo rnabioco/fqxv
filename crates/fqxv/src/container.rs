@@ -1603,6 +1603,80 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
     Ok(info)
 }
 
+/// Extract the reads in the half-open global-index range `[range)` as FASTQ on
+/// `writer`, decoding only the row groups that overlap the range (located via the
+/// v1 footer). Random access is at row-group granularity — every codec carries
+/// model state across the reads within a row group, so a group is the smallest
+/// independently decodable unit — but only the reads inside `range` are emitted.
+///
+/// Reordered archives are rejected: their on-disk read order is clustered, not
+/// input order, so a global-index range would not mean what a caller expects.
+/// Use [`decompress`] for those.
+pub fn extract<R: Read + Seek, W: Write>(
+    reader: R,
+    range: std::ops::Range<u64>,
+    writer: W,
+) -> Result<Stats> {
+    let mut r = BufReader::new(reader);
+    let header = read_header(&mut r)?;
+    if header.flags & (FLAG_REORDERED | FLAG_GLOBAL_REORDER) != 0 {
+        return Err(Error::Malformed(
+            "extract is not supported for reordered archives (use decompress)",
+        ));
+    }
+    let footer = read_footer(&mut r)?;
+    let mut stats = Stats {
+        group_size: header.group_size,
+        ..Stats::default()
+    };
+    let (a, b) = (range.start, range.end.min(footer.total_reads));
+    if a >= b {
+        return Ok(stats);
+    }
+
+    // Prefix sums of per-group read counts: `starts[gi]` is the global index of
+    // row group `gi`'s first read.
+    let mut starts = Vec::with_capacity(footer.groups.len());
+    let mut acc = 0u64;
+    for &(_, rc) in &footer.groups {
+        starts.push(acc);
+        acc += rc as u64;
+    }
+
+    let mut w = BufWriter::new(writer);
+    for (gi, &(off, rc)) in footer.groups.iter().enumerate() {
+        let g_start = starts[gi];
+        let g_end = g_start + rc as u64;
+        if g_end <= a || g_start >= b {
+            continue; // row group entirely outside the range
+        }
+        r.seek(SeekFrom::Start(off))?;
+        let block = read_block(&mut r)?.ok_or(Error::Truncated)?;
+        let (n_reads, names, lens, seq, qual) = decode_block_parts(&block)?;
+        stats.blocks += 1;
+        let mut byte_off = 0usize;
+        for i in 0..n_reads {
+            let gidx = g_start + i as u64;
+            let l = lens[i] as usize;
+            if gidx >= a && gidx < b {
+                let mut rec = Vec::with_capacity(l * 2 + names[i].len() + 8);
+                write_record(
+                    &mut rec,
+                    &names[i],
+                    &seq[byte_off..byte_off + l],
+                    &qual[byte_off..byte_off + l],
+                );
+                w.write_all(&rec)?;
+                stats.reads += 1;
+                stats.out_bytes += rec.len() as u64;
+            }
+            byte_off += l;
+        }
+    }
+    w.flush()?;
+    Ok(stats)
+}
+
 // --- header / block framing --------------------------------------------------
 
 struct Header {
@@ -2105,7 +2179,24 @@ NNGGCCTA\n\
         assert!(matches!(err, Err(Error::BadMagic)));
     }
 
-    // --- v1 footer: index, determinism --------------------------------------
+    // --- v1 footer: index, extract, determinism -----------------------------
+
+    /// Split FASTQ into per-record byte blocks (each 4 lines + trailing `\n`).
+    fn fastq_records(fastq: &[u8]) -> Vec<Vec<u8>> {
+        let lines: Vec<&[u8]> = fastq.split(|&b| b == b'\n').collect();
+        lines
+            .chunks(4)
+            .filter(|c| c.len() == 4)
+            .map(|c| {
+                let mut v = Vec::new();
+                for l in c {
+                    v.extend_from_slice(l);
+                    v.push(b'\n');
+                }
+                v
+            })
+            .collect()
+    }
 
     #[test]
     fn block_ranges_cuts_on_reads_bytes_and_spots() {
@@ -2133,6 +2224,45 @@ NNGGCCTA\n\
             block_ranges(&chunks, 1000, 1, 2),
             vec![(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)]
         );
+    }
+
+    #[test]
+    fn extract_range_matches_full_decode() {
+        let input = make_reads("x", 20);
+        // Small blocks so the 20 reads span several row groups.
+        let params = Params {
+            block_reads: 4,
+            ..Params::default()
+        };
+        let archive = compress_bytes(&input, params);
+        assert!(inspect(io::Cursor::new(&archive[..])).unwrap().blocks >= 5);
+
+        let mut full = Vec::new();
+        decompress(&archive[..], &mut full, 1).unwrap();
+        let recs = fastq_records(&full);
+
+        for (a, b) in [(0u64, 20u64), (5, 12), (0, 1), (19, 20), (7, 7), (18, 100)] {
+            let mut got = Vec::new();
+            extract(io::Cursor::new(&archive[..]), a..b, &mut got).unwrap();
+            let hi = (b as usize).min(recs.len());
+            let lo = (a as usize).min(hi);
+            let want: Vec<u8> = recs[lo..hi].concat();
+            assert_eq!(got, want, "extract {a}..{b}");
+        }
+    }
+
+    #[test]
+    fn extract_rejects_reordered() {
+        let input = dup_rich_input('r');
+        let params = Params {
+            reorder: true,
+            keep_order: true,
+            ..Params::default()
+        };
+        let mut archive = Vec::new();
+        compress(&input[..], &mut archive, params).unwrap();
+        let err = extract(io::Cursor::new(&archive[..]), 0..1, &mut Vec::new());
+        assert!(matches!(err, Err(Error::Malformed(_))));
     }
 
     #[test]

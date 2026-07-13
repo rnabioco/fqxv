@@ -16,7 +16,7 @@ mod container;
 
 pub use container::{
     compress, compress_auto, compress_interleaved, compress_multi, decompress, decompress_split,
-    inspect, peek, Info, Params, Stats,
+    extract, inspect, peek, Info, Params, Stats,
 };
 pub use fqxv_fqzcomp::QualityBinning;
 
