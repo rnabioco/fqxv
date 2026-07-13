@@ -102,6 +102,9 @@ const FLAG_KEEP_ORDER: u8 = 0x04;
 /// Whole-file, globally-clustered reorder layout (see `compress_reordered_whole`)
 /// as opposed to the older per-block reorder blocks.
 const FLAG_GLOBAL_REORDER: u8 = 0x08;
+/// Names are regenerated from a stored counter template, not coded per read
+/// (reorder-lossy: reads are renumbered). Set only in the discard-order layout.
+const FLAG_REGEN_NAMES: u8 = 0x10;
 /// Minimizer length for clustering in reorder mode.
 const REORDER_K: usize = 15;
 /// Reads per block in whole-file (global-cluster) reorder mode. Moderate, so the
@@ -133,6 +136,13 @@ pub struct Params {
     /// k-mer-indexed assembly step). Smaller sequence stream on deep data, at a
     /// higher encode cost. Ignored when `reorder` is false. Decode auto-detects.
     pub rescue: bool,
+    /// In single-end reorder mode, if the read names are purely positional (a
+    /// counter, e.g. SRA `@RUN.N N`), discard the original order and regenerate
+    /// the names from a stored template instead of coding them — no permutation,
+    /// no name stream. **Reorder-lossy: reads are renumbered** (sequence/quality
+    /// preserved exactly). Ignored unless the names are detected as regenerable;
+    /// ignored for grouped input. Opt-in.
+    pub regenerate_names: bool,
     /// Worker threads (0 = all available cores); clamped to available cores.
     pub threads: usize,
 }
@@ -146,6 +156,7 @@ impl Default for Params {
             reorder: false,
             keep_order: false,
             rescue: false,
+            regenerate_names: false,
             threads: 0,
         }
     }
@@ -182,6 +193,9 @@ pub struct Info {
     /// stored). Always true for non-reordered archives; for reordered archives it
     /// reflects the keep-order layout choice.
     pub keep_order: bool,
+    /// Whether names were regenerated from a counter template (discard-order,
+    /// reorder-lossy — reads were renumbered) rather than coded per read.
+    pub regenerated_names: bool,
     /// Number of blocks (0 from [`peek`]).
     pub blocks: u64,
     /// Total reads (0 from [`peek`]).
@@ -1223,7 +1237,21 @@ fn encode_reordered<W: Write>(
         Ok(if o0.len() <= o1.len() { o0 } else { o1 })
     };
 
-    let (keep_order, name_blocks, perm_c) = if params.keep_order || g > 1 {
+    // Discard-order (opt-in, single-end): if the names are purely positional (a
+    // counter), regenerate them from a tiny template instead of coding them — no
+    // name stream, no permutation. Reorder-lossy (reads are renumbered), so it is
+    // gated on `params.regenerate_names` AND a successful template detection.
+    let template = if params.regenerate_names && !(params.keep_order || g > 1) {
+        let orig_names: Vec<&[u8]> = (0..n).map(|i| all.header(i)).collect();
+        fqxv_tokenizer::detect_template(&orig_names)
+    } else {
+        None
+    };
+
+    let (keep_order, name_blocks, perm_c) = if template.is_some() {
+        // Clustered layout, no permutation, empty (regenerated) name blocks.
+        (false, vec![Vec::new(); ranges.len()], Vec::new())
+    } else if params.keep_order || g > 1 {
         (true, names_original()?, encode_perm()?)
     } else {
         // Adaptive: keep_order iff original-order names + permutation beat the
@@ -1285,6 +1313,9 @@ fn encode_reordered<W: Write>(
     if keep_order {
         flags |= FLAG_KEEP_ORDER;
     }
+    if template.is_some() {
+        flags |= FLAG_REGEN_NAMES;
+    }
     w.write_all(&MAGIC)?;
     w.write_all(&FORMAT_VERSION.to_le_bytes())?;
     w.write_all(&[
@@ -1296,6 +1327,9 @@ fn encode_reordered<W: Write>(
     w.write_all(&(n as u64).to_le_bytes())?;
     write_framed(&mut w, &flip_bits)?;
     write_framed(&mut w, &perm_c)?;
+    // Name-template frame (empty unless regenerating names).
+    let tmpl_bytes = template.as_ref().map(|t| t.to_bytes()).unwrap_or_default();
+    write_framed(&mut w, &tmpl_bytes)?;
     w.write_all(&(ranges.len() as u32).to_le_bytes())?;
     for payload in &seq_blocks {
         write_framed(&mut w, payload)?;
@@ -1338,6 +1372,9 @@ struct ReorderStreams {
     names: Vec<Vec<u8>>,
     lens: Vec<u32>,
     quals: Vec<u8>,
+    /// When set (discard-order archives), `names` is empty and each output name
+    /// is regenerated from this template at its output position.
+    template: Option<fqxv_tokenizer::NameTemplate>,
 }
 
 /// Read and entropy-decode the whole-file reorder layout. `r` is positioned just
@@ -1349,6 +1386,13 @@ fn read_reordered_streams<R: Read>(mut r: R, pool: &rayon::ThreadPool) -> Result
     let n = u64::from_le_bytes(n_buf) as usize;
     let flip = read_framed(&mut r, "reorder flip bitmap")?;
     let perm_c = read_framed(&mut r, "reorder permutation")?;
+    let tmpl_bytes = read_framed(&mut r, "reorder name template")?;
+    let template = if tmpl_bytes.is_empty() {
+        None
+    } else {
+        Some(fqxv_tokenizer::NameTemplate::from_bytes(&tmpl_bytes)?)
+    };
+    let regen = template.is_some();
     let mut nb = [0u8; 4];
     r.read_exact(&mut nb)?;
     let n_blocks = u32::from_le_bytes(nb) as usize;
@@ -1377,7 +1421,14 @@ fn read_reordered_streams<R: Read>(mut r: R, pool: &rayon::ThreadPool) -> Result
         nq_payloads
             .par_iter()
             .map(|(nm, q)| -> Result<_> {
-                Ok((fqxv_tokenizer::decode(nm)?, fqxv_fqzcomp::decode(q)?))
+                // Discard-order archives carry empty name blocks; names are
+                // regenerated from the template, so skip name decoding.
+                let names = if regen {
+                    Vec::new()
+                } else {
+                    fqxv_tokenizer::decode(nm)?
+                };
+                Ok((names, fqxv_fqzcomp::decode(q)?))
             })
             .collect::<Result<_>>()
     })?;
@@ -1387,7 +1438,7 @@ fn read_reordered_streams<R: Read>(mut r: R, pool: &rayon::ThreadPool) -> Result
     for blk in seq_dec {
         cl_reads.extend(blk);
     }
-    let mut names: Vec<Vec<u8>> = Vec::with_capacity(n);
+    let mut names: Vec<Vec<u8>> = Vec::with_capacity(if regen { 0 } else { n });
     let mut lens: Vec<u32> = Vec::with_capacity(n);
     let mut quals: Vec<u8> = Vec::new();
     for (nm, (ls, qs)) in nq_dec {
@@ -1395,7 +1446,12 @@ fn read_reordered_streams<R: Read>(mut r: R, pool: &rayon::ThreadPool) -> Result
         lens.extend(ls);
         quals.extend(qs);
     }
-    if cl_reads.len() != n || names.len() != n || lens.len() != n {
+    let names_ok = if regen {
+        names.is_empty()
+    } else {
+        names.len() == n
+    };
+    if cl_reads.len() != n || !names_ok || lens.len() != n {
         return Err(Error::Malformed("reordered stream length disagreement"));
     }
     Ok(ReorderStreams {
@@ -1407,6 +1463,7 @@ fn read_reordered_streams<R: Read>(mut r: R, pool: &rayon::ThreadPool) -> Result
         names,
         lens,
         quals,
+        template,
     })
 }
 
@@ -1478,8 +1535,10 @@ fn decode_reordered_whole<R: Read, W: Write>(
         // Reads emerge in clustered order; names/quality were coded clustered too.
         // Un-flip the reverse-complemented reads (sequence and quality) to restore
         // each record's original content, then emit in clustered order.
+        let template = s.template.take();
+        let cl_reads = std::mem::take(&mut s.cl_reads);
         let mut qoff = 0usize;
-        for (j, mut seq) in std::mem::take(&mut s.cl_reads).into_iter().enumerate() {
+        for (j, mut seq) in cl_reads.into_iter().enumerate() {
             let l = s.lens[j] as usize;
             let mut qual = s
                 .quals
@@ -1494,8 +1553,17 @@ fn decode_reordered_whole<R: Read, W: Write>(
                 seq = fqxv_reorder::revcomp(&seq);
                 qual.reverse();
             }
-            let mut rec = Vec::with_capacity(l * 2 + s.names[j].len() + 8);
-            write_record(&mut rec, &s.names[j], &seq, &qual);
+            // Discard-order archives regenerate the name from the template at the
+            // output position; otherwise use the clustered-order decoded name.
+            let regen_name;
+            let name: &[u8] = if let Some(t) = &template {
+                regen_name = t.regenerate(j);
+                &regen_name
+            } else {
+                &s.names[j]
+            };
+            let mut rec = Vec::with_capacity(l * 2 + name.len() + 8);
+            write_record(&mut rec, name, &seq, &qual);
             w.write_all(&rec)?;
         }
     }
@@ -1935,6 +2003,7 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
         group_size: header.group_size,
         reordered: header.flags & FLAG_REORDERED != 0,
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
+        regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
         ..Info::default()
     })
 }
@@ -1971,16 +2040,19 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         group_size: header.group_size,
         reordered: header.flags & FLAG_REORDERED != 0,
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
+        regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
         ..Info::default()
     };
-    // Whole-file global-cluster layout: [u64 n][flip][perm][u32 n_blocks]
-    // [seq blocks][name+qual blocks]. Permutation overhead is charged to seq.
+    // Whole-file global-cluster layout: [u64 n][flip][perm][name template]
+    // [u32 n_blocks][seq blocks][name+qual blocks]. Permutation is charged to seq;
+    // the name template (non-empty only in discard-order mode) to names.
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
         let mut n8 = [0u8; 8];
         r.read_exact(&mut n8)?;
         info.reads = u64::from_le_bytes(n8);
         skip_framed(&mut r)?; // flip bitmap
         info.seq_bytes += skip_framed(&mut r)? as u64; // permutation
+        info.names_bytes += skip_framed(&mut r)? as u64; // name template (regen mode)
         let mut nb = [0u8; 4];
         r.read_exact(&mut nb)?;
         let n_blocks = u32::from_le_bytes(nb) as usize;
@@ -2662,6 +2734,89 @@ NNGGCCTA\n\
             v.push(b'\n');
         }
         v
+    }
+
+    /// Sorted multiset of sequence lines (record line 1) — the content a
+    /// reorder-lossy mode must preserve even as it renumbers names.
+    fn seq_set(fastq: &[u8]) -> Vec<Vec<u8>> {
+        let lines: Vec<&[u8]> = fastq.split(|&b| b == b'\n').collect();
+        let mut s: Vec<Vec<u8>> = lines
+            .chunks(4)
+            .filter(|c| c.len() == 4)
+            .map(|c| c[1].to_vec())
+            .collect();
+        s.sort();
+        s
+    }
+
+    #[test]
+    fn discard_order_renumbers_and_preserves_content() {
+        // Counter-named, reorder-inducing input. Discard-order regenerates the
+        // names as a fresh 1..n counter in OUTPUT order (reorder-lossy for names)
+        // while preserving the sequence content exactly.
+        let input = windowed_input(|i| format!("@read.{} {}", i + 1, i + 1), 3000, 40);
+        for threads in [1usize, 4] {
+            let params = Params {
+                reorder: true,
+                regenerate_names: true,
+                threads,
+                ..Params::default()
+            };
+            let mut archive = Vec::new();
+            compress(&input[..], &mut archive, params).unwrap();
+            // Discard-order is a non-keep-order layout with regenerated names.
+            assert!(!peek(&archive[..]).unwrap().keep_order, "threads={threads}");
+            // inspect must skip the name-template frame and report correctly.
+            let info = inspect(io::Cursor::new(&archive[..])).unwrap();
+            assert!(info.regenerated_names, "threads={threads}");
+            assert_eq!(info.reads, 3000, "threads={threads}");
+
+            let mut out = Vec::new();
+            decompress(&archive[..], &mut out, 1).unwrap();
+
+            let lines: Vec<&[u8]> = out.split(|&b| b == b'\n').collect();
+            let recs: Vec<&[&[u8]]> = lines.chunks(4).filter(|c| c.len() == 4).collect();
+            assert_eq!(recs.len(), 3000, "threads={threads}");
+            // Names regenerated sequentially in output order.
+            for (k, c) in recs.iter().enumerate() {
+                assert_eq!(
+                    c[0],
+                    format!("@read.{} {}", k + 1, k + 1).as_bytes(),
+                    "name at output {k} (threads={threads})"
+                );
+            }
+            // Sequence multiset preserved exactly.
+            assert_eq!(seq_set(&out), seq_set(&input), "threads={threads}");
+        }
+    }
+
+    #[test]
+    fn discard_order_falls_back_for_non_counter_names() {
+        // Illumina tile/x/y names aren't a per-read counter (x/y vary
+        // non-monotonically), so regenerate_names can't engage — it must fall back
+        // to a byte-lossless clustered layout (records preserved as a set, names
+        // intact and still paired with their reads).
+        let input = windowed_input(
+            |i| {
+                format!(
+                    "@INST:1:FC:1:1101:{}:{}",
+                    1000 + (i * 7) % 500,
+                    2000 + (i * 13) % 500
+                )
+            },
+            2000,
+            40,
+        );
+        let params = Params {
+            reorder: true,
+            regenerate_names: true,
+            ..Params::default()
+        };
+        let mut archive = Vec::new();
+        compress(&input[..], &mut archive, params).unwrap();
+        let mut out = Vec::new();
+        decompress(&archive[..], &mut out, 1).unwrap();
+        assert_eq!(record_set(&out), record_set(&input));
     }
 
     #[test]
