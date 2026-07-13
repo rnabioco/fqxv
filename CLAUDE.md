@@ -9,7 +9,7 @@ FASTQ. It's a Cargo workspace of one-crate-per-algorithm codecs plus a container
 format library and CLI. All codecs are **clean-room** implementations from specs
 and papers (CRAM 3.1 codecs spec, fqzcomp/SPRING/PgRC2), never translated from C
 — see `THIRD-PARTY-NOTICES.md`. Status is early development; `FORMAT_VERSION` is
-`0` and nothing on disk is stable yet.
+`2` and nothing on disk is stable yet (each build reads only its own version).
 
 ## Commands
 

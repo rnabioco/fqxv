@@ -33,6 +33,7 @@ clap = { version = "4", features = ["derive"] }
 noodles-fastq = "0.23"
 noodles-bgzf = "0.48"
 memchr = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 bitstream-io = "4"
 flate2 = "1"
 tracing = "0.1"
