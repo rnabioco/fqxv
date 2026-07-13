@@ -3658,7 +3658,11 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
         let ra = fqxv_reorder::revcomp(a);
         let ql: Vec<u8> = (0..a.len()).map(|i| b'!' + (i as u8 * 3 % 40)).collect();
         let read = |i: u32| -> Vec<u8> {
-            let s = if i % 2 == 0 { a.to_vec() } else { ra.clone() };
+            let s = if i.is_multiple_of(2) {
+                a.to_vec()
+            } else {
+                ra.clone()
+            };
             let mut rec = format!("@read.{i}\n").into_bytes();
             rec.extend_from_slice(&s);
             rec.extend_from_slice(b"\n+\n");
@@ -3671,7 +3675,11 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
             rec.push(b'\n');
             input.extend_from_slice(&rec);
         }
-        for bin in [QualityBinning::Bin8, QualityBinning::Bin4, QualityBinning::Bin2] {
+        for bin in [
+            QualityBinning::Bin8,
+            QualityBinning::Bin4,
+            QualityBinning::Bin2,
+        ] {
             let params = Params {
                 reorder: true,
                 quality_binning: bin,
