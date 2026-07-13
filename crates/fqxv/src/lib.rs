@@ -16,7 +16,7 @@ mod container;
 
 pub use container::{
     compress, compress_auto, compress_interleaved, compress_multi, decompress, decompress_split,
-    inspect, peek, Info, Params, Stats,
+    extract, inspect, peek, Info, Params, Stats,
 };
 pub use fqxv_fqzcomp::QualityBinning;
 
@@ -26,7 +26,13 @@ use thiserror::Error;
 pub const MAGIC: [u8; 4] = *b"FQXV";
 
 /// The container format version this build writes.
-pub const FORMAT_VERSION: u16 = 0;
+///
+/// v1 appends a footer index (`[u32 n_row_groups]`, per-group `[u64 offset]
+/// [u32 read_count]`, `[u64 total_reads]`) plus an EOF trailer (`[u64
+/// footer_offset]["FQXF"]`) after a zero-length terminator block, so `inspect`
+/// and random access can seek straight to the row-group index. See
+/// `container.rs` for the full layout.
+pub const FORMAT_VERSION: u16 = 1;
 
 /// Errors returned by the archiver.
 #[derive(Debug, Error)]

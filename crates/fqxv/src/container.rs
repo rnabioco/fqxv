@@ -9,9 +9,19 @@
 //! [1] flags (bit0: '+' normalized; bit1: reordered; bit2: order preserved)
 //! [1] group size G (reads interleaved per spot: 1 single-end, 2 paired,
 //!                   3-4 single-cell R1/R2/I1[/I2], ...)
-//! repeated until EOF:
-//!   [8] block payload length (LE)
+//! repeated until the terminator:
+//!   [8] block payload length (LE, nonzero)
 //!   [ ] block payload
+//! [8] 0  (zero-length terminator block: a streaming, non-seekable decoder
+//!         stops here; seekable readers jump to the footer via the trailer)
+//! footer (row-group index — lets `inspect`/random access seek, not scan):
+//!   [4] n_row_groups (LE)
+//!   per row group: [8] byte_offset (LE, points at the group's length field)
+//!                  [4] read_count  (LE)
+//!   [8] total_reads (LE)
+//! trailer (fixed, at EOF):
+//!   [8] footer_offset (LE)   -- seek straight to the footer
+//!   [4] magic "FQXF"
 //! block payload (plain):
 //!   [4] n_reads (LE)
 //!   [4] names_len (LE)  [ ] names   (fqxv-tokenizer)
@@ -33,7 +43,10 @@
 //! so block size is free to be moderate for parallelism without hurting ratio.
 //! Layout after the header: `[8] n  [ ] flip  [ ] perm  [4] n_blocks
 //! [seq block]*n  [ [names][qual] ]*n` (each `[ ]` is a `[u32 len][bytes]` frame;
-//! seq blocks are clustered order, name/qual blocks original order).
+//! seq blocks are clustered order, name/qual blocks original order). This layout
+//! is self-describing and carries no footer/terminator — decode dispatches on
+//! flag bit3 before ever reading a block, so the block-region terminator and the
+//! footer index above apply only to the plain / per-block-reorder layouts.
 //! ```
 //!
 //! When `G > 1`, reads are interleaved per spot (`m0₀, m1₀, …, m0₁, m1₁, …`).
@@ -43,7 +56,7 @@
 //! spot adjacent for the sequence model. [`decompress`] streams interleaved
 //! FASTQ (pipe to an aligner); [`decompress_split`] restores the `G` files.
 
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 use rayon::prelude::*;
 use tracing::{debug, info, instrument, trace};
@@ -54,7 +67,19 @@ use fqxv_fqzcomp::QualityBinning;
 /// Default reads per block. Larger blocks populate the sequence model's contexts
 /// better (higher ratio) but reduce parallelism and raise memory.
 const DEFAULT_BLOCK_READS: usize = 1 << 20;
+/// Raw-sequence byte budget per row group. A group is cut at whichever comes
+/// first — `block_reads` reads or this many raw sequence bytes — so long-read
+/// (nanopore-style) data does not collapse into one enormous row group that
+/// destroys parallelism and random-access granularity and could overflow the
+/// `u32` per-stream compressed length. For fixed short reads the read count is
+/// the binding limit and this never triggers.
+const MAX_BLOCK_SEQ_BYTES: usize = 256 << 20;
 const HEADER_LEN: usize = 10;
+/// Magic at the very end of a v1 archive, just after the `[8] footer_offset`
+/// back-pointer, so a reader can confirm it found a real footer.
+const FOOTER_MAGIC: [u8; 4] = *b"FQXF";
+/// Bytes in the fixed EOF trailer: `[8] footer_offset` + `[4] FOOTER_MAGIC`.
+const TRAILER_LEN: usize = 12;
 const FLAG_PLUS_NORMALIZED: u8 = 0x01;
 const FLAG_REORDERED: u8 = 0x02;
 const FLAG_KEEP_ORDER: u8 = 0x04;
@@ -377,7 +402,10 @@ pub fn compress_multi<'a, W: Write>(
     // Keep whole spots together: round the block target down to a multiple of g.
     let block_reads = (params.block_reads / g).max(1) * g;
     drive(writer, params, g as u8, |b| {
-        while b.n_reads() < block_reads {
+        // Cut on reads OR the raw-sequence byte budget, whichever comes first;
+        // the loop reads whole spots, so a byte cut still lands on a spot
+        // boundary. Matches the byte budgeting in `block_ranges`.
+        while b.n_reads() < block_reads && b.seq.len() < MAX_BLOCK_SEQ_BYTES {
             // Read one record from each input; member 0 EOF ends cleanly.
             let mut got = 0;
             for j in 0..g {
@@ -627,18 +655,50 @@ fn parse_blocks(
         return Ok(Vec::new());
     }
 
-    let num_blocks = n.div_ceil(block_reads);
+    let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
     let blocks: Vec<RawBlock> = pool.install(|| {
-        (0..num_blocks)
-            .into_par_iter()
-            .map(|b| {
-                let gs = b * block_reads;
-                let ge = ((b + 1) * block_reads).min(n);
-                build_block(buf, &chunks, &gstart, gs, ge)
-            })
+        ranges
+            .par_iter()
+            .map(|&(gs, ge)| build_block(buf, &chunks, &gstart, gs, ge))
             .collect()
     });
     Ok(blocks)
+}
+
+/// Split the parsed reads into row-group ranges `[gs, ge)`, cutting at whichever
+/// comes first — `block_reads` reads or `max_bytes` raw sequence bytes — while
+/// keeping whole spots together (every cut lands on a multiple of `g` reads).
+/// `block_reads` is assumed already rounded to a multiple of `g`.
+///
+/// Boundaries depend only on the per-read lengths and the two limits, not on how
+/// many parse chunks/threads produced them, so the resulting archive is
+/// byte-identical regardless of thread count.
+fn block_ranges(
+    chunks: &[ChunkParse],
+    block_reads: usize,
+    max_bytes: usize,
+    g: usize,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut gs = 0usize; // current row group's first global read index
+    let mut gi = 0usize; // reads seen so far
+    let mut bytes = 0usize; // raw sequence bytes in the current row group
+    for chunk in chunks {
+        for rec in &chunk.recs {
+            gi += 1;
+            bytes += rec.seq_len as usize;
+            let in_block = gi - gs;
+            if in_block.is_multiple_of(g) && (in_block >= block_reads || bytes >= max_bytes) {
+                ranges.push((gs, gi));
+                gs = gi;
+                bytes = 0;
+            }
+        }
+    }
+    if gs < gi {
+        ranges.push((gs, gi));
+    }
+    ranges
 }
 
 /// Write the container header.
@@ -692,6 +752,7 @@ fn compress_buffered<W: Write>(
     // Compress in batches so at most `batch` compressed payloads are buffered
     // before being written in block order.
     let batch = pool.current_num_threads().max(1);
+    let mut index = FooterIndex::new();
     for chunk in blocks.chunks(batch) {
         let compressed: Vec<Result<Vec<u8>>> = pool.install(|| {
             chunk
@@ -699,10 +760,11 @@ fn compress_buffered<W: Write>(
                 .map(|b| compress_block(b, &params))
                 .collect()
         });
-        write_blocks(&mut w, chunk, compressed, &mut stats)?;
+        write_blocks(&mut w, chunk, compressed, &mut stats, &mut index)?;
     }
+    let footer_bytes = write_footer(&mut w, &index, stats.reads)?;
     w.flush()?;
-    stats.out_bytes += HEADER_LEN as u64;
+    stats.out_bytes += HEADER_LEN as u64 + footer_bytes;
     Ok(stats)
 }
 
@@ -737,6 +799,7 @@ where
     };
     // One batch of buffering: the reader parses the next batch while this thread
     // compresses and writes the current one.
+    let mut index = FooterIndex::new();
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<RawBlock>>>(1);
     std::thread::scope(|scope| -> Result<()> {
         let reader = scope.spawn(move || {
@@ -786,7 +849,7 @@ where
                     .map(|b| compress_block(b, &params))
                     .collect()
             });
-            if let Err(e) = write_blocks(&mut w, &blocks, compressed, &mut stats) {
+            if let Err(e) = write_blocks(&mut w, &blocks, compressed, &mut stats, &mut index) {
                 result = Err(e);
                 break;
             }
@@ -796,22 +859,70 @@ where
         result
     })?;
 
+    let footer_bytes = write_footer(&mut w, &index, stats.reads)?;
     w.flush()?;
-    stats.out_bytes += HEADER_LEN as u64;
+    stats.out_bytes += HEADER_LEN as u64 + footer_bytes;
     Ok(stats)
 }
 
-/// Write a batch's compressed payloads in order, updating `stats`.
+/// Row-group index accumulated as blocks are written, serialized into the v1
+/// footer. `offset` tracks the current byte position from the start of the file,
+/// so each entry records where its row group's `[8] length` field begins.
+struct FooterIndex {
+    entries: Vec<(u64, u32)>,
+    offset: u64,
+}
+
+impl FooterIndex {
+    fn new() -> Self {
+        // Blocks begin right after the fixed header.
+        FooterIndex {
+            entries: Vec::new(),
+            offset: HEADER_LEN as u64,
+        }
+    }
+}
+
+/// Close the block region and append the footer + EOF trailer, returning the
+/// number of bytes written (terminator + footer + trailer).
+///
+/// A zero-length block terminates the region so a streaming, non-seekable
+/// decoder stops before the footer; seekable readers ([`inspect`], random
+/// access) instead seek to the footer via the trailer's back-pointer.
+fn write_footer<W: Write>(w: &mut W, index: &FooterIndex, total_reads: u64) -> Result<u64> {
+    // Zero-length terminator block.
+    w.write_all(&0u64.to_le_bytes())?;
+    let footer_offset = index.offset + 8;
+
+    let mut body = Vec::with_capacity(4 + index.entries.len() * 12 + 8);
+    body.extend_from_slice(&(index.entries.len() as u32).to_le_bytes());
+    for &(off, read_count) in &index.entries {
+        body.extend_from_slice(&off.to_le_bytes());
+        body.extend_from_slice(&read_count.to_le_bytes());
+    }
+    body.extend_from_slice(&total_reads.to_le_bytes());
+    w.write_all(&body)?;
+
+    w.write_all(&footer_offset.to_le_bytes())?;
+    w.write_all(&FOOTER_MAGIC)?;
+    Ok(8 + body.len() as u64 + TRAILER_LEN as u64)
+}
+
+/// Write a batch's compressed payloads in order, updating `stats` and recording
+/// each row group in `index` for the footer.
 fn write_blocks<W: Write>(
     w: &mut W,
     blocks: &[RawBlock],
     compressed: Vec<Result<Vec<u8>>>,
     stats: &mut Stats,
+    index: &mut FooterIndex,
 ) -> Result<()> {
     for (b, payload) in blocks.iter().zip(compressed) {
         let payload = payload?;
+        index.entries.push((index.offset, b.n_reads() as u32));
         w.write_all(&(payload.len() as u64).to_le_bytes())?;
         w.write_all(&payload)?;
+        index.offset += 8 + payload.len() as u64;
         trace!(
             reads = b.n_reads(),
             payload = payload.len(),
@@ -1586,7 +1697,14 @@ fn skip_framed<R: Read>(r: &mut R) -> Result<usize> {
 }
 
 /// Read the header and per-stream sizes without decoding block payloads.
-pub fn inspect<R: Read>(reader: R) -> Result<Info> {
+///
+/// For the plain and per-block-reorder layouts this uses the v1 footer: it reads
+/// the row-group index (O(1) for reads/blocks/total), then seeks to each row
+/// group and reads only its small block header — the `n_reads`, reorder preamble,
+/// and three stream length prefixes — skipping every coded payload. So the cost
+/// is O(row groups) tiny reads rather than O(archive bytes). The globally
+/// clustered layout has no footer and is scanned sequentially as before.
+pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
     let mut r = BufReader::new(reader);
     let header = read_header(&mut r)?;
     let mut info = Info {
@@ -1618,22 +1736,106 @@ pub fn inspect<R: Read>(reader: R) -> Result<Info> {
         }
         return Ok(info);
     }
-    while let Some(block) = read_block(&mut r)? {
-        let mut c = Cursor::new(&block);
-        let n = c.u32()? as usize;
-        info.reads += n as u64;
+
+    let footer = read_footer(&mut r)?;
+    info.reads = footer.total_reads;
+    info.blocks = footer.groups.len() as u64;
+    for &(off, _) in &footer.groups {
+        // Skip the [8] payload length, then walk the block header: [4] n_reads,
+        // an optional reorder preamble, and the three [4 len][bytes] stream
+        // frames. We read each stream's length and seek past its bytes.
+        r.seek(SeekFrom::Start(off + 8))?;
+        let n = read_u32(&mut r)? as usize;
         if info.reordered {
-            // Reordered blocks carry a flip bitmap and a permutation stream
-            // before the three coded streams.
-            c.take(n.div_ceil(8))?;
-            c.slice_u32()?;
+            r.seek(SeekFrom::Current(n.div_ceil(8) as i64))?; // flip bitmap
+            let perm_len = read_u32(&mut r)? as i64;
+            r.seek(SeekFrom::Current(perm_len))?;
         }
-        info.names_bytes += c.slice_u32()?.len() as u64;
-        info.seq_bytes += c.slice_u32()?.len() as u64;
-        info.qual_bytes += c.slice_u32()?.len() as u64;
-        info.blocks += 1;
+        for bytes in [
+            &mut info.names_bytes,
+            &mut info.seq_bytes,
+            &mut info.qual_bytes,
+        ] {
+            let len = read_u32(&mut r)?;
+            *bytes += len as u64;
+            r.seek(SeekFrom::Current(len as i64))?;
+        }
     }
     Ok(info)
+}
+
+/// Extract the reads in the half-open global-index range `[range)` as FASTQ on
+/// `writer`, decoding only the row groups that overlap the range (located via the
+/// v1 footer). Random access is at row-group granularity — every codec carries
+/// model state across the reads within a row group, so a group is the smallest
+/// independently decodable unit — but only the reads inside `range` are emitted.
+///
+/// Reordered archives are rejected: their on-disk read order is clustered, not
+/// input order, so a global-index range would not mean what a caller expects.
+/// Use [`decompress`] for those.
+pub fn extract<R: Read + Seek, W: Write>(
+    reader: R,
+    range: std::ops::Range<u64>,
+    writer: W,
+) -> Result<Stats> {
+    let mut r = BufReader::new(reader);
+    let header = read_header(&mut r)?;
+    if header.flags & (FLAG_REORDERED | FLAG_GLOBAL_REORDER) != 0 {
+        return Err(Error::Malformed(
+            "extract is not supported for reordered archives (use decompress)",
+        ));
+    }
+    let footer = read_footer(&mut r)?;
+    let mut stats = Stats {
+        group_size: header.group_size,
+        ..Stats::default()
+    };
+    let (a, b) = (range.start, range.end.min(footer.total_reads));
+    if a >= b {
+        return Ok(stats);
+    }
+
+    // Prefix sums of per-group read counts: `starts[gi]` is the global index of
+    // row group `gi`'s first read.
+    let mut starts = Vec::with_capacity(footer.groups.len());
+    let mut acc = 0u64;
+    for &(_, rc) in &footer.groups {
+        starts.push(acc);
+        acc += rc as u64;
+    }
+
+    let mut w = BufWriter::new(writer);
+    for (gi, &(off, rc)) in footer.groups.iter().enumerate() {
+        let g_start = starts[gi];
+        let g_end = g_start + rc as u64;
+        if g_end <= a || g_start >= b {
+            continue; // row group entirely outside the range
+        }
+        r.seek(SeekFrom::Start(off))?;
+        let block = read_block(&mut r)?.ok_or(Error::Truncated)?;
+        let (n_reads, names, lens, seq, qual) = decode_block_parts(&block)?;
+        stats.blocks += 1;
+        let mut byte_off = 0usize;
+        for i in 0..n_reads {
+            let gidx = g_start + i as u64;
+            let l = lens[i] as usize;
+            if gidx >= a && gidx < b {
+                let mut rec = Vec::with_capacity(l * 2 + names[i].len() + 8);
+                write_record(
+                    &mut rec,
+                    &names[i],
+                    &seq[byte_off..byte_off + l],
+                    &qual[byte_off..byte_off + l],
+                );
+                w.write_all(&rec)?;
+                stats.reads += 1;
+                stats.out_bytes += rec.len() as u64;
+            }
+            byte_off += l;
+        }
+    }
+    w.flush()?;
+    Ok(stats)
 }
 
 // --- header / block framing --------------------------------------------------
@@ -1664,7 +1866,12 @@ fn read_header<R: Read>(r: &mut R) -> Result<Header> {
     })
 }
 
-/// Read one length-prefixed block, or `None` at a clean EOF.
+/// Read one length-prefixed block, or `None` at the terminator / a clean EOF.
+///
+/// A zero-length block is the v1 terminator that separates the block region from
+/// the footer, so a streaming (non-seekable) decoder stops here without reading
+/// into the footer. A clean EOF (no length at all) is also treated as the end,
+/// which keeps truncated pre-footer streams decoding what they can.
 fn read_block<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
     let mut len = [0u8; 8];
     match r.read_exact(&mut len) {
@@ -1673,9 +1880,74 @@ fn read_block<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
         Err(e) => return Err(e.into()),
     }
     let len = u64::from_le_bytes(len) as usize;
+    if len == 0 {
+        return Ok(None);
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf).map_err(|_| Error::Truncated)?;
     Ok(Some(buf))
+}
+
+/// The v1 footer index: per row group `(byte_offset, read_count)` plus the total
+/// read count, located via the EOF trailer's back-pointer. Only the plain and
+/// per-block-reorder layouts carry a footer (the globally-clustered layout is
+/// self-describing — see the module docs).
+struct Footer {
+    /// `(byte offset of the row group's [8] length field, its read count)`.
+    groups: Vec<(u64, u32)>,
+    total_reads: u64,
+}
+
+/// Read the footer by seeking to the EOF trailer and following its back-pointer.
+fn read_footer<R: Read + Seek>(r: &mut R) -> Result<Footer> {
+    let end = r.seek(SeekFrom::End(0))?;
+    if end < (HEADER_LEN + TRAILER_LEN) as u64 {
+        return Err(Error::Truncated);
+    }
+    let mut trailer = [0u8; TRAILER_LEN];
+    r.seek(SeekFrom::End(-(TRAILER_LEN as i64)))?;
+    r.read_exact(&mut trailer)?;
+    if trailer[8..] != FOOTER_MAGIC {
+        return Err(Error::Malformed("missing footer trailer magic"));
+    }
+    let footer_offset = u64::from_le_bytes(trailer[..8].try_into().unwrap());
+    if footer_offset < HEADER_LEN as u64 || footer_offset > end - TRAILER_LEN as u64 {
+        return Err(Error::Malformed("footer offset out of range"));
+    }
+    r.seek(SeekFrom::Start(footer_offset))?;
+    let mut nb = [0u8; 4];
+    r.read_exact(&mut nb)?;
+    let n_groups = u32::from_le_bytes(nb) as usize;
+    // The declared group count could be hostile; cap the eager allocation to the
+    // number of 12-byte entries that could possibly fit before the trailer.
+    let max_groups = ((end - TRAILER_LEN as u64 - footer_offset).saturating_sub(4) / 12) as usize;
+    if n_groups > max_groups {
+        return Err(Error::Malformed("footer group count exceeds file size"));
+    }
+    let mut groups = Vec::with_capacity(n_groups);
+    for _ in 0..n_groups {
+        let mut eb = [0u8; 12];
+        r.read_exact(&mut eb)?;
+        let off = u64::from_le_bytes(eb[..8].try_into().unwrap());
+        let rc = u32::from_le_bytes(eb[8..].try_into().unwrap());
+        if off < HEADER_LEN as u64 || off >= footer_offset {
+            return Err(Error::Malformed("footer row-group offset out of range"));
+        }
+        groups.push((off, rc));
+    }
+    let mut tr = [0u8; 8];
+    r.read_exact(&mut tr)?;
+    Ok(Footer {
+        groups,
+        total_reads: u64::from_le_bytes(tr),
+    })
+}
+
+/// Read a little-endian `u32` from `r`.
+fn read_u32<R: Read>(r: &mut R) -> Result<u32> {
+    let mut b = [0u8; 4];
+    r.read_exact(&mut b)?;
+    Ok(u32::from_le_bytes(b))
 }
 
 fn build_pool(threads: usize) -> Result<rayon::ThreadPool> {
@@ -1907,7 +2179,7 @@ NNGGCCTA\n\
     #[test]
     fn inspect_reports_streams() {
         let archive = compress_bytes(SAMPLE, Params::default());
-        let info = inspect(&archive[..]).expect("inspect");
+        let info = inspect(io::Cursor::new(&archive[..])).expect("inspect");
         assert_eq!(info.reads, 2);
         assert_eq!(info.blocks, 1);
         assert_eq!(info.group_size, 1);
@@ -1941,7 +2213,9 @@ NNGGCCTA\n\
 
             // The header tag round-trips through inspect.
             assert_eq!(
-                inspect(&archive[..]).expect("inspect").quality_binning,
+                inspect(io::Cursor::new(&archive[..]))
+                    .expect("inspect")
+                    .quality_binning,
                 tag,
                 "info tag for {bin:?}"
             );
@@ -1967,7 +2241,12 @@ NNGGCCTA\n\
     #[test]
     fn lossless_default_reports_zero_tag() {
         let archive = compress_bytes(SAMPLE, Params::default());
-        assert_eq!(inspect(&archive[..]).unwrap().quality_binning, 0);
+        assert_eq!(
+            inspect(io::Cursor::new(&archive[..]))
+                .unwrap()
+                .quality_binning,
+            0
+        );
     }
 
     fn dup_rich_input(keep_order_marker: char) -> Vec<u8> {
@@ -2010,7 +2289,10 @@ NNGGCCTA\n\
         };
         let mut archive = Vec::new();
         compress(&input[..], &mut archive, params).unwrap();
-        assert_eq!(inspect(&archive[..]).unwrap().group_size, 1);
+        assert_eq!(
+            inspect(io::Cursor::new(&archive[..])).unwrap().group_size,
+            1
+        );
         let mut out = Vec::new();
         decompress(&archive[..], &mut out, 1).unwrap();
         assert_eq!(out, input, "reorder --keep-order must be byte-exact");
@@ -2056,5 +2338,138 @@ NNGGCCTA\n\
     fn bad_magic() {
         let err = decompress(&b"not an fqxv file at all"[..], &mut Vec::new(), 1);
         assert!(matches!(err, Err(Error::BadMagic)));
+    }
+
+    // --- v1 footer: index, extract, determinism -----------------------------
+
+    /// Split FASTQ into per-record byte blocks (each 4 lines + trailing `\n`).
+    fn fastq_records(fastq: &[u8]) -> Vec<Vec<u8>> {
+        let lines: Vec<&[u8]> = fastq.split(|&b| b == b'\n').collect();
+        lines
+            .chunks(4)
+            .filter(|c| c.len() == 4)
+            .map(|c| {
+                let mut v = Vec::new();
+                for l in c {
+                    v.extend_from_slice(l);
+                    v.push(b'\n');
+                }
+                v
+            })
+            .collect()
+    }
+
+    #[test]
+    fn block_ranges_cuts_on_reads_bytes_and_spots() {
+        // 10 reads × 100 bp, one parse chunk.
+        let mut fq = Vec::new();
+        for i in 0..10 {
+            fq.extend_from_slice(
+                format!("@r{i}\n{}\n+\n{}\n", "A".repeat(100), "I".repeat(100)).as_bytes(),
+            );
+        }
+        let chunks = vec![parse_chunk(&fq, 0, fq.len()).unwrap()];
+
+        // Byte budget binds first: cut every 3 reads (300 B ≥ 250 B).
+        assert_eq!(
+            block_ranges(&chunks, 1000, 250, 1),
+            vec![(0, 3), (3, 6), (6, 9), (9, 10)]
+        );
+        // Read budget binds first.
+        assert_eq!(
+            block_ranges(&chunks, 4, usize::MAX, 1),
+            vec![(0, 4), (4, 8), (8, 10)]
+        );
+        // A tiny byte budget still only cuts on whole spots (g = 2).
+        assert_eq!(
+            block_ranges(&chunks, 1000, 1, 2),
+            vec![(0, 2), (2, 4), (4, 6), (6, 8), (8, 10)]
+        );
+    }
+
+    #[test]
+    fn extract_range_matches_full_decode() {
+        let input = make_reads("x", 20);
+        // Small blocks so the 20 reads span several row groups.
+        let params = Params {
+            block_reads: 4,
+            ..Params::default()
+        };
+        let archive = compress_bytes(&input, params);
+        assert!(inspect(io::Cursor::new(&archive[..])).unwrap().blocks >= 5);
+
+        let mut full = Vec::new();
+        decompress(&archive[..], &mut full, 1).unwrap();
+        let recs = fastq_records(&full);
+
+        for (a, b) in [(0u64, 20u64), (5, 12), (0, 1), (19, 20), (7, 7), (18, 100)] {
+            let mut got = Vec::new();
+            extract(io::Cursor::new(&archive[..]), a..b, &mut got).unwrap();
+            let hi = (b as usize).min(recs.len());
+            let lo = (a as usize).min(hi);
+            let want: Vec<u8> = recs[lo..hi].concat();
+            assert_eq!(got, want, "extract {a}..{b}");
+        }
+    }
+
+    #[test]
+    fn extract_rejects_reordered() {
+        let input = dup_rich_input('r');
+        let params = Params {
+            reorder: true,
+            keep_order: true,
+            ..Params::default()
+        };
+        let mut archive = Vec::new();
+        compress(&input[..], &mut archive, params).unwrap();
+        let err = extract(io::Cursor::new(&archive[..]), 0..1, &mut Vec::new());
+        assert!(matches!(err, Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn archive_is_deterministic_across_threads() {
+        let input = make_reads("y", 500);
+        let mk = |threads| {
+            compress_bytes(
+                &input,
+                Params {
+                    block_reads: 32,
+                    threads,
+                    ..Params::default()
+                },
+            )
+        };
+        // Byte-identical (header, blocks, and footer offsets) regardless of pool.
+        assert_eq!(mk(1), mk(4));
+    }
+
+    #[test]
+    fn inspect_rejects_missing_trailer() {
+        let archive = compress_bytes(SAMPLE, Params::default());
+        // Drop the trailing "FQXF" magic.
+        let truncated = &archive[..archive.len() - 4];
+        assert!(inspect(io::Cursor::new(truncated)).is_err());
+    }
+
+    #[test]
+    fn ragged_lengths_roundtrip_multiblock() {
+        // Mixed read lengths (10..=310 bp) exercise variable-length framing; a
+        // small block target spreads them over several row groups.
+        let mut input = Vec::new();
+        for i in 0..30usize {
+            let len = 10 + (i % 7) * 50;
+            let seq: String = "ACGT".chars().cycle().take(len).collect();
+            input.extend_from_slice(
+                format!("@read.{i}\n{seq}\n+\n{}\n", "I".repeat(len)).as_bytes(),
+            );
+        }
+        let params = Params {
+            block_reads: 5,
+            ..Params::default()
+        };
+        let archive = compress_bytes(&input, params);
+        let mut out = Vec::new();
+        decompress(&archive[..], &mut out, 1).unwrap();
+        assert_eq!(out, input, "ragged variable-length reads must round-trip");
     }
 }
