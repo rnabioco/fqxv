@@ -8,10 +8,12 @@
 //! `is_x86_feature_detected!`; the decoded output is identical whichever runs:
 //!
 //! - **scalar** — always available, the correctness reference (all orders).
-//! - **AVX2** — order-0 decode and encode on x86-64. Decode is the default
-//!   whenever AVX2 is detected (≈1.9–3.4× scalar on Intel); encode is gather-
-//!   bound and enabled only on Broadwell-class cores (see [`encode`]). Both use
-//!   `vpgatherdd`, which is AVX2-only.
+//! - **AVX2** — order-0 decode and encode (8-wide). One L1-resident gather per
+//!   group plus a branchless renorm; encode is gather-bound (see [`encode`]).
+//! - **AVX-512** — order-0 decode and encode (16-wide, two groups per round).
+//!   Adds native `k`-mask compares and a `vpexpandd` renorm; the widest
+//!   detected path wins, so it supersedes AVX2 on Intel (decode ≈5×, encode
+//!   ≈1.4× scalar on Cascade Lake).
 //!
 //! There is deliberately no SSE4.2 vector path: gather (`vpgatherdd`) requires
 //! AVX2, and without it a 4-lane path degenerates to per-lane scalar loads with
@@ -27,6 +29,8 @@
 
 #[cfg(target_arch = "x86_64")]
 mod avx2;
+#[cfg(target_arch = "x86_64")]
+mod avx512;
 mod model;
 mod scalar;
 
@@ -68,6 +72,8 @@ pub enum Backend {
     Sse42,
     /// x86-64 AVX2.
     Avx2,
+    /// x86-64 AVX-512 (F).
+    Avx512,
 }
 
 impl Backend {
@@ -76,6 +82,9 @@ impl Backend {
     pub fn detect() -> Self {
         #[cfg(target_arch = "x86_64")]
         {
+            if std::is_x86_feature_detected!("avx512f") {
+                return Backend::Avx512;
+            }
             if std::is_x86_feature_detected!("avx2") {
                 return Backend::Avx2;
             }
@@ -93,21 +102,21 @@ impl Backend {
 /// AVX2 host decodes bit-for-bit the same as one written on a scalar host, and
 /// two hosts encode the same input to the same bytes.
 ///
-/// Order-1 is always scalar. Order-0 uses the AVX2 encoder only on Broadwell-
-/// class cores (AVX2 without AVX-512): the vector encoder is gather-bound (two
-/// per-symbol gathers it can't drop below), so it wins ~1.5× where the scalar
-/// core is slower (Broadwell: ≈206 vs ≈137 MiB/s) but only ties — occasionally
-/// trails a few percent — on AVX-512-class Intel (Cascade Lake: ≈153 vs ≈158),
-/// whose scalar encode is faster. `avx512f`-absent is the empirical proxy for
-/// "the vector encoder helps here." (Decode wins on all AVX2 and is not gated.)
+/// Order-1 is always scalar. Order-0 picks the widest vector encoder that wins
+/// on the host: AVX-512 where present (≈233 vs ≈163 MiB/s scalar on Cascade
+/// Lake — the 16-wide gather turns the AVX2 wash into a win), otherwise the AVX2
+/// encoder on Broadwell-class cores (≈206 vs ≈137). Both are gather-bound, so an
+/// AVX-512-class core that also has AVX2 skips AVX2 (which only ties there) in
+/// favor of AVX-512. Output is byte-identical to scalar whichever path runs.
 pub fn encode(src: &[u8], order: Order) -> Result<Vec<u8>> {
     match order {
         Order::Zero => {
             #[cfg(target_arch = "x86_64")]
             {
-                if std::is_x86_feature_detected!("avx2")
-                    && !std::is_x86_feature_detected!("avx512f")
-                {
+                if std::is_x86_feature_detected!("avx512f") {
+                    return Ok(avx512::encode_order0(src));
+                }
+                if std::is_x86_feature_detected!("avx2") {
                     return Ok(avx2::encode_order0(src));
                 }
             }
@@ -145,15 +154,29 @@ pub mod bench_api {
     pub fn encode_order0_avx2(src: &[u8]) -> Vec<u8> {
         crate::avx2::encode_order0(src)
     }
+
+    /// Decode an order-0 stream with the AVX-512 backend.
+    #[cfg(target_arch = "x86_64")]
+    pub fn decode_avx512(src: &[u8]) -> Result<Vec<u8>> {
+        crate::avx512::decode_order0(src)
+    }
+
+    /// Encode an order-0 stream with the AVX-512 backend.
+    #[cfg(target_arch = "x86_64")]
+    pub fn encode_order0_avx512(src: &[u8]) -> Vec<u8> {
+        crate::avx512::encode_order0(src)
+    }
 }
 
 /// Decode a stream produced by [`encode`].
 ///
-/// Order-0 streams take the AVX2 backend when the running CPU has AVX2; order-1
-/// (and non-x86) fall back to scalar. The AVX2 order-0 decoder resolves each
-/// group with a single L1-resident gather and a branchless renorm, measuring
-/// ≈1.9× scalar on Intel Cascade Lake (≈315 vs ≈163 MiB/s, 8 MiB order-0).
-/// Output is byte-identical to scalar whichever path runs.
+/// Order-0 streams take the widest vector decoder the CPU supports — AVX-512,
+/// else AVX2; order-1 (and non-x86) fall back to scalar. Both vector decoders
+/// resolve each group with one L1-resident gather and a branchless renorm.
+/// Measured on Intel Cascade Lake (8 MiB order-0): scalar ≈163, AVX2 ≈315,
+/// AVX-512 ≈817 MiB/s (5×) — AVX-512 adds native `k`-mask compares and a
+/// single `vpexpandd` for the renorm distribution. Output is byte-identical to
+/// scalar whichever path runs.
 ///
 /// Historical note: an earlier three-gather AVX2 decoder ran *slower* than
 /// scalar (microcoded `vpgatherdd`, worst on AMD Zen 3), which is why scalar was
@@ -164,8 +187,13 @@ pub fn decode(src: &[u8]) -> Result<Vec<u8>> {
     #[cfg(target_arch = "x86_64")]
     {
         // Order tag 0 == order-0; the only vectorized path today.
-        if src.first() == Some(&0) && std::is_x86_feature_detected!("avx2") {
-            return avx2::decode_order0(src);
+        if src.first() == Some(&0) {
+            if std::is_x86_feature_detected!("avx512f") {
+                return avx512::decode_order0(src);
+            }
+            if std::is_x86_feature_detected!("avx2") {
+                return avx2::decode_order0(src);
+            }
         }
     }
     scalar::decode(src)
@@ -173,19 +201,22 @@ pub fn decode(src: &[u8]) -> Result<Vec<u8>> {
 
 /// Decode using an explicitly chosen [`Backend`].
 ///
-/// [`Backend::Avx2`] uses the AVX2 order-0 decoder when the stream is order-0
-/// and the CPU supports AVX2; it falls back to scalar otherwise (including for
-/// order-1). Provided for benchmarking and for callers who know their
-/// micro-architecture has fast gather — see [`decode`] for why scalar is the
-/// default. Output is identical regardless of backend.
+/// [`Backend::Avx512`] / [`Backend::Avx2`] use the corresponding order-0 vector
+/// decoder when the stream is order-0 and the CPU supports that feature; any
+/// other case (order-1, unsupported CPU, [`Backend::Sse42`], [`Backend::Scalar`])
+/// falls back to scalar. Provided for benchmarking and for pinning a backend;
+/// [`decode`] already selects the widest supported path. Output is identical
+/// regardless of backend.
 pub fn decode_with(src: &[u8], backend: Backend) -> Result<Vec<u8>> {
     #[cfg(target_arch = "x86_64")]
     {
-        if backend == Backend::Avx2
-            && src.first() == Some(&0)
-            && std::is_x86_feature_detected!("avx2")
-        {
-            return avx2::decode_order0(src);
+        if src.first() == Some(&0) {
+            if backend == Backend::Avx512 && std::is_x86_feature_detected!("avx512f") {
+                return avx512::decode_order0(src);
+            }
+            if backend == Backend::Avx2 && std::is_x86_feature_detected!("avx2") {
+                return avx2::decode_order0(src);
+            }
         }
     }
     let _ = backend;
@@ -202,7 +233,7 @@ mod tests {
         let b = Backend::detect();
         assert!(matches!(
             b,
-            Backend::Scalar | Backend::Sse42 | Backend::Avx2
+            Backend::Scalar | Backend::Sse42 | Backend::Avx2 | Backend::Avx512
         ));
     }
 
@@ -325,6 +356,23 @@ mod tests {
             let scalar_enc = crate::scalar::encode_order0(&data);
             proptest::prop_assert_eq!(&avx2_enc, &scalar_enc);
             proptest::prop_assert_eq!(crate::scalar::decode(&avx2_enc).expect("decode"), data);
+        }
+
+        // The AVX-512 order-0 decode and encode must both be byte-identical to
+        // scalar: decode reproduces the bytes, encode emits the same stream.
+        #[cfg(target_arch = "x86_64")]
+        #[test]
+        fn avx512_matches_scalar(
+            data in proptest::collection::vec(0u8..40, 0..5000)
+        ) {
+            if !std::is_x86_feature_detected!("avx512f") {
+                return Ok(());
+            }
+            let scalar_enc = crate::scalar::encode_order0(&data);
+            let avx512_enc = crate::avx512::encode_order0(&data);
+            proptest::prop_assert_eq!(&avx512_enc, &scalar_enc);
+            let avx512_dec = crate::avx512::decode_order0(&scalar_enc).expect("avx512 decode");
+            proptest::prop_assert_eq!(&avx512_dec, &data);
         }
     }
 

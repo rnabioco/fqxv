@@ -34,12 +34,12 @@ use crate::{Error, Result};
 /// alphabet, so we store `freq - 1` (12 bits) and add one back after unpacking.
 /// `offset` and `sym` are 12 and 8 bits, so all three share a single word and
 /// resolve with one gather over a 16 KiB (L1-resident) table.
-struct SlotTable {
-    packed: Vec<i32>,
+pub(crate) struct SlotTable {
+    pub(crate) packed: Vec<i32>,
 }
 
 impl SlotTable {
-    fn from_model(model: &Model) -> Self {
+    pub(crate) fn from_model(model: &Model) -> Self {
         let n = TOTFREQ as usize;
         let mut packed = vec![0i32; n];
         for (slot, p) in packed.iter_mut().enumerate() {
@@ -242,13 +242,13 @@ fn read_word(src: &[u8], sp: &mut usize) -> Result<u16> {
 /// with one estimate-and-correct step: `magic = floor((2^32 - 1) / freq)` gives
 /// `q0 = mulhi(v, magic) ∈ {q - 1, q}` (never an overestimate), and a single
 /// conditional `+1` corrects it. Branchless, and byte-identical to scalar.
-struct EncTables {
-    magic: Vec<i32>,
-    fc: Vec<i32>,
+pub(crate) struct EncTables {
+    pub(crate) magic: Vec<i32>,
+    pub(crate) fc: Vec<i32>,
 }
 
 impl EncTables {
-    fn from_model(model: &Model) -> Self {
+    pub(crate) fn from_model(model: &Model) -> Self {
         let mut magic = vec![0i32; 256];
         let mut fc = vec![0i32; 256];
         for s in 0..256 {
