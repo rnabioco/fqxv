@@ -147,6 +147,17 @@ impl RawBlock {
         self.qual.extend_from_slice(qual);
     }
 
+    /// Append a record whose header text is already in its final (normalized)
+    /// form — see [`normalize_header`]. Used by the parallel parser, which builds
+    /// the name/description join itself and hands over the finished header bytes.
+    fn push_raw(&mut self, header: &[u8], seq: &[u8], qual: &[u8]) {
+        self.header_buf.extend_from_slice(header);
+        self.header_ends.push(self.header_buf.len() as u32);
+        self.lens.push(seq.len() as u32);
+        self.seq.extend_from_slice(seq);
+        self.qual.extend_from_slice(qual);
+    }
+
     /// Number of records in the block.
     fn n_reads(&self) -> usize {
         self.header_ends.len()
@@ -176,27 +187,19 @@ impl RawBlock {
 
 /// Compress single-end FASTQ from `reader` into a `.fqxv` stream.
 ///
-/// `reader` must be `Send`: parsing runs on a dedicated thread so it overlaps
-/// compression (see [`drive`]).
+/// The whole input is read into memory and parsed in parallel (see
+/// [`parse_blocks`]) before the blocks are compressed — the serial FASTQ parse
+/// was otherwise the dominant single-threaded cost and left most cores idle.
+/// Output is byte-identical regardless of thread count.
 #[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, reorder = params.reorder, threads = params.threads))]
-pub fn compress<R: Read + Send, W: Write>(reader: R, writer: W, params: Params) -> Result<Stats> {
-    let block_reads = params.block_reads.max(1);
-    let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
-    let mut rec = noodles_fastq::Record::default();
-    drive(writer, params, 1, |b| {
-        while b.n_reads() < block_reads {
-            if fq.read_record(&mut rec)? == 0 {
-                break;
-            }
-            b.push(
-                rec.name(),
-                rec.description(),
-                rec.sequence(),
-                rec.quality_scores(),
-            );
-        }
-        Ok(b.n_reads())
-    })
+pub fn compress<R: Read + Send, W: Write>(
+    mut reader: R,
+    writer: W,
+    params: Params,
+) -> Result<Stats> {
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf)?;
+    compress_buffered(&buf, writer, params, 1)
 }
 
 /// How many leading records [`compress_auto`] reads to decide whether a single
@@ -257,11 +260,16 @@ fn detect_group_size(peeked: &[noodles_fastq::Record]) -> u8 {
 /// is always treated as single-end (reorder is single-end only).
 #[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, reorder = params.reorder, threads = params.threads))]
 pub fn compress_auto<R: Read + Send, W: Write>(
-    reader: R,
+    mut reader: R,
     writer: W,
     params: Params,
 ) -> Result<Stats> {
-    let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf)?;
+
+    // Peek the leading records to decide the layout. `&[u8]` is `BufRead`, so the
+    // noodles reader parses straight out of the buffer with no extra copy.
+    let mut fq = noodles_fastq::io::Reader::new(&buf[..]);
     let mut peeked: Vec<noodles_fastq::Record> = Vec::with_capacity(AUTODETECT_PEEK);
     for _ in 0..AUTODETECT_PEEK {
         let mut rec = noodles_fastq::Record::default();
@@ -274,35 +282,9 @@ pub fn compress_auto<R: Read + Send, W: Write>(
         1
     } else {
         detect_group_size(&peeked)
-    } as usize;
+    };
     info!(group_size = g, "detected layout");
-    let block_reads = (params.block_reads / g).max(1) * g;
-    let mut queue = std::collections::VecDeque::from(peeked);
-    drive(writer, params, g as u8, |b| {
-        while b.n_reads() < block_reads {
-            let rec = if let Some(front) = queue.pop_front() {
-                front
-            } else {
-                let mut rec = noodles_fastq::Record::default();
-                if fq.read_record(&mut rec)? == 0 {
-                    if b.n_reads() % g != 0 {
-                        return Err(Error::Malformed(
-                            "interleaved stream ended mid-spot (record count not a multiple of group size)",
-                        ));
-                    }
-                    break;
-                }
-                rec
-            };
-            b.push(
-                rec.name(),
-                rec.description(),
-                rec.sequence(),
-                rec.quality_scores(),
-            );
-        }
-        Ok(b.n_reads())
-    })
+    compress_buffered(&buf, writer, params, g)
 }
 
 /// Compress a single FASTQ stream whose records are *already* interleaved per
@@ -316,12 +298,12 @@ pub fn compress_auto<R: Read + Send, W: Write>(
 /// interleaved with [`decompress`].
 #[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, group_size, threads = params.threads))]
 pub fn compress_interleaved<R: Read + Send, W: Write>(
-    reader: R,
+    mut reader: R,
     writer: W,
     params: Params,
     group_size: u8,
 ) -> Result<Stats> {
-    let g = group_size.max(1) as usize;
+    let g = group_size.max(1);
     if g == 1 {
         return compress(reader, writer, params);
     }
@@ -330,30 +312,9 @@ pub fn compress_interleaved<R: Read + Send, W: Write>(
             "reorder is single-end only (would break spot grouping)",
         ));
     }
-    // Keep whole spots together: round the block target down to a multiple of g.
-    let block_reads = (params.block_reads / g).max(1) * g;
-    let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
-    let mut rec = noodles_fastq::Record::default();
-    drive(writer, params, g as u8, |b| {
-        while b.n_reads() < block_reads {
-            if fq.read_record(&mut rec)? == 0 {
-                // EOF must land on a spot boundary, or the stream is truncated.
-                if b.n_reads() % g != 0 {
-                    return Err(Error::Malformed(
-                        "interleaved stream ended mid-spot (record count not a multiple of group size)",
-                    ));
-                }
-                break;
-            }
-            b.push(
-                rec.name(),
-                rec.description(),
-                rec.sequence(),
-                rec.quality_scores(),
-            );
-        }
-        Ok(b.n_reads())
-    })
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf)?;
+    compress_buffered(&buf, writer, params, g)
 }
 
 /// Compress `G >= 1` per-spot read files (paired mates, single-cell R1/R2/I1/I2,
@@ -409,6 +370,314 @@ pub fn compress_multi<'a, W: Write>(
     })
 }
 
+// --- parallel FASTQ parsing --------------------------------------------------
+
+/// One record's location: its normalized header lives in the owning chunk's
+/// header arena (`[prev.hdr_end .. hdr_end)`); its sequence and quality bytes are
+/// contiguous ranges of the input buffer (CR/LF already excluded).
+#[derive(Clone, Copy)]
+struct RecMeta {
+    hdr_end: u32,
+    seq_off: usize,
+    seq_len: u32,
+    qual_off: usize,
+    qual_len: u32,
+}
+
+/// One byte-chunk's parse result: a header arena plus per-record metadata.
+struct ChunkParse {
+    hdr: Vec<u8>,
+    recs: Vec<RecMeta>,
+}
+
+/// Read one line from `buf[pos..end]`, returning `(content_off, content_len,
+/// next_pos)`. Matches `noodles` line semantics: the trailing `\n` (and a `\r`
+/// immediately before it) is stripped, but a `\r` at true end-of-input with no
+/// following `\n` is kept.
+#[inline]
+fn take_line(buf: &[u8], pos: usize, end: usize) -> (usize, usize, usize) {
+    match memchr::memchr(b'\n', &buf[pos..end]) {
+        Some(k) => {
+            let line_end = pos + k;
+            let mut len = k;
+            if len > 0 && buf[line_end - 1] == b'\r' {
+                len -= 1;
+            }
+            (pos, len, line_end + 1)
+        }
+        None => (pos, end - pos, end),
+    }
+}
+
+/// Build a record's header exactly as [`RawBlock::push`] would from the
+/// `noodles` name/description split: name is the bytes before the first space or
+/// tab; the separator becomes a single space; an empty description is dropped.
+fn normalize_header(out: &mut Vec<u8>, def: &[u8]) {
+    match def.iter().position(|&b| b == b' ' || b == b'\t') {
+        None => out.extend_from_slice(def),
+        Some(i) => {
+            out.extend_from_slice(&def[..i]);
+            let desc = &def[i + 1..];
+            if !desc.is_empty() {
+                out.push(b' ');
+                out.extend_from_slice(desc);
+            }
+        }
+    }
+}
+
+/// True when `o` begins a well-formed 4-line FASTQ record: `@`-line, sequence,
+/// `+`-line, and a quality line of the same length as the sequence. The length
+/// check makes a false sync (landing on a quality line that happens to start with
+/// `@`) astronomically unlikely, so record boundaries can be found in parallel.
+fn is_record_start(buf: &[u8], o: usize) -> bool {
+    if buf.get(o) != Some(&b'@') {
+        return false;
+    }
+    let n = buf.len();
+    let (_, _, p1) = take_line(buf, o, n);
+    if p1 >= n {
+        return false;
+    }
+    let (_, seq_len, p2) = take_line(buf, p1, n);
+    if buf.get(p2) != Some(&b'+') {
+        return false;
+    }
+    let (_, _, p3) = take_line(buf, p2, n);
+    let (_, qual_len, _) = take_line(buf, p3, n);
+    seq_len == qual_len
+}
+
+/// Find the first record boundary at or after `from` (a line-starting `@` that
+/// passes [`is_record_start`]). Used only to split the buffer into parse chunks,
+/// so a conservatively-late boundary is harmless.
+fn find_record_start(buf: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    loop {
+        let k = memchr::memchr(b'\n', &buf[i..])?;
+        let ls = i + k + 1;
+        if ls >= buf.len() {
+            return None;
+        }
+        if buf[ls] == b'@' && is_record_start(buf, ls) {
+            return Some(ls);
+        }
+        i = ls;
+    }
+}
+
+/// Parse the records wholly contained in `buf[start..end)`. `start` and `end`
+/// are record boundaries, so every record's four lines lie inside the range
+/// (only the final record of the whole input may lack a trailing `\n`).
+fn parse_chunk(buf: &[u8], start: usize, end: usize) -> Result<ChunkParse> {
+    let mut hdr = Vec::new();
+    let mut recs = Vec::new();
+    let mut pos = start;
+    while pos < end {
+        if buf[pos] != b'@' {
+            return Err(Error::Malformed("expected FASTQ record start ('@')"));
+        }
+        let (def_off, def_len, p1) = take_line(buf, pos, end);
+        // Header text is everything after the '@', name/description-normalized.
+        normalize_header(&mut hdr, &buf[def_off + 1..def_off + def_len]);
+        let hdr_end = hdr.len() as u32;
+
+        let (seq_off, seq_len, p2) = take_line(buf, p1, end);
+        if buf.get(p2) != Some(&b'+') {
+            return Err(Error::Malformed("expected FASTQ '+' separator line"));
+        }
+        let (_, _, p3) = take_line(buf, p2, end);
+        let (qual_off, qual_len, p4) = take_line(buf, p3, end);
+
+        recs.push(RecMeta {
+            hdr_end,
+            seq_off,
+            seq_len: seq_len as u32,
+            qual_off,
+            qual_len: qual_len as u32,
+        });
+        pos = p4;
+    }
+    Ok(ChunkParse { hdr, recs })
+}
+
+/// Assemble one output block from the globally-ordered record range `[gs, ge)`,
+/// copying each record's header (from its chunk's arena) and sequence/quality
+/// (from `buf`) into a fresh [`RawBlock`]. `gstart[c]` is the global index of
+/// chunk `c`'s first record.
+fn build_block(
+    buf: &[u8],
+    chunks: &[ChunkParse],
+    gstart: &[usize],
+    gs: usize,
+    ge: usize,
+) -> RawBlock {
+    let mut blk = RawBlock::default();
+    let mut gi = gs;
+    // Chunk holding the first record: the last c with gstart[c] <= gi.
+    let mut c = gstart.partition_point(|&x| x <= gi) - 1;
+    while gi < ge {
+        let chunk = &chunks[c];
+        let base = gstart[c];
+        let local_start = gi - base;
+        let take = (ge.min(gstart[c + 1]) - gi) + local_start;
+        for local in local_start..take {
+            let rec = chunk.recs[local];
+            let hdr_start = if local == 0 {
+                0
+            } else {
+                chunk.recs[local - 1].hdr_end as usize
+            };
+            let header = &chunk.hdr[hdr_start..rec.hdr_end as usize];
+            let seq = &buf[rec.seq_off..rec.seq_off + rec.seq_len as usize];
+            let qual = &buf[rec.qual_off..rec.qual_off + rec.qual_len as usize];
+            blk.push_raw(header, seq, qual);
+        }
+        gi = ge.min(gstart[c + 1]);
+        c += 1;
+    }
+    blk
+}
+
+/// Parse the whole input buffer into ordered [`RawBlock`]s of up to `block_reads`
+/// records each (a multiple of `g`).
+///
+/// The buffer is split into byte-chunks at record boundaries and parsed in
+/// parallel, then re-sliced into blocks purely by global record index — so block
+/// contents (and thus the archive) are byte-identical regardless of how many
+/// chunks/threads did the parsing. Determinism holds by construction.
+fn parse_blocks(
+    buf: &[u8],
+    g: usize,
+    block_reads: usize,
+    pool: &rayon::ThreadPool,
+) -> Result<Vec<RawBlock>> {
+    if buf.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Split into ~8 chunks per worker (for load balance), but never finer than
+    // ~1 MiB, and resolve each nominal split to a real record boundary.
+    let nthreads = pool.current_num_threads().max(1);
+    let min_chunk = 1usize << 20;
+    let target = nthreads.saturating_mul(8).max(1);
+    let n_chunks = (buf.len() / min_chunk).clamp(1, target);
+    let mut bounds = Vec::with_capacity(n_chunks + 1);
+    bounds.push(0usize);
+    for i in 1..n_chunks {
+        let nominal = i * buf.len() / n_chunks;
+        if let Some(s) = find_record_start(buf, nominal) {
+            if *bounds.last().unwrap() < s {
+                bounds.push(s);
+            }
+        }
+    }
+    bounds.push(buf.len());
+
+    let chunks: Vec<ChunkParse> = pool.install(|| {
+        (0..bounds.len() - 1)
+            .into_par_iter()
+            .map(|i| parse_chunk(buf, bounds[i], bounds[i + 1]))
+            .collect::<Result<Vec<_>>>()
+    })?;
+
+    // Global record index of each chunk's first record.
+    let mut gstart = Vec::with_capacity(chunks.len() + 1);
+    let mut acc = 0usize;
+    for ch in &chunks {
+        gstart.push(acc);
+        acc += ch.recs.len();
+    }
+    gstart.push(acc);
+    let n = acc;
+    if g > 1 && !n.is_multiple_of(g) {
+        return Err(Error::Malformed(
+            "interleaved stream ended mid-spot (record count not a multiple of group size)",
+        ));
+    }
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let num_blocks = n.div_ceil(block_reads);
+    let blocks: Vec<RawBlock> = pool.install(|| {
+        (0..num_blocks)
+            .into_par_iter()
+            .map(|b| {
+                let gs = b * block_reads;
+                let ge = ((b + 1) * block_reads).min(n);
+                build_block(buf, &chunks, &gstart, gs, ge)
+            })
+            .collect()
+    });
+    Ok(blocks)
+}
+
+/// Write the container header.
+fn write_header<W: Write>(w: &mut W, params: &Params, group_size: u8) -> Result<()> {
+    let mut flags = FLAG_PLUS_NORMALIZED;
+    if params.reorder {
+        flags |= FLAG_REORDERED;
+        if params.keep_order {
+            flags |= FLAG_KEEP_ORDER;
+        }
+    }
+    w.write_all(&MAGIC)?;
+    w.write_all(&FORMAT_VERSION.to_le_bytes())?;
+    w.write_all(&[
+        params.seq_order,
+        binning_tag(params.quality_binning),
+        flags,
+        group_size,
+    ])?;
+    Ok(())
+}
+
+/// Compress an in-memory FASTQ buffer: parse it in parallel into blocks, then
+/// compress the blocks (in parallel) and write them in order. `group_size` is
+/// the interleaving already determined by the caller.
+fn compress_buffered<W: Write>(
+    buf: &[u8],
+    writer: W,
+    params: Params,
+    group_size: u8,
+) -> Result<Stats> {
+    let g = group_size.max(1) as usize;
+    // Keep whole spots together: round the block target down to a multiple of g.
+    let block_reads = (params.block_reads.max(1) / g).max(1) * g;
+    let pool = build_pool(params.threads)?;
+    debug!(
+        threads = pool.current_num_threads(),
+        block_reads,
+        group_size,
+        backend = ?fqxv_rans::Backend::detect(),
+        "compress pool ready"
+    );
+    let blocks = parse_blocks(buf, g, block_reads, &pool)?;
+
+    let mut w = BufWriter::new(writer);
+    write_header(&mut w, &params, group_size)?;
+    let mut stats = Stats {
+        group_size,
+        ..Stats::default()
+    };
+    // Compress in batches so at most `batch` compressed payloads are buffered
+    // before being written in block order.
+    let batch = pool.current_num_threads().max(1);
+    for chunk in blocks.chunks(batch) {
+        let compressed: Vec<Result<Vec<u8>>> = pool.install(|| {
+            chunk
+                .par_iter()
+                .map(|b| compress_block(b, &params))
+                .collect()
+        });
+        write_blocks(&mut w, chunk, compressed, &mut stats)?;
+    }
+    w.flush()?;
+    stats.out_bytes += HEADER_LEN as u64;
+    Ok(stats)
+}
+
 /// Shared block driver: `fill` populates one [`RawBlock`] and returns the number
 /// of reads it added (0 at EOF). Blocks are compressed in parallel, written in
 /// order.
@@ -432,22 +701,7 @@ where
         "compress pool ready"
     );
     let mut w = BufWriter::new(writer);
-
-    let mut flags = FLAG_PLUS_NORMALIZED;
-    if params.reorder {
-        flags |= FLAG_REORDERED;
-        if params.keep_order {
-            flags |= FLAG_KEEP_ORDER;
-        }
-    }
-    w.write_all(&MAGIC)?;
-    w.write_all(&FORMAT_VERSION.to_le_bytes())?;
-    w.write_all(&[
-        params.seq_order,
-        binning_tag(params.quality_binning),
-        flags,
-        group_size,
-    ])?;
+    write_header(&mut w, &params, group_size)?;
 
     let mut stats = Stats {
         group_size,
