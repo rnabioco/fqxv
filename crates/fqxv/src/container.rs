@@ -121,6 +121,12 @@ const DIGEST_LEN: usize = 8;
 /// length field can't drive a multi-exabyte allocation before the CRC is even
 /// checked; anything larger is rejected as malformed.
 const MAX_BLOCK_PAYLOAD: u64 = (MAX_BLOCK_SEQ_BYTES as u64) * 8;
+/// Mean read length (bp) above which globally-clustered reorder is skipped. On
+/// long-read data (nanopore/PacBio, ~10-14 kb reads) reorder yields no ratio
+/// gain — the non-reorder deep-context path is actually *smaller* — for roughly
+/// 10x the compress time and 6x the peak memory. Illumina reads are <= ~300 bp,
+/// so this threshold cleanly separates the two regimes. See [`is_long_read`].
+const REORDER_MAX_MEAN_LEN: u64 = 500;
 /// Magic at the very end of a v1 archive, just after the `[8] footer_offset`
 /// back-pointer, so a reader can confirm it found a real footer.
 const FOOTER_MAGIC: [u8; 4] = *b"FQXF";
@@ -1444,6 +1450,45 @@ fn buffer_records(buf: &[u8]) -> Result<RawBlock> {
     Ok(all)
 }
 
+/// Mean of a read-length sample (the first `sample` reads is plenty to tell
+/// ~14 kb long reads from ~150 bp short reads). Zero for an empty block.
+fn mean_read_len(lens: &[u32]) -> u64 {
+    if lens.is_empty() {
+        return 0;
+    }
+    let sample = lens.len().min(256);
+    let sum: u64 = lens[..sample].iter().map(|&l| u64::from(l)).sum();
+    sum / sample as u64
+}
+
+/// True when the data is long-read (mean length over [`REORDER_MAX_MEAN_LEN`]),
+/// for which the globally-clustered reorder layout is skipped in favour of the
+/// non-reorder deep-context path.
+fn is_long_read(lens: &[u32]) -> bool {
+    mean_read_len(lens) > REORDER_MAX_MEAN_LEN
+}
+
+/// Serialize a buffered block back to interleaved FASTQ, so a reorder-path block
+/// can be handed to the non-reorder encoder ([`compress_buffered`]) unchanged.
+/// Record order (hence any mate interleaving) is preserved.
+fn serialize_block(all: &RawBlock) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(
+        all.seq.len() + all.qual.len() + all.header_buf.len() + all.n_reads() * 4,
+    );
+    let mut off = 0usize;
+    for i in 0..all.n_reads() {
+        let l = all.lens[i] as usize;
+        write_record(
+            &mut buf,
+            all.header(i),
+            &all.seq[off..off + l],
+            &all.qual[off..off + l],
+        );
+        off += l;
+    }
+    buf
+}
+
 /// Buffer a single reader and hand off to [`encode_reordered`] (single-end when
 /// `group_size == 1`, or an already-interleaved stream for `group_size > 1`).
 fn compress_reordered_whole<R: Read + Send, W: Write>(
@@ -1490,6 +1535,21 @@ fn encode_reordered<W: Write>(
     params: Params,
     group_size: u8,
 ) -> Result<Stats> {
+    // Long-read data: reorder buys nothing (the non-reorder deep-context path is
+    // smaller on nanopore/PacBio) for ~10x the time and ~6x the memory. Fall back
+    // to the non-reorder layout, keeping the requested effort level — its hashed
+    // high-order sequence context is exactly what wins on long reads. This makes
+    // reorder adaptive: `--order any` / `--max` still do the right thing on a
+    // long-read input instead of paying a large cost for no benefit.
+    if is_long_read(&all.lens) {
+        info!(
+            mean_len = mean_read_len(&all.lens),
+            "long-read data: skipping reorder (no ratio benefit, high cost) — using non-reorder layout"
+        );
+        let mut p = params;
+        p.reorder = false;
+        return compress_buffered(&serialize_block(&all), writer, p, group_size);
+    }
     let g = group_size.max(1);
     let pool = build_pool(params.threads)?;
     let n = all.n_reads();
@@ -3765,6 +3825,33 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
         let mut out = Vec::new();
         decompress(&archive[..], &mut out, 1).unwrap();
         assert_eq!(out, input, "reorder --keep-order must be byte-exact");
+    }
+
+    #[test]
+    fn long_reads_skip_reorder() {
+        // Requesting reorder on long-read data must auto-fall-back to the
+        // non-reorder layout (smaller and far cheaper there): the global-reorder
+        // flag stays clear, and the archive still round-trips byte-exact.
+        let seq: Vec<u8> = (0..800u32).map(|i| b"ACGT"[(i * 7 % 4) as usize]).collect();
+        let qual = vec![b'I'; seq.len()];
+        let mut input = Vec::new();
+        for i in 0..30u32 {
+            write_record(&mut input, format!("read.{i}").as_bytes(), &seq, &qual);
+        }
+        let params = Params {
+            reorder: true,
+            ..Params::default()
+        };
+        let mut archive = Vec::new();
+        compress(&input[..], &mut archive, params).unwrap();
+        assert_eq!(
+            archive[8] & FLAG_GLOBAL_REORDER,
+            0,
+            "reorder must be skipped (flag clear) for long-read data"
+        );
+        let mut out = Vec::new();
+        decompress(&archive[..], &mut out, 1).unwrap();
+        assert_eq!(out, input, "long-read fallback must be byte-exact");
     }
 
     #[test]

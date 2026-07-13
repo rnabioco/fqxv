@@ -13,7 +13,7 @@ use serde::Serialize;
 use tabled::builder::Builder as TableBuilder;
 use tabled::settings::object::Columns;
 use tabled::settings::{Alignment, Modify, Style};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 /// Terminal color scheme for `--help` (shared with the rnabioco tooling look):
@@ -123,10 +123,13 @@ enum Command {
         /// stdin (`-`).
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Maximum-compression preset — shorthand for `-l 9 --order any` (deepest
-        /// sequence context plus read reordering). Overrides `--level` and
-        /// `--order`. Single-end reads may come back reordered; names, sequence,
-        /// and quality are preserved exactly (still lossless).
+        /// Maximum-compression preset: the deepest sequence context plus read
+        /// reordering *where it helps*. Overrides `--level`/`--order`. Reordering
+        /// is applied to short-read data and automatically skipped for long reads
+        /// (nanopore/PacBio), where it costs ~10x the time and memory for no ratio
+        /// gain — so `--max` adapts to the input rather than forcing one fixed
+        /// setting. Single-end short reads may come back reordered; names,
+        /// sequence, and quality are preserved exactly (still lossless).
         #[arg(long)]
         max: bool,
         /// Compression effort level (1-9); higher raises the sequence order.
@@ -386,8 +389,12 @@ fn main() -> anyhow::Result<()> {
                 Some(p) => p,
                 None => default_archive_name(&inputs[0])?,
             };
-            // `--max` is a convenience preset for the best ratio, so users don't
-            // have to know the knobs; it overrides `--level`/`--order`.
+            // `--max` is the best-ratio preset so users don't have to know the
+            // knobs: top effort level plus a request to reorder. The library then
+            // decides *dynamically* whether reordering actually pays off for the
+            // input — it is applied to short reads and skipped for long reads —
+            // so `--max` tracks "the best available for this data" rather than a
+            // fixed pair of flags. Overrides `--level`/`--order`.
             let level = if max { 9 } else { level };
             let order = if max { ReadOrder::Any } else { order };
             let interleaved = interleaved.filter(|_| inputs.len() == 1);
@@ -409,6 +416,9 @@ fn main() -> anyhow::Result<()> {
                 threads: cli.threads,
                 platform: platform.map(Into::into),
             };
+            // Surface the lossy-binning footgun before doing the work: binning
+            // an already-binned quality stream only adds distortion.
+            warn_redundant_binning(&inputs, params.quality_binning);
             let in_size: u64 = inputs
                 .iter()
                 .filter_map(|p| std::fs::metadata(p).ok())
@@ -898,6 +908,69 @@ fn is_bgzf(hdr: &[u8]) -> bool {
 /// gzip is a single DEFLATE stream and stays serial. The decoded byte stream —
 /// and therefore the archive — is identical regardless of how the input was
 /// compressed or how many decode workers run.
+/// Warn when the requested lossy quality binning can't actually shrink the
+/// input, so it would only add distortion. Binning to N levels is pointless when
+/// the quality stream already has no more than N distinct levels — it can't
+/// reduce cardinality, and if its representatives don't line up with the native
+/// ones it re-quantizes nearly every base off-grid for no size gain (the classic
+/// case: `--quality-bin bin4` on already-4-level NovaSeq quality). Peeks the
+/// first input's quality; silent on stdin (can't rewind) or when inconclusive.
+fn warn_redundant_binning(inputs: &[PathBuf], binning: fqxv::QualityBinning) {
+    let (name, target_levels) = match binning {
+        fqxv::QualityBinning::Lossless => return,
+        fqxv::QualityBinning::Bin8 => ("bin8", 8usize),
+        fqxv::QualityBinning::Bin4 => ("bin4", 4),
+        fqxv::QualityBinning::Bin2 => ("bin2", 2),
+    };
+    let Some(path) = inputs.first() else { return };
+    if path.as_os_str() == "-" {
+        return; // stdin: peeking would consume the stream the compressor needs.
+    }
+    let Ok(mut rdr) = open_input(path) else {
+        return;
+    };
+    let mut buf = vec![0u8; 1 << 20];
+    let mut filled = 0;
+    while filled < buf.len() {
+        match rdr.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(_) => return,
+        }
+    }
+    buf.truncate(filled);
+    // Quality is line 4 of each 4-line FASTQ record; a trailing partial line is
+    // ignored. (fqxv targets single-line-per-field FASTQ.)
+    let mut seen = [false; 256];
+    let (mut distinct, mut sampled, mut changed) = (0usize, 0u64, 0u64);
+    for (i, line) in buf.split(|&b| b == b'\n').enumerate() {
+        if i % 4 != 3 || line.is_empty() {
+            continue;
+        }
+        for &q in line {
+            if !std::mem::replace(&mut seen[q as usize], true) {
+                distinct += 1;
+            }
+            sampled += 1;
+            changed += u64::from(binning.apply(q) != q);
+        }
+    }
+    if sampled == 0 || distinct > target_levels {
+        return;
+    }
+    let pct = 100.0 * changed as f64 / sampled as f64;
+    let hint = if target_levels > 2 {
+        " Use lossless, or a coarser bin (e.g. bin2) if you want a real size reduction."
+    } else {
+        " Use lossless instead."
+    };
+    warn!(
+        "input quality already has {distinct} distinct level(s); --quality-bin {name} \
+         targets {target_levels} and re-quantizes {pct:.0}% of sampled bases — this adds \
+         distortion for little or no size gain.{hint}"
+    );
+}
+
 fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
     let mut src: Box<dyn Read + Send> = if path.as_os_str() == "-" {
         Box::new(io::stdin())
