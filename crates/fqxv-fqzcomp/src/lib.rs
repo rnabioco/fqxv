@@ -154,7 +154,16 @@ const MAX_SYMBOLS_PER_BYTE: usize = 1 << 16;
 const N_CTX: usize = 1 << 18;
 /// Saturating cap on the running delta counter (2 bits).
 const DELTA_MAX: u8 = 3;
-const FORMAT_VERSION: u8 = 0;
+const FORMAT_VERSION: u8 = 1;
+/// Context bits (table size 2^18, unchanged).
+const CTX_BITS: usize = 18;
+/// Alphabets with at most this many distinct values use the dense adaptive
+/// context; larger alphabets keep the legacy [`context`]. Targets binned data
+/// (Illumina RTA 4-/8-level), where packing several full-resolution previous
+/// qualities densely plus wide position beats the legacy sparse layout.
+const NSYM_DENSE_MAX: usize = 16;
+/// Previous qualities the dense context packs.
+const DENSE_K: usize = 3;
 
 /// Position bucket: fine near the read start, then 32-wide buckets so the
 /// low-quality tail of long reads keeps positional resolution. The old `pos>>3`
@@ -179,6 +188,90 @@ fn context(q1: u8, q2: u8, q3: u8, delta: u8, pos: usize) -> usize {
         | (pos_bucket(pos) << 14) // bits 14..17
 }
 
+/// Bits needed to hold a dense symbol in `0..nsym` (at least 1).
+#[inline]
+fn sym_bits(nsym: usize) -> usize {
+    if nsym <= 1 {
+        1
+    } else {
+        (usize::BITS - (nsym - 1).leading_zeros()) as usize
+    }
+}
+
+/// Adaptive bit layout for the dense context: pack up to [`DENSE_K`] previous
+/// qualities at `ceil(log2(nsym))` bits each, then split the remaining bits
+/// between position (saturating) and delta, within [`CTX_BITS`]. For a 4-level
+/// alphabet this yields q1q2q3 (2b each) + position (8b) + delta (4b) — the
+/// layout a context sweep found best on binned NovaSeq.
+struct DenseLayout {
+    qb: usize,
+    k: usize,
+    pos_bits: usize,
+    delta_max: usize,
+}
+
+fn dense_layout(nsym: usize) -> DenseLayout {
+    let qb = sym_bits(nsym);
+    let mut k = DENSE_K;
+    while k > 1 && k * qb > CTX_BITS - 4 {
+        k -= 1;
+    }
+    let rem = CTX_BITS - k * qb; // bits for position + delta
+    let delta_bits = if rem >= 6 {
+        4
+    } else if rem >= 3 {
+        2
+    } else {
+        0
+    };
+    DenseLayout {
+        qb,
+        k,
+        pos_bits: rem - delta_bits,
+        delta_max: (1usize << delta_bits) - 1,
+    }
+}
+
+impl DenseLayout {
+    /// Pack the previous `k` dense qualities, position, and delta into a context
+    /// index `< 2^CTX_BITS`.
+    #[inline]
+    fn ctx(&self, prev: &[u8; DENSE_K], delta: u8, pos: usize) -> usize {
+        let mut c = 0usize;
+        for j in 0..self.k {
+            c |= (prev[j] as usize) << (j * self.qb);
+        }
+        let pos_cap = (1usize << self.pos_bits) - 1;
+        c |= pos.min(pos_cap) << (self.k * self.qb);
+        c | ((delta as usize).min(self.delta_max) << (self.k * self.qb + self.pos_bits))
+    }
+}
+
+/// Distinct quality values (ascending) and a value→dense-index map. The dense
+/// index collapses a sparse alphabet (e.g. binned Phred values 35/44/58/70) to
+/// `0..nsym`, so each previous quality costs `ceil(log2(nsym))` context bits.
+fn dense_alphabet(quals: &[u8]) -> Result<([u8; 256], Vec<u8>)> {
+    let mut present = [false; 256];
+    for &b in quals {
+        present[b as usize] = true;
+    }
+    let mut qmap = [0u8; 256];
+    let mut values = Vec::new();
+    for (v, &p) in present.iter().enumerate() {
+        if p {
+            qmap[v] = values.len() as u8;
+            values.push(v as u8);
+        }
+    }
+    if values.is_empty() {
+        values.push(0); // empty input: one dummy symbol
+    }
+    if values.len() > QMAX {
+        return Err(Error::AlphabetTooLarge(values.len()));
+    }
+    Ok((qmap, values))
+}
+
 /// Encode per-read quality strings.
 ///
 /// `lens` gives each read's quality length; `quals` is their concatenation.
@@ -200,7 +293,8 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
     } else {
         Cow::Owned(quals.iter().map(|&b| binning.apply(b)).collect())
     };
-    let (qmin, qsize) = alphabet(&binned)?;
+    let (qmap, values) = dense_alphabet(&binned)?;
+    let nsym = values.len();
 
     let mut models = vec![SimpleModel::<QMAX>::new(); N_CTX];
     let mut enc = Encoder::new();
@@ -208,32 +302,56 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
     // access iterates a slice directly and carries no bounds check. `total`
     // (checked above) equals `binned.len()`, so every `split_at` is in range.
     let mut rest: &[u8] = &binned;
-    for &l in lens {
-        let (read, tail) = rest.split_at(l as usize);
-        rest = tail;
-        let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
-        let mut delta = 0u8;
-        for (pos, &b) in read.iter().enumerate() {
-            let sym = b - qmin;
-            let c = context(q1, q2, q3, delta, pos);
-            debug_assert!(c < N_CTX);
-            // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
-            unsafe { models.get_unchecked_mut(c) }.encode(&mut enc, sym as usize);
-            if pos > 0 && sym != q1 {
-                delta = (delta + 1).min(DELTA_MAX);
+    if nsym <= NSYM_DENSE_MAX {
+        // Dense adaptive context: q1..qk (dense) + wide position + delta.
+        let ly = dense_layout(nsym);
+        for &l in lens {
+            let (read, tail) = rest.split_at(l as usize);
+            rest = tail;
+            let mut prev = [0u8; DENSE_K];
+            let mut delta = 0u8;
+            for (pos, &b) in read.iter().enumerate() {
+                let d = qmap[b as usize];
+                let c = ly.ctx(&prev, delta, pos);
+                // SAFETY: `ctx` packs into CTX_BITS, so `c < N_CTX == models.len()`.
+                unsafe { models.get_unchecked_mut(c) }.encode(&mut enc, d as usize);
+                if pos > 0 && d != prev[0] {
+                    delta = delta.saturating_add(1);
+                }
+                prev[2] = prev[1];
+                prev[1] = prev[0];
+                prev[0] = d;
             }
-            q3 = q2;
-            q2 = q1;
-            q1 = sym;
+        }
+    } else {
+        // Legacy context for large alphabets (full-range quality).
+        let qmin = values[0];
+        for &l in lens {
+            let (read, tail) = rest.split_at(l as usize);
+            rest = tail;
+            let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
+            let mut delta = 0u8;
+            for (pos, &b) in read.iter().enumerate() {
+                let sym = b - qmin;
+                let c = context(q1, q2, q3, delta, pos);
+                // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
+                unsafe { models.get_unchecked_mut(c) }.encode(&mut enc, sym as usize);
+                if pos > 0 && sym != q1 {
+                    delta = (delta + 1).min(DELTA_MAX);
+                }
+                q3 = q2;
+                q2 = q1;
+                q1 = sym;
+            }
         }
     }
     let payload = enc.finish();
 
-    let mut out = Vec::with_capacity(16 + lens.len() + payload.len());
+    let mut out = Vec::with_capacity(16 + nsym + lens.len() + payload.len());
     out.push(FORMAT_VERSION);
     out.push(binning.tag());
-    out.push(qmin);
-    out.push(qsize as u8);
+    out.push(nsym as u8);
+    out.extend_from_slice(&values); // distinct values, ascending
     write_lens(&mut out, lens);
     out.extend_from_slice(&payload);
     Ok(out)
@@ -247,10 +365,13 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
         return Err(Error::Malformed("unsupported version"));
     }
     let _binning = QualityBinning::from_tag(r.u8()?)?;
-    let qmin = r.u8()?;
-    let qsize = r.u8()? as usize;
-    if qsize > QMAX {
-        return Err(Error::AlphabetTooLarge(qsize));
+    let nsym = r.u8()? as usize;
+    if nsym == 0 || nsym > QMAX {
+        return Err(Error::AlphabetTooLarge(nsym));
+    }
+    let mut values = [0u8; QMAX];
+    for v in values.iter_mut().take(nsym) {
+        *v = r.u8()?;
     }
     let lens = read_lens(&mut r)?;
 
@@ -279,45 +400,56 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     quals
         .try_reserve(total)
         .map_err(|_| Error::Malformed("declared total length too large to allocate"))?;
-    for &l in &lens {
-        let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
-        let mut delta = 0u8;
-        for pos in 0..l as usize {
-            let c = context(q1, q2, q3, delta, pos);
-            debug_assert!(c < N_CTX);
-            // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
-            let sym = unsafe { models.get_unchecked_mut(c) }.decode(&mut dec) as u8;
-            if sym as usize >= qsize {
-                return Err(Error::Malformed("decoded symbol outside alphabet"));
+    if nsym <= NSYM_DENSE_MAX {
+        // Dense adaptive context (mirror of the encoder).
+        let ly = dense_layout(nsym);
+        for &l in &lens {
+            let mut prev = [0u8; DENSE_K];
+            let mut delta = 0u8;
+            for pos in 0..l as usize {
+                let c = ly.ctx(&prev, delta, pos);
+                // SAFETY: `ctx` packs into CTX_BITS, so `c < N_CTX == models.len()`.
+                let d = unsafe { models.get_unchecked_mut(c) }.decode(&mut dec) as u8;
+                if d as usize >= nsym {
+                    return Err(Error::Malformed("decoded symbol outside alphabet"));
+                }
+                quals.push(values[d as usize]);
+                if pos > 0 && d != prev[0] {
+                    delta = delta.saturating_add(1);
+                }
+                prev[2] = prev[1];
+                prev[1] = prev[0];
+                prev[0] = d;
             }
-            quals.push(sym + qmin);
-            if pos > 0 && sym != q1 {
-                delta = (delta + 1).min(DELTA_MAX);
+        }
+    } else {
+        // Legacy context for large alphabets.
+        let qmin = values[0];
+        let qsize = (values[nsym - 1] - values[0]) as usize + 1;
+        if qsize > QMAX {
+            return Err(Error::AlphabetTooLarge(qsize));
+        }
+        for &l in &lens {
+            let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
+            let mut delta = 0u8;
+            for pos in 0..l as usize {
+                let c = context(q1, q2, q3, delta, pos);
+                // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
+                let sym = unsafe { models.get_unchecked_mut(c) }.decode(&mut dec) as u8;
+                if sym as usize >= qsize {
+                    return Err(Error::Malformed("decoded symbol outside alphabet"));
+                }
+                quals.push(sym + qmin);
+                if pos > 0 && sym != q1 {
+                    delta = (delta + 1).min(DELTA_MAX);
+                }
+                q3 = q2;
+                q2 = q1;
+                q1 = sym;
             }
-            q3 = q2;
-            q2 = q1;
-            q1 = sym;
         }
     }
     Ok((lens, quals))
-}
-
-/// Determine `(min_byte, alphabet_size)` over the quality bytes.
-fn alphabet(quals: &[u8]) -> Result<(u8, usize)> {
-    if quals.is_empty() {
-        return Ok((0, 1));
-    }
-    let mut lo = u8::MAX;
-    let mut hi = 0u8;
-    for &b in quals {
-        lo = lo.min(b);
-        hi = hi.max(b);
-    }
-    let size = (hi - lo) as usize + 1;
-    if size > QMAX {
-        return Err(Error::AlphabetTooLarge(size));
-    }
-    Ok((lo, size))
 }
 
 // --- length stream (LEB128 varints, with a fixed-length fast path) -----------
@@ -549,7 +681,7 @@ mod tests {
     // ~13-byte stream requested hundreds of petabytes via `Vec::with_capacity`.
     #[test]
     fn rejects_huge_length_count() {
-        let mut buf = vec![0u8, 0, 0, 1]; // version, binning, qmin, qsize
+        let mut buf = vec![1u8, 0, 1, 0]; // version, binning, nsym=1, value[0]
         push_varint(&mut buf, u64::MAX >> 8); // n: absurd length count
         buf.push(1); // fixed = true -> resize(n, f) path
         push_varint(&mut buf, 100); // f
@@ -558,7 +690,7 @@ mod tests {
 
     #[test]
     fn rejects_huge_total_length() {
-        let mut buf = vec![0u8, 0, 0, 1];
+        let mut buf = vec![1u8, 0, 1, 0]; // version, binning, nsym=1, value[0]
         push_varint(&mut buf, 1000); // n reads
         buf.push(1); // fixed = true
         push_varint(&mut buf, u32::MAX as u64); // each read u32::MAX long
