@@ -227,7 +227,7 @@ impl RawBlock {
 /// Compress single-end FASTQ from `reader` into a `.fqxv` stream.
 ///
 /// The whole input is read into memory and parsed in parallel (see
-/// [`parse_blocks`]) before the blocks are compressed — the serial FASTQ parse
+/// [`parse_chunks`]) before the blocks are compressed — the serial FASTQ parse
 /// was otherwise the dominant single-threaded cost and left most cores idle.
 /// Output is byte-identical regardless of thread count.
 #[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, reorder = params.reorder, threads = params.threads))]
@@ -589,21 +589,23 @@ fn build_block(
     blk
 }
 
-/// Parse the whole input buffer into ordered [`RawBlock`]s of up to `block_reads`
-/// records each (a multiple of `g`).
+/// Parse the whole input buffer into per-chunk record metadata plus the global
+/// record index of each chunk's first record (`gstart`) and the total record
+/// count `n`.
 ///
 /// The buffer is split into byte-chunks at record boundaries and parsed in
-/// parallel, then re-sliced into blocks purely by global record index — so block
-/// contents (and thus the archive) are byte-identical regardless of how many
-/// chunks/threads did the parsing. Determinism holds by construction.
-fn parse_blocks(
+/// parallel. Callers materialize [`RawBlock`]s lazily from this metadata (via
+/// [`build_block`]) so only the blocks being compressed right now are resident,
+/// rather than a second full copy of the input. Block contents are re-sliced
+/// purely by global record index, so the archive is byte-identical regardless of
+/// how many chunks/threads did the parsing — determinism holds by construction.
+fn parse_chunks(
     buf: &[u8],
     g: usize,
-    block_reads: usize,
     pool: &rayon::ThreadPool,
-) -> Result<Vec<RawBlock>> {
+) -> Result<(Vec<ChunkParse>, Vec<usize>, usize)> {
     if buf.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), vec![0], 0));
     }
 
     // Split into ~8 chunks per worker (for load balance), but never finer than
@@ -645,18 +647,7 @@ fn parse_blocks(
             "interleaved stream ended mid-spot (record count not a multiple of group size)",
         ));
     }
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-
-    let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
-    let blocks: Vec<RawBlock> = pool.install(|| {
-        ranges
-            .par_iter()
-            .map(|&(gs, ge)| build_block(buf, &chunks, &gstart, gs, ge))
-            .collect()
-    });
-    Ok(blocks)
+    Ok((chunks, gstart, n))
 }
 
 /// Split the parsed reads into row-group ranges `[gs, ge)`, cutting at whichever
@@ -732,7 +723,7 @@ fn compress_buffered<W: Write>(
         backend = ?fqxv_rans::Backend::detect(),
         "compress pool ready"
     );
-    let blocks = parse_blocks(buf, g, block_reads, &pool)?;
+    let (chunks, gstart, _n) = parse_chunks(buf, g, &pool)?;
 
     let mut w = BufWriter::new(writer);
     write_header(&mut w, &params, group_size)?;
@@ -740,18 +731,32 @@ fn compress_buffered<W: Write>(
         group_size,
         ..Stats::default()
     };
-    // Compress in batches so at most `batch` compressed payloads are buffered
-    // before being written in block order.
+    // Materialize and compress blocks one batch at a time so at most `batch`
+    // `RawBlock`s (and their compressed payloads) are ever resident — building
+    // every block up front would hold a second full copy of the input alongside
+    // `buf`. Each block is a pure function of its global index range, so lazy
+    // per-batch building is byte-identical to building them all at once.
+    // Byte-budgeted row-group ranges (min of block_reads and a raw-sequence byte
+    // cap, on whole-spot boundaries) — a pure function of the read lengths, so
+    // determinism holds regardless of thread count.
+    let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
+    let num_blocks = ranges.len();
     let batch = pool.current_num_threads().max(1);
     let mut index = FooterIndex::new();
-    for chunk in blocks.chunks(batch) {
-        let compressed: Vec<Result<Vec<u8>>> = pool.install(|| {
-            chunk
-                .par_iter()
-                .map(|b| compress_block(b, &params))
-                .collect()
+    for batch_start in (0..num_blocks).step_by(batch) {
+        let batch_end = (batch_start + batch).min(num_blocks);
+        let (blocks, compressed): (Vec<RawBlock>, Vec<Result<Vec<u8>>>) = pool.install(|| {
+            (batch_start..batch_end)
+                .into_par_iter()
+                .map(|bi| {
+                    let (gs, ge) = ranges[bi];
+                    let blk = build_block(buf, &chunks, &gstart, gs, ge);
+                    let payload = compress_block(&blk, &params);
+                    (blk, payload)
+                })
+                .unzip()
         });
-        write_blocks(&mut w, chunk, compressed, &mut stats, &mut index)?;
+        write_blocks(&mut w, &blocks, compressed, &mut stats, &mut index)?;
     }
     let footer_bytes = write_footer(&mut w, &index, stats.reads)?;
     w.flush()?;

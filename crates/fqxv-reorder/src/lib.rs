@@ -28,6 +28,8 @@
 //! assert_ne!(p.flip[0], p.flip[1]);
 //! ```
 
+use std::borrow::Cow;
+
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -169,13 +171,20 @@ pub fn plan(lens: &[u32], seq: &[u8], k: usize) -> Plan {
     offs.push(acc);
 
     // (canonical minimizer, oriented sequence, original index, flip, anchor).
-    // Building each key is independent, so it runs across cores.
-    let mut keys: Vec<(u64, Vec<u8>, u32, bool, u32)> = (0..n)
+    // Building each key is independent, so it runs across cores. The oriented
+    // sequence is only a sort tiebreak, so borrow the input for the common
+    // non-flipped case and allocate (via `revcomp`) only when a read flips.
+    type Key<'a> = (u64, Cow<'a, [u8]>, u32, bool, u32);
+    let mut keys: Vec<Key<'_>> = (0..n)
         .into_par_iter()
         .map(|i| {
             let read = &seq[offs[i]..offs[i + 1]];
             let (canon, flip, anchor) = min_canonical(read, k);
-            let oriented = if flip { revcomp(read) } else { read.to_vec() };
+            let oriented: Cow<'_, [u8]> = if flip {
+                Cow::Owned(revcomp(read))
+            } else {
+                Cow::Borrowed(read)
+            };
             (canon, oriented, i as u32, flip, anchor)
         })
         .collect();

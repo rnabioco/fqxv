@@ -22,7 +22,7 @@
 use crate::model::{EncSym, Model, N_STATES, RANS_L, SCALE_BITS, TOTFREQ};
 use crate::{Error, Result};
 
-const ORDER0: u8 = 0;
+pub(crate) const ORDER0: u8 = 0;
 const ORDER1: u8 = 1;
 
 /// Encode `src` with an order-0 model using the scalar coder.
@@ -117,7 +117,7 @@ pub(crate) fn encode_order1(src: &[u8]) -> Vec<u8> {
 /// renormalization into `[x_max >> 16, x_max)` so the result lands back in
 /// `[RANS_L, RANS_L << 16)`. `x_max` can reach 2^32, hence the u64 compare.
 #[inline]
-fn encode_symbol(x: &mut u32, sym: &EncSym, renorm: &mut Vec<u16>) {
+pub(crate) fn encode_symbol(x: &mut u32, sym: &EncSym, renorm: &mut Vec<u16>) {
     let mut v = *x;
     while u64::from(v) >= sym.x_max {
         renorm.push((v & 0xffff) as u16);
@@ -127,7 +127,7 @@ fn encode_symbol(x: &mut u32, sym: &EncSym, renorm: &mut Vec<u16>) {
 }
 
 /// Write the final states and the (reversed) renorm words.
-fn finish(out: &mut Vec<u8>, states: &[u32; N_STATES], renorm: &mut [u16]) {
+pub(crate) fn finish(out: &mut Vec<u8>, states: &[u32; N_STATES], renorm: &mut [u16]) {
     for x in states {
         out.extend_from_slice(&x.to_le_bytes());
     }
@@ -163,9 +163,14 @@ fn decode_order0(r: &mut Reader<'_>, n: usize) -> Result<Vec<u8>> {
 
     let mut states = read_states(r)?;
     let mut out = vec![0u8; n];
+    // Bind `slot2sym` as a fixed-size array so LLVM proves the masked index is
+    // in range and drops the per-symbol bounds check on this hot decode loop.
+    let s2s: &[u8; TOTFREQ as usize] = (&model.slot2sym[..])
+        .try_into()
+        .expect("slot2sym has TOTFREQ entries");
     for (i, o) in out.iter_mut().enumerate() {
         let x = &mut states[i % N_STATES];
-        let s = model.slot2sym[(*x & (TOTFREQ - 1)) as usize];
+        let s = s2s[(*x & (TOTFREQ - 1)) as usize];
         *o = s;
         step_state(x, &model, s, r)?;
     }
@@ -191,13 +196,19 @@ fn decode_order1(r: &mut Reader<'_>, n: usize) -> Result<Vec<u8>> {
     let mut states = read_states(r)?;
     let mut out = vec![0u8; n];
     let mut prev = 0u8;
+    // `ctx` is a byte, so bind `models` as a fixed 256-entry array to drop the
+    // per-symbol bounds check on the context lookup.
+    let models: &[Option<Model>; 256] = (&models[..]).try_into().expect("models has 256 entries");
     for (i, o) in out.iter_mut().enumerate() {
         let ctx = if i == 0 { 0 } else { prev } as usize;
         let model = models[ctx]
             .as_ref()
             .ok_or(Error::Malformed("symbol references absent context"))?;
         let x = &mut states[i % N_STATES];
-        let s = model.slot2sym[(*x & (TOTFREQ - 1)) as usize];
+        let slot = (*x & (TOTFREQ - 1)) as usize;
+        // SAFETY: the mask restricts `slot` to `0..TOTFREQ`, which is exactly
+        // `slot2sym.len()`, so this access is always in bounds.
+        let s = *unsafe { model.slot2sym.get_unchecked(slot) };
         *o = s;
         step_state(x, model, s, r)?;
         prev = s;
