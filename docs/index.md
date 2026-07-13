@@ -32,7 +32,7 @@ fqxv compress R1.fq.gz R2.fq.gz -o sample.fqxv
 fqxv decompress sample.fqxv --split out           # out_1.fastq, out_2.fastq
 fqxv decompress sample.fqxv | bwa mem -p ref.fa -  # interleaved to stdout
 
-fqxv info sample.fqxv                             # layout, reads, per-stream sizes
+fqxv info sample.fqxv                             # layout, reads, per-stream sizes (--tsv/--json)
 ```
 
 ## How it works

@@ -6,7 +6,9 @@
 //! [2] format version (LE)
 //! [1] sequence context order (k)
 //! [1] quality binning tag
-//! [1] flags (bit0: '+' normalized; bit1: reordered; bit2: order preserved)
+//! [1] flags (bit0: '+' normalized; bit1: reordered; bit2: order preserved;
+//!            bit3: global-cluster reorder; bit4: names regenerated;
+//!            bits5-7: platform tag)
 //! [1] group size G (reads interleaved per spot: 1 single-end, 2 paired,
 //!                   3-4 single-cell R1/R2/I1[/I2], ...)
 //! repeated until the terminator:
@@ -113,6 +115,269 @@ const REORDER_K: usize = 15;
 /// per-block model reset (cheap, since clustered duplicates collapse to MATCH).
 const REORDER_BLOCK_READS: usize = 1 << 18;
 
+/// One interleaved spot's records — `(name, description, sequence, quality)` per
+/// member — owned so the platform can be detected before the streaming header is
+/// written (see `compress_multi`).
+type PrimedSpot = Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>;
+
+/// The platform tag lives in flag bits 5-7 (values 0-7), so it is archive-level
+/// metadata carried in the existing header byte — no extra bytes, no per-read
+/// cost — and is read straight off `flags` by [`peek`]/[`inspect`]. Bit 4 is
+/// [`FLAG_REGEN_NAMES`].
+const PLATFORM_SHIFT: u8 = 5;
+const PLATFORM_MASK: u8 = 0b1110_0000;
+/// Leading reads sampled to guess the platform (see [`detect_platform`]).
+const PLATFORM_PEEK: usize = 16;
+
+/// Sequencing platform recorded in the archive metadata. Detected from read-name
+/// grammar at compress time (see [`detect_platform`]) and overridable via
+/// [`Params::platform`]; stored once in the container header, since it is a
+/// per-archive fact, not a per-read one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    /// Not recorded, or the read names matched no known convention.
+    #[default]
+    Unknown,
+    /// Illumina — `instrument:run:flowcell:lane:tile:x:y` colon-delimited names.
+    Illumina,
+    /// Oxford Nanopore — UUID read names, `runid=`/`ch=` description tags.
+    Nanopore,
+    /// PacBio — `movie/zmw[/ccs]` read names.
+    PacBio,
+    /// MGI / BGI — `V`/`E`/`DP`-prefixed `…L<lane>C…R…` read names.
+    MgiBgi,
+}
+
+impl Platform {
+    /// Numeric tag stored in the header flag bits.
+    fn to_code(self) -> u8 {
+        match self {
+            Platform::Unknown => 0,
+            Platform::Illumina => 1,
+            Platform::Nanopore => 2,
+            Platform::PacBio => 3,
+            Platform::MgiBgi => 4,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => Platform::Illumina,
+            2 => Platform::Nanopore,
+            3 => Platform::PacBio,
+            4 => Platform::MgiBgi,
+            _ => Platform::Unknown,
+        }
+    }
+
+    /// Decode the platform from a header `flags` byte.
+    fn from_flags(flags: u8) -> Self {
+        Self::from_code((flags & PLATFORM_MASK) >> PLATFORM_SHIFT)
+    }
+
+    /// The platform's contribution to the header `flags` byte.
+    fn flag_bits(self) -> u8 {
+        self.to_code() << PLATFORM_SHIFT
+    }
+
+    /// Human-facing label for the `info` report.
+    pub fn label(self) -> &'static str {
+        match self {
+            Platform::Unknown => "unknown",
+            Platform::Illumina => "Illumina",
+            Platform::Nanopore => "Oxford Nanopore",
+            Platform::PacBio => "PacBio",
+            Platform::MgiBgi => "MGI/BGI",
+        }
+    }
+
+    /// Stable lowercase token for TSV/JSON output and the `--platform` flag.
+    pub fn token(self) -> &'static str {
+        match self {
+            Platform::Unknown => "unknown",
+            Platform::Illumina => "illumina",
+            Platform::Nanopore => "nanopore",
+            Platform::PacBio => "pacbio",
+            Platform::MgiBgi => "mgi",
+        }
+    }
+}
+
+/// Guess the sequencing platform from a sample of read headers (each the name
+/// plus any description, as stored in a [`RawBlock`]). Read-name grammar is a
+/// dead giveaway per platform; a per-header vote is taken and the most common
+/// non-`Unknown` verdict wins. Returns [`Platform::Unknown`] when nothing
+/// matches, so a wrong platform is never recorded.
+fn detect_platform(headers: &[&[u8]]) -> Platform {
+    let mut votes = [0u32; 5];
+    for &h in headers {
+        votes[classify_header(h).to_code() as usize] += 1;
+    }
+    // Most-voted platform among the real ones; ties resolve to the lower code.
+    let mut best = Platform::Unknown;
+    let mut best_votes = 0;
+    for code in 1..5u8 {
+        if votes[code as usize] > best_votes {
+            best_votes = votes[code as usize];
+            best = Platform::from_code(code);
+        }
+    }
+    best
+}
+
+/// Classify one read header by its name grammar. The header is the first
+/// whitespace-delimited token (the name) plus an optional description tail; both
+/// carry platform signal (Illumina packs everything in the name; Nanopore's
+/// `runid=`/`ch=` tags live in the description).
+fn classify_header(header: &[u8]) -> Platform {
+    let (name, desc) = match header.iter().position(|&b| b == b' ') {
+        Some(i) => (&header[..i], &header[i + 1..]),
+        None => (header, &[][..]),
+    };
+    if is_uuid(name)
+        || [b"runid=".as_slice(), b"read=", b"ch=", b"start_time="]
+            .iter()
+            .any(|&needle| contains_sub(desc, needle))
+    {
+        return Platform::Nanopore;
+    }
+    if is_pacbio_name(name) {
+        return Platform::PacBio;
+    }
+    if is_mgi_name(name) {
+        return Platform::MgiBgi;
+    }
+    if is_illumina_name(name) {
+        return Platform::Illumina;
+    }
+    Platform::Unknown
+}
+
+/// Strip a trailing `/1` or `/2` mate marker from a read name.
+fn strip_mate(name: &[u8]) -> &[u8] {
+    match name {
+        [base @ .., b'/', b'1' | b'2'] => base,
+        _ => name,
+    }
+}
+
+/// True if `needle` occurs in `hay` (small-slice substring search).
+fn contains_sub(hay: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// True if `s` is a canonical 8-4-4-4-12 hex UUID (a Nanopore read id).
+fn is_uuid(s: &[u8]) -> bool {
+    if s.len() != 36 {
+        return false;
+    }
+    s.iter().enumerate().all(|(i, &b)| {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            b == b'-'
+        } else {
+            b.is_ascii_hexdigit()
+        }
+    })
+}
+
+/// True for PacBio `movie/zmw[/…]` names: a movie id (`m…` with digits), a numeric
+/// ZMW hole number, and at least one more `/`-part (subread coords or `ccs`).
+fn is_pacbio_name(name: &[u8]) -> bool {
+    let mut parts = name.split(|&b| b == b'/');
+    let movie = parts.next().unwrap_or_default();
+    let zmw = match parts.next() {
+        Some(z) => z,
+        None => return false,
+    };
+    if parts.next().is_none() {
+        return false;
+    }
+    let movie_ok = movie.first() == Some(&b'm') && movie.iter().any(u8::is_ascii_digit);
+    let zmw_ok = !zmw.is_empty() && zmw.iter().all(u8::is_ascii_digit);
+    movie_ok && zmw_ok
+}
+
+/// True for MGI/BGI names: a 1-3 letter prefix (`V`, `E`, `CL`, `DP`), a digit
+/// flowcell id, then the `L<lane>…C…R…` tile layout.
+fn is_mgi_name(name: &[u8]) -> bool {
+    let base = strip_mate(name);
+    let letters = base.iter().take_while(|b| b.is_ascii_uppercase()).count();
+    if !(1..=3).contains(&letters) {
+        return false;
+    }
+    let after_letters = &base[letters..];
+    let digits = after_letters
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digits == 0 {
+        return false;
+    }
+    let rest = &after_letters[digits..];
+    // `L<digit>` lane marker, with column/row markers following.
+    matches!(rest, [b'L', d, ..] if d.is_ascii_digit())
+        && rest.contains(&b'C')
+        && rest.contains(&b'R')
+}
+
+/// True for Illumina names: 5+ colon-delimited fields (7 in Casava 1.8+, 5 in
+/// older machines) ending in numeric x/y coordinates.
+fn is_illumina_name(name: &[u8]) -> bool {
+    let base = strip_mate(name);
+    // Older `…#index/mate` names carry an index after a `#`; drop it.
+    let base = match base.iter().position(|&b| b == b'#') {
+        Some(i) => &base[..i],
+        None => base,
+    };
+    let fields: Vec<&[u8]> = base.split(|&b| b == b':').collect();
+    if fields.len() < 5 {
+        return false;
+    }
+    let numeric = |f: &[u8]| !f.is_empty() && f.iter().all(u8::is_ascii_digit);
+    numeric(fields[fields.len() - 1]) && numeric(fields[fields.len() - 2])
+}
+
+/// Resolve the platform to record: the caller's override if set, else a guess
+/// from the leading read headers of an in-memory FASTQ buffer.
+fn resolve_platform_buf(forced: Option<Platform>, buf: &[u8]) -> Platform {
+    if let Some(p) = forced {
+        return p;
+    }
+    let mut fq = noodles_fastq::io::Reader::new(buf);
+    let mut rec = noodles_fastq::Record::default();
+    let mut headers: Vec<Vec<u8>> = Vec::with_capacity(PLATFORM_PEEK);
+    for _ in 0..PLATFORM_PEEK {
+        match fq.read_record(&mut rec) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => headers.push(join_header(rec.name(), rec.description())),
+        }
+    }
+    let refs: Vec<&[u8]> = headers.iter().map(Vec::as_slice).collect();
+    detect_platform(&refs)
+}
+
+/// Resolve the platform from the leading headers of an already-buffered block
+/// (the reorder path buffers every read before writing the header).
+fn resolve_platform_block(forced: Option<Platform>, all: &RawBlock) -> Platform {
+    if let Some(p) = forced {
+        return p;
+    }
+    let n = all.n_reads().min(PLATFORM_PEEK);
+    let refs: Vec<&[u8]> = (0..n).map(|i| all.header(i)).collect();
+    detect_platform(&refs)
+}
+
+/// Join a read `name` and optional `description` the way a [`RawBlock`] stores a
+/// header, so platform detection sees the same bytes on every code path.
+fn join_header(name: &[u8], description: &[u8]) -> Vec<u8> {
+    let mut h = name.to_vec();
+    if !description.is_empty() {
+        h.push(b' ');
+        h.extend_from_slice(description);
+    }
+    h
+}
+
 /// Compression parameters.
 #[derive(Debug, Clone, Copy)]
 pub struct Params {
@@ -145,6 +410,9 @@ pub struct Params {
     pub regenerate_names: bool,
     /// Worker threads (0 = all available cores); clamped to available cores.
     pub threads: usize,
+    /// Sequencing platform to record. `None` (default) auto-detects it from the
+    /// leading read names; `Some(_)` forces the recorded value.
+    pub platform: Option<Platform>,
 }
 
 impl Default for Params {
@@ -158,6 +426,7 @@ impl Default for Params {
             rescue: false,
             regenerate_names: false,
             threads: 0,
+            platform: None,
         }
     }
 }
@@ -206,6 +475,9 @@ pub struct Info {
     pub seq_bytes: u64,
     /// Compressed quality bytes.
     pub qual_bytes: u64,
+    /// Sequencing platform recorded at compress time (from read-name grammar or
+    /// an explicit override); [`Platform::Unknown`] if none was recorded.
+    pub platform: Platform,
 }
 
 /// One block of parsed FASTQ records. Header text is packed into a single arena
@@ -457,7 +729,40 @@ pub fn compress_multi<'a, W: Write>(
 
     // Keep whole spots together: round the block target down to a multiple of g.
     let block_reads = (params.block_reads / g).max(1) * g;
-    drive(writer, params, g as u8, |b| {
+    // Prime the first spot so the platform can be detected before the header is
+    // written (this path streams, so no full buffer exists to peek). The fill
+    // closure emits the primed spot before reading any further records, so block
+    // boundaries are byte-identical to reading it inline.
+    let mut primed: PrimedSpot = Vec::with_capacity(g);
+    for j in 0..g {
+        if fqs[j].read_record(&mut recs[j])? == 0 {
+            if j == 0 {
+                break; // empty input
+            }
+            return Err(Error::Malformed("inputs have unequal read counts"));
+        }
+        let r = &recs[j];
+        primed.push((
+            r.name().to_vec(),
+            r.description().to_vec(),
+            r.sequence().to_vec(),
+            r.quality_scores().to_vec(),
+        ));
+    }
+    let headers: Vec<Vec<u8>> = primed
+        .iter()
+        .map(|(n, d, _, _)| join_header(n, d))
+        .collect();
+    let refs: Vec<&[u8]> = headers.iter().map(Vec::as_slice).collect();
+    let platform = params.platform.unwrap_or_else(|| detect_platform(&refs));
+    let mut primed = Some(primed).filter(|p| !p.is_empty());
+    drive(writer, params, g as u8, platform, |b| {
+        // Emit the primed first spot into the first block before reading on.
+        if let Some(spot) = primed.take() {
+            for (name, desc, seq, qual) in &spot {
+                b.push(name, desc, seq, qual);
+            }
+        }
         // Cut on reads OR the raw-sequence byte budget, whichever comes first;
         // the loop reads whole spots, so a byte cut still lands on a spot
         // boundary. Matches the byte budgeting in `block_ranges`.
@@ -749,11 +1054,16 @@ fn block_ranges(
 }
 
 /// Write the container header.
-fn write_header<W: Write>(w: &mut W, params: &Params, group_size: u8) -> Result<()> {
+fn write_header<W: Write>(
+    w: &mut W,
+    params: &Params,
+    group_size: u8,
+    platform: Platform,
+) -> Result<()> {
     // The block layout is always non-reorder — reorder (both keep-order modes)
     // uses the whole-file path, which writes its own header.
     debug_assert!(!params.reorder);
-    let flags = FLAG_PLUS_NORMALIZED;
+    let flags = FLAG_PLUS_NORMALIZED | platform.flag_bits();
     w.write_all(&MAGIC)?;
     w.write_all(&FORMAT_VERSION.to_le_bytes())?;
     w.write_all(&[
@@ -786,9 +1096,10 @@ fn compress_buffered<W: Write>(
         "compress pool ready"
     );
     let (chunks, gstart, _n) = parse_chunks(buf, g, &pool)?;
+    let platform = resolve_platform_buf(params.platform, buf);
 
     let mut w = CrcWriter::new(BufWriter::new(writer));
-    write_header(&mut w, &params, group_size)?;
+    write_header(&mut w, &params, group_size, platform)?;
     let mut stats = Stats {
         group_size,
         ..Stats::default()
@@ -835,7 +1146,13 @@ fn compress_buffered<W: Write>(
 /// channel, so it overlaps the parallel compression of the previous batch
 /// instead of alternating with it — the parse phase was otherwise a serial
 /// stretch that left cores idle and capped utilization.
-fn drive<W, F>(writer: W, params: Params, group_size: u8, mut fill: F) -> Result<Stats>
+fn drive<W, F>(
+    writer: W,
+    params: Params,
+    group_size: u8,
+    platform: Platform,
+    mut fill: F,
+) -> Result<Stats>
 where
     W: Write,
     F: FnMut(&mut RawBlock) -> Result<usize> + Send,
@@ -849,7 +1166,7 @@ where
         "compress pool ready"
     );
     let mut w = CrcWriter::new(BufWriter::new(writer));
-    write_header(&mut w, &params, group_size)?;
+    write_header(&mut w, &params, group_size, platform)?;
 
     let mut stats = Stats {
         group_size,
@@ -1308,8 +1625,10 @@ fn encode_reordered<W: Write>(
     let nq_blocks: Vec<(Vec<u8>, Vec<u8>)> = name_blocks.into_iter().zip(qual_blocks).collect();
 
     // 7. Write: header, then n / flip / perm / seq blocks / name+qual blocks.
+    let platform = resolve_platform_block(params.platform, &all);
     let mut w = BufWriter::new(writer);
-    let mut flags = FLAG_PLUS_NORMALIZED | FLAG_REORDERED | FLAG_GLOBAL_REORDER;
+    let mut flags =
+        FLAG_PLUS_NORMALIZED | FLAG_REORDERED | FLAG_GLOBAL_REORDER | platform.flag_bits();
     if keep_order {
         flags |= FLAG_KEEP_ORDER;
     }
@@ -2004,6 +2323,7 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
         reordered: header.flags & FLAG_REORDERED != 0,
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
         regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
+        platform: Platform::from_flags(header.flags),
         ..Info::default()
     })
 }
@@ -2041,6 +2361,7 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         reordered: header.flags & FLAG_REORDERED != 0,
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
         regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
+        platform: Platform::from_flags(header.flags),
         ..Info::default()
     };
     // Whole-file global-cluster layout: [u64 n][flip][perm][name template]
@@ -2402,6 +2723,96 @@ NNGGCCTA\n\
 +\n\
 ###IIIFF\n";
         assert_eq!(fastq, expected);
+    }
+
+    #[test]
+    fn classify_header_reads_platform_from_name_grammar() {
+        // Illumina Casava 1.8 name + description.
+        assert_eq!(
+            classify_header(b"M01234:12:000-ABC:1:1101:1234:5678 1:N:0:ATCACG"),
+            Platform::Illumina
+        );
+        // Older Illumina with #index/mate.
+        assert_eq!(
+            classify_header(b"HWUSI:2:3:4:5#ATCACG/1"),
+            Platform::Illumina
+        );
+        // Nanopore: UUID name, and the runid= description tag alone.
+        assert_eq!(
+            classify_header(b"1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d runid=x read=1 ch=100"),
+            Platform::Nanopore
+        );
+        assert_eq!(
+            classify_header(b"anything runid=deadbeef ch=42"),
+            Platform::Nanopore
+        );
+        // PacBio movie/zmw/ccs.
+        assert_eq!(
+            classify_header(b"m64011_190228_190319/1001/ccs"),
+            Platform::PacBio
+        );
+        // MGI/BGI V-prefixed flowcell.
+        assert_eq!(
+            classify_header(b"V300026399L1C001R0010000001/1"),
+            Platform::MgiBgi
+        );
+        // Bare names match nothing.
+        assert_eq!(classify_header(b"read_42"), Platform::Unknown);
+        assert_eq!(classify_header(b"SRR1.1"), Platform::Unknown);
+    }
+
+    #[test]
+    fn platform_is_detected_stored_and_reported() {
+        let ont = b"\
+@1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d runid=x read=1 ch=100\n\
+ACGTACGT\n+\nIIIIFFF#\n";
+        let archive = compress_bytes(ont, Params::default());
+        assert_eq!(
+            inspect(std::io::Cursor::new(&archive)).unwrap().platform,
+            Platform::Nanopore
+        );
+        // peek reads it from the header flags too.
+        assert_eq!(peek(&archive[..]).unwrap().platform, Platform::Nanopore);
+    }
+
+    #[test]
+    fn platform_override_forces_recorded_value() {
+        // Bare names would auto-detect Unknown; the override wins.
+        let params = Params {
+            platform: Some(Platform::PacBio),
+            ..Params::default()
+        };
+        let archive = compress_bytes(SAMPLE, params);
+        assert_eq!(
+            inspect(std::io::Cursor::new(&archive)).unwrap().platform,
+            Platform::PacBio
+        );
+    }
+
+    #[test]
+    fn platform_survives_paired_and_reorder_paths() {
+        // Paired input flows through compress_multi's streaming drive path.
+        let mate = |m: &str| {
+            format!("@M01234:12:000-ABC:1:1101:1000:2000 {m}:N:0:ATCACG\nACGT\n+\nIIII\n")
+                .into_bytes()
+        };
+        let (r1, r2) = (mate("1"), mate("2"));
+        let mut archive = Vec::new();
+        let readers: Vec<Box<dyn Read + Send>> =
+            vec![Box::new(&r1[..]) as Box<dyn Read + Send>, Box::new(&r2[..])];
+        compress_multi(readers, &mut archive, Params::default()).unwrap();
+        assert_eq!(peek(&archive[..]).unwrap().platform, Platform::Illumina);
+
+        // Reorder (global-cluster) path stores it in its own header.
+        let ont = b"\
+@1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d runid=x read=1 ch=100\n\
+ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
+        let params = Params {
+            reorder: true,
+            ..Params::default()
+        };
+        let archive = compress_bytes(ont, params);
+        assert_eq!(peek(&archive[..]).unwrap().platform, Platform::Nanopore);
     }
 
     fn make_reads(tag: &str, n: usize) -> Vec<u8> {

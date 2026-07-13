@@ -37,6 +37,9 @@ bitstream-io = "4"
 flate2 = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tabled = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Dev/bench deps.
 proptest = "1"
