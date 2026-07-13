@@ -128,6 +128,11 @@ pub struct Params {
     /// restored (otherwise reads emerge in clustered order). Forced on for grouped
     /// input (`group_size > 1`), where the permutation reconstructs the spots.
     pub keep_order: bool,
+    /// In reorder mode, use the literal-rescue sequence codec: keep every contig
+    /// alive and re-attach would-be literals to any contig they overlap (a
+    /// k-mer-indexed assembly step). Smaller sequence stream on deep data, at a
+    /// higher encode cost. Ignored when `reorder` is false. Decode auto-detects.
+    pub rescue: bool,
     /// Worker threads (0 = all available cores); clamped to available cores.
     pub threads: usize,
 }
@@ -140,6 +145,7 @@ impl Default for Params {
             quality_binning: QualityBinning::Lossless,
             reorder: false,
             keep_order: false,
+            rescue: false,
             threads: 0,
         }
     }
@@ -1143,11 +1149,13 @@ fn encode_reordered<W: Write>(
             .par_iter()
             .map(|&(s, e)| -> Result<Vec<u8>> {
                 let refs: Vec<&[u8]> = cl_reads[s..e].iter().map(Vec::as_slice).collect();
-                Ok(fqxv_reorder::encode_clustered(
-                    &refs,
-                    &cl_anchors[s..e],
-                    params.seq_order as usize,
-                )?)
+                let anch = &cl_anchors[s..e];
+                let order = params.seq_order as usize;
+                Ok(if params.rescue {
+                    fqxv_reorder::encode_clustered_rescue(&refs, anch, order)?
+                } else {
+                    fqxv_reorder::encode_clustered(&refs, anch, order)?
+                })
             })
             .collect::<Result<_>>()
     })?;
@@ -1298,7 +1306,7 @@ fn read_reordered_streams<R: Read>(mut r: R, pool: &rayon::ThreadPool) -> Result
     let seq_dec: Vec<Vec<Vec<u8>>> = pool.install(|| {
         seq_payloads
             .par_iter()
-            .map(|p| -> Result<Vec<Vec<u8>>> { Ok(fqxv_reorder::decode_clustered(p)?) })
+            .map(|p| -> Result<Vec<Vec<u8>>> { Ok(fqxv_reorder::decode_clustered_auto(p)?) })
             .collect::<Result<_>>()
     })?;
     // Per name+quality block: (decoded names, (per-read lengths, quality bytes)).
@@ -2498,6 +2506,7 @@ NNGGCCTA\n\
         let params = Params {
             reorder: true,
             keep_order: true,
+            rescue: false,
             ..Params::default()
         };
         let mut archive = Vec::new();
@@ -2517,6 +2526,7 @@ NNGGCCTA\n\
         let params = Params {
             reorder: true,
             keep_order: false,
+            rescue: false,
             ..Params::default()
         };
         let mut archive = Vec::new();
@@ -2524,6 +2534,28 @@ NNGGCCTA\n\
         let mut out = Vec::new();
         decompress(&archive[..], &mut out, 1).unwrap();
         assert_eq!(record_set(&out), record_set(&input));
+    }
+
+    #[test]
+    fn reorder_rescue_preserves_records_as_a_set() {
+        // The literal-rescue sequence codec must round-trip through the container
+        // (decode auto-detects the version byte). Multi-thread to exercise the
+        // parallel per-block encode path.
+        let input = dup_rich_input('e');
+        for threads in [1usize, 4] {
+            let params = Params {
+                reorder: true,
+                keep_order: false,
+                rescue: true,
+                threads,
+                ..Params::default()
+            };
+            let mut archive = Vec::new();
+            compress(&input[..], &mut archive, params).unwrap();
+            let mut out = Vec::new();
+            decompress(&archive[..], &mut out, 1).unwrap();
+            assert_eq!(record_set(&out), record_set(&input), "threads={threads}");
+        }
     }
 
     /// Duplicate-rich reads for one mate of a paired set (`n` spots), sharing
@@ -2848,6 +2880,7 @@ NNGGCCTA\n\
             Params {
                 reorder: true,
                 keep_order: true,
+                rescue: false,
                 block_reads: 64,
                 ..Params::default()
             },

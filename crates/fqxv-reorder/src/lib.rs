@@ -959,6 +959,17 @@ pub fn decode_clustered_rescue(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(reads)
 }
 
+/// Decode a clustered sequence block written by either [`encode_clustered`]
+/// (version 2) or [`encode_clustered_rescue`] (version 3), dispatching on the
+/// leading version byte so the container need not track which codec produced it.
+pub fn decode_clustered_auto(src: &[u8]) -> Result<Vec<Vec<u8>>> {
+    match src.first() {
+        Some(2) => decode_clustered(src),
+        Some(3) => decode_clustered_rescue(src),
+        _ => Err(Error::Malformed("unsupported version")),
+    }
+}
+
 /// Op-mix tally for the literal-rescue codec — the [`op_stats`] analogue for
 /// [`encode_clustered_rescue`], driving the same [`Assembler`] so the counts
 /// match the encoder. Lets the diagnostic measure how many literals the rescue
