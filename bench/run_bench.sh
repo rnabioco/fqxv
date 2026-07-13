@@ -369,8 +369,17 @@ for row in "${rows[@]}"; do
     # Restore both mates and concatenate to compare the multiset against R1+R2.
     measure "$FQXV_BIN" decompress "$COMP" --split "$rt" --threads "$THREADS"; d_secs="$MEAS_SECS"; d_rss="$MEAS_RSS_KB"
     rt_ok="no"
-    if [[ -f "${rt}_1.fastq" && -f "${rt}_2.fastq" ]]; then
-      cat "${rt}_1.fastq" "${rt}_2.fastq" > "${rt}.all"
+    # `--split` (PR #44) writes BGZF mates named <prefix>_R1.fastq.gz /
+    # _R2.fastq.gz — decompress before digesting. record_digest sorts, so the
+    # concat order across mates is irrelevant.
+    shopt -s nullglob
+    _parts=( "${rt}"_*.fastq.gz "${rt}"_*.fastq )
+    shopt -u nullglob
+    if [[ "${#_parts[@]}" -ge 2 ]]; then
+      : > "${rt}.all"
+      for _p in "${_parts[@]}"; do
+        case "$_p" in *.gz) zcat "$_p" ;; *) cat "$_p" ;; esac >> "${rt}.all"
+      done
       [[ "$(record_digest "${rt}.all" full)" == "$p_full" ]] && rt_ok="yes"
     fi
     mapfile -t _info < <("$FQXV_BIN" info "$COMP" --tsv 2>/dev/null || true)
