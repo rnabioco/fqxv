@@ -6,10 +6,11 @@
 fqxv compress reads.fastq -o reads.fqxv
 ```
 
-Gzipped input is detected automatically:
+Gzipped input is detected automatically, and `-o` is optional — it defaults to the
+input's name with the FASTQ/gzip extension replaced by `.fqxv`:
 
 ```bash
-fqxv compress reads.fastq.gz -o reads.fqxv
+fqxv compress reads.fastq.gz            # writes reads.fqxv
 ```
 
 Tune effort with `--level` (1–9; higher raises the sequence context order) and
@@ -40,8 +41,13 @@ reads.fqxv
 
 ## Decompress
 
+Pick a destination — a file (`-o`), split mate files (`--split`), or a stdout
+stream (`-Z`). A bare `decompress` with none of these errors rather than flooding
+the terminal.
+
 ```bash
-fqxv decompress reads.fqxv -o reads.fastq
+fqxv decompress reads.fqxv -o reads.fastq        # plain FASTQ
+fqxv decompress reads.fqxv -o reads.fastq.gz     # block-gzip (BGZF)
 ```
 
 ## Paired-end and single-cell
@@ -49,16 +55,19 @@ fqxv decompress reads.fqxv -o reads.fastq
 Give multiple inputs to interleave per-spot files into one archive:
 
 ```bash
-fqxv compress R1.fq.gz R2.fq.gz -o sample.fqxv           # paired
-fqxv compress R1.fq R2.fq I1.fq I2.fq -o sample.fqxv     # 10x single-cell
+fqxv compress sample_R1.fq.gz sample_R2.fq.gz -o sample.fqxv   # paired
+fqxv compress R1.fq R2.fq I1.fq I2.fq -o sample.fqxv           # 10x single-cell
 ```
 
 Restore the separate files, or stream interleaved straight to an aligner:
 
 ```bash
-fqxv decompress sample.fqxv --split out                  # out_1.fastq, out_2.fastq, ...
-fqxv decompress sample.fqxv | bwa mem -p ref.fa -         # interleaved on stdout
+fqxv decompress sample.fqxv --split out                  # out_R1.fastq.gz, out_R2.fastq.gz, ...
+fqxv decompress sample.fqxv -Z | bwa mem -p ref.fa -     # interleaved, raw, on stdout
 ```
+
+`--split` writes block-gzip `.fastq.gz` with `_R1`/`_R2` labels by default; add
+`--no-gzip` for plain FASTQ or `--mate-style num` for `_1`/`_2` labels.
 
 ## Lossy quality (optional)
 

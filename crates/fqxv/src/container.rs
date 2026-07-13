@@ -2321,6 +2321,29 @@ pub fn verify<R: Read + Seek>(reader: R) -> Result<()> {
     Ok(())
 }
 
+/// The authoritative number of reads the archive should contain, for detecting a
+/// truncated file on decompress.
+///
+/// For the plain and per-block-reorder layouts this reads the footer's
+/// `total_reads` field **with no forward-scan fallback**: a file that lost its
+/// trailing blocks also lost the footer/EOF trailer, so [`read_footer`] fails and
+/// the truncation surfaces as an error rather than a short, silent success.
+/// (Contrast [`inspect`], which deliberately falls back to counting the surviving
+/// blocks so a partial file still reports what it holds — the wrong tool for a
+/// completeness check.)
+///
+/// Returns `Ok(None)` for the globally-clustered reorder layout, which carries no
+/// footer but is already truncation-safe: its trailing whole-output digest frame is
+/// the last thing in the file, so a lost tail fails that digest on decode.
+pub fn expected_reads<R: Read + Seek>(reader: R) -> Result<Option<u64>> {
+    let mut r = BufReader::new(reader);
+    let header = read_header(&mut r)?;
+    if header.flags & FLAG_GLOBAL_REORDER != 0 {
+        return Ok(None);
+    }
+    Ok(Some(read_footer(&mut r)?.total_reads))
+}
+
 /// CRC-32C of the first `covered` bytes of `r`, computed in parallel.
 ///
 /// The stream is read serially (a single `Read` can't be shared across threads),

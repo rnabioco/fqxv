@@ -5,7 +5,7 @@ Compress one or more FASTQ files into a single `.fqxv` archive.
 ## Usage
 
 ```bash
-fqxv compress <INPUTS>... -o <OUTPUT> [OPTIONS]
+fqxv compress <INPUTS>... [-o <OUTPUT>] [OPTIONS]
 ```
 
 Give one input for single-end, two for paired-end, or three/four for single-cell
@@ -23,7 +23,7 @@ preserved for the split.
 
 | Option | Description |
 | --- | --- |
-| `-o, --output <PATH>` | Output `.fqxv` path (required). |
+| `-o, --output <PATH>` | Output `.fqxv` path. Defaults to the first input's name with the FASTQ/gzip extension replaced by `.fqxv` (`reads.fastq.gz` → `reads.fqxv`), alongside the input. Required when reading from stdin (`-`). |
 | `-l, --level <N>` | Effort 1–9; higher raises the sequence context order. Default: 5. |
 | `--quality-bin <MODE>` | `lossless` (default), `bin8`, `bin4`, `bin2` (lossy). |
 | `--platform <NAME>` | Sequencing platform to record: `illumina`, `nanopore`, `pacbio`, `mgi`. Auto-detected from read names by default; pass to override. |
@@ -32,11 +32,11 @@ preserved for the split.
 ## Examples
 
 ```bash
-# single-end, gzipped input
-fqxv compress reads.fastq.gz -o reads.fqxv
+# single-end, gzipped input (-o defaults to reads.fqxv)
+fqxv compress reads.fastq.gz
 
 # paired-end at higher effort
-fqxv compress R1.fq.gz R2.fq.gz -o sample.fqxv --level 7 --threads 16
+fqxv compress sample_R1.fq.gz sample_R2.fq.gz -o sample.fqxv --level 7 --threads 16
 
 # 10x single-cell (R1 + R2 + I1 + I2)
 fqxv compress R1.fq R2.fq I1.fq I2.fq -o sample.fqxv

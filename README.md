@@ -49,25 +49,36 @@ Every crate is independently publishable to crates.io and dual-licensed
 ## Usage
 
 ```bash
-# single-end
-fqxv compress reads.fastq.gz -o reads.fqxv          # gzip input auto-detected
+# single-end (gzip input auto-detected; -o defaults to reads.fqxv)
+fqxv compress reads.fastq.gz
 fqxv decompress reads.fqxv -o reads.fastq
 
 # paired-end / single-cell: interleave per-spot files into one archive
-fqxv compress R1.fq.gz R2.fq.gz -o sample.fqxv                 # paired
-fqxv compress R1.fq R2.fq I1.fq I2.fq -o sample.fqxv          # 10x single-cell
+fqxv compress sample_R1.fq.gz sample_R2.fq.gz -o sample.fqxv   # paired
+fqxv compress R1.fq R2.fq I1.fq I2.fq -o sample.fqxv           # 10x single-cell
 
-# restore the separate files, or stream interleaved to an aligner
-fqxv decompress sample.fqxv --split out                       # out_1.fastq, out_2.fastq, ...
-fqxv decompress sample.fqxv | bwa mem -p ref.fa -             # interleaved to stdout
+# restore the separate mate files, or stream interleaved to an aligner
+fqxv decompress sample.fqxv --split sample                     # sample_R1.fastq.gz, sample_R2.fastq.gz
+fqxv decompress sample.fqxv --split s --no-gzip --mate-style num  # s_1.fastq, s_2.fastq (plain)
+fqxv decompress sample.fqxv -Z | bwa mem -p ref.fa -          # interleaved, raw, to stdout
 
 fqxv info sample.fqxv                                          # layout, reads, per-stream sizes (--tsv/--json)
+fqxv verify sample.fqxv                                        # CRC integrity check (exit non-zero if corrupt)
 ```
 
 Combining mates/index reads shrinks the archive (near-identical mate names
 collapse; the sequence model sees a spot's related reads together) and keeps one
 file per sample. `compress`/`decompress` are `rayon`-parallel (`--threads`).
 Lossless by default; `--quality-bin {bin8,bin4,bin2}` opts into lossy quality.
+
+`decompress` needs an explicit destination — `-o FILE`, `--split PREFIX`, or
+`-Z/--stdout` — so a bare invocation never floods the terminal. `--split` writes
+block-gzip (BGZF) `*_R1.fastq.gz`/`*_R2.fastq.gz` by default; `--no-gzip` emits
+plain FASTQ and `--mate-style num` uses `_1`/`_2` labels. For `-o FILE` the
+compression follows the extension (`.gz` → BGZF); `-Z` streams raw FASTQ to stdout.
+Every decode verifies each block's CRC and content digest, and a file `decompress`
+also confirms the decoded read count against the archive footer, so a truncated
+archive fails loudly instead of yielding a short, silent result.
 
 ## Milestones
 

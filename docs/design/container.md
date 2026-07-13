@@ -46,7 +46,7 @@ Each block payload:
 The block region carries an inline `[8]` length before every payload, so a
 **streaming** decoder reads row groups one after another and stops at the
 zero-length terminator — it never needs to seek, so `fqxv decompress` stays
-bounded-memory and pipe-friendly (`fqxv decompress x.fqxv | bwa mem -p`). A
+bounded-memory and pipe-friendly (`fqxv decompress x.fqxv -Z | bwa mem -p`). A
 **seeking** reader instead jumps to the EOF trailer, follows `footer_offset` back
 to the footer, and reads the row-group index directly. The terminator is what
 lets the same file serve both: the streaming reader stops before the footer, the
