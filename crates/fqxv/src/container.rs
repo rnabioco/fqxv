@@ -1731,7 +1731,10 @@ fn encode_reordered<W: Write>(
     // Trailing whole-output content digest: fold the reads exactly as decode will
     // emit them (see [`OutputDigest`]). keep-order emits original order/content;
     // otherwise clustered order, original orientation, template-regenerated names.
+    // Quality is folded *post-binning* — the values actually stored and
+    // reconstructed — so a lossy-quality archive doesn't trip its own check.
     let mut od = OutputDigest::new();
+    let binning = params.quality_binning;
     let read_slice = |a: usize| {
         (
             &all.seq[offs[a]..offs[a + 1]],
@@ -1741,7 +1744,7 @@ fn encode_reordered<W: Write>(
     if keep_order {
         for i in 0..n {
             let (seq, qual) = read_slice(i);
-            od.push(all.header(i), seq, qual);
+            od.push(all.header(i), seq, &apply_binning(qual, binning));
         }
     } else {
         for j in 0..n {
@@ -1754,7 +1757,7 @@ fn encode_reordered<W: Write>(
             } else {
                 all.header(oi)
             };
-            od.push(name, seq, qual);
+            od.push(name, seq, &apply_binning(qual, binning));
         }
     }
     let output_digest = od.finish();
@@ -3275,6 +3278,16 @@ fn binning_tag(b: QualityBinning) -> u8 {
     }
 }
 
+/// Fold quality through the active binning table so a content digest covers the
+/// *stored* (post-binning) bytes that decode reconstructs — not the original
+/// input. Borrows unchanged when lossless. Mirrors the per-block digest's rule.
+fn apply_binning(qual: &[u8], binning: QualityBinning) -> Cow<'_, [u8]> {
+    match binning {
+        QualityBinning::Lossless => Cow::Borrowed(qual),
+        b => Cow::Owned(qual.iter().map(|&q| b.apply(q)).collect()),
+    }
+}
+
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -3629,6 +3642,59 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
                 record_line(SAMPLE, 1),
                 "bases must be exact for {bin:?}"
             );
+        }
+    }
+
+    #[test]
+    fn reorder_with_lossy_binning_roundtrips() {
+        // Regression: the reorder whole-output digest must be folded over the
+        // *stored* (post-binning) quality, not the original input. Folding the
+        // original made a `--order any --quality-bin` archive fail its own
+        // output-digest check on decode — it recovered the data but returned
+        // Err(Corrupt { "reorder output digest" }). Use quality that actually
+        // shifts under binning so a digest-over-original would mismatch, and a
+        // revcomp pair so clustering exercises the un-flip path.
+        let a = b"ACGTTTGACCGATTGCAACGT";
+        let ra = fqxv_reorder::revcomp(a);
+        let ql: Vec<u8> = (0..a.len()).map(|i| b'!' + (i as u8 * 3 % 40)).collect();
+        let read = |i: u32| -> Vec<u8> {
+            let s = if i % 2 == 0 { a.to_vec() } else { ra.clone() };
+            let mut rec = format!("@read.{i}\n").into_bytes();
+            rec.extend_from_slice(&s);
+            rec.extend_from_slice(b"\n+\n");
+            rec
+        };
+        let mut input = Vec::new();
+        for i in 0..40u32 {
+            let mut rec = read(i);
+            rec.extend_from_slice(&ql);
+            rec.push(b'\n');
+            input.extend_from_slice(&rec);
+        }
+        for bin in [QualityBinning::Bin8, QualityBinning::Bin4, QualityBinning::Bin2] {
+            let params = Params {
+                reorder: true,
+                quality_binning: bin,
+                ..Params::default()
+            };
+            let mut archive = Vec::new();
+            compress(&input[..], &mut archive, params).unwrap();
+            assert_eq!(archive[8] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+            let mut out = Vec::new();
+            decompress(&archive[..], &mut out, 1)
+                .unwrap_or_else(|e| panic!("reorder + {bin:?} decode failed: {e:?}"));
+            // Order-independent (reorder permutes reads): recovered records equal
+            // the input with quality passed through the bin table.
+            let binned: Vec<u8> = ql.iter().map(|&q| bin.apply(q)).collect();
+            let mut want: Vec<Vec<u8>> = (0..40u32)
+                .map(|i| {
+                    let mut rec = read(i);
+                    rec.extend_from_slice(&binned);
+                    rec
+                })
+                .collect();
+            want.sort();
+            assert_eq!(record_set(&out), want, "content for reorder + {bin:?}");
         }
     }
 
