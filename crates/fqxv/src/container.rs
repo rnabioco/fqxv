@@ -68,7 +68,7 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use rayon::prelude::*;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::crc::{crc32c, CrcWriter, Hasher};
+use crate::crc::{crc32c, crc32c_combine, CrcWriter};
 use crate::{Error, Result, FORMAT_VERSION, MAGIC};
 use fqxv_fqzcomp::QualityBinning;
 
@@ -2103,21 +2103,56 @@ pub fn verify<R: Read + Seek>(reader: R) -> Result<()> {
     }
     let footer = read_footer(&mut r)?;
     r.seek(SeekFrom::Start(0))?;
-    let mut hasher = Hasher::new();
-    let mut remaining = footer.covered_len;
-    let mut buf = [0u8; 1 << 16];
-    while remaining > 0 {
-        let want = remaining.min(buf.len() as u64) as usize;
-        r.read_exact(&mut buf[..want])?;
-        hasher.update(&buf[..want]);
-        remaining -= want as u64;
-    }
-    if hasher.finalize() != footer.whole_file_crc {
+    if verify_whole_file_crc(&mut r, footer.covered_len)? != footer.whole_file_crc {
         return Err(Error::Corrupt {
             what: "archive (whole-file crc)".to_string(),
         });
     }
     Ok(())
+}
+
+/// CRC-32C of the first `covered` bytes of `r`, computed in parallel.
+///
+/// The stream is read serially (a single `Read` can't be shared across threads),
+/// but the CPU-bound checksum is not: bytes are pulled in batches of fixed-size
+/// chunks, every chunk in a batch is hashed on the rayon pool at once, and the
+/// per-chunk CRCs are folded back together in order with [`crc32c_combine`]. The
+/// result is bit-identical to a single-pass hash for any thread count or
+/// chunking, so this stays exactly as strong a check as the serial version — it
+/// just stops leaving cores idle while the table-driven CRC runs.
+fn verify_whole_file_crc<R: Read>(r: &mut R, covered: u64) -> Result<u32> {
+    /// Per-chunk CRC granularity: large enough that combine/dispatch overhead is
+    /// negligible, small enough to keep a batch's buffers bounded in memory.
+    const CHUNK: usize = 1 << 20; // 1 MiB
+
+    // Small archives: one serial pass, no thread-pool spin-up to amortize.
+    if covered <= CHUNK as u64 {
+        let mut buf = vec![0u8; covered as usize];
+        r.read_exact(&mut buf)?;
+        return Ok(crc32c(&buf));
+    }
+
+    let pool = build_pool(0)?;
+    let batch = pool.current_num_threads().max(1);
+    let mut running = crc32c(&[]); // CRC of the empty prefix (0x0000_0000)
+    let mut remaining = covered;
+    let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(batch);
+    while remaining > 0 {
+        bufs.clear();
+        while bufs.len() < batch && remaining > 0 {
+            let want = remaining.min(CHUNK as u64) as usize;
+            let mut buf = vec![0u8; want];
+            r.read_exact(&mut buf)?;
+            remaining -= want as u64;
+            bufs.push(buf);
+        }
+        let crcs: Vec<(u32, usize)> =
+            pool.install(|| bufs.par_iter().map(|b| (crc32c(b), b.len())).collect());
+        for (crc, len) in crcs {
+            running = crc32c_combine(running, crc, len as u64);
+        }
+    }
+    Ok(running)
 }
 
 /// Outcome of a best-effort [`decompress_recover`] run.
@@ -3557,6 +3592,21 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
         archive[HEADER_LEN + 8 + CRC_LEN] ^= 0x01;
         let err = verify(io::Cursor::new(&archive)).unwrap_err();
         assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn parallel_whole_file_crc_matches_serial() {
+        // Exceed CHUNK (1 MiB) and the batch size so several parallel batches run,
+        // then confirm the combined result is byte-identical to a single-pass CRC.
+        let data: Vec<u8> = (0..5_000_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let got = verify_whole_file_crc(&mut io::Cursor::new(&data), data.len() as u64).unwrap();
+        assert_eq!(got, crc32c(&data), "full buffer");
+        // A partial covered_len must hash only that prefix (not a chunk boundary).
+        let partial = 3_000_001usize;
+        let got = verify_whole_file_crc(&mut io::Cursor::new(&data), partial as u64).unwrap();
+        assert_eq!(got, crc32c(&data[..partial]), "partial prefix");
     }
 
     #[test]
