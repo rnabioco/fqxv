@@ -130,6 +130,20 @@ enum Command {
         /// interleaving requires it), it just costs a stored permutation.
         #[arg(long, value_enum, default_value_t = ReadOrder::Preserve, help_heading = "Advanced")]
         order: ReadOrder,
+        /// With `--order any`, use the literal-rescue sequence codec: keep every
+        /// contig alive and re-attach would-be literals to any contig they
+        /// overlap. Smaller sequence stream on deep data, at a higher encode
+        /// cost. No effect without `--order any`.
+        #[arg(long, help_heading = "Advanced")]
+        rescue: bool,
+        /// With `--order any`, force original read order to be restored on
+        /// decompress (store a permutation, code names/quality in original order).
+        /// By default single-end reorder picks this automatically when it makes
+        /// the archive smaller — counter-style names (e.g. an incrementing
+        /// `.N N`) delta-code to almost nothing in original order, so the
+        /// permutation beats a scrambled-name stream. Pass this to force it on.
+        #[arg(long, help_heading = "Advanced")]
+        keep_order: bool,
         /// Opt-in lossy quality binning (changes the data; default is lossless).
         #[arg(long, value_enum, default_value_t = QualityBin::Lossless, help_heading = "Advanced")]
         quality_bin: QualityBin,
@@ -255,6 +269,8 @@ fn main() -> anyhow::Result<()> {
             level,
             interleaved,
             order,
+            rescue,
+            keep_order,
             quality_bin,
         } => {
             if inputs.is_empty() {
@@ -269,7 +285,8 @@ fn main() -> anyhow::Result<()> {
                 block_reads: level_to_block(level),
                 quality_binning: quality_bin.into(),
                 reorder: order == ReadOrder::Any,
-                keep_order: false,
+                keep_order: keep_order && order == ReadOrder::Any,
+                rescue: rescue && order == ReadOrder::Any,
                 threads: cli.threads,
             };
             let in_size: u64 = inputs
@@ -448,6 +465,16 @@ fn print_info(path: &Path, tsv: bool) -> anyhow::Result<()> {
         "  reordered      {}",
         if info.reordered { "yes" } else { "no" }
     );
+    if info.reordered {
+        println!(
+            "  read order     {}",
+            if info.keep_order {
+                "preserved (permutation stored)"
+            } else {
+                "clustered (not preserved)"
+            }
+        );
+    }
     println!(
         "  plus line      {}",
         if info.plus_normalized {
