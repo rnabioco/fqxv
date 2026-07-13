@@ -198,9 +198,34 @@ fn level_to_block(level: u8) -> usize {
     }
 }
 
+/// Resolve the `--threads` budget to a concrete worker count: 0 means all
+/// available cores, and any explicit request is clamped to what physically
+/// exists so we never oversubscribe. Mirrors the library's compression pool
+/// sizing so decode and compress use the same budget.
+fn resolve_threads(threads: usize) -> usize {
+    let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if threads == 0 {
+        available
+    } else {
+        threads.min(available)
+    }
+}
+
+/// Size rayon's global thread pool to the `--threads` budget. The parallel BGZF
+/// decoder ([`noodles_bgzf::io::MultithreadedReader`]) runs on this global pool,
+/// so this makes `--threads` govern decode as well as compress. Must run before
+/// any rayon use; a re-init error would only occur if the pool were already
+/// built, which never happens this early.
+fn configure_global_pool(threads: usize) -> Result<(), rayon::ThreadPoolBuildError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(resolve_threads(threads))
+        .build_global()
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose, cli.quiet);
+    configure_global_pool(cli.threads).context("configuring the global thread pool")?;
     match cli.command {
         Command::Compress {
             inputs,
@@ -402,19 +427,47 @@ fn print_info(path: &Path, tsv: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// True if `hdr` begins with a BGZF block header: gzip magic (`1f 8b`), deflate
+/// method, the `FEXTRA` flag, and the mandatory `BC` extra subfield (`SI1='B'`,
+/// `SI2='C'`) that BGZF places first in the header. BGZF is the block-gzip
+/// variant emitted by `bgzip`/`samtools`; unlike plain gzip its blocks are
+/// independently inflatable, so decode can be parallelized. Matches htslib's
+/// fixed-offset check (a spec-conformant BGZF header is at least 18 bytes).
+fn is_bgzf(hdr: &[u8]) -> bool {
+    hdr.len() >= 18
+        && hdr[0] == 0x1f
+        && hdr[1] == 0x8b
+        && hdr[2] == 0x08 // CM = deflate
+        && (hdr[3] & 0x04) != 0 // FLG.FEXTRA
+        && hdr[12] == b'B'
+        && hdr[13] == b'C'
+}
+
 /// Open a FASTQ input, transparently decoding gzip (detected by magic bytes).
 /// A path of `-` reads from stdin, so a downloader can pipe straight in.
+///
+/// BGZF (block-gzip) input is inflated in parallel: its blocks are independent,
+/// so [`noodles_bgzf::io::MultithreadedReader`] decodes them across rayon's
+/// global thread pool, sized to `--threads` by [`configure_global_pool`]. Plain
+/// gzip is a single DEFLATE stream and stays serial. The decoded byte stream —
+/// and therefore the archive — is identical regardless of how the input was
+/// compressed or how many decode workers run.
 fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
     let mut src: Box<dyn Read + Send> = if path.as_os_str() == "-" {
         Box::new(io::stdin())
     } else {
         Box::new(File::open(path).with_context(|| format!("opening input {}", path.display()))?)
     };
-    let mut magic = [0u8; 2];
+    // Peek enough to classify: 2 bytes for gzip magic, 18 for a full BGZF header.
+    let mut magic = [0u8; 18];
     let n = read_up_to(&mut src, &mut magic)?;
     let head = io::Cursor::new(magic[..n].to_vec());
     let chained = head.chain(src);
-    if n == 2 && magic == [0x1f, 0x8b] {
+    if is_bgzf(&magic[..n]) {
+        Ok(Box::new(noodles_bgzf::io::MultithreadedReader::new(
+            chained,
+        )))
+    } else if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
         Ok(Box::new(MultiGzDecoder::new(chained)))
     } else {
         Ok(Box::new(chained))
@@ -442,4 +495,50 @@ fn read_up_to<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real 18-byte BGZF block header (from `bgzip`): gzip magic, deflate,
+    /// FEXTRA, then the `BC` subfield carrying BSIZE.
+    const BGZF_HEADER: [u8; 18] = [
+        0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0x06, 0x00, b'B', b'C', 0x02,
+        0x00, 0x5f, 0x00,
+    ];
+
+    #[test]
+    fn detects_bgzf_header() {
+        assert!(is_bgzf(&BGZF_HEADER));
+    }
+
+    #[test]
+    fn plain_gzip_is_not_bgzf() {
+        // gzip magic + deflate, FNAME flag (0x08) instead of FEXTRA — plain gzip.
+        let hdr = [
+            0x1f, 0x8b, 0x08, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+        ];
+        assert!(!is_bgzf(&hdr));
+    }
+
+    #[test]
+    fn non_gzip_and_short_inputs_are_not_bgzf() {
+        assert!(!is_bgzf(b"@read\n")); // plain FASTQ
+        assert!(!is_bgzf(&[0x1f, 0x8b])); // gzip magic but too short for a BGZF header
+        assert!(!is_bgzf(&[])); // empty
+                                // FEXTRA present but the extra subfield is not `BC`.
+        let mut hdr = BGZF_HEADER;
+        hdr[12] = b'X';
+        assert!(!is_bgzf(&hdr));
+    }
+
+    #[test]
+    fn resolve_threads_zero_is_all_cores_and_explicit_is_clamped() {
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(resolve_threads(0), available); // 0 = all cores
+        assert_eq!(resolve_threads(1), 1);
+        assert_eq!(resolve_threads(usize::MAX), available); // never oversubscribe
+    }
 }

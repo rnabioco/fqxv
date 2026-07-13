@@ -23,5 +23,7 @@ fqxv.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 flate2.workspace = true
+noodles-bgzf.workspace = true
+rayon.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
