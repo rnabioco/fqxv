@@ -191,6 +191,11 @@ enum Command {
     Verify {
         /// Input `.fqxv` file.
         input: PathBuf,
+        /// Faster, weaker check: verify each block's stored CRC via the footer
+        /// index (parallel positioned reads) instead of the whole-file digest.
+        /// Skips the header, footer, and inter-block framing bytes.
+        #[arg(long)]
+        quick: bool,
     },
 }
 
@@ -435,10 +440,15 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Info { input, tsv, json } => print_info(&input, tsv, json)?,
-        Command::Verify { input } => {
+        Command::Verify { input, quick } => {
             let file =
                 File::open(&input).with_context(|| format!("opening input {}", input.display()))?;
-            match fqxv::verify(file) {
+            let result = if quick {
+                fqxv::verify_quick(&file)
+            } else {
+                fqxv::verify(file)
+            };
+            match result {
                 Ok(()) => println!("{}: OK", input.display()),
                 Err(e) => {
                     eprintln!("{}: CORRUPT — {e}", input.display());

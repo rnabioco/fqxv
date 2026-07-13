@@ -8,7 +8,7 @@ whether the archive is intact.
 ## Usage
 
 ```bash
-fqxv verify <INPUT>
+fqxv verify [--quick] <INPUT>
 ```
 
 ## Arguments
@@ -16,6 +16,12 @@ fqxv verify <INPUT>
 | Argument | Description |
 | --- | --- |
 | `<INPUT>` | Input `.fqxv` file. |
+
+## Options
+
+| Option | Description |
+| --- | --- |
+| `--quick` | Faster, weaker check: validate each block's stored CRC via the footer index instead of the whole-file digest. |
 
 ## Output and exit status
 
@@ -54,6 +60,17 @@ for f in *.fqxv; do fqxv verify "$f" || echo "FAILED: $f"; done
   guarding the row-group index, and a per-block payload CRC. See
   [Container Format](../design/container.md#integrity) for where each checksum
   lives on disk.
+- The default check recomputes the whole-file CRC-32C, which covers **every**
+  byte — the header, the footer index, the inter-block framing, and every
+  payload — parallelized across cores.
+- `--quick` instead checks only the per-block payload CRCs, reading blocks
+  concurrently from their footer offsets (parallel positioned reads). On a
+  large multi-block archive this is typically a few times faster, and it
+  localizes any failure to a specific block (`CORRUPT — block 5`). It is a
+  **weaker** check: corruption confined to the header, footer, or framing bytes
+  is not detected, and a single-block archive gains no parallelism (the default
+  check is faster there). The globally-reordered layout has no per-block index,
+  so `--quick` transparently falls back to the full check for it.
 - To *recover data* from an archive that fails verification rather than just
   detect the damage, use [`decompress --recover`](decompress.md#recovering-a-corrupted-archive),
   which skips the corrupt blocks and decodes the rest.
