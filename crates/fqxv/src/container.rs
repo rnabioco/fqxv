@@ -63,12 +63,13 @@
 //! spot adjacent for the sequence model. [`decompress`] streams interleaved
 //! FASTQ (pipe to an aligner); [`decompress_split`] restores the `G` files.
 
+use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 use rayon::prelude::*;
 use tracing::{debug, info, instrument, trace, warn};
 
-use crate::crc::{crc32c, CrcWriter, Hasher};
+use crate::crc::{crc32c, crc32c_combine, CrcWriter};
 use crate::{Error, Result, FORMAT_VERSION, MAGIC};
 use fqxv_fqzcomp::QualityBinning;
 
@@ -2103,21 +2104,134 @@ pub fn verify<R: Read + Seek>(reader: R) -> Result<()> {
     }
     let footer = read_footer(&mut r)?;
     r.seek(SeekFrom::Start(0))?;
-    let mut hasher = Hasher::new();
-    let mut remaining = footer.covered_len;
-    let mut buf = [0u8; 1 << 16];
-    while remaining > 0 {
-        let want = remaining.min(buf.len() as u64) as usize;
-        r.read_exact(&mut buf[..want])?;
-        hasher.update(&buf[..want]);
-        remaining -= want as u64;
-    }
-    if hasher.finalize() != footer.whole_file_crc {
+    if verify_whole_file_crc(&mut r, footer.covered_len)? != footer.whole_file_crc {
         return Err(Error::Corrupt {
             what: "archive (whole-file crc)".to_string(),
         });
     }
     Ok(())
+}
+
+/// CRC-32C of the first `covered` bytes of `r`, computed in parallel.
+///
+/// The stream is read serially (a single `Read` can't be shared across threads),
+/// but the CPU-bound checksum is not: bytes are pulled in batches of fixed-size
+/// chunks, every chunk in a batch is hashed on the rayon pool at once, and the
+/// per-chunk CRCs are folded back together in order with [`crc32c_combine`]. The
+/// result is bit-identical to a single-pass hash for any thread count or
+/// chunking, so this stays exactly as strong a check as the serial version — it
+/// just stops leaving cores idle while the table-driven CRC runs.
+fn verify_whole_file_crc<R: Read>(r: &mut R, covered: u64) -> Result<u32> {
+    /// Per-chunk CRC granularity: large enough that combine/dispatch overhead is
+    /// negligible, small enough to keep a batch's buffers bounded in memory.
+    const CHUNK: usize = 1 << 20; // 1 MiB
+
+    // Small archives: one serial pass, no thread-pool spin-up to amortize.
+    if covered <= CHUNK as u64 {
+        let mut buf = vec![0u8; covered as usize];
+        r.read_exact(&mut buf)?;
+        return Ok(crc32c(&buf));
+    }
+
+    let pool = build_pool(0)?;
+    let batch = pool.current_num_threads().max(1);
+    let mut running = crc32c(&[]); // CRC of the empty prefix (0x0000_0000)
+    let mut remaining = covered;
+    let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(batch);
+    while remaining > 0 {
+        bufs.clear();
+        while bufs.len() < batch && remaining > 0 {
+            let want = remaining.min(CHUNK as u64) as usize;
+            let mut buf = vec![0u8; want];
+            r.read_exact(&mut buf)?;
+            remaining -= want as u64;
+            bufs.push(buf);
+        }
+        let crcs: Vec<(u32, usize)> =
+            pool.install(|| bufs.par_iter().map(|b| (crc32c(b), b.len())).collect());
+        for (crc, len) in crcs {
+            running = crc32c_combine(running, crc, len as u64);
+        }
+    }
+    Ok(running)
+}
+
+/// Quick integrity check: verify every block's stored CRC-32C via the footer's
+/// row-group index, in parallel, without recomputing the whole-file digest.
+///
+/// This is a deliberately *weaker* check than [`verify`]: it covers each block's
+/// coded payload but **not** the 10-byte header, the footer index itself, or the
+/// inter-block framing (`[len][crc]`) bytes — corruption confined to those
+/// regions slips past. In exchange the blocks are read straight from their footer
+/// offsets with positioned reads and checked concurrently, so on a parallel
+/// filesystem the many independent reads can outrun [`verify`]'s single serial
+/// scan of the whole file. It takes a [`File`] (rather than a generic reader)
+/// because that concurrency relies on offset-addressed reads.
+///
+/// The globally-clustered reorder layout has no per-block footer index, so this
+/// transparently falls back to the full decode-driven [`verify`] for that layout
+/// (as does any platform without positioned-read support).
+pub fn verify_quick(file: &File) -> Result<()> {
+    let mut r = BufReader::new(file);
+    let header = read_header(&mut r)?;
+    if header.flags & FLAG_GLOBAL_REORDER != 0 {
+        // No per-block index to check — decoding is the only integrity path.
+        r.seek(SeekFrom::Start(0))?;
+        return verify(r);
+    }
+    let footer = read_footer(&mut r)?;
+    quick_check_blocks(file, &footer)
+}
+
+/// Verify each block's stored CRC in parallel via positioned reads (Unix).
+#[cfg(unix)]
+fn quick_check_blocks(file: &File, footer: &Footer) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    let pool = build_pool(0)?;
+    pool.install(|| {
+        footer
+            .groups
+            .par_iter()
+            .enumerate()
+            .try_for_each(|(i, &(off, _read_count))| {
+                // Block frame on disk: [8 payload_len][4 crc32c][payload].
+                let mut frame = [0u8; 8 + CRC_LEN];
+                file.read_exact_at(&mut frame, off)
+                    .map_err(|_| Error::Truncated)?;
+                let len = u64::from_le_bytes(frame[..8].try_into().unwrap());
+                if len == 0 {
+                    return Err(Error::Malformed(
+                        "row-group offset points at the terminator",
+                    ));
+                }
+                if len > MAX_BLOCK_PAYLOAD {
+                    return Err(Error::Malformed("block payload length exceeds the maximum"));
+                }
+                let expected = u32::from_le_bytes(frame[8..].try_into().unwrap());
+                // Fallible allocation: a corrupt-but-in-range length must not abort
+                // the process (mirrors `read_block`).
+                let mut buf = Vec::new();
+                buf.try_reserve_exact(len as usize)
+                    .map_err(|_| Error::Malformed("block payload too large to allocate"))?;
+                buf.resize(len as usize, 0);
+                file.read_exact_at(&mut buf, off + (8 + CRC_LEN) as u64)
+                    .map_err(|_| Error::Truncated)?;
+                if crc32c(&buf) != expected {
+                    return Err(Error::Corrupt {
+                        what: format!("block {i}"),
+                    });
+                }
+                Ok(())
+            })
+    })
+}
+
+/// Platforms without positioned reads can't read blocks concurrently from one
+/// handle, so quick verification falls back to the full [`verify`] scan.
+#[cfg(not(unix))]
+fn quick_check_blocks(file: &File, _footer: &Footer) -> Result<()> {
+    verify(BufReader::new(file))
 }
 
 /// Outcome of a best-effort [`decompress_recover`] run.
@@ -3560,6 +3674,21 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
     }
 
     #[test]
+    fn parallel_whole_file_crc_matches_serial() {
+        // Exceed CHUNK (1 MiB) and the batch size so several parallel batches run,
+        // then confirm the combined result is byte-identical to a single-pass CRC.
+        let data: Vec<u8> = (0..5_000_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let got = verify_whole_file_crc(&mut io::Cursor::new(&data), data.len() as u64).unwrap();
+        assert_eq!(got, crc32c(&data), "full buffer");
+        // A partial covered_len must hash only that prefix (not a chunk boundary).
+        let partial = 3_000_001usize;
+        let got = verify_whole_file_crc(&mut io::Cursor::new(&data), partial as u64).unwrap();
+        assert_eq!(got, crc32c(&data[..partial]), "partial prefix");
+    }
+
+    #[test]
     fn verify_rejects_footer_bit_flip() {
         let mut archive = multiblock_archive(40, 8);
         // Flip a byte inside the footer body (just before the EOF trailer).
@@ -3567,6 +3696,64 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
         archive[i] ^= 0x01;
         let err = verify(io::Cursor::new(&archive)).unwrap_err();
         assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
+    }
+
+    /// Write `bytes` to a fresh temp file and return an open handle plus its path.
+    /// The name is unique per process *and* per call so it is safe whether tests
+    /// run as separate processes (nextest) or as threads (`cargo test`).
+    fn temp_archive(bytes: &[u8]) -> (File, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("fqxv-quick-{}-{n}.fqxv", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        (File::open(&path).unwrap(), path)
+    }
+
+    #[test]
+    fn verify_quick_accepts_intact_archive() {
+        let archive = multiblock_archive(40, 8);
+        let (file, path) = temp_archive(&archive);
+        let result = verify_quick(&file);
+        std::fs::remove_file(&path).ok();
+        result.expect("intact archive passes quick verify");
+    }
+
+    #[test]
+    fn verify_quick_rejects_payload_bit_flip() {
+        let mut archive = multiblock_archive(40, 8);
+        archive[HEADER_LEN + 8 + CRC_LEN] ^= 0x01;
+        let (file, path) = temp_archive(&archive);
+        let err = verify_quick(&file).unwrap_err();
+        std::fs::remove_file(&path).ok();
+        // The per-block check localizes the failure to the offending block.
+        assert!(
+            matches!(&err, Error::Corrupt { what } if what.starts_with("block")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_quick_falls_back_for_reorder_layout() {
+        // The globally-clustered layout has no per-block footer index, so quick
+        // verify must transparently run the full decode-driven check.
+        let input = dup_rich_input('q');
+        let params = Params {
+            reorder: true,
+            ..Params::default()
+        };
+        let mut archive = Vec::new();
+        compress(&input[..], &mut archive, params).unwrap();
+        // Header flags byte sits at offset 8 ([4]magic [2]ver [1]order [1]binning).
+        assert_eq!(
+            archive[8] & FLAG_GLOBAL_REORDER,
+            FLAG_GLOBAL_REORDER,
+            "test archive must use the reorder layout to exercise the fallback"
+        );
+        let (file, path) = temp_archive(&archive);
+        let result = verify_quick(&file);
+        std::fs::remove_file(&path).ok();
+        result.expect("intact reorder archive passes quick verify via fallback");
     }
 
     #[test]
