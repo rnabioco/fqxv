@@ -188,9 +188,14 @@ pub fn encode(lens: &[u32], seq: &[u8], order: usize) -> Result<Vec<u8>> {
     let mut idx = 0usize;
     // Context carries across reads within this block (blocks stay independent).
     let mut ctx = 0usize;
+    // Cursor over `seq` so the per-base read carries no bounds check; `idx` is
+    // kept only to tag exception positions. `total == seq.len()` (checked
+    // above), so every `split_at` is in range.
+    let mut rest: &[u8] = seq;
     for &l in lens {
-        for _ in 0..l {
-            let byte = seq[idx];
+        let (read, tail) = rest.split_at(l as usize);
+        rest = tail;
+        for &byte in read {
             let raw = BASE_LUT[byte as usize];
             let sym = if raw == 255 { NSYM } else { raw as usize };
             let lc = ctx & lo_mask;

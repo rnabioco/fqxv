@@ -1497,8 +1497,7 @@ fn decode_block_reordered(buf: &[u8], keep_order: bool) -> Result<(u64, Vec<u8>)
         // at its original position (un-flipped) via the permutation, then emit
         // records in original order.
         let mut seq_orig: Vec<Vec<u8>> = vec![Vec::new(); n];
-        for j in 0..n {
-            let mut s = reads[j].clone();
+        for (j, mut s) in reads.into_iter().enumerate() {
             if flip_bits[j / 8] >> (j % 8) & 1 == 1 {
                 s = fqxv_reorder::revcomp(&s);
             }
@@ -1522,9 +1521,8 @@ fn decode_block_reordered(buf: &[u8], keep_order: bool) -> Result<(u64, Vec<u8>)
     } else {
         // Reads emerge in clustered order; names/quality were coded clustered too.
         let mut qoff = 0usize;
-        for j in 0..n {
+        for (j, mut seq) in reads.into_iter().enumerate() {
             let l = r_lens[j] as usize;
-            let mut seq = reads[j].clone();
             let mut qual = r_qual
                 .get(qoff..qoff + l)
                 .ok_or(Error::Malformed("quality underrun"))?
