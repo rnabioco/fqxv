@@ -7,9 +7,13 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16       # Memory is the real floor: the worst cell (xz9
 #SBATCH --mem=28G                # on NovaSeq) peaks ~22.5G, and amilan caps mem
-#SBATCH --time=01:00:00          # at 3840M/core, so 28G needs >=8 cores; 16 adds
-#SBATCH --output=fqxv-cell-%A_%a.out                # throughput headroom while
-## #SBATCH --account=amc-general                     # still packing onto a node.
+#SBATCH --time=02:00:00          # at 3840M/core, so 28G needs >=8 cores; 16 adds
+#SBATCH --output=fqxv-cell-%A_%a.out    # throughput headroom while still packing.
+## #SBATCH --account=amc-general
+# Walltime is gated by post-processing, not compression: the 2.1G-base NovaSeq
+# cells spend ~1h in the round-trip/determinism/Δqual verification (a
+# single-thread recompress + char-by-char awk over billions of bases), while the
+# 16-thread compress itself is ~30s. 1h timed the NovaSeq bin2 cell out; keep 2h.
 #
 # Phase 2 of the parallel harness: one array task per (dataset, tool) cell. Each
 # cell runs one measured tool at a time on its bound cores — the point is never
