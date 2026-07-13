@@ -10,3 +10,7 @@ DRR174812	rnaseq_novaseq	NovaSeq6000	paired	binned	2.1GB	-
 SRR453566	rnaseq_fullrange	GAIIx	paired	full-range	500MB	-
 # ERR10213669 dropped: reference-compressed cSRA, not reconstructable by sracha.
 # Add a plain (unaligned) human NovaSeq run here if a binned-human sample is wanted.
+# Long-read (Oxford Nanopore) — single-end, wide quality range (Phred ~0-90),
+# ~14 kb mean read length. sracha writes this as DRR205413.fastq (no _1 suffix);
+# run_bench.sh falls back to that name for single-end layouts.
+DRR205413	ecoli_ont	MinION	single	full-range	260MB	-

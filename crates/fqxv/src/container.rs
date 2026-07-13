@@ -1001,7 +1001,11 @@ fn write_blocks<W: Write>(
 
 /// Write `[u32 len][u32 crc32c][bytes]`.
 fn write_framed<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
-    w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    // The reorder layout frames have no raw-byte budget, so guard the u32 length
+    // cast explicitly: a >4 GiB frame must error, not silently truncate.
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| Error::Malformed("framed slice exceeds u32 length"))?;
+    w.write_all(&len.to_le_bytes())?;
     w.write_all(&crc32c(bytes).to_le_bytes())?;
     w.write_all(bytes)?;
     Ok(())
@@ -1571,7 +1575,13 @@ fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(16 + names_c.len() + seq_c.len() + qual_c.len());
     out.extend_from_slice(&(b.n_reads() as u32).to_le_bytes());
     for stream in [&names_c, &seq_c, &qual_c] {
-        out.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        // Stream lengths are stored as u32. The MAX_BLOCK_SEQ_BYTES row-group
+        // budget keeps every compressed stream well under this, but guard the
+        // cast so a future budget change can never silently truncate a length
+        // and misframe the block on decode.
+        let len = u32::try_from(stream.len())
+            .map_err(|_| Error::Malformed("compressed stream exceeds u32 length"))?;
+        out.extend_from_slice(&len.to_le_bytes());
         out.extend_from_slice(stream);
     }
     Ok(out)
@@ -2904,6 +2914,54 @@ NNGGCCTA\n\
         let mut out = Vec::new();
         decompress(&archive[..], &mut out, 1).unwrap();
         assert_eq!(out, input, "ragged variable-length reads must round-trip");
+    }
+
+    #[test]
+    fn nanopore_wide_quality_roundtrip_deterministic() {
+        // The nanopore profile: long, variable-length reads with N bases and the
+        // full Sanger quality range (Phred 0..=93) — which previously tripped the
+        // 64-symbol quality cap. A small block target spreads the long reads over
+        // several row groups. Output must be byte-exact and identical regardless
+        // of thread count.
+        let mut input = Vec::new();
+        let mut st = 0x9e37_79b9u32;
+        for i in 0..12usize {
+            let len = 800 + (i % 5) * 900; // 800..=4400 bp
+            let mut seq = String::with_capacity(len);
+            let mut qual = String::with_capacity(len);
+            for _ in 0..len {
+                st ^= st << 13;
+                st ^= st >> 17;
+                st ^= st << 5;
+                let r = st % 20;
+                seq.push(if r == 0 {
+                    'N'
+                } else {
+                    b"ACGT"[(r % 4) as usize] as char
+                });
+                st ^= st << 13;
+                st ^= st >> 17;
+                st ^= st << 5;
+                qual.push((b'!' + (st % 94) as u8) as char); // '!'..='~'
+            }
+            input.extend_from_slice(format!("@read.{i} ch={i}\n{seq}\n+\n{qual}\n").as_bytes());
+        }
+        let base = Params {
+            block_reads: 4,
+            ..Params::default()
+        };
+        let a1 = compress_bytes(&input, Params { threads: 1, ..base });
+        let a4 = compress_bytes(&input, Params { threads: 4, ..base });
+        assert_eq!(
+            a1, a4,
+            "nanopore archive must be deterministic across threads"
+        );
+        let mut out = Vec::new();
+        decompress(&a1[..], &mut out, 1).unwrap();
+        assert_eq!(
+            out, input,
+            "wide-quality long reads must round-trip byte-exact"
+        );
     }
 
     // --- integrity: CRC detection, recovery, truncation --------------------
