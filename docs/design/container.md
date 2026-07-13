@@ -52,8 +52,9 @@ seeking reader skips straight past it.
 ## Footer index, `inspect`, and random access
 
 The footer records, per row group, the byte offset of its length field and its
-read count (read-start is the running sum). This buys two things over the old
-scan-everything approach:
+read count (read-start is the running sum). It covers the plain layout; reordered
+archives use a distinct self-describing layout (below). This buys two things over
+the old scan-everything approach:
 
 - **`inspect` is O(row groups), not O(bytes).** It reads the footer for the read
   and block totals, then seeks to each row group and reads only its small block
@@ -101,12 +102,15 @@ restores the `G` separate files.
 
 ## Reordered archives
 
-`--reorder --keep-order` uses a distinct whole-file, globally-clustered layout
-(flag bit3) that is self-describing and carries no footer or terminator — decode
-dispatches on the flag before reading any block, so the footer index above
-applies only to the plain and per-block-reorder layouts. `extract` is not
-supported on reordered archives (their on-disk order is clustered, not input
-order); use `fqxv decompress`. See [Read Reordering](reordering.md).
+`--reorder` uses a distinct whole-file, globally-clustered layout (flag bit3)
+that is self-describing and carries no footer or terminator — decode dispatches
+on the flag before reading any block, so the footer index applies only to the
+plain layout. Both reorder modes share this one path: with `--keep-order`
+(flag bit2) names/quality are coded in original order and a permutation restores
+it; without it they follow the clustered order and no permutation is written.
+`extract` is not supported on reordered archives (their on-disk order is
+clustered, not input order); use `fqxv decompress`. See
+[Read Reordering](reordering.md).
 
 ## Losslessness
 
