@@ -162,11 +162,11 @@ enum Command {
 enum QualityBin {
     /// Fully lossless (default).
     Lossless,
-    /// Illumina 8-level binning (lossy).
+    /// Illumina standard 8-level binning (lossy).
     Bin8,
-    /// Illumina 4-level binning (lossy).
+    /// Illumina documented 4-level binning (NovaSeq X / RTA4; lossy).
     Bin4,
-    /// 2-level binning (lossy).
+    /// Custom 2-level binning (lossy).
     Bin2,
 }
 
@@ -348,8 +348,8 @@ fn print_info(path: &Path, tsv: bool) -> anyhow::Result<()> {
     let quality = match info.quality_binning {
         0 => "lossless",
         1 => "lossy (Illumina 8-bin)",
-        2 => "lossy (4-bin)",
-        3 => "lossy (2-bin)",
+        2 => "lossy (Illumina 4-bin, RTA4)",
+        3 => "lossy (2-bin, custom)",
         _ => "unknown",
     };
 

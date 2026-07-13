@@ -23,6 +23,13 @@ fqzcomp = "*"
 seqkit = "*"
 samtools = "*"
 
+# Downstream-concordance fidelity check (concordance.sh): align lossless vs
+# binned reads and compare variant calls. Not used by run_bench.sh.
+bwa = "*"
+# Pin a modern bcftools: the unconstrained solve pulls the ancient 1.6, which
+# links a long-gone libcrypto.so.1.0.0 and fails to load.
+bcftools = ">=1.20"
+
 # Harness scripting
 python = ">=3.11"
 
@@ -44,3 +51,5 @@ bzip2 = "*"
 build-tools = { cmd = "bash build_tools.sh", description = "Build PgRC and fqzcomp5 from source" }
 # Print quality-score alphabet + basic stats for a FASTQ (binned vs full-range check)
 qstats = { cmd = "seqkit stats -a", description = "Quality/length stats for a FASTQ" }
+# Downstream fidelity: variant-call concordance of lossy binning vs lossless.
+concordance = { cmd = "bash concordance.sh", description = "Variant-call concordance: lossy quality binning vs lossless" }

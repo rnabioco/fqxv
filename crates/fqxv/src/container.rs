@@ -1661,6 +1661,61 @@ NNGGCCTA\n\
         assert!(info.names_bytes > 0 && info.seq_bytes > 0 && info.qual_bytes > 0);
     }
 
+    // Concatenate every Nth record line (line 4 = quality, line 2 = sequence)
+    // across a FASTQ byte stream, in order.
+    fn record_line(fastq: &[u8], which: usize) -> Vec<u8> {
+        fastq
+            .split(|&b| b == b'\n')
+            .enumerate()
+            .filter(|(i, l)| i % 4 == which && !l.is_empty())
+            .flat_map(|(_, l)| l.iter().copied())
+            .collect()
+    }
+
+    #[test]
+    fn lossy_binning_roundtrips_and_reports_tag() {
+        for (bin, tag) in [
+            (QualityBinning::Bin8, 1u8),
+            (QualityBinning::Bin4, 2),
+            (QualityBinning::Bin2, 3),
+        ] {
+            let params = Params {
+                quality_binning: bin,
+                ..Params::default()
+            };
+            let archive = compress_bytes(SAMPLE, params);
+
+            // The header tag round-trips through inspect.
+            assert_eq!(
+                inspect(&archive[..]).expect("inspect").quality_binning,
+                tag,
+                "info tag for {bin:?}"
+            );
+
+            let mut fastq = Vec::new();
+            decompress(&archive[..], &mut fastq, 1).expect("decompress");
+
+            // Lossy contract: recovered qualities equal the input qualities passed
+            // through the same bin table; bases survive exactly.
+            let want: Vec<u8> = record_line(SAMPLE, 3)
+                .iter()
+                .map(|&b| bin.apply(b))
+                .collect();
+            assert_eq!(record_line(&fastq, 3), want, "binned qualities for {bin:?}");
+            assert_eq!(
+                record_line(&fastq, 1),
+                record_line(SAMPLE, 1),
+                "bases must be exact for {bin:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lossless_default_reports_zero_tag() {
+        let archive = compress_bytes(SAMPLE, Params::default());
+        assert_eq!(inspect(&archive[..]).unwrap().quality_binning, 0);
+    }
+
     fn dup_rich_input(keep_order_marker: char) -> Vec<u8> {
         // Duplicate-rich single-end reads, including a reverse-complement pair so
         // clustering flips a read (exercises the un-flip path).

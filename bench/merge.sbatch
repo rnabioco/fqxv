@@ -21,7 +21,7 @@ HERE="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 RESULTS_DIR="${FQXV_RESULTS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/results}"
 R="$RESULTS_DIR/results.tsv"
 
-echo -e "dataset\ttool\torig_bytes\tcomp_bytes\tratio\tc_secs\td_secs\tc_rss_kb\td_rss_kb\tnames_bytes\tseq_bytes\tqual_bytes\trt_ok\tdeterministic" > "$R"
+echo -e "dataset\ttool\torig_bytes\tcomp_bytes\tratio\tc_secs\td_secs\tc_rss_kb\td_rss_kb\tnames_bytes\tseq_bytes\tqual_bytes\trt_ok\tdeterministic\tqual_mae\tqual_rmse\tqual_pct_changed" > "$R"
 cat "$RESULTS_DIR/parts"/results.*.tsv >> "$R" 2>/dev/null || true
 echo "==> merged $(( $(wc -l < "$R") - 1 )) result rows into $R"
 
