@@ -163,9 +163,14 @@ fn decode_order0(r: &mut Reader<'_>, n: usize) -> Result<Vec<u8>> {
 
     let mut states = read_states(r)?;
     let mut out = vec![0u8; n];
+    // Bind `slot2sym` as a fixed-size array so LLVM proves the masked index is
+    // in range and drops the per-symbol bounds check on this hot decode loop.
+    let s2s: &[u8; TOTFREQ as usize] = (&model.slot2sym[..])
+        .try_into()
+        .expect("slot2sym has TOTFREQ entries");
     for (i, o) in out.iter_mut().enumerate() {
         let x = &mut states[i % N_STATES];
-        let s = model.slot2sym[(*x & (TOTFREQ - 1)) as usize];
+        let s = s2s[(*x & (TOTFREQ - 1)) as usize];
         *o = s;
         step_state(x, &model, s, r)?;
     }
@@ -191,13 +196,21 @@ fn decode_order1(r: &mut Reader<'_>, n: usize) -> Result<Vec<u8>> {
     let mut states = read_states(r)?;
     let mut out = vec![0u8; n];
     let mut prev = 0u8;
+    // `ctx` is a byte, so bind `models` as a fixed 256-entry array to drop the
+    // per-symbol bounds check on the context lookup.
+    let models: &[Option<Model>; 256] = (&models[..])
+        .try_into()
+        .expect("models has 256 entries");
     for (i, o) in out.iter_mut().enumerate() {
         let ctx = if i == 0 { 0 } else { prev } as usize;
         let model = models[ctx]
             .as_ref()
             .ok_or(Error::Malformed("symbol references absent context"))?;
         let x = &mut states[i % N_STATES];
-        let s = model.slot2sym[(*x & (TOTFREQ - 1)) as usize];
+        let slot = (*x & (TOTFREQ - 1)) as usize;
+        // SAFETY: the mask restricts `slot` to `0..TOTFREQ`, which is exactly
+        // `slot2sym.len()`, so this access is always in bounds.
+        let s = *unsafe { model.slot2sym.get_unchecked(slot) };
         *o = s;
         step_state(x, model, s, r)?;
         prev = s;
