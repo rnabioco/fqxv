@@ -178,6 +178,10 @@ pub struct Info {
     pub group_size: u8,
     /// Whether reads were clustered/reordered.
     pub reordered: bool,
+    /// Whether original read order is restored on decompress (a permutation is
+    /// stored). Always true for non-reordered archives; for reordered archives it
+    /// reflects the keep-order layout choice.
+    pub keep_order: bool,
     /// Number of blocks (0 from [`peek`]).
     pub blocks: u64,
     /// Total reads (0 from [`peek`]).
@@ -1090,7 +1094,6 @@ fn encode_reordered<W: Write>(
     group_size: u8,
 ) -> Result<Stats> {
     let g = group_size.max(1);
-    let keep_order = params.keep_order || g > 1;
     let pool = build_pool(params.threads)?;
     let n = all.n_reads();
 
@@ -1160,31 +1163,93 @@ fn encode_reordered<W: Write>(
             .collect::<Result<_>>()
     })?;
 
-    // 5b. Names + quality. With keep_order, code them in ORIGINAL order (the
-    // permutation reunites each clustered sequence with its read, so the name and
-    // quality models keep their positional structure). Without keep_order, code
-    // them in CLUSTERED order alongside the sequence — quality is reversed for
-    // flipped reads so its bytes line up with the reverse-complemented sequence.
-    let nq_blocks: Vec<(Vec<u8>, Vec<u8>)> = pool.install(|| {
+    // 5b. Names, then the keep_order decision, then quality.
+    //
+    // Reorder has two layouts: keep_order codes names/quality in ORIGINAL order
+    // and stores a permutation; otherwise they're coded in CLUSTERED order and no
+    // permutation is stored (reads emerge clustered). For single-end input we
+    // pick ADAPTIVELY: counter-style names (e.g. SRA `.N N`) delta-code to almost
+    // nothing in original order, so a permutation is cheaper than a scrambled
+    // name stream; random names are the reverse. Grouped input (the permutation
+    // reconstructs spots) and an explicit `params.keep_order` force keep_order.
+
+    // Names coded in ORIGINAL order, per block.
+    let names_original = || -> Result<Vec<Vec<u8>>> {
+        pool.install(|| {
+            ranges
+                .par_iter()
+                .map(|&(s, e)| {
+                    let headers: Vec<&[u8]> = (s..e).map(|i| all.header(i)).collect();
+                    Ok(fqxv_tokenizer::encode(&headers)?)
+                })
+                .collect()
+        })
+    };
+    // Names coded in CLUSTERED order, per block.
+    let names_clustered = || -> Result<Vec<Vec<u8>>> {
+        pool.install(|| {
+            ranges
+                .par_iter()
+                .map(|&(s, e)| {
+                    let headers: Vec<&[u8]> =
+                        plan.order[s..e].iter().map(|&oi| all.header(oi as usize)).collect();
+                    Ok(fqxv_tokenizer::encode(&headers)?)
+                })
+                .collect()
+        })
+    };
+    // Global permutation (byte-plane split → rANS). Order-0: clustered-adjacent
+    // reads have unrelated original indices, so the planes have no byte-to-byte
+    // correlation for order-1 to exploit — and order-1's ~130 KB per-context
+    // header would dominate on all but huge inputs, wrongly making keep_order
+    // look expensive.
+    let encode_perm = || -> Result<Vec<u8>> {
+        let mut planes = vec![0u8; n * 4];
+        for (i, &x) in plan.order.iter().enumerate() {
+            planes[i] = x as u8;
+            planes[n + i] = (x >> 8) as u8;
+            planes[2 * n + i] = (x >> 16) as u8;
+            planes[3 * n + i] = (x >> 24) as u8;
+        }
+        Ok(fqxv_rans::encode(&planes, fqxv_rans::Order::Zero)?)
+    };
+
+    let (keep_order, name_blocks, perm_c) = if params.keep_order || g > 1 {
+        (true, names_original()?, encode_perm()?)
+    } else {
+        // Adaptive: keep_order iff original-order names + permutation beat the
+        // clustered-order name stream. (Quality's order dependence is second-order
+        // and ignored here.) Deterministic — sizes don't depend on thread count.
+        let orig = names_original()?;
+        let clustered = names_clustered()?;
+        let perm = encode_perm()?;
+        let keep_bytes = orig.iter().map(Vec::len).sum::<usize>() + perm.len();
+        let cluster_bytes = clustered.iter().map(Vec::len).sum::<usize>();
+        if keep_bytes < cluster_bytes {
+            (true, orig, perm)
+        } else {
+            (false, clustered, Vec::new())
+        }
+    };
+
+    // Quality in the chosen order: original for keep_order; otherwise clustered,
+    // reversed for flipped reads so bytes line up with the reverse-complemented
+    // sequence.
+    let qual_blocks: Vec<Vec<u8>> = pool.install(|| {
         ranges
             .par_iter()
-            .map(|&(s, e)| -> Result<(Vec<u8>, Vec<u8>)> {
+            .map(|&(s, e)| -> Result<Vec<u8>> {
                 if keep_order {
-                    let headers: Vec<&[u8]> = (s..e).map(|i| all.header(i)).collect();
-                    let names = fqxv_tokenizer::encode(&headers)?;
-                    let qual = fqxv_fqzcomp::encode(
+                    Ok(fqxv_fqzcomp::encode(
                         &all.lens[s..e],
                         &all.qual[offs[s]..offs[e]],
                         params.quality_binning,
-                    )?;
-                    Ok((names, qual))
+                    )?)
                 } else {
-                    let mut headers: Vec<&[u8]> = Vec::with_capacity(e - s);
                     let mut cl_lens: Vec<u32> = Vec::with_capacity(e - s);
                     let mut cl_qual: Vec<u8> = Vec::new();
                     for &oi in &plan.order[s..e] {
                         let oi = oi as usize;
-                        headers.push(all.header(oi));
                         cl_lens.push(all.lens[oi]);
                         let q = &all.qual[offs[oi]..offs[oi + 1]];
                         if plan.flip[oi] {
@@ -1193,29 +1258,13 @@ fn encode_reordered<W: Write>(
                             cl_qual.extend_from_slice(q);
                         }
                     }
-                    let names = fqxv_tokenizer::encode(&headers)?;
-                    let qual = fqxv_fqzcomp::encode(&cl_lens, &cl_qual, params.quality_binning)?;
-                    Ok((names, qual))
+                    Ok(fqxv_fqzcomp::encode(&cl_lens, &cl_qual, params.quality_binning)?)
                 }
             })
             .collect::<Result<_>>()
     })?;
 
-    // 6. Global permutation (byte-plane split → rANS) — only with keep_order.
-    // Without it, reads emerge clustered, so no permutation is needed; an empty
-    // frame keeps the on-disk layout uniform.
-    let perm_c = if keep_order {
-        let mut planes = vec![0u8; n * 4];
-        for (i, &x) in plan.order.iter().enumerate() {
-            planes[i] = x as u8;
-            planes[n + i] = (x >> 8) as u8;
-            planes[2 * n + i] = (x >> 16) as u8;
-            planes[3 * n + i] = (x >> 24) as u8;
-        }
-        fqxv_rans::encode(&planes, fqxv_rans::Order::One)?
-    } else {
-        Vec::new()
-    };
+    let nq_blocks: Vec<(Vec<u8>, Vec<u8>)> = name_blocks.into_iter().zip(qual_blocks).collect();
 
     // 7. Write: header, then n / flip / perm / seq blocks / name+qual blocks.
     let mut w = BufWriter::new(writer);
@@ -1866,6 +1915,8 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
         plus_normalized: header.flags & FLAG_PLUS_NORMALIZED != 0,
         group_size: header.group_size,
         reordered: header.flags & FLAG_REORDERED != 0,
+        keep_order: header.flags & FLAG_REORDERED == 0
+            || header.flags & FLAG_KEEP_ORDER != 0,
         ..Info::default()
     })
 }
@@ -1901,6 +1952,8 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         plus_normalized: header.flags & FLAG_PLUS_NORMALIZED != 0,
         group_size: header.group_size,
         reordered: header.flags & FLAG_REORDERED != 0,
+        keep_order: header.flags & FLAG_REORDERED == 0
+            || header.flags & FLAG_KEEP_ORDER != 0,
         ..Info::default()
     };
     // Whole-file global-cluster layout: [u64 n][flip][perm][u32 n_blocks]
@@ -2556,6 +2609,91 @@ NNGGCCTA\n\
             decompress(&archive[..], &mut out, 1).unwrap();
             assert_eq!(record_set(&out), record_set(&input), "threads={threads}");
         }
+    }
+
+    /// FASTQ of `n` overlapping windows (length `win`) of a fixed pseudo-random
+    /// reference, emitted in a SHUFFLED order with header text from `name(i)`.
+    /// The windows share minimizers so clustering re-groups them; because file
+    /// order is shuffled, clustered order differs from file order — so a
+    /// positional counter in the name scrambles under clustering (the case where
+    /// keep-order pays off). Bare `+`, so a keep-order archive round-trips
+    /// byte-for-byte.
+    fn windowed_input(name: impl Fn(usize) -> String, n: usize, win: usize) -> Vec<u8> {
+        let bases = b"ACGT";
+        let mut x = 0x1234_5678u32;
+        let mut lcg = || {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            x
+        };
+        let mut refseq = Vec::with_capacity(n + win);
+        for _ in 0..n + win {
+            refseq.push(bases[((lcg() >> 16) & 3) as usize]);
+        }
+        // Window starts, Fisher-Yates shuffled so file order != clustered order.
+        let mut starts: Vec<usize> = (0..n).collect();
+        for i in (1..n).rev() {
+            starts.swap(i, lcg() as usize % (i + 1));
+        }
+        let mut v = Vec::new();
+        for i in 0..n {
+            v.extend_from_slice(name(i).as_bytes());
+            v.push(b'\n');
+            let s = starts[i];
+            v.extend_from_slice(&refseq[s..s + win]);
+            v.extend_from_slice(b"\n+\n");
+            v.extend(std::iter::repeat_n(b'I', win));
+            v.push(b'\n');
+        }
+        v
+    }
+
+    #[test]
+    fn adaptive_keeps_order_for_counter_names() {
+        // Counter-style names (the `.N N` pattern) delta-code to almost nothing in
+        // original order, so the permutation is cheaper than the scrambled-counter
+        // clustered-order stream: adaptive should keep order — and then restore it
+        // byte-for-byte.
+        let input = windowed_input(|i| format!("@read.{i} {i}"), 2000, 40);
+        let params = Params {
+            reorder: true,
+            ..Params::default()
+        };
+        let mut archive = Vec::new();
+        compress(&input[..], &mut archive, params).unwrap();
+        assert!(
+            peek(&archive[..]).unwrap().keep_order,
+            "counter names should trigger keep_order"
+        );
+        let mut out = Vec::new();
+        decompress(&archive[..], &mut out, 1).unwrap();
+        assert_eq!(out, input, "keep_order must restore original order exactly");
+    }
+
+    #[test]
+    fn adaptive_drops_order_for_random_names() {
+        // Avalanched (splitmix64) names look i.i.d., so they carry no order
+        // structure: original- and clustered-order coding cost the same and the
+        // permutation is pure overhead — adaptive should NOT keep order.
+        let splitmix = |i: usize| -> u64 {
+            let mut z = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let input = windowed_input(|i| format!("@{:016x}", splitmix(i)), 2000, 40);
+        let params = Params {
+            reorder: true,
+            ..Params::default()
+        };
+        let mut archive = Vec::new();
+        compress(&input[..], &mut archive, params).unwrap();
+        assert!(
+            !peek(&archive[..]).unwrap().keep_order,
+            "random names should not keep order (permutation is pure overhead)"
+        );
+        let mut out = Vec::new();
+        decompress(&archive[..], &mut out, 1).unwrap();
+        assert_eq!(record_set(&out), record_set(&input));
     }
 
     /// Duplicate-rich reads for one mate of a paired set (`n` spots), sharing

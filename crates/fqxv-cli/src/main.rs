@@ -136,11 +136,12 @@ enum Command {
         /// cost. No effect without `--order any`.
         #[arg(long, help_heading = "Advanced")]
         rescue: bool,
-        /// With `--order any`, reorder for the sequence win but still restore the
-        /// original read order on decompress, by storing a permutation and coding
-        /// names/quality in original order. On data whose names carry the original
-        /// order (e.g. an incrementing counter) the permutation is far cheaper
-        /// than the scrambled-name stream, so this can shrink the archive too.
+        /// With `--order any`, force original read order to be restored on
+        /// decompress (store a permutation, code names/quality in original order).
+        /// By default single-end reorder picks this automatically when it makes
+        /// the archive smaller — counter-style names (e.g. an incrementing
+        /// `.N N`) delta-code to almost nothing in original order, so the
+        /// permutation beats a scrambled-name stream. Pass this to force it on.
         #[arg(long, help_heading = "Advanced")]
         keep_order: bool,
         /// Opt-in lossy quality binning (changes the data; default is lossless).
@@ -464,6 +465,16 @@ fn print_info(path: &Path, tsv: bool) -> anyhow::Result<()> {
         "  reordered      {}",
         if info.reordered { "yes" } else { "no" }
     );
+    if info.reordered {
+        println!(
+            "  read order     {}",
+            if info.keep_order {
+                "preserved (permutation stored)"
+            } else {
+                "clustered (not preserved)"
+            }
+        );
+    }
     println!(
         "  plus line      {}",
         if info.plus_normalized {
