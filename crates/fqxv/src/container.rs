@@ -11,6 +11,9 @@
 //!            bits5-7: platform tag)
 //! [1] group size G (reads interleaved per spot: 1 single-end, 2 paired,
 //!                   3-4 single-cell R1/R2/I1[/I2], ...)
+//! [4] header_crc (LE) -- CRC-32C over the 10 header-field bytes above, verified
+//!     on read so a flipped version/flags/binning-tag/group-size byte is caught
+//!     rather than silently changing decode. Present in both layouts.
 //! repeated until the terminator:
 //!   [8] block payload length (LE, nonzero)
 //!   [4] CRC-32C of the payload (LE) -- verified before decode, so corruption is
@@ -53,9 +56,13 @@
 //! permutation reconstructs the original spot interleaving, so `keep_order` is
 //! forced on and the archive de-interleaves cleanly on `decompress_split`.
 //! Layout after the header:
-//! `[8] n  [ ] flip  [ ] perm  [4] n_blocks  [seq block]*n  [ [names][qual] ]*n`
+//! `[8] n  [ ] flip  [ ] perm  [ ] template  [4] n_blocks  [seq block]*n
+//!  [ [names][qual] ]*n  [ ] output_digest`
 //! (each `[ ]` is a `[u32 len][u32 crc32c][bytes]` frame, CRC-verified on decode;
-//! `perm` is empty without keep-order).
+//! `perm` is empty without keep-order, `template` is empty unless regenerating
+//! names). The trailing `output_digest` frame holds an xxh3-64 over the reads in
+//! output order (the reorder analog of the per-block content digest), verified
+//! after decode so a codec bug that reconstructs wrong reads is caught.
 //! This layout is self-describing and carries no footer/terminator — decode
 //! dispatches on flag bit3 before ever reading a block, so the block-region
 //! terminator and footer index above apply only to the plain layout.
@@ -90,7 +97,15 @@ const DEFAULT_BLOCK_READS: usize = 1 << 20;
 /// `u32` per-stream compressed length. For fixed short reads the read count is
 /// the binding limit and this never triggers.
 const MAX_BLOCK_SEQ_BYTES: usize = 256 << 20;
-const HEADER_LEN: usize = 10;
+/// Header fields covered by the header CRC: magic(4) + version(2) + seq_order(1)
+/// + quality-binning tag(1) + flags(1) + group size(1).
+const HEADER_FIELDS_LEN: usize = 10;
+/// Full on-disk header prefix: the [`HEADER_FIELDS_LEN`] fields followed by a
+/// CRC-32C over them, so a flipped header byte (version, flags, the lossy binning
+/// tag, group size) is caught on read rather than silently changing decode — in
+/// both the plain and reorder layouts. Also the byte offset at which the first
+/// block / reorder frame begins.
+const HEADER_LEN: usize = HEADER_FIELDS_LEN + CRC_LEN;
 /// Bytes of CRC-32C appended after a frame's length field (plain block frames)
 /// or after a `[u32 len]` framed slice (reorder layout).
 const CRC_LEN: usize = 4;
@@ -1066,7 +1081,30 @@ fn block_ranges(
     ranges
 }
 
-/// Write the container header.
+/// Write the `HEADER_FIELDS_LEN` header fields followed by a CRC-32C over them,
+/// so a flipped header byte is caught on read instead of silently altering decode.
+/// Shared by the plain ([`write_header`]) and reorder ([`encode_reordered`])
+/// layouts, which differ only in their `flags`.
+fn write_header_prefix<W: Write>(
+    w: &mut W,
+    seq_order: u8,
+    binning: u8,
+    flags: u8,
+    group_size: u8,
+) -> Result<()> {
+    let mut hdr = [0u8; HEADER_FIELDS_LEN];
+    hdr[..4].copy_from_slice(&MAGIC);
+    hdr[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    hdr[6] = seq_order;
+    hdr[7] = binning;
+    hdr[8] = flags;
+    hdr[9] = group_size;
+    w.write_all(&hdr)?;
+    w.write_all(&crc32c(&hdr).to_le_bytes())?;
+    Ok(())
+}
+
+/// Write the container header (plain layout).
 fn write_header<W: Write>(
     w: &mut W,
     params: &Params,
@@ -1077,15 +1115,13 @@ fn write_header<W: Write>(
     // uses the whole-file path, which writes its own header.
     debug_assert!(!params.reorder);
     let flags = FLAG_PLUS_NORMALIZED | platform.flag_bits();
-    w.write_all(&MAGIC)?;
-    w.write_all(&FORMAT_VERSION.to_le_bytes())?;
-    w.write_all(&[
+    write_header_prefix(
+        w,
         params.seq_order,
         binning_tag(params.quality_binning),
         flags,
         group_size,
-    ])?;
-    Ok(())
+    )
 }
 
 /// Compress an in-memory FASTQ buffer: parse it in parallel into blocks, then
@@ -1648,14 +1684,13 @@ fn encode_reordered<W: Write>(
     if template.is_some() {
         flags |= FLAG_REGEN_NAMES;
     }
-    w.write_all(&MAGIC)?;
-    w.write_all(&FORMAT_VERSION.to_le_bytes())?;
-    w.write_all(&[
+    write_header_prefix(
+        &mut w,
         params.seq_order,
         binning_tag(params.quality_binning),
         flags,
         g,
-    ])?;
+    )?;
     w.write_all(&(n as u64).to_le_bytes())?;
     write_framed(&mut w, &flip_bits)?;
     write_framed(&mut w, &perm_c)?;
@@ -1670,6 +1705,38 @@ fn encode_reordered<W: Write>(
         write_framed(&mut w, names)?;
         write_framed(&mut w, qual)?;
     }
+
+    // Trailing whole-output content digest: fold the reads exactly as decode will
+    // emit them (see [`OutputDigest`]). keep-order emits original order/content;
+    // otherwise clustered order, original orientation, template-regenerated names.
+    let mut od = OutputDigest::new();
+    let read_slice = |a: usize| {
+        (
+            &all.seq[offs[a]..offs[a + 1]],
+            &all.qual[offs[a]..offs[a + 1]],
+        )
+    };
+    if keep_order {
+        for i in 0..n {
+            let (seq, qual) = read_slice(i);
+            od.push(all.header(i), seq, qual);
+        }
+    } else {
+        for j in 0..n {
+            let oi = plan.order[j] as usize;
+            let (seq, qual) = read_slice(oi);
+            let regen;
+            let name: &[u8] = if let Some(t) = &template {
+                regen = t.regenerate(j);
+                &regen
+            } else {
+                all.header(oi)
+            };
+            od.push(name, seq, qual);
+        }
+    }
+    let output_digest = od.finish();
+    write_framed(&mut w, &output_digest.to_le_bytes())?;
     w.flush()?;
 
     // Each framed slice is [4 len][4 crc][bytes]; n_blocks is a bare [4].
@@ -1683,7 +1750,8 @@ fn encode_reordered<W: Write>(
         + nq_blocks
             .iter()
             .map(|(nm, q)| frame(nm.len()) + frame(q.len()))
-            .sum::<usize>()) as u64;
+            .sum::<usize>()
+        + frame(DIGEST_LEN)) as u64;
     Ok(Stats {
         reads: n as u64,
         blocks: ranges.len() as u64,
@@ -1707,6 +1775,9 @@ struct ReorderStreams {
     /// When set (discard-order archives), `names` is empty and each output name
     /// is regenerated from this template at its output position.
     template: Option<fqxv_tokenizer::NameTemplate>,
+    /// Whole-output content digest (see [`OutputDigest`]); the decode paths fold
+    /// the reads they emit and compare against this.
+    output_digest: u64,
 }
 
 /// Read and entropy-decode the whole-file reorder layout. `r` is positioned just
@@ -1739,6 +1810,14 @@ fn read_reordered_streams<R: Read>(mut r: R, pool: &rayon::ThreadPool) -> Result
         let qual = read_framed(&mut r, &format!("reorder quality block {i}"))?;
         nq_payloads.push((names, qual));
     }
+    // Trailing whole-output content digest frame.
+    let digest_bytes = read_framed(&mut r, "reorder output digest")?;
+    let output_digest = u64::from_le_bytes(
+        digest_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Malformed("reorder output digest length"))?,
+    );
 
     // Decode both partitions in parallel.
     let seq_dec: Vec<Vec<Vec<u8>>> = pool.install(|| {
@@ -1796,6 +1875,7 @@ fn read_reordered_streams<R: Read>(mut r: R, pool: &rayon::ThreadPool) -> Result
         lens,
         quals,
         template,
+        output_digest,
     })
 }
 
@@ -1843,6 +1923,8 @@ fn decode_reordered_whole<R: Read, W: Write>(
     let mut s = read_reordered_streams(r, &pool)?;
     let n = s.n;
     let n_blocks = s.n_blocks;
+    let expected_digest = s.output_digest;
+    let mut od = OutputDigest::new();
     let mut w = BufWriter::new(writer);
     if keep_order {
         // Un-permute, then emit in original order against the original-order
@@ -1859,6 +1941,7 @@ fn decode_reordered_whole<R: Read, W: Write>(
             if seq_orig[i].len() != l {
                 return Err(Error::Malformed("reordered sequence length mismatch"));
             }
+            od.push(&s.names[i], &seq_orig[i], qual);
             let mut rec = Vec::with_capacity(l * 2 + s.names[i].len() + 8);
             write_record(&mut rec, &s.names[i], &seq_orig[i], qual);
             w.write_all(&rec)?;
@@ -1894,12 +1977,18 @@ fn decode_reordered_whole<R: Read, W: Write>(
             } else {
                 &s.names[j]
             };
+            od.push(name, &seq, &qual);
             let mut rec = Vec::with_capacity(l * 2 + name.len() + 8);
             write_record(&mut rec, name, &seq, &qual);
             w.write_all(&rec)?;
         }
     }
     w.flush()?;
+    if od.finish() != expected_digest {
+        return Err(Error::Corrupt {
+            what: "reorder output digest".to_string(),
+        });
+    }
     Ok(Stats {
         reads: n as u64,
         blocks: n_blocks as u64,
@@ -1922,6 +2011,7 @@ fn decode_reordered_split<R: Read, W: Write>(
     let mut s = read_reordered_streams(r, &pool)?;
     let n = s.n;
     let n_blocks = s.n_blocks;
+    let expected_digest = s.output_digest;
     let seq_orig = unpermute_sequences(&mut s)?;
     let mut bufs: Vec<BufWriter<&mut W>> = writers.iter_mut().map(BufWriter::new).collect();
     let mut stats = Stats {
@@ -1930,6 +2020,7 @@ fn decode_reordered_split<R: Read, W: Write>(
         group_size: g as u8,
         ..Stats::default()
     };
+    let mut od = OutputDigest::new();
     let mut qoff = 0usize;
     for i in 0..n {
         let l = s.lens[i] as usize;
@@ -1941,6 +2032,7 @@ fn decode_reordered_split<R: Read, W: Write>(
         if seq_orig[i].len() != l {
             return Err(Error::Malformed("reordered sequence length mismatch"));
         }
+        od.push(&s.names[i], &seq_orig[i], qual);
         let mut rec = Vec::with_capacity(l * 2 + s.names[i].len() + 8);
         write_record(&mut rec, &s.names[i], &seq_orig[i], qual);
         bufs[i % g].write_all(&rec)?;
@@ -1948,6 +2040,13 @@ fn decode_reordered_split<R: Read, W: Write>(
     }
     for b in &mut bufs {
         b.flush()?;
+    }
+    // Split emits reads in original (i) order across the g writers, matching the
+    // keep-order digest folded above.
+    if od.finish() != expected_digest {
+        return Err(Error::Corrupt {
+            what: "reorder output digest".to_string(),
+        });
     }
     Ok(stats)
 }
@@ -1983,6 +2082,42 @@ fn content_digest<'a>(
     h.update(seq);
     h.update(qual);
     h.digest()
+}
+
+/// Rolling xxh3-64 over reads in output order — the whole-file reorder layout's
+/// analog of the per-block [`content_digest`] (that layout splits reads across
+/// seq/name/quality partitions, so there is no single block to digest). Encode
+/// folds the reads it *will* emit (original order for keep-order; clustered order,
+/// original orientation, with template-regenerated names otherwise); decode folds
+/// the reads it *actually* emits and compares. A mismatch means the reorder codec
+/// stack (clustering, contig assembly, permutation, flips) round-tripped into
+/// wrong output. Per-read name/seq lengths are folded to pin boundaries; the read
+/// count is folded last so a short/long read set can't collide. `qual.len()`
+/// equals `seq.len()` per read.
+struct OutputDigest {
+    h: Xxh3,
+    n: u64,
+}
+
+impl OutputDigest {
+    fn new() -> Self {
+        OutputDigest {
+            h: Xxh3::new(),
+            n: 0,
+        }
+    }
+    fn push(&mut self, name: &[u8], seq: &[u8], qual: &[u8]) {
+        self.h.update(&(name.len() as u32).to_le_bytes());
+        self.h.update(name);
+        self.h.update(&(seq.len() as u32).to_le_bytes());
+        self.h.update(seq);
+        self.h.update(qual);
+        self.n += 1;
+    }
+    fn finish(mut self) -> u64 {
+        self.h.update(&self.n.to_le_bytes());
+        self.h.digest()
+    }
 }
 
 /// Code one non-reorder block: names (tokenizer), sequence (order-k), and quality
@@ -2887,18 +3022,28 @@ struct Header {
 fn read_header<R: Read>(r: &mut R) -> Result<Header> {
     let mut buf = [0u8; HEADER_LEN];
     r.read_exact(&mut buf)?;
-    if buf[..4] != MAGIC {
+    let (fields, crc) = buf.split_at(HEADER_FIELDS_LEN);
+    if fields[..4] != MAGIC {
         return Err(Error::BadMagic);
     }
-    let ver = u16::from_le_bytes([buf[4], buf[5]]);
+    let ver = u16::from_le_bytes([fields[4], fields[5]]);
     if ver != FORMAT_VERSION {
         return Err(Error::UnsupportedVersion(ver));
     }
-    let group_size = buf[9].max(1);
+    // Verify the header CRC only after magic/version, so a genuinely foreign or
+    // wrong-version file reports that (more useful) error rather than a CRC
+    // mismatch. Within this version, a flipped field byte is caught here before
+    // it can silently change decode (group size, flags, the lossy binning tag).
+    if u32::from_le_bytes(crc.try_into().unwrap()) != crc32c(fields) {
+        return Err(Error::Corrupt {
+            what: "header".to_string(),
+        });
+    }
+    let group_size = fields[9].max(1);
     Ok(Header {
-        seq_order: buf[6],
-        quality_binning: buf[7],
-        flags: buf[8],
+        seq_order: fields[6],
+        quality_binning: fields[7],
+        flags: fields[8],
         group_size,
     })
 }
@@ -4196,6 +4341,77 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
         let mut out = Vec::new();
         decompress(&archive[..], &mut out, 1)
             .expect("lossy archive round-trips without a false content-digest failure");
+    }
+
+    #[test]
+    fn decompress_rejects_header_bit_flip() {
+        // The header CRC catches a flipped field byte (here the lossy binning tag)
+        // that would otherwise silently change how the archive is interpreted.
+        let mut archive = multiblock_archive(20, 64);
+        archive[7] ^= 0x02; // quality-binning tag, inside the CRC'd header fields
+        let mut out = Vec::new();
+        let err = decompress(&archive[..], &mut out, 1).unwrap_err();
+        assert!(
+            matches!(&err, Error::Corrupt { what } if what == "header"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reorder_header_is_crc_protected() {
+        // The reorder layout previously left its header (incl. the lossy binning
+        // tag and flags) covered by no checksum; the header CRC now covers it too.
+        let input = dup_rich_input('q');
+        let mut archive = Vec::new();
+        compress(
+            &input[..],
+            &mut archive,
+            Params {
+                reorder: true,
+                ..Params::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(archive[8] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+        archive[7] ^= 0x02; // binning tag in the reorder layout's header
+        let mut out = Vec::new();
+        let err = decompress(&archive[..], &mut out, 1).unwrap_err();
+        assert!(
+            matches!(&err, Error::Corrupt { what } if what == "header"),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decompress_detects_reorder_output_digest_mismatch() {
+        // Reorder analog of the per-block content-digest test: repair the trailing
+        // digest frame's CRC after corrupting the stored digest, so only the
+        // whole-output content check can reject the (otherwise valid) archive.
+        let input = dup_rich_input('q');
+        let mut archive = Vec::new();
+        compress(
+            &input[..],
+            &mut archive,
+            Params {
+                reorder: true,
+                ..Params::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(archive[8] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+        // Trailing frame is [4 len=8][4 crc][8 digest] at the very end (no footer).
+        let len = archive.len();
+        let dig_start = len - DIGEST_LEN;
+        let crc_start = dig_start - CRC_LEN;
+        archive[len - 1] ^= 0xFF; // flip a stored-digest byte
+        let repaired = crc32c(&archive[dig_start..len]);
+        archive[crc_start..dig_start].copy_from_slice(&repaired.to_le_bytes());
+        let mut out = Vec::new();
+        let err = decompress(&archive[..], &mut out, 1).unwrap_err();
+        assert!(
+            matches!(&err, Error::Corrupt { what } if what.contains("output digest")),
+            "got {err:?}"
+        );
     }
 
     #[test]
