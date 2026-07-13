@@ -76,7 +76,10 @@ fn main() {
         }
     }
     let qmin = present.iter().position(|&p| p).unwrap_or(0) as u8;
-    let qsize = present.iter().rposition(|&p| p).map_or(1, |m| m + 1 - qmin as usize);
+    let qsize = present
+        .iter()
+        .rposition(|&p| p)
+        .map_or(1, |m| m + 1 - qmin as usize);
     eprintln!(
         "{path}: {} reads, {} quals, {nsym} distinct values (qmin={qmin}, qsize={qsize})",
         lens.len(),
@@ -88,19 +91,79 @@ fn main() {
     report("fqxv-current (18b)", baseline, quals.len());
 
     let configs = [
-        Cfg { name: "q1 dense + pos150 + d4", k_prev: 1, pos_cap: 149, delta_cap: 3 },
-        Cfg { name: "q1q2 + pos150 + d4", k_prev: 2, pos_cap: 149, delta_cap: 3 },
-        Cfg { name: "q1q2q3 + pos150 + d4", k_prev: 3, pos_cap: 149, delta_cap: 3 },
-        Cfg { name: "q1q2q3q4 + pos150 + d4", k_prev: 4, pos_cap: 149, delta_cap: 3 },
-        Cfg { name: "q1q2q3q4 + pos150 + d0", k_prev: 4, pos_cap: 149, delta_cap: 0 },
-        Cfg { name: "q1q2q3q4q5 + pos150 + d4", k_prev: 5, pos_cap: 149, delta_cap: 3 },
-        Cfg { name: "q1q2q3 + pos256 + d8", k_prev: 3, pos_cap: 255, delta_cap: 7 },
-        Cfg { name: "q1q2q3q4 + pos48 + d4", k_prev: 4, pos_cap: 47, delta_cap: 3 },
+        Cfg {
+            name: "q1 dense + pos150 + d4",
+            k_prev: 1,
+            pos_cap: 149,
+            delta_cap: 3,
+        },
+        Cfg {
+            name: "q1q2 + pos150 + d4",
+            k_prev: 2,
+            pos_cap: 149,
+            delta_cap: 3,
+        },
+        Cfg {
+            name: "q1q2q3 + pos150 + d4",
+            k_prev: 3,
+            pos_cap: 149,
+            delta_cap: 3,
+        },
+        Cfg {
+            name: "q1q2q3q4 + pos150 + d4",
+            k_prev: 4,
+            pos_cap: 149,
+            delta_cap: 3,
+        },
+        Cfg {
+            name: "q1q2q3q4 + pos150 + d0",
+            k_prev: 4,
+            pos_cap: 149,
+            delta_cap: 0,
+        },
+        Cfg {
+            name: "q1q2q3q4q5 + pos150 + d4",
+            k_prev: 5,
+            pos_cap: 149,
+            delta_cap: 3,
+        },
+        Cfg {
+            name: "q1q2q3 + pos256 + d8",
+            k_prev: 3,
+            pos_cap: 255,
+            delta_cap: 7,
+        },
+        Cfg {
+            name: "q1q2q3q4 + pos48 + d4",
+            k_prev: 4,
+            pos_cap: 47,
+            delta_cap: 3,
+        },
         // Larger contexts — more training data on the full file may favor these.
-        Cfg { name: "q1q2q3q4 + pos256 + d8", k_prev: 4, pos_cap: 255, delta_cap: 7 },
-        Cfg { name: "q1q2q3 + pos256 + d16", k_prev: 3, pos_cap: 255, delta_cap: 15 },
-        Cfg { name: "q1q2q3q4q5 + pos256 + d4", k_prev: 5, pos_cap: 255, delta_cap: 3 },
-        Cfg { name: "q1q2q3q4q5q6 + pos150 + d4", k_prev: 6, pos_cap: 149, delta_cap: 3 },
+        Cfg {
+            name: "q1q2q3q4 + pos256 + d8",
+            k_prev: 4,
+            pos_cap: 255,
+            delta_cap: 7,
+        },
+        Cfg {
+            name: "q1q2q3 + pos256 + d16",
+            k_prev: 3,
+            pos_cap: 255,
+            delta_cap: 15,
+        },
+        Cfg {
+            name: "q1q2q3q4q5 + pos256 + d4",
+            k_prev: 5,
+            pos_cap: 255,
+            delta_cap: 3,
+        },
+        Cfg {
+            name: "q1q2q3q4q5q6 + pos150 + d4",
+            k_prev: 6,
+            pos_cap: 149,
+            delta_cap: 3,
+        },
     ];
     for c in &configs {
         let ts = c.table_size(nsym);
@@ -161,7 +224,14 @@ fn encode_fqxv(lens: &[u32], quals: &[u8], qmin: u8, _qsize: usize) -> usize {
     enc.finish().len()
 }
 
-fn encode_cfg(c: &Cfg, lens: &[u32], quals: &[u8], qmap: &[u8; 256], nsym: usize, ts: usize) -> usize {
+fn encode_cfg(
+    c: &Cfg,
+    lens: &[u32],
+    quals: &[u8],
+    qmap: &[u8; 256],
+    nsym: usize,
+    ts: usize,
+) -> usize {
     let mut models = vec![SimpleModel::<QMAX>::new(); ts];
     let mut enc = Encoder::new();
     let mut rest = quals;

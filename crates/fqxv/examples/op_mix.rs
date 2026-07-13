@@ -78,7 +78,11 @@ fn main() {
             }
         })
         .collect();
-    let cl_anchors: Vec<u32> = plan.order.iter().map(|&oi| plan.anchor[oi as usize]).collect();
+    let cl_anchors: Vec<u32> = plan
+        .order
+        .iter()
+        .map(|&oi| plan.anchor[oi as usize])
+        .collect();
 
     // Per-block: op-mix + compressed bytes for both codecs, round-trip v3.
     let bsz = REORDER_BLOCK_READS.max(1);

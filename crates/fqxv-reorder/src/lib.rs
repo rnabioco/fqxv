@@ -682,7 +682,9 @@ fn try_place(contig: &[Column], cur: &[u8], off: usize) -> Option<(usize, Vec<us
     if overlap == 0 || overlap < MIN_CONTIG_OVERLAP.min(cur.len()) {
         return None;
     }
-    let mism: Vec<usize> = (0..overlap).filter(|&j| cur[j] != contig[off + j].base).collect();
+    let mism: Vec<usize> = (0..overlap)
+        .filter(|&j| cur[j] != contig[off + j].base)
+        .collect();
     let novel_n = cur.len() - overlap;
     (mism.len() <= overlap / 4 && novel_n + mism.len() * 2 < cur.len()).then_some((overlap, mism))
 }
@@ -752,7 +754,12 @@ impl Assembler {
                 let key = (mism.len(), self.contigs.len() - 1 - ci, off);
                 if key < best_key {
                     best_key = key;
-                    best = Some(Placement { ci, off, overlap, mism });
+                    best = Some(Placement {
+                        ci,
+                        off,
+                        overlap,
+                        mism,
+                    });
                 }
             }
         }
@@ -779,7 +786,8 @@ impl Assembler {
     /// Seed a fresh contig from a literal read and index all its k-mers.
     fn seed(&mut self, cur: &[u8], anchor: u32) {
         let ci = self.contigs.len();
-        self.contigs.push(cur.iter().map(|&b| seed_column(b)).collect());
+        self.contigs
+            .push(cur.iter().map(|&b| seed_column(b)).collect());
         self.ref_anchors.push(anchor);
         self.index_range(ci, 0, cur.len());
     }
@@ -851,7 +859,15 @@ pub fn encode_clustered_rescue(
     out.push(3u8); // version 3: literal-rescue contig-assembly layout
     write_varint(&mut out, reads.len() as u64);
     for s in [
-        &ops_c, &cref_c, &offdelta_c, &slen_c, &nmis_c, &pos_c, &subs_c, &novel_c, &lit_c,
+        &ops_c,
+        &cref_c,
+        &offdelta_c,
+        &slen_c,
+        &nmis_c,
+        &pos_c,
+        &subs_c,
+        &novel_c,
+        &lit_c,
     ] {
         write_varint(&mut out, s.len() as u64);
         out.extend_from_slice(s);
@@ -934,14 +950,18 @@ pub fn decode_clustered_rescue(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                 let mut p = 0usize;
                 for _ in 0..m {
                     p += c_pos.varint()? as usize;
-                    let b = *subs.get(subs_pos).ok_or(Error::Malformed("subs underrun"))?;
+                    let b = *subs
+                        .get(subs_pos)
+                        .ok_or(Error::Malformed("subs underrun"))?;
                     subs_pos += 1;
                     *read
                         .get_mut(p)
                         .ok_or(Error::Malformed("mismatch position out of range"))? = b;
                 }
                 for slot in read.iter_mut().skip(overlap) {
-                    *slot = *novel.get(novel_pos).ok_or(Error::Malformed("novel underrun"))?;
+                    *slot = *novel
+                        .get(novel_pos)
+                        .ok_or(Error::Malformed("novel underrun"))?;
                     novel_pos += 1;
                 }
                 for (j, &b) in read.iter().enumerate().take(overlap) {

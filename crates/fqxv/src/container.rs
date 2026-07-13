@@ -1191,8 +1191,10 @@ fn encode_reordered<W: Write>(
             ranges
                 .par_iter()
                 .map(|&(s, e)| {
-                    let headers: Vec<&[u8]> =
-                        plan.order[s..e].iter().map(|&oi| all.header(oi as usize)).collect();
+                    let headers: Vec<&[u8]> = plan.order[s..e]
+                        .iter()
+                        .map(|&oi| all.header(oi as usize))
+                        .collect();
                     Ok(fqxv_tokenizer::encode(&headers)?)
                 })
                 .collect()
@@ -1261,7 +1263,11 @@ fn encode_reordered<W: Write>(
                             cl_qual.extend_from_slice(q);
                         }
                     }
-                    Ok(fqxv_fqzcomp::encode(&cl_lens, &cl_qual, params.quality_binning)?)
+                    Ok(fqxv_fqzcomp::encode(
+                        &cl_lens,
+                        &cl_qual,
+                        params.quality_binning,
+                    )?)
                 }
             })
             .collect::<Result<_>>()
@@ -1918,8 +1924,7 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
         plus_normalized: header.flags & FLAG_PLUS_NORMALIZED != 0,
         group_size: header.group_size,
         reordered: header.flags & FLAG_REORDERED != 0,
-        keep_order: header.flags & FLAG_REORDERED == 0
-            || header.flags & FLAG_KEEP_ORDER != 0,
+        keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
         ..Info::default()
     })
 }
@@ -1955,8 +1960,7 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         plus_normalized: header.flags & FLAG_PLUS_NORMALIZED != 0,
         group_size: header.group_size,
         reordered: header.flags & FLAG_REORDERED != 0,
-        keep_order: header.flags & FLAG_REORDERED == 0
-            || header.flags & FLAG_KEEP_ORDER != 0,
+        keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
         ..Info::default()
     };
     // Whole-file global-cluster layout: [u64 n][flip][perm][u32 n_blocks]
