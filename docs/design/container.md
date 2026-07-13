@@ -17,6 +17,7 @@ seek to any of them without scanning the file.
 [1]  group size G               (1 single-end, 2 paired, 3-4 single-cell)
 repeated until the terminator:
   [8]  block payload length (LE, nonzero)
+  [4]  CRC-32C of the payload (LE)       (verified before the block is decoded)
   [ ]  block payload
 [8]  0                          (zero-length terminator block)
 footer:
@@ -24,6 +25,8 @@ footer:
   per row group: [8] byte_offset (LE)   (points at the group's length field)
                  [4] read_count  (LE)
   [8]  total_reads (LE)
+  [4]  whole_file_crc (LE)              (CRC-32C of byte 0 .. total_reads)
+  [4]  footer_crc (LE)                  (CRC-32C of the footer body above)
 trailer (at EOF):
   [8]  footer_offset (LE)
   [4]  magic "FQXF"
@@ -112,6 +115,32 @@ ignoring mate structure, but the group size is recorded in the header and the
 permutation reconstructs the original spot interleaving, so keep-order is forced
 on and the archive de-interleaves cleanly on `--split`. See
 [Read Reordering](reordering.md).
+
+## Integrity
+
+Every archive carries CRC-32C (Castagnoli) checksums — the same checksum family
+BGZF/BAM and CRAM use — layered so a single flipped bit is both *detected* and
+*localized* rather than silently decoded into wrong bases or quality scores.
+Three checksums sit at three levels of the layout above:
+
+- **Per-block payload CRC.** Each block frame is `[8] length · [4] CRC-32C · [ ]
+  payload`; the CRC is verified *before* the payload is handed to the codecs, so
+  corruption is caught and confined to one row group. This is what makes
+  [`decompress --recover`](../cli/decompress.md#recovering-a-corrupted-archive)
+  possible — a bad block is identified and skipped, not decoded into garbage.
+- **Footer CRC** (`footer_crc`) guards the row-group index. It covers the footer
+  body and is checked before any byte offset in the index is trusted, so a
+  damaged footer can't send a seeking reader to a bogus location.
+- **Whole-file CRC** (`whole_file_crc`) is a CRC-32C over the archive from byte 0
+  through the `total_reads` field — a single end-to-end digest of everything but
+  the two footer CRCs and the trailer.
+
+[`fqxv verify`](../cli/verify.md) checks all three in one pass without running any
+codec: it re-hashes the archive prefix against `whole_file_crc`, validates
+`footer_crc`, and confirms every per-block CRC — far cheaper than a full
+`decompress`. The globally-clustered [reordered layout](#reordered-archives)
+carries no footer, so `verify` there drives every frame CRC by decoding into a
+sink instead.
 
 ## Losslessness
 
