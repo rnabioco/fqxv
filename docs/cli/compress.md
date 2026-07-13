@@ -26,6 +26,7 @@ preserved for the split.
 | `-o, --output <PATH>` | Output `.fqxv` path (required). |
 | `-l, --level <N>` | Effort 1–9; higher raises the sequence context order. Default: 5. |
 | `--quality-bin <MODE>` | `lossless` (default), `bin8`, `bin4`, `bin2` (lossy). |
+| `--platform <NAME>` | Sequencing platform to record: `illumina`, `nanopore`, `pacbio`, `mgi`. Auto-detected from read names by default; pass to override. |
 | `--threads <N>` | Worker threads (0 = all cores). |
 
 ## Examples

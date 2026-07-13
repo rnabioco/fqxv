@@ -9,6 +9,10 @@ use anyhow::Context;
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Parser, Subcommand, ValueEnum};
 use flate2::read::MultiGzDecoder;
+use serde::Serialize;
+use tabled::builder::Builder as TableBuilder;
+use tabled::settings::object::Columns;
+use tabled::settings::{Alignment, Modify, Style};
 use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -38,7 +42,7 @@ Examples:
   # Restore the separate paired files
   fqxv decompress sample.fqxv --split sample
 
-  # Inspect an archive without decompressing it
+  # Inspect an archive without decompressing it (add --json or --tsv for scripts)
   fqxv info sample.fqxv
 
   # Download from SRA with sracha (rnabioco/sracha-rs) and archive in one pass,
@@ -147,6 +151,11 @@ enum Command {
         /// Opt-in lossy quality binning (changes the data; default is lossless).
         #[arg(long, value_enum, default_value_t = QualityBin::Lossless, help_heading = "Advanced")]
         quality_bin: QualityBin,
+        /// Sequencing platform to record in the archive. Auto-detected from the
+        /// read names by default; pass to force it (e.g. for unusual name
+        /// conventions the detector doesn't recognize).
+        #[arg(long, value_enum, help_heading = "Advanced")]
+        platform: Option<Platform>,
     },
     /// Decompress a `.fqxv` file to FASTQ.
     Decompress {
@@ -171,8 +180,11 @@ enum Command {
         input: PathBuf,
         /// Emit a single machine-readable TSV line instead of the human
         /// report (stable columns for the benchmark harness / scripts).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
         tsv: bool,
+        /// Emit a JSON object instead of the human report.
+        #[arg(long)]
+        json: bool,
     },
     /// Verify archive integrity (CRC checks) without writing any output.
     /// Exits non-zero if the archive is corrupt.
@@ -211,6 +223,30 @@ enum QualityBin {
     Bin4,
     /// Custom 2-level binning (lossy).
     Bin2,
+}
+
+/// Sequencing platform override for `compress --platform` (absent = auto-detect).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Platform {
+    /// Illumina (colon-delimited instrument names).
+    Illumina,
+    /// Oxford Nanopore (UUID read names).
+    Nanopore,
+    /// PacBio (movie/zmw read names).
+    Pacbio,
+    /// MGI / BGI (V/E/DP-prefixed read names).
+    Mgi,
+}
+
+impl From<Platform> for fqxv::Platform {
+    fn from(p: Platform) -> Self {
+        match p {
+            Platform::Illumina => fqxv::Platform::Illumina,
+            Platform::Nanopore => fqxv::Platform::Nanopore,
+            Platform::Pacbio => fqxv::Platform::PacBio,
+            Platform::Mgi => fqxv::Platform::MgiBgi,
+        }
+    }
 }
 
 impl From<QualityBin> for fqxv::QualityBinning {
@@ -279,6 +315,7 @@ fn main() -> anyhow::Result<()> {
             rescue,
             keep_order,
             quality_bin,
+            platform,
         } => {
             if inputs.is_empty() {
                 anyhow::bail!("at least one input FASTQ is required");
@@ -298,6 +335,7 @@ fn main() -> anyhow::Result<()> {
                 rescue: rescue && reorders,
                 regenerate_names: order == ReadOrder::Shuffle,
                 threads: cli.threads,
+                platform: platform.map(Into::into),
             };
             let in_size: u64 = inputs
                 .iter()
@@ -396,7 +434,7 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Command::Info { input, tsv } => print_info(&input, tsv)?,
+        Command::Info { input, tsv, json } => print_info(&input, tsv, json)?,
         Command::Verify { input } => {
             let file =
                 File::open(&input).with_context(|| format!("opening input {}", input.display()))?;
@@ -412,20 +450,67 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_info(path: &Path, tsv: bool) -> anyhow::Result<()> {
+/// A per-stream size row in the machine-readable [`InfoReport`].
+#[derive(Debug, Serialize)]
+struct StreamJson {
+    bytes: u64,
+    /// Share of the three compressed streams, in percent (0 when empty).
+    pct: f64,
+}
+
+/// JSON shape emitted by `fqxv info --json`. Mirrors the human report and adds
+/// derived fields (labels, percentages, bytes/read) so consumers don't have to
+/// recompute them. Unlike the TSV line this is free to grow.
+#[derive(Debug, Serialize)]
+struct InfoReport {
+    file: String,
+    file_size: u64,
+    /// Human-readable file size (e.g. `"1.06 MB"`).
+    file_size_human: String,
+    platform: String,
+    reads: u64,
+    /// Present only for grouped/paired archives (`group_size > 1`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spots: Option<u64>,
+    blocks: u64,
+    layout: String,
+    group_size: u8,
+    sequence_order: u8,
+    quality: String,
+    quality_binning: u8,
+    reordered: bool,
+    read_order_preserved: bool,
+    plus_normalized: bool,
+    streams: InfoStreams,
+    /// Compressed stream bytes divided by read count (null when there are none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_per_read: Option<f64>,
+}
+
+/// The `streams` object nested in [`InfoReport`].
+#[derive(Debug, Serialize)]
+struct InfoStreams {
+    names: StreamJson,
+    sequence: StreamJson,
+    quality: StreamJson,
+    total: StreamJson,
+}
+
+fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let info = fqxv::inspect(
         File::open(path).with_context(|| format!("opening input {}", path.display()))?,
     )?;
     let total = info.names_bytes + info.seq_bytes + info.qual_bytes;
+
     if tsv {
         // Stable, tab-separated columns for scripts. Keep field order fixed;
         // append new fields at the end so existing parsers don't break.
         println!(
-            "file_size\treads\tblocks\tgroup_size\tseq_order\tquality_binning\treordered\tnames_bytes\tseq_bytes\tqual_bytes"
+            "file_size\treads\tblocks\tgroup_size\tseq_order\tquality_binning\treordered\tnames_bytes\tseq_bytes\tqual_bytes\tplatform"
         );
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             file_size,
             info.reads,
             info.blocks,
@@ -436,9 +521,11 @@ fn print_info(path: &Path, tsv: bool) -> anyhow::Result<()> {
             info.names_bytes,
             info.seq_bytes,
             info.qual_bytes,
+            info.platform.token(),
         );
         return Ok(());
     }
+
     let pct = |x: u64| {
         if total > 0 {
             100.0 * x as f64 / total as f64
@@ -458,66 +545,159 @@ fn print_info(path: &Path, tsv: bool) -> anyhow::Result<()> {
         3 => "lossy (2-bin, custom)",
         _ => "unknown",
     };
+    let spots = (info.group_size > 1).then(|| info.reads / info.group_size.max(1) as u64);
+    let bytes_per_read = (info.reads > 0).then(|| total as f64 / info.reads as f64);
+
+    if json {
+        let report = InfoReport {
+            file: path.display().to_string(),
+            file_size,
+            file_size_human: human_bytes(file_size),
+            platform: info.platform.token().to_string(),
+            reads: info.reads,
+            spots,
+            blocks: info.blocks,
+            layout,
+            group_size: info.group_size,
+            sequence_order: info.seq_order,
+            quality: quality.to_string(),
+            quality_binning: info.quality_binning,
+            reordered: info.reordered,
+            read_order_preserved: info.keep_order,
+            plus_normalized: info.plus_normalized,
+            streams: InfoStreams {
+                names: StreamJson {
+                    bytes: info.names_bytes,
+                    pct: pct(info.names_bytes),
+                },
+                sequence: StreamJson {
+                    bytes: info.seq_bytes,
+                    pct: pct(info.seq_bytes),
+                },
+                quality: StreamJson {
+                    bytes: info.qual_bytes,
+                    pct: pct(info.qual_bytes),
+                },
+                total: StreamJson {
+                    bytes: total,
+                    pct: pct(total),
+                },
+            },
+            bytes_per_read,
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    // Human report: a metadata table plus a per-stream size table.
+    let read_order = if info.keep_order {
+        "preserved (permutation stored)"
+    } else if info.regenerated_names {
+        "discarded (reads renumbered, names regenerated)"
+    } else {
+        "clustered (not preserved)"
+    };
+    let mut meta = TableBuilder::default();
+    let mut meta_row = |k: &str, v: String| meta.push_record([k.to_string(), v]);
+    meta_row("property", "value".to_string());
+    meta_row(
+        "layout",
+        format!("{layout} (group size {})", info.group_size),
+    );
+    meta_row("reads", group_digits(info.reads));
+    if let Some(spots) = spots {
+        meta_row("spots", group_digits(spots));
+    }
+    meta_row("blocks", group_digits(info.blocks));
+    meta_row("platform", info.platform.label().to_string());
+    meta_row("sequence order", info.seq_order.to_string());
+    meta_row("quality", quality.to_string());
+    meta_row("reordered", bool_word(info.reordered, "yes", "no"));
+    if info.reordered {
+        meta_row("read order", read_order.to_string());
+    }
+    meta_row(
+        "plus line",
+        bool_word(info.plus_normalized, "normalized", "verbatim"),
+    );
+    meta_row(
+        "file size",
+        format!(
+            "{} ({} bytes)",
+            human_bytes(file_size),
+            group_digits(file_size)
+        ),
+    );
+    let mut meta = meta.build();
+    meta.with(Style::rounded());
+
+    let mut streams = TableBuilder::default();
+    streams.push_record([
+        "stream".to_string(),
+        "bytes".to_string(),
+        "share".to_string(),
+    ]);
+    for (label, bytes) in [
+        ("names", info.names_bytes),
+        ("sequence", info.seq_bytes),
+        ("quality", info.qual_bytes),
+        ("total", total),
+    ] {
+        streams.push_record([
+            label.to_string(),
+            group_digits(bytes),
+            format!("{:.1}%", pct(bytes)),
+        ]);
+    }
+    let mut streams = streams.build();
+    streams
+        .with(Style::rounded())
+        .with(Modify::new(Columns::new(1..)).with(Alignment::right()));
 
     println!("{}", path.display());
-    println!("  layout         {layout} (group size {})", info.group_size);
-    println!("  reads          {}", info.reads);
-    if info.group_size > 1 {
-        println!(
-            "  spots          {}",
-            info.reads / info.group_size.max(1) as u64
-        );
-    }
-    println!("  blocks         {}", info.blocks);
-    println!("  sequence order {}", info.seq_order);
-    println!("  quality        {quality}");
-    println!(
-        "  reordered      {}",
-        if info.reordered { "yes" } else { "no" }
-    );
-    if info.reordered {
-        println!(
-            "  read order     {}",
-            if info.keep_order {
-                "preserved (permutation stored)"
-            } else if info.regenerated_names {
-                "discarded (reads renumbered, names regenerated)"
-            } else {
-                "clustered (not preserved)"
-            }
-        );
-    }
-    println!(
-        "  plus line      {}",
-        if info.plus_normalized {
-            "normalized"
-        } else {
-            "verbatim"
-        }
-    );
-    println!("  file size      {file_size} bytes");
-    println!(
-        "  names  {:>12} bytes ({:.1}%)",
-        info.names_bytes,
-        pct(info.names_bytes)
-    );
-    println!(
-        "  seq    {:>12} bytes ({:.1}%)",
-        info.seq_bytes,
-        pct(info.seq_bytes)
-    );
-    println!(
-        "  qual   {:>12} bytes ({:.1}%)",
-        info.qual_bytes,
-        pct(info.qual_bytes)
-    );
-    if info.reads > 0 {
-        println!(
-            "  streams total  {total} bytes ({:.2} bytes/read)",
-            total as f64 / info.reads as f64
-        );
+    println!("{meta}");
+    println!("{streams}");
+    if let Some(bpr) = bytes_per_read {
+        println!("{bpr:.2} bytes/read");
     }
     Ok(())
+}
+
+/// Pick one of two words by a flag and own it (small helper so the metadata
+/// table rows are all `String`).
+fn bool_word(flag: bool, yes: &str, no: &str) -> String {
+    if flag { yes } else { no }.to_string()
+}
+
+/// Format a byte count with a binary-scaled unit (KB/MB/GB/TB/PB, 1024-based like
+/// `du -h`). Bytes stay integral; larger units show two decimals.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 6] = ["bytes", "KB", "MB", "GB", "TB", "PB"];
+    if n < 1024 {
+        return format!("{n} bytes");
+    }
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.2} {}", UNITS[unit])
+}
+
+/// Format an integer with `,` thousands separators (e.g. `1234567` -> `1,234,567`)
+/// so large byte and read counts stay legible in the human report.
+fn group_digits(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let first = digits.len() % 3;
+    for (i, ch) in digits.chars().enumerate() {
+        if i != 0 && i >= first && (i - first).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// True if `hdr` begins with a BGZF block header: gzip magic (`1f 8b`), deflate

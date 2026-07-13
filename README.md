@@ -61,7 +61,7 @@ fqxv compress R1.fq R2.fq I1.fq I2.fq -o sample.fqxv          # 10x single-cell
 fqxv decompress sample.fqxv --split out                       # out_1.fastq, out_2.fastq, ...
 fqxv decompress sample.fqxv | bwa mem -p ref.fa -             # interleaved to stdout
 
-fqxv info sample.fqxv                                          # layout, reads, per-stream sizes
+fqxv info sample.fqxv                                          # layout, reads, per-stream sizes (--tsv/--json)
 ```
 
 Combining mates/index reads shrinks the archive (near-identical mate names
