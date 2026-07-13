@@ -13,7 +13,7 @@ The `fqxv` binary has four subcommands:
 
 | Option | Description |
 | --- | --- |
-| `--threads <N>` | Worker threads (0 = all available cores). Default: 0. |
+| `--threads <N>` | Worker threads (0 = all available cores). Default: 16, capped at available cores. |
 | `-h, --help` | Print help. |
 | `-V, --version` | Print version. |
 

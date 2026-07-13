@@ -23,16 +23,16 @@ block-based container.
 ## Quick look
 
 ```bash
-# single-end
-fqxv compress reads.fastq.gz -o reads.fqxv        # gzip input auto-detected
+# single-end (gzip input auto-detected; -o defaults to reads.fqxv)
+fqxv compress reads.fastq.gz
 fqxv decompress reads.fqxv -o reads.fastq
 
 # paired-end / single-cell: one archive, split back or stream to an aligner
-fqxv compress R1.fq.gz R2.fq.gz -o sample.fqxv
-fqxv decompress sample.fqxv --split out           # out_1.fastq, out_2.fastq
-fqxv decompress sample.fqxv | bwa mem -p ref.fa -  # interleaved to stdout
+fqxv compress sample_R1.fq.gz sample_R2.fq.gz -o sample.fqxv
+fqxv decompress sample.fqxv --split out            # out_R1.fastq.gz, out_R2.fastq.gz
+fqxv decompress sample.fqxv -Z | bwa mem -p ref.fa -  # interleaved, raw, to stdout
 
-fqxv info sample.fqxv                             # layout, reads, per-stream sizes (--tsv/--json)
+fqxv info sample.fqxv                              # layout, reads, per-stream sizes (--tsv/--json)
 ```
 
 ## How it works

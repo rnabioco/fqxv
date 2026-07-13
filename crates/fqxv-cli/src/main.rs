@@ -27,20 +27,22 @@ const STYLES: Styles = Styles::styled()
 /// Worked examples, appended under the top-level `--help`.
 const EXAMPLES: &str = "\
 Examples:
-  # Compress a single-end FASTQ (gzip is auto-detected by magic bytes)
-  fqxv compress reads.fastq.gz -o reads.fqxv
+  # Compress a single-end FASTQ (gzip auto-detected; -o defaults to reads.fqxv)
+  fqxv compress reads.fastq.gz
 
   # Paired-end: mates are interleaved per spot into one archive
-  fqxv compress R1.fastq.gz R2.fastq.gz -o sample.fqxv
+  fqxv compress sample_R1.fastq.gz sample_R2.fastq.gz -o sample.fqxv
 
   # Squeeze harder: top level plus read reordering (single-end order may change)
-  fqxv compress reads.fastq.gz -o reads.fqxv -l 9 --order any
+  fqxv compress reads.fastq.gz -l 9 --order any
 
-  # Decompress to stdout and pipe straight into an aligner
-  fqxv decompress sample.fqxv | bwa mem -p ref.fa -
+  # Stream to stdout (-Z, always raw) and pipe straight into an aligner
+  fqxv decompress sample.fqxv -Z | bwa mem -p ref.fa -
 
-  # Restore the separate paired files
+  # Restore the separate mate files -> sample_R1.fastq.gz, sample_R2.fastq.gz
   fqxv decompress sample.fqxv --split sample
+  # ...or plain, numbered: sample_1.fastq, sample_2.fastq
+  fqxv decompress sample.fqxv --split sample --no-gzip --mate-style num
 
   # Inspect an archive without decompressing it (add --json or --tsv for scripts)
   fqxv info sample.fqxv
@@ -115,9 +117,12 @@ enum Command {
         /// files are interleaved per spot. Order is preserved for `--split`.
         #[arg(num_args = 1..)]
         inputs: Vec<PathBuf>,
-        /// Output `.fqxv` path.
+        /// Output `.fqxv` path. Defaults to the first input's name with the
+        /// FASTQ/gzip extension replaced by `.fqxv` (`reads.fastq.gz` ->
+        /// `reads.fqxv`), written alongside the input. Required when the input is
+        /// stdin (`-`).
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
         /// Compression effort level (1-9); higher raises the sequence order.
         #[arg(short, long, default_value_t = 5)]
         level: u8,
@@ -162,13 +167,29 @@ enum Command {
     Decompress {
         /// Input `.fqxv` file.
         input: PathBuf,
-        /// Interleaved FASTQ output; omit or use `-` for stdout (pipe to an
-        /// aligner: `fqxv decompress x.fqxv | bwa mem -p ref -`).
+        /// Interleaved FASTQ output file. A `.gz` extension writes block-gzip
+        /// (BGZF); any other extension writes plain FASTQ. Use `-Z/--stdout` (or
+        /// `-o -`) to stream to stdout instead.
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Restore separate per-spot files as `<prefix>_1.fastq … _G.fastq`.
+        /// Stream interleaved FASTQ (always raw) to stdout, e.g. to pipe into an
+        /// aligner: `fqxv decompress x.fqxv -Z | bwa mem -p ref -`. Required to
+        /// write to stdout — a bare `decompress` with no `-o`/`--split`/`-Z` errors
+        /// rather than flooding the terminal with reads.
+        #[arg(short = 'Z', long, conflicts_with_all = ["output", "split"])]
+        stdout: bool,
+        /// Restore separate per-spot files as `<prefix>_R1.fastq.gz …
+        /// _R<G>.fastq.gz` (block-gzip by default; see `--mate-style`/`--no-gzip`).
         #[arg(long, conflicts_with = "output")]
         split: Option<PathBuf>,
+        /// Labeling for `--split` outputs: `r` gives `_R1`,`_R2`,… (Illumina
+        /// convention, the default); `num` gives `_1`,`_2`,….
+        #[arg(long, value_enum, default_value_t = MateStyle::R, requires = "split")]
+        mate_style: MateStyle,
+        /// Write plain `.fastq` for `--split` instead of the default block-gzip
+        /// `.fastq.gz`. (For `-o FILE`, compression follows the file extension.)
+        #[arg(long, requires = "split")]
+        no_gzip: bool,
         /// Best-effort recovery of a corrupted archive: skip blocks that fail
         /// their CRC and decode the rest, reporting what was lost. Interleaved
         /// output only (plain, non-reordered archives).
@@ -223,6 +244,15 @@ enum ReadOrder {
     /// and quality preserved exactly). Falls back to `any` when names aren't a
     /// counter. Single-end only.
     Shuffle,
+}
+
+/// Labeling for the per-mate files produced by `decompress --split`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MateStyle {
+    /// `_R1`, `_R2`, … — the Illumina convention (default).
+    R,
+    /// `_1`, `_2`, … — bare member numbers.
+    Num,
 }
 
 /// Lossy quality quantization choices exposed on the CLI.
@@ -333,6 +363,10 @@ fn main() -> anyhow::Result<()> {
             if inputs.is_empty() {
                 anyhow::bail!("at least one input FASTQ is required");
             }
+            let output = match output {
+                Some(p) => p,
+                None => default_archive_name(&inputs[0])?,
+            };
             let interleaved = interleaved.filter(|_| inputs.len() == 1);
             // `--order any`/`shuffle` turn on reordering; the library forces the
             // permutation (keep_order) back on for grouped input, so paired
@@ -398,18 +432,21 @@ fn main() -> anyhow::Result<()> {
         Command::Decompress {
             input,
             output,
+            stdout,
             split,
+            mate_style,
+            no_gzip,
             recover,
         } => {
             let open_in =
                 || File::open(&input).with_context(|| format!("opening input {}", input.display()));
             let t0 = Instant::now();
             if recover {
-                let rec = fqxv::decompress_recover(
-                    open_in()?,
-                    open_output(output.as_deref())?,
-                    cli.threads,
-                )?;
+                // Recovery deliberately tolerates missing/corrupt blocks, so the
+                // completeness check below does not apply here.
+                let mut sink = open_sink(output.as_deref(), stdout)?;
+                let rec = fqxv::decompress_recover(open_in()?, &mut sink, cli.threads)?;
+                sink.finish()?;
                 if rec.blocks_skipped > 0 {
                     // User-facing summary on stderr so it shows even when the
                     // decoded FASTQ is piped from stdout.
@@ -427,18 +464,36 @@ fn main() -> anyhow::Result<()> {
                     "recovered"
                 );
             } else {
+                // Read the footer's authoritative read count first. For a truncated
+                // archive (which also lost its footer) this errors before any output
+                // is written; otherwise we compare it against what we actually
+                // decode so a silently short file is caught rather than trusted.
+                let expected = fqxv::expected_reads(open_in()?)?;
                 let stats = if let Some(prefix) = split {
                     let g = fqxv::peek(open_in()?)?.group_size as usize;
-                    let mut files: Vec<File> = (1..=g)
-                        .map(|i| {
-                            let path = format!("{}_{}.fastq", prefix.display(), i);
-                            File::create(&path).with_context(|| format!("creating output {path}"))
-                        })
+                    let mut sinks: Vec<FastqSink> = (1..=g)
+                        .map(|i| open_fastq_file(&split_path(&prefix, i, mate_style, !no_gzip)))
                         .collect::<anyhow::Result<_>>()?;
-                    fqxv::decompress_split(open_in()?, &mut files, cli.threads)?
+                    let stats = fqxv::decompress_split(open_in()?, &mut sinks, cli.threads)?;
+                    for sink in sinks {
+                        sink.finish()?;
+                    }
+                    stats
                 } else {
-                    fqxv::decompress(open_in()?, open_output(output.as_deref())?, cli.threads)?
+                    let mut sink = open_sink(output.as_deref(), stdout)?;
+                    let stats = fqxv::decompress(open_in()?, &mut sink, cli.threads)?;
+                    sink.finish()?;
+                    stats
                 };
+                if let Some(expected) = expected {
+                    if stats.reads != expected {
+                        anyhow::bail!(
+                            "archive is truncated: footer declares {expected} reads but only \
+                             {} were decoded — the output is incomplete",
+                            stats.reads
+                        );
+                    }
+                }
                 info!(
                     reads = stats.reads,
                     blocks = stats.blocks,
@@ -840,16 +895,113 @@ fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
     }
 }
 
-/// Open an output sink: a file, or stdout when the path is absent or `-`.
-fn open_output(path: Option<&Path>) -> anyhow::Result<Box<dyn Write>> {
-    match path {
-        Some(p) if p.as_os_str() != "-" => {
-            Ok(Box::new(File::create(p).with_context(|| {
-                format!("creating output {}", p.display())
-            })?))
+/// A FASTQ output sink: raw bytes, or BGZF (block-gzip) compression.
+///
+/// BGZF is selected by a `.gz` filename ([`is_gzip_path`]); stdout is always raw so
+/// a decode piped straight into an aligner isn't gzip-wrapped. The multithreaded
+/// BGZF writer compresses blocks on rayon's global pool (sized by `--threads`), so
+/// gzipping the output doesn't serialize the otherwise-parallel decode.
+enum FastqSink {
+    Raw(Box<dyn Write + Send>),
+    Bgzf(noodles_bgzf::io::MultithreadedWriter<Box<dyn Write + Send>>),
+}
+
+impl Write for FastqSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            FastqSink::Raw(w) => w.write(buf),
+            FastqSink::Bgzf(w) => w.write(buf),
         }
-        _ => Ok(Box::new(io::stdout())),
     }
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            FastqSink::Raw(w) => w.flush(),
+            FastqSink::Bgzf(w) => w.flush(),
+        }
+    }
+}
+
+impl FastqSink {
+    /// Wrap `inner` in a BGZF encoder when `gzip`, else pass it through raw.
+    fn new(inner: Box<dyn Write + Send>, gzip: bool) -> Self {
+        if gzip {
+            FastqSink::Bgzf(noodles_bgzf::io::MultithreadedWriter::new(inner))
+        } else {
+            FastqSink::Raw(inner)
+        }
+    }
+
+    /// Flush and, for BGZF, append the mandatory EOF marker block. The library
+    /// decode paths only flush their writers, so finalization lives here; a dropped
+    /// `MultithreadedWriter` also writes the EOF block, but calling `finish`
+    /// surfaces a write error (a full disk, say) instead of swallowing it in `Drop`.
+    fn finish(self) -> io::Result<()> {
+        match self {
+            FastqSink::Raw(mut w) => w.flush(),
+            FastqSink::Bgzf(mut w) => w.finish().and_then(|mut inner| inner.flush()),
+        }
+    }
+}
+
+/// True when `path` ends in a `.gz` extension (case-insensitive), i.e. the caller
+/// asked for gzip-compressed output.
+fn is_gzip_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gz"))
+}
+
+/// Resolve the interleaved-output sink from `-o`/`-Z`. An explicit path (or `-o -`)
+/// wins; `-Z/--stdout` streams raw to stdout; with neither we refuse rather than
+/// dump a whole FASTQ to the terminal. Stdout is always raw so a piped decode isn't
+/// gzip-wrapped; a file's `.gz` extension selects BGZF.
+fn open_sink(output: Option<&Path>, to_stdout: bool) -> anyhow::Result<FastqSink> {
+    match output {
+        Some(p) if p.as_os_str() == "-" => Ok(FastqSink::Raw(Box::new(io::stdout()))),
+        Some(p) => open_fastq_file(p),
+        None if to_stdout => Ok(FastqSink::Raw(Box::new(io::stdout()))),
+        None => anyhow::bail!(
+            "no output specified: pass -o FILE (\".gz\" for BGZF), --split PREFIX for separate \
+             mate files, or -Z/--stdout to stream interleaved FASTQ to stdout"
+        ),
+    }
+}
+
+/// Create a FASTQ output file, choosing BGZF compression from its `.gz` extension.
+fn open_fastq_file(path: &Path) -> anyhow::Result<FastqSink> {
+    let file = File::create(path).with_context(|| format!("creating output {}", path.display()))?;
+    Ok(FastqSink::new(Box::new(file), is_gzip_path(path)))
+}
+
+/// Build the path for member `i` (1-based) of a `--split` decode: `<prefix>` plus a
+/// mate label (`_R1` or `_1`, per `style`) and a `.fastq`/`.fastq.gz` extension.
+fn split_path(prefix: &Path, i: usize, style: MateStyle, gzip: bool) -> PathBuf {
+    let label = match style {
+        MateStyle::R => format!("R{i}"),
+        MateStyle::Num => i.to_string(),
+    };
+    let ext = if gzip { "fastq.gz" } else { "fastq" };
+    PathBuf::from(format!("{}_{}.{}", prefix.display(), label, ext))
+}
+
+/// Derive the default archive name from the first input: strip a gzip suffix and a
+/// FASTQ extension, append `.fqxv`, and keep it in the input's directory
+/// (`path/to/reads.fastq.gz` -> `path/to/reads.fqxv`). Errors on stdin (`-`), which
+/// has no name to derive from.
+fn default_archive_name(first: &Path) -> anyhow::Result<PathBuf> {
+    if first.as_os_str() == "-" {
+        anyhow::bail!("reading FASTQ from stdin (-) has no name to derive from; pass -o/--output");
+    }
+    let name = first
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let base = name.strip_suffix(".gz").unwrap_or(&name);
+    let base = base
+        .strip_suffix(".fastq")
+        .or_else(|| base.strip_suffix(".fq"))
+        .unwrap_or(base);
+    let base = if base.is_empty() { "out" } else { base };
+    Ok(first.with_file_name(format!("{base}.fqxv")))
 }
 
 fn read_up_to<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
