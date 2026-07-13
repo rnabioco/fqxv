@@ -5,21 +5,24 @@
 #SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32       # 32 cores, not whole-node --exclusive, so cells
-#SBATCH --mem=32G                # pack onto partially-free nodes and queue faster;
-                                 # sized to the worst tool (xz9 ~24G) + headroom
-#SBATCH --time=02:00:00
-#SBATCH --output=fqxv-cell-%A_%a.out
-## #SBATCH --account=amc-general
+#SBATCH --cpus-per-task=16       # Memory is the real floor: the worst cell (xz9
+#SBATCH --mem=28G                # on NovaSeq) peaks ~22.5G, and amilan caps mem
+#SBATCH --time=01:00:00          # at 3840M/core, so 28G needs >=8 cores; 16 adds
+#SBATCH --output=fqxv-cell-%A_%a.out                # throughput headroom while
+## #SBATCH --account=amc-general                     # still packing onto a node.
 #
 # Phase 2 of the parallel harness: one array task per (dataset, tool) cell. Each
-# cell still runs one measured tool at a time on its 32 bound cores — the point
-# is never to co-schedule tools within a cell (every tool already uses all its
-# cores, so that would only oversubscribe and blur MB/s). Requesting 32 cores
-# rather than a whole exclusive node schedules much faster; the cost is that a
-# co-tenant on the other socket can add some memory-bandwidth noise to the
-# throughput columns (ratios and rt/det correctness are unaffected). For a
-# publication-clean throughput run, add `#SBATCH --exclusive` back.
+# cell runs one measured tool at a time on its bound cores — the point is never
+# to co-schedule tools within a cell (every tool already uses all its cores, so
+# that would only oversubscribe and blur MB/s). The ask is sized to memory, not
+# throughput: xz9/fqxv-reorder on the 5.5G NovaSeq set peak ~16-22.5G, and this
+# partition hard-caps memory at 3840M/core, so 28G already pulls in ~8 cores.
+# Fewer cores means every cell packs onto a partially-free node and schedules
+# far faster; the cost is lower absolute MB/s in the throughput columns (ratios
+# and rt/det correctness are core-count-independent). Tools use fewer per-thread
+# buffers at 8 threads, so peak memory is *below* the 32-thread figures above.
+# For a publication-clean throughput run, raise cpus-per-task and add
+# `#SBATCH --exclusive`.
 # The cell index maps into $RESULTS_DIR/cells.tsv (submit_parallel.sh generated
 # it); results append to a private part file.
 set -euo pipefail
