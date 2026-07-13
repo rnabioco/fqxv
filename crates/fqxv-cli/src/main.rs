@@ -123,8 +123,14 @@ enum Command {
         /// stdin (`-`).
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Maximum-compression preset — shorthand for `-l 9 --order any` (deepest
+        /// sequence context plus read reordering). Overrides `--level` and
+        /// `--order`. Single-end reads may come back reordered; names, sequence,
+        /// and quality are preserved exactly (still lossless).
+        #[arg(long)]
+        max: bool,
         /// Compression effort level (1-9); higher raises the sequence order.
-        #[arg(short, long, default_value_t = 5)]
+        #[arg(short, long, default_value_t = 5, help_heading = "Advanced")]
         level: u8,
 
         /// Interleaving of a single input, in members per spot. Auto-detected
@@ -308,6 +314,18 @@ fn level_to_order(level: u8) -> u8 {
     (level as usize + 6).clamp(1, 11) as u8
 }
 
+/// Map a 1-9 effort level to the hashed high-order sequence tier `(order, bits)`
+/// (`1 << bits` table slots). Off below level 8; the table costs ~`16 << bits`
+/// bytes per active block, so it is gated to the top levels where the user has
+/// opted into maximum compression. `0` order disables it. Applies to the
+/// non-reorder (`--order preserve`) path only.
+fn level_to_hash(level: u8) -> (u8, u8) {
+    match level {
+        0..=7 => (0, 0),
+        _ => (13, 25), // level 8 and up
+    }
+}
+
 /// Map a 1-9 effort level to reads per block. Larger blocks train the sequence
 /// model on more reads (better ratio) at the cost of parallelism and memory.
 fn level_to_block(level: u8) -> usize {
@@ -353,6 +371,7 @@ fn main() -> anyhow::Result<()> {
             inputs,
             output,
             level,
+            max,
             interleaved,
             order,
             no_rescue,
@@ -367,6 +386,10 @@ fn main() -> anyhow::Result<()> {
                 Some(p) => p,
                 None => default_archive_name(&inputs[0])?,
             };
+            // `--max` is a convenience preset for the best ratio, so users don't
+            // have to know the knobs; it overrides `--level`/`--order`.
+            let level = if max { 9 } else { level };
+            let order = if max { ReadOrder::Any } else { order };
             let interleaved = interleaved.filter(|_| inputs.len() == 1);
             // `--order any`/`shuffle` turn on reordering; the library forces the
             // permutation (keep_order) back on for grouped input, so paired
@@ -375,6 +398,8 @@ fn main() -> anyhow::Result<()> {
             let reorders = order != ReadOrder::Preserve;
             let params = fqxv::Params {
                 seq_order: level_to_order(level),
+                seq_hash_order: level_to_hash(level).0,
+                seq_hash_bits: level_to_hash(level).1,
                 block_reads: level_to_block(level),
                 quality_binning: quality_bin.into(),
                 reorder: reorders,

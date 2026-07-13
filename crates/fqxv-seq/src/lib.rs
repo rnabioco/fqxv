@@ -53,7 +53,7 @@ pub enum Error {
 /// The result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-const FORMAT_VERSION: u8 = 0;
+const FORMAT_VERSION: u8 = 1;
 
 /// Loose upper bound on bases the range coder can emit per compressed byte, used
 /// as a decompression-bomb guard in [`decode`]. The adaptive model caps its
@@ -63,6 +63,17 @@ const FORMAT_VERSION: u8 = 0;
 const MAX_BASES_PER_BYTE: usize = 1 << 18;
 /// Largest context order (4^11 contexts ≈ 4.2M models).
 const MAX_ORDER: usize = 11;
+/// Largest hashed high-order tier order. `2 * MAX_HASH_ORDER` bits must fit the
+/// `u64` rolling context used to index the hash table.
+const MAX_HASH_ORDER: usize = 24;
+/// Largest hashed-tier table size (`1 << MAX_HASH_BITS` slots). Caps a hostile
+/// header from requesting an enormous allocation before any decode happens.
+const MAX_HASH_BITS: u32 = 26;
+/// Odd multipliers for the hashed tier's index and collision-check (Fibonacci
+/// hashing; the check uses an independent constant so index and check don't
+/// correlate). See [`HashSlot`].
+const HASH_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
+const CHECK_MUL: u64 = 0xD6E8_FEB8_6659_FD93;
 /// Escape threshold: use the order-k model once its context total reaches this,
 /// else fall back to the warm low-order model. A `NucModel` starts at `tot == 5`
 /// and gains `STEP == 16` per observation, so this fires after ~4 observations —
@@ -167,8 +178,69 @@ impl NucModel {
     }
 }
 
+/// One slot of the hashed high-order tier: a [`NucModel`] plus a `check` tag of
+/// the context that owns it. On access, a slot whose `check` disagrees with the
+/// current context is evicted (reset) — so a hash collision just costs recall (the
+/// coder escapes to the dense order-k model), never correctness: encoder and
+/// decoder derive `check` identically and evict in lock-step, so the stream stays
+/// byte-exact. `check == 0` marks an empty slot ([`hash_check`] never returns 0).
+#[derive(Clone)]
+struct HashSlot {
+    check: u32,
+    m: NucModel,
+}
+
+impl HashSlot {
+    #[inline]
+    fn empty() -> Self {
+        HashSlot {
+            check: 0,
+            m: NucModel::new(),
+        }
+    }
+}
+
+/// Table slot index for `ctx` (Fibonacci hash, top `bits` of the product).
+#[inline]
+fn hash_index(ctx: u64, bits: u32) -> usize {
+    (ctx.wrapping_mul(HASH_MUL) >> (64 - bits)) as usize
+}
+
+/// Nonzero collision-check tag for `ctx`, independent of [`hash_index`].
+#[inline]
+fn hash_check(ctx: u64) -> u32 {
+    (ctx.wrapping_mul(CHECK_MUL) as u32) | 1
+}
+
 /// Encode per-read sequences with an order-`order` context model.
 pub fn encode(lens: &[u32], seq: &[u8], order: usize) -> Result<Vec<u8>> {
+    encode_impl(lens, seq, order, 0, 0)
+}
+
+/// Encode with an extra **hashed** high-order tier above the dense order-`order`
+/// model: an order-`hash_order` context indexed into a `1 << hash_bits`-slot
+/// table (see [`HashSlot`]). Per base the warmest of `hashed → order-k → order-k/2`
+/// codes the symbol; collisions in the table cost only recall (escape to the dense
+/// tier), never correctness. `hash_order <= order` or `hash_bits == 0` disables it,
+/// making this identical to [`encode`]. Byte-exactly reversible by [`decode`]
+/// (the tier params are self-describing in the header).
+pub fn encode_hashed(
+    lens: &[u32],
+    seq: &[u8],
+    order: usize,
+    hash_order: usize,
+    hash_bits: u32,
+) -> Result<Vec<u8>> {
+    encode_impl(lens, seq, order, hash_order, hash_bits)
+}
+
+fn encode_impl(
+    lens: &[u32],
+    seq: &[u8],
+    order: usize,
+    hash_order: usize,
+    hash_bits: u32,
+) -> Result<Vec<u8>> {
     let total: usize = lens.iter().map(|&l| l as usize).sum();
     if total != seq.len() {
         return Err(Error::LengthMismatch {
@@ -180,9 +252,29 @@ pub fn encode(lens: &[u32], seq: &[u8], order: usize) -> Result<Vec<u8>> {
     let klo = lo_order(k);
     let ctx_mask = (1usize << (2 * k)) - 1;
     let lo_mask = (1usize << (2 * klo)) - 1;
+    // Optional hashed high-order tier. Only meaningful strictly above the dense
+    // order-k model; `hash_bits` is clamped so the table stays bounded.
+    let h = hash_order.min(MAX_HASH_ORDER);
+    let hb = hash_bits.min(MAX_HASH_BITS);
+    let use_hash = h > k && hb > 0;
+    let h_mask: u64 = if use_hash { (1u64 << (2 * h)) - 1 } else { 0 };
+    // The rolling context must retain the WIDEST tier's history (the hashed order
+    // when enabled); each tier masks it down to its own order at lookup. Masking
+    // it to `ctx_mask` here would strip the extra bases the hashed tier needs,
+    // silently degrading that tier to an order-k copy.
+    let top_mask: usize = if use_hash {
+        (1usize << (2 * h)) - 1
+    } else {
+        ctx_mask
+    };
 
     let mut hi = vec![NucModel::new(); ctx_mask + 1];
     let mut lo = vec![NucModel::new(); lo_mask + 1];
+    let mut hh: Vec<HashSlot> = if use_hash {
+        vec![HashSlot::empty(); 1usize << hb]
+    } else {
+        Vec::new()
+    };
     let mut enc = Encoder::new();
     let mut exceptions: Vec<(usize, u8)> = Vec::new();
     let mut idx = 0usize;
@@ -199,19 +291,47 @@ pub fn encode(lens: &[u32], seq: &[u8], order: usize) -> Result<Vec<u8>> {
             let raw = BASE_LUT[byte as usize];
             let sym = if raw == 255 { NSYM } else { raw as usize };
             let lc = ctx & lo_mask;
-            debug_assert!(ctx <= ctx_mask && lc <= lo_mask);
-            // SAFETY: `ctx` is masked to `ctx_mask == hi.len()-1`; `lc` to
-            // `lo_mask == lo.len()-1`. Escape to the warm low-order model while
-            // the high-order context is still cold; both models observe every
-            // symbol so they stay in sync for the decoder.
-            let use_hi = unsafe { hi.get_unchecked(ctx) }.tot() >= SEQ_ESCAPE_TOT;
+            let hi_ctx = ctx & ctx_mask;
+            debug_assert!(hi_ctx <= ctx_mask && lc <= lo_mask && ctx <= top_mask);
+            // Hashed slot for this context, evicting a colliding occupant first so
+            // its total reads cold. `hslot` indexes `hh` for the rest of the base.
+            let hslot = if use_hash {
+                let hc = (ctx as u64) & h_mask;
+                let idxh = hash_index(hc, hb);
+                let ck = hash_check(hc);
+                debug_assert!(idxh < hh.len());
+                // SAFETY: `idxh < 1 << hb == hh.len()`.
+                let s = unsafe { hh.get_unchecked_mut(idxh) };
+                if s.check != ck {
+                    s.check = ck;
+                    s.m = NucModel::new();
+                }
+                idxh
+            } else {
+                0
+            };
+            // Code with the warmest tier (hashed → hi → lo); every tier observes
+            // the symbol so encoder and decoder stay in sync.
+            // SAFETY: `ctx <= ctx_mask == hi.len()-1`, `lc <= lo_mask == lo.len()-1`,
+            // and `hslot < hh.len()` (set above; unread when `!use_hash`).
             unsafe {
-                if use_hi {
-                    hi.get_unchecked_mut(ctx).encode(&mut enc, sym);
+                let hashed_warm = use_hash && hh.get_unchecked(hslot).m.tot() >= SEQ_ESCAPE_TOT;
+                if hashed_warm {
+                    hh.get_unchecked_mut(hslot).m.encode(&mut enc, sym);
+                    hi.get_unchecked_mut(hi_ctx).update(sym);
+                    lo.get_unchecked_mut(lc).update(sym);
+                } else if hi.get_unchecked(hi_ctx).tot() >= SEQ_ESCAPE_TOT {
+                    hi.get_unchecked_mut(hi_ctx).encode(&mut enc, sym);
+                    if use_hash {
+                        hh.get_unchecked_mut(hslot).m.update(sym);
+                    }
                     lo.get_unchecked_mut(lc).update(sym);
                 } else {
                     lo.get_unchecked_mut(lc).encode(&mut enc, sym);
-                    hi.get_unchecked_mut(ctx).update(sym);
+                    if use_hash {
+                        hh.get_unchecked_mut(hslot).m.update(sym);
+                    }
+                    hi.get_unchecked_mut(hi_ctx).update(sym);
                 }
             }
             if raw == 255 {
@@ -221,7 +341,7 @@ pub fn encode(lens: &[u32], seq: &[u8], order: usize) -> Result<Vec<u8>> {
                     exceptions.push((idx, byte));
                 }
             } else {
-                ctx = ((ctx << 2) | sym) & ctx_mask;
+                ctx = ((ctx << 2) | sym) & top_mask;
             }
             idx += 1;
         }
@@ -231,6 +351,9 @@ pub fn encode(lens: &[u32], seq: &[u8], order: usize) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(16 + lens.len() + exceptions.len() * 2 + payload.len());
     out.push(FORMAT_VERSION);
     out.push(k as u8);
+    // Hashed-tier params (0 = none), self-describing so decode rebuilds the ladder.
+    out.push(if use_hash { h as u8 } else { 0 });
+    out.push(if use_hash { hb as u8 } else { 0 });
     write_lens(&mut out, lens);
     write_exceptions(&mut out, &exceptions);
     out.extend_from_slice(&payload);
@@ -247,14 +370,35 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     if !(1..=MAX_ORDER).contains(&k) {
         return Err(Error::Malformed("order out of range"));
     }
+    // Hashed-tier params (0 = none). Validate before any shift/allocation, since
+    // they come from an untrusted header.
+    let h = r.u8()? as usize;
+    let hb = u32::from(r.u8()?);
+    let use_hash = h > k && hb > 0;
+    if use_hash && (h > MAX_HASH_ORDER || hb > MAX_HASH_BITS) {
+        return Err(Error::Malformed("hashed-tier params out of range"));
+    }
     let klo = lo_order(k);
     let ctx_mask = (1usize << (2 * k)) - 1;
     let lo_mask = (1usize << (2 * klo)) - 1;
+    let h_mask: u64 = if use_hash { (1u64 << (2 * h)) - 1 } else { 0 };
+    let top_mask: usize = if use_hash {
+        (1usize << (2 * h)) - 1
+    } else {
+        ctx_mask
+    };
     let lens = read_lens(&mut r)?;
     let exceptions = read_exceptions(&mut r)?;
 
     let mut hi = vec![NucModel::new(); ctx_mask + 1];
     let mut lo = vec![NucModel::new(); lo_mask + 1];
+    let mut hh: Vec<HashSlot> = Vec::new();
+    if use_hash {
+        // Fallible: the (capped) table must error, not abort, if it won't allocate.
+        hh.try_reserve_exact(1usize << hb)
+            .map_err(|_| Error::Malformed("hashed-tier table too large to allocate"))?;
+        hh.resize(1usize << hb, HashSlot::empty());
+    }
     let payload_len = r.rest().len();
     // Checked sum: a malformed stream can declare lengths whose total wraps
     // `usize`, which would under-allocate `seq` and then over-push.
@@ -281,17 +425,47 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     for &l in &lens {
         for _ in 0..l {
             let lc = ctx & lo_mask;
-            debug_assert!(ctx <= ctx_mask && lc <= lo_mask);
-            // SAFETY: `ctx <= ctx_mask == hi.len()-1`, `lc <= lo_mask ==
-            // lo.len()-1`. Mirror the encoder's escape decision exactly.
+            let hi_ctx = ctx & ctx_mask;
+            debug_assert!(hi_ctx <= ctx_mask && lc <= lo_mask && ctx <= top_mask);
+            // Hashed slot, evicting a collision first (mirrors the encoder).
+            let hslot = if use_hash {
+                let hc = (ctx as u64) & h_mask;
+                let idxh = hash_index(hc, hb);
+                let ck = hash_check(hc);
+                debug_assert!(idxh < hh.len());
+                // SAFETY: `idxh < 1 << hb == hh.len()`.
+                let s = unsafe { hh.get_unchecked_mut(idxh) };
+                if s.check != ck {
+                    s.check = ck;
+                    s.m = NucModel::new();
+                }
+                idxh
+            } else {
+                0
+            };
+            // SAFETY: `ctx <= ctx_mask == hi.len()-1`, `lc <= lo_mask == lo.len()-1`,
+            // `hslot < hh.len()` (unread when `!use_hash`). Mirror the encoder's
+            // tier choice exactly.
             let sym = unsafe {
-                if hi.get_unchecked(ctx).tot() >= SEQ_ESCAPE_TOT {
-                    let s = hi.get_unchecked_mut(ctx).decode(&mut dec);
+                let hashed_warm = use_hash && hh.get_unchecked(hslot).m.tot() >= SEQ_ESCAPE_TOT;
+                if hashed_warm {
+                    let s = hh.get_unchecked_mut(hslot).m.decode(&mut dec);
+                    hi.get_unchecked_mut(hi_ctx).update(s);
+                    lo.get_unchecked_mut(lc).update(s);
+                    s
+                } else if hi.get_unchecked(hi_ctx).tot() >= SEQ_ESCAPE_TOT {
+                    let s = hi.get_unchecked_mut(hi_ctx).decode(&mut dec);
+                    if use_hash {
+                        hh.get_unchecked_mut(hslot).m.update(s);
+                    }
                     lo.get_unchecked_mut(lc).update(s);
                     s
                 } else {
                     let s = lo.get_unchecked_mut(lc).decode(&mut dec);
-                    hi.get_unchecked_mut(ctx).update(s);
+                    if use_hash {
+                        hh.get_unchecked_mut(hslot).m.update(s);
+                    }
+                    hi.get_unchecked_mut(hi_ctx).update(s);
                     s
                 }
             };
@@ -301,7 +475,7 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
                 seq.push(b'N');
             } else {
                 seq.push(SYM2BASE[sym]);
-                ctx = ((ctx << 2) | sym) & ctx_mask;
+                ctx = ((ctx << 2) | sym) & top_mask;
             }
         }
     }
@@ -515,11 +689,108 @@ mod tests {
             roundtrip(&lens, &seq, order);
         }
 
+        // Same, with the hashed tier on and a deliberately tiny table (hb=6) so
+        // collisions and evictions are frequent — the eviction path must stay
+        // byte-exact for arbitrary inputs.
+        #[test]
+        fn hashed_roundtrip_arbitrary(
+            reads in proptest::collection::vec(
+                proptest::collection::vec(
+                    proptest::sample::select(b"ACGTNacgtRYKM".to_vec()), 0..60),
+                0..40),
+        ) {
+            let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
+            let seq: Vec<u8> = reads.concat();
+            let enc = encode_hashed(&lens, &seq, 11, 13, 6).expect("encode");
+            let (out_lens, out_seq) = decode(&enc).expect("decode");
+            proptest::prop_assert_eq!(out_lens, lens);
+            proptest::prop_assert_eq!(out_seq, seq);
+        }
+
         // Arbitrary bytes must never panic or abort the decoder — only Ok/Err.
         #[test]
         fn decode_never_aborts_on_garbage(bytes in proptest::collection::vec(0u8..=255, 0..256)) {
             let _ = decode(&bytes);
         }
+    }
+
+    fn roundtrip_hashed(lens: &[u32], seq: &[u8], order: usize, h: usize, hb: u32) {
+        let enc = encode_hashed(lens, seq, order, h, hb).expect("encode");
+        let (out_lens, out_seq) = decode(&enc).expect("decode");
+        assert_eq!(out_lens, lens, "lengths mismatch (h={h} hb={hb})");
+        assert_eq!(
+            out_seq, seq,
+            "sequence mismatch (order {order} h={h} hb={hb})"
+        );
+    }
+
+    #[test]
+    fn hashed_tier_roundtrips() {
+        let seq: Vec<u8> = (0..5000u32)
+            .map(|i| SYM2BASE[((i * 7 + i / 3) % 4) as usize])
+            .collect();
+        // Various table sizes, including tiny ones that force heavy collisions.
+        for hb in [4u32, 8, 12, 16] {
+            roundtrip_hashed(&[100; 50], &seq, 11, 13, hb);
+        }
+        // With N/exception bytes mixed in.
+        roundtrip_hashed(&[20], b"ACGTNNRYACGTacgtACGT", 11, 13, 8);
+    }
+
+    #[test]
+    fn hashed_disabled_matches_plain() {
+        // hash_order <= order, or hash_bits == 0, must be byte-identical to plain
+        // encode (the "levels 1-7 unchanged" guarantee).
+        let seq: Vec<u8> = (0..3000u32)
+            .map(|i| SYM2BASE[((i * 5 + 1) % 4) as usize])
+            .collect();
+        let lens = [150; 20];
+        let plain = encode(&lens, &seq, 11).expect("plain");
+        assert_eq!(encode_hashed(&lens, &seq, 11, 0, 0).expect("h0"), plain);
+        assert_eq!(encode_hashed(&lens, &seq, 11, 13, 0).expect("hb0"), plain);
+        assert_eq!(encode_hashed(&lens, &seq, 11, 11, 20).expect("h<=k"), plain);
+    }
+
+    #[test]
+    fn hashed_encode_is_deterministic() {
+        let seq: Vec<u8> = (0..8000u32)
+            .map(|i| SYM2BASE[((i * 11 + i / 7) % 4) as usize])
+            .collect();
+        let a = encode_hashed(&[200; 40], &seq, 11, 13, 14).expect("a");
+        let b = encode_hashed(&[200; 40], &seq, 11, 13, 14).expect("b");
+        assert_eq!(a, b, "hashed encode must be reproducible");
+    }
+
+    #[test]
+    fn hashed_beats_order11_on_order13_dependency() {
+        // The next base is determined by the bases 12-13 back (the shared "AA"/"CC"
+        // prefix) but NOT by the last 11 (a fixed 11-mer), so order-11 must pay ~1
+        // bit at each such base while the order-13 hashed tier resolves it. This is
+        // exactly the win the context-masking bug silently lost, so the hashed
+        // stream must be clearly smaller than plain order-11.
+        let p11: &[u8] = b"ACGTAACCGGT"; // 11 bases
+        let mut seq = Vec::new();
+        let mut lens = Vec::new();
+        for i in 0..3000u32 {
+            let bit = (i.wrapping_mul(2_654_435_761) >> 20) & 1 == 1;
+            let (pre, nxt) = if bit { (b'A', b'G') } else { (b'C', b'T') };
+            let mut read = vec![pre, pre];
+            read.extend_from_slice(p11);
+            read.push(nxt);
+            lens.push(read.len() as u32);
+            seq.extend_from_slice(&read);
+        }
+        let plain = encode(&lens, &seq, 11).expect("plain").len();
+        let hashed = encode_hashed(&lens, &seq, 11, 13, 16)
+            .expect("hashed")
+            .len();
+        assert!(
+            hashed < plain,
+            "order-13 hashed tier should beat order-11 here: {hashed} vs {plain}"
+        );
+        // Still byte-exact.
+        let enc = encode_hashed(&lens, &seq, 11, 13, 16).unwrap();
+        assert_eq!(decode(&enc).unwrap().1, seq);
     }
 
     fn push_varint(out: &mut Vec<u8>, mut v: u64) {
@@ -538,7 +809,7 @@ mod tests {
     // process on an impossible allocation.
     #[test]
     fn rejects_huge_length_count() {
-        let mut buf = vec![FORMAT_VERSION, 1]; // version, order k=1
+        let mut buf = vec![FORMAT_VERSION, 1, 0, 0]; // version, order k=1, no hash tier
         push_varint(&mut buf, u64::MAX >> 8); // n: absurd length count
         buf.push(1); // fixed = true -> resize(n, f) path
         push_varint(&mut buf, 100); // f
@@ -547,7 +818,7 @@ mod tests {
 
     #[test]
     fn rejects_huge_total_length() {
-        let mut buf = vec![FORMAT_VERSION, 1];
+        let mut buf = vec![FORMAT_VERSION, 1, 0, 0];
         push_varint(&mut buf, 1000); // n reads
         buf.push(1); // fixed = true
         push_varint(&mut buf, u32::MAX as u64); // each read u32::MAX long
