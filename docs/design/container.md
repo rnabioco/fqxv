@@ -60,12 +60,11 @@ the old scan-everything approach:
   and block totals, then seeks to each row group and reads only its small block
   header (the `n_reads` and three stream length prefixes), skipping every coded
   payload.
-- **`extract a..b` decodes only the row groups overlapping the range.** The
-  footer's read counts locate the covering groups; each is decoded and the reads
-  inside `[a, b)` are emitted. Granularity is the row group, not the read — every
-  codec carries model state across the reads within a group, so a group is the
-  smallest independently decodable unit — but only the requested reads are
-  written out.
+- **Coarse random access.** The per-group `read_count` (read-start is the running
+  sum) locates the row groups overlapping any read range, so a reader can seek to
+  and decode just those. Granularity is the row group, not the read — every codec
+  carries model state across the reads within a group, so a group is the smallest
+  independently decodable unit.
 
 ## Blocks and parallelism
 
@@ -108,9 +107,7 @@ on the flag before reading any block, so the footer index applies only to the
 plain layout. Both reorder modes share this one path: with `--keep-order`
 (flag bit2) names/quality are coded in original order and a permutation restores
 it; without it they follow the clustered order and no permutation is written.
-`extract` is not supported on reordered archives (their on-disk order is
-clustered, not input order); use `fqxv decompress`. See
-[Read Reordering](reordering.md).
+See [Read Reordering](reordering.md).
 
 ## Losslessness
 
