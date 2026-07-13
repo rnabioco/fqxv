@@ -146,3 +146,48 @@ SNP precision (coarser binning tends to inflate false-positive calls) is not
 free. Only DNA-resequencing datasets carry a reference; RNA-seq needs
 splice-aware calling and is left out (`-` in `datasets.tsv`). Extra pixi deps:
 `bwa`, `bcftools` (`samtools` was already present).
+
+## Robustness corpus (`corpus.sh`) — correctness, not ratio
+
+`run_bench.sh` is a curated *ratio* comparison against the field.
+`corpus.sh` is the opposite: a *correctness net* that throws a random pile of
+real SRA runs at fqxv and asserts every archive round-trips and builds
+identically regardless of thread count. It's how we shake out the messy long
+tail (odd read lengths, wide/narrow quality alphabets, Ns, empty reads, long
+names) that four curated datasets never hit. Modeled on sracha-rs'
+`validation/random_corpus.sh`.
+
+For each accession, per compression **mode** it runs:
+
+- `compress` → `decompress` → order-independent **content** round-trip
+  (name/seq/qual multiset, `+` line excluded — fqxv's one documented deviation;
+  reordering-safe for `--order any`);
+- `compress --threads 1` → **byte-compare** against the many-threaded archive
+  (the determinism invariant).
+
+Modes: `default` (`-l5` lossless), `max` (`-l9 --order any`), and `bin8`
+(lossy Illumina 8-level, checked against the *binned-expected* content). Set
+`FQXV_MODES` to change. Outcomes: `PASS` / `FAIL_RT` / `FAIL_DET` /
+`FAIL_COMPRESS` / `FAIL_DECOMPRESS` / `ERROR_FETCH`.
+
+```bash
+pixi run bash corpus.sh sample -n 20 -s 42   # random ENA accessions -> $CORPUS_DIR/accessions.txt
+pixi run bash corpus.sh build-digest         # compile fqdigest (fast round-trip hash; optional)
+pixi run bash corpus.sh fetch                # sracha get every accession (login node — I/O bound)
+pixi run bash corpus.sh sbatch               # fan out as a slurm array (COMPUTE) — one accession/task
+pixi run bash corpus.sh summary              # pass/fail tally + failing accessions
+```
+
+`sample` draws random Illumina runs by default (`-p all` for every platform);
+seed the shuffle for a reproducible corpus. Everything lands under
+`FQXV_CORPUS_DIR` (default `$SCRATCH/fqxv/corpus`): `data/`, per-accession
+`logs/`, and `results.tsv`. On a **`FAIL_*`** the offending archive is kept in
+`work/<acc>/` for post-mortem (`fqxv info`, re-decompress with `-v`).
+
+`fqdigest.rs` is the round-trip hash: an order-independent multiset digest
+(sum of per-record hashes — commutative, so read order doesn't matter) in one
+O(n) streaming pass with bounded memory, replacing a slow `awk | sort | md5sum`
+(~4× faster, and it sidesteps awk's per-byte quality-binning loop entirely).
+`corpus.sh` uses it when built and falls back to the awk pipeline otherwise, so
+results are identical either way. Build it once with `corpus.sh build-digest`
+(needs `rustc` on PATH; the harness never builds on the login node otherwise).
