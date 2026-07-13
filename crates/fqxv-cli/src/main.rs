@@ -136,6 +136,13 @@ enum Command {
         /// cost. No effect without `--order any`.
         #[arg(long, help_heading = "Advanced")]
         rescue: bool,
+        /// With `--order any`, reorder for the sequence win but still restore the
+        /// original read order on decompress, by storing a permutation and coding
+        /// names/quality in original order. On data whose names carry the original
+        /// order (e.g. an incrementing counter) the permutation is far cheaper
+        /// than the scrambled-name stream, so this can shrink the archive too.
+        #[arg(long, help_heading = "Advanced")]
+        keep_order: bool,
         /// Opt-in lossy quality binning (changes the data; default is lossless).
         #[arg(long, value_enum, default_value_t = QualityBin::Lossless, help_heading = "Advanced")]
         quality_bin: QualityBin,
@@ -262,6 +269,7 @@ fn main() -> anyhow::Result<()> {
             interleaved,
             order,
             rescue,
+            keep_order,
             quality_bin,
         } => {
             if inputs.is_empty() {
@@ -276,7 +284,7 @@ fn main() -> anyhow::Result<()> {
                 block_reads: level_to_block(level),
                 quality_binning: quality_bin.into(),
                 reorder: order == ReadOrder::Any,
-                keep_order: false,
+                keep_order: keep_order && order == ReadOrder::Any,
                 rescue: rescue && order == ReadOrder::Any,
                 threads: cli.threads,
             };
