@@ -97,15 +97,24 @@ fn read_stream(r: &mut Cursor<'_>) -> Result<Vec<u8>> {
     Ok(fqxv_rans::decode(r.take(len)?)?)
 }
 
-/// Append the per-column buckets, each as its own `[varint comp_len, bytes]`
-/// stream (empty columns collapse to a single `0` byte). Coding each column
-/// separately lets its near-constant run compress to almost nothing.
-fn push_cols(out: &mut Vec<u8>, cols: &[Vec<u8>]) -> Result<()> {
+/// Append the per-column numeric deltas as fixed-width little-endian byte
+/// planes: for each column, `[varint width]` then one best-order stream per
+/// byte plane. Splitting a value's low/high bytes into separate streams lets
+/// each plane model its own distribution — the high planes of x/y coordinate
+/// deltas are near-zero and compress away, which coding the packed varints in
+/// one model cannot reach. `width == 0` marks an empty column.
+fn push_delta_planes(out: &mut Vec<u8>, cols: &[Vec<u64>]) -> Result<()> {
     for col in cols {
         if col.is_empty() {
             write_varint(out, 0);
-        } else {
-            let c = encode_best(col)?;
+            continue;
+        }
+        let maxv = col.iter().copied().max().unwrap();
+        let width = (64 - maxv.leading_zeros()).div_ceil(8).max(1) as usize;
+        write_varint(out, width as u64);
+        for plane in 0..width {
+            let s: Vec<u8> = col.iter().map(|&v| (v >> (8 * plane)) as u8).collect();
+            let c = encode_best(&s)?;
             write_varint(out, c.len() as u64);
             out.extend_from_slice(&c);
         }
@@ -113,16 +122,29 @@ fn push_cols(out: &mut Vec<u8>, cols: &[Vec<u8>]) -> Result<()> {
     Ok(())
 }
 
-/// Inverse of [`push_cols`]: decode `MAX_COL + 1` per-column buckets.
-fn read_cols(r: &mut Cursor<'_>) -> Result<Vec<Vec<u8>>> {
+/// Inverse of [`push_delta_planes`]. `n_delta[col]` (derived from the op stream:
+/// one delta per `DELTA` op in that column) gives each column's value count, so
+/// no per-column length is stored; it also bounds the per-column allocation.
+fn read_delta_planes(r: &mut Cursor<'_>, n_delta: &[usize]) -> Result<Vec<Vec<u64>>> {
     let mut cols = Vec::with_capacity(MAX_COL + 1);
-    for _ in 0..=MAX_COL {
-        let len = r.varint()? as usize;
-        if len == 0 {
+    for &n in n_delta.iter().take(MAX_COL + 1) {
+        let width = r.varint()? as usize;
+        if width == 0 {
             cols.push(Vec::new());
-        } else {
-            cols.push(fqxv_rans::decode(r.take(len)?)?);
+            continue;
         }
+        let mut vals = vec![0u64; n];
+        for plane in 0..width {
+            let len = r.varint()? as usize;
+            let bytes = fqxv_rans::decode(r.take(len)?)?;
+            if bytes.len() != n {
+                return Err(Error::Malformed("delta plane length mismatch"));
+            }
+            for (v, &b) in vals.iter_mut().zip(bytes.iter()) {
+                *v |= u64::from(b) << (8 * plane);
+            }
+        }
+        cols.push(vals);
     }
     Ok(cols)
 }
@@ -212,7 +234,8 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
     // digit count. Almost always 0 (names rarely zero-pad), so this stream is
     // near-degenerate — far cheaper than storing the full width.
     let mut pads: Vec<u8> = Vec::new();
-    let mut delta_cols: Vec<Vec<u8>> = vec![Vec::new(); MAX_COL + 1];
+    // Zigzag numeric deltas per column, coded later as byte planes.
+    let mut delta_vals: Vec<Vec<u64>> = vec![Vec::new(); MAX_COL + 1];
     let mut prev: Vec<Tok> = Vec::new();
 
     for name in names {
@@ -229,7 +252,7 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
                 let pad = t.bytes.len() - natural_digits(t.value);
                 if let Some(p) = p.filter(|p| p.is_num) {
                     op_cols[col].push(DELTA);
-                    write_varint(&mut delta_cols[col], zigzag(t.value - p.value));
+                    delta_vals[col].push(zigzag(t.value - p.value));
                 } else {
                     op_cols[col].push(NUM);
                     write_varint(&mut num_vals, t.value as u64);
@@ -257,7 +280,7 @@ pub fn encode(names: &[&[u8]]) -> Result<Vec<u8>> {
     // Ops are RLE'd (near-periodic runs); deltas keep their raw per-column
     // coding (they carry the genuine coordinate entropy, not runs).
     push_op_rle(&mut out, &op_cols)?;
-    push_cols(&mut out, &delta_cols)?;
+    push_delta_planes(&mut out, &delta_vals)?;
     Ok(out)
 }
 
@@ -275,10 +298,16 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     let num_vals = read_stream(&mut r)?;
     let pads = read_stream(&mut r)?;
     let op_data = read_op_rle(&mut r, n_records)?;
-    let delta_data = read_cols(&mut r)?;
+    // Each column holds one delta per DELTA op in it; that count sizes the byte
+    // planes, so it need not be stored.
+    let n_delta: Vec<usize> = op_data
+        .iter()
+        .map(|col| col.iter().filter(|&&o| o == DELTA).count())
+        .collect();
+    let delta_vals = read_delta_planes(&mut r, &n_delta)?;
 
     let mut op_cursors: Vec<Cursor> = op_data.iter().map(|v| Cursor::new(v)).collect();
-    let mut delta_cursors: Vec<Cursor> = delta_data.iter().map(|v| Cursor::new(v)).collect();
+    let mut delta_pos = vec![0usize; MAX_COL + 1];
     let mut c_counts = Cursor::new(&counts);
     let mut c_str_lens = Cursor::new(&str_lens);
     let mut c_num = Cursor::new(&num_vals);
@@ -325,7 +354,11 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                     cur.push(num_tok(value, width));
                 }
                 DELTA => {
-                    let d = unzigzag(delta_cursors[col].varint()?);
+                    let z = *delta_vals[col]
+                        .get(delta_pos[col])
+                        .ok_or(Error::Malformed("delta underrun"))?;
+                    delta_pos[col] += 1;
+                    let d = unzigzag(z);
                     let p = prev
                         .get(cur.len())
                         .filter(|p| p.is_num)
