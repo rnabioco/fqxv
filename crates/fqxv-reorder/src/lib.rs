@@ -1273,6 +1273,44 @@ mod tests {
             proptest::prop_assert_eq!(dec, reads);
         }
 
+        // Harden the rescue codec against the way the container actually drives it:
+        // longer reads, a realistic `seq_order`, and NON-uniform anchors (the
+        // anchors above are all zero, so the anchor-implied offset path — the v2
+        // fast candidate inside `Assembler::place` — went largely unexercised).
+        // Also pins encode determinism, which the container's determinism invariant
+        // relies on now that rescue is on by default.
+        #[test]
+        fn rescue_roundtrip_varied_anchors(
+            reads in proptest::collection::vec(
+                proptest::collection::vec(proptest::sample::select(b"ACGTN".to_vec()), 0..80),
+                0..80)
+        ) {
+            let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+            let anchors: Vec<u32> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| ((r.len() * 7 + i * 3) % 41) as u32)
+                .collect();
+            for order in [1usize, 8] {
+                let v3 = encode_clustered_rescue(&refs, &anchors, order).expect("v3 encode");
+                proptest::prop_assert_eq!(
+                    decode_clustered_rescue(&v3).expect("v3 decode"),
+                    reads.clone()
+                );
+                // Deterministic: re-encoding the same input yields identical bytes.
+                proptest::prop_assert_eq!(
+                    encode_clustered_rescue(&refs, &anchors, order).expect("v3 again"),
+                    v3
+                );
+                // v2 must also round-trip under the same non-uniform anchors.
+                let v2 = encode_clustered(&refs, &anchors, order).expect("v2 encode");
+                proptest::prop_assert_eq!(
+                    decode_clustered(&v2).expect("v2 decode"),
+                    reads.clone()
+                );
+            }
+        }
+
         #[test]
         fn clustered_roundtrip_arbitrary(
             reads in proptest::collection::vec(
