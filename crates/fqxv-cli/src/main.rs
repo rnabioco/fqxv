@@ -134,12 +134,13 @@ enum Command {
         /// interleaving requires it), it just costs a stored permutation.
         #[arg(long, value_enum, default_value_t = ReadOrder::Preserve, help_heading = "Advanced")]
         order: ReadOrder,
-        /// With `--order any`, use the literal-rescue sequence codec: keep every
-        /// contig alive and re-attach would-be literals to any contig they
-        /// overlap. Smaller sequence stream on deep data, at a higher encode
-        /// cost. No effect without `--order any`.
-        #[arg(long, help_heading = "Advanced")]
-        rescue: bool,
+        /// With `--order any`, disable adaptive literal-rescue and use the faster
+        /// single-contig sequence codec only. By default reorder codes each block
+        /// with both codecs and keeps the smaller (never worse), which recovers
+        /// reads the single-contig codec would strand as literals at a higher
+        /// encode cost. No effect without `--order any`.
+        #[arg(long = "no-rescue", help_heading = "Advanced")]
+        no_rescue: bool,
         /// With `--order any`, force original read order to be restored on
         /// decompress (store a permutation, code names/quality in original order).
         /// By default single-end reorder picks this automatically when it makes
@@ -324,7 +325,7 @@ fn main() -> anyhow::Result<()> {
             level,
             interleaved,
             order,
-            rescue,
+            no_rescue,
             keep_order,
             quality_bin,
             platform,
@@ -344,7 +345,7 @@ fn main() -> anyhow::Result<()> {
                 quality_binning: quality_bin.into(),
                 reorder: reorders,
                 keep_order: keep_order && reorders,
-                rescue: rescue && reorders,
+                rescue: !no_rescue && reorders,
                 regenerate_names: order == ReadOrder::Shuffle,
                 threads: cli.threads,
                 platform: platform.map(Into::into),

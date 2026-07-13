@@ -424,10 +424,13 @@ pub struct Params {
     /// restored (otherwise reads emerge in clustered order). Forced on for grouped
     /// input (`group_size > 1`), where the permutation reconstructs the spots.
     pub keep_order: bool,
-    /// In reorder mode, use the literal-rescue sequence codec: keep every contig
-    /// alive and re-attach would-be literals to any contig they overlap (a
-    /// k-mer-indexed assembly step). Smaller sequence stream on deep data, at a
-    /// higher encode cost. Ignored when `reorder` is false. Decode auto-detects.
+    /// In reorder mode, adaptively use the literal-rescue sequence codec: each
+    /// clustered block is coded with both the single-contig (v2) and the
+    /// literal-rescue (v3, keeps every contig alive and re-attaches would-be
+    /// literals via a k-mer-indexed assembly step) assemblers, and the smaller is
+    /// kept — never worse than either alone. Default `true`; set `false` for the
+    /// faster v2-only path. Ignored when `reorder` is false. Decode auto-detects
+    /// the codec per block from a version byte, so blocks may mix versions.
     pub rescue: bool,
     /// In single-end reorder mode, if the read names are purely positional (a
     /// counter, e.g. SRA `@RUN.N N`), discard the original order and regenerate
@@ -451,7 +454,7 @@ impl Default for Params {
             quality_binning: QualityBinning::Lossless,
             reorder: false,
             keep_order: false,
-            rescue: false,
+            rescue: true,
             regenerate_names: false,
             threads: 0,
             platform: None,
@@ -1531,6 +1534,13 @@ fn encode_reordered<W: Write>(
     };
 
     // 5a. Sequence — clustered order, differential-coded per block, in parallel.
+    // Adaptive rescue (default): code each block with both the single-contig (v2)
+    // and literal-rescue (v3) assemblers and keep the smaller — v3 recovers reads
+    // v2 strands as literals, but adds a back-reference stream that can cost more
+    // than it saves on data v2 already assembles well, so picking per block is
+    // never worse than either alone. The decoder auto-dispatches on the version
+    // byte, so blocks may mix versions freely. `--no-rescue` (`rescue = false`)
+    // forces the faster v2-only path. Ties keep v2 for determinism.
     let seq_blocks: Vec<Vec<u8>> = pool.install(|| {
         ranges
             .par_iter()
@@ -1538,11 +1548,13 @@ fn encode_reordered<W: Write>(
                 let refs: Vec<&[u8]> = cl_reads[s..e].iter().map(Vec::as_slice).collect();
                 let anch = &cl_anchors[s..e];
                 let order = params.seq_order as usize;
-                Ok(if params.rescue {
-                    fqxv_reorder::encode_clustered_rescue(&refs, anch, order)?
+                let v2 = fqxv_reorder::encode_clustered(&refs, anch, order)?;
+                if params.rescue {
+                    let v3 = fqxv_reorder::encode_clustered_rescue(&refs, anch, order)?;
+                    Ok(if v3.len() < v2.len() { v3 } else { v2 })
                 } else {
-                    fqxv_reorder::encode_clustered(&refs, anch, order)?
-                })
+                    Ok(v2)
+                }
             })
             .collect::<Result<_>>()
     })?;
