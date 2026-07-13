@@ -1198,11 +1198,12 @@ fn encode_reordered<W: Write>(
                 .collect()
         })
     };
-    // Global permutation (byte-plane split → rANS). Order-0: clustered-adjacent
-    // reads have unrelated original indices, so the planes have no byte-to-byte
-    // correlation for order-1 to exploit — and order-1's ~130 KB per-context
-    // header would dominate on all but huge inputs, wrongly making keep_order
-    // look expensive.
+    // Global permutation (byte-plane split → rANS), coded with whichever order is
+    // smaller (decode auto-detects). The two regimes differ: on huge inputs
+    // order-1 wins (real byte-to-byte correlation, its per-context header
+    // amortized); on small-to-medium inputs order-1's ~130 KB header dominates
+    // and order-0 wins — picking the smaller keeps keep_order efficient at every
+    // size. Perm encode is a small fraction of total, so trying both is cheap.
     let encode_perm = || -> Result<Vec<u8>> {
         let mut planes = vec![0u8; n * 4];
         for (i, &x) in plan.order.iter().enumerate() {
@@ -1211,7 +1212,9 @@ fn encode_reordered<W: Write>(
             planes[2 * n + i] = (x >> 16) as u8;
             planes[3 * n + i] = (x >> 24) as u8;
         }
-        Ok(fqxv_rans::encode(&planes, fqxv_rans::Order::Zero)?)
+        let o0 = fqxv_rans::encode(&planes, fqxv_rans::Order::Zero)?;
+        let o1 = fqxv_rans::encode(&planes, fqxv_rans::Order::One)?;
+        Ok(if o0.len() <= o1.len() { o0 } else { o1 })
     };
 
     let (keep_order, name_blocks, perm_c) = if params.keep_order || g > 1 {
