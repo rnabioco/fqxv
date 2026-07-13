@@ -191,6 +191,13 @@ enum ReadOrder {
     Preserve,
     /// Allow reordering for a better ratio; single-end order may change.
     Any,
+    /// Like `any`, but if the read names are purely positional (a counter, e.g.
+    /// SRA `@RUN.N N`), discard the original order entirely: renumber the reads
+    /// and regenerate the names, dropping the permutation and the name stream for
+    /// the smallest archive. **Reorder-lossy — reads are renumbered** (sequence
+    /// and quality preserved exactly). Falls back to `any` when names aren't a
+    /// counter. Single-end only.
+    Shuffle,
 }
 
 /// Lossy quality quantization choices exposed on the CLI.
@@ -277,16 +284,19 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("at least one input FASTQ is required");
             }
             let interleaved = interleaved.filter(|_| inputs.len() == 1);
-            // `--order any` turns on reordering; the library forces the permutation
-            // (keep_order) back on for grouped input, so paired archives still
-            // round-trip in order regardless.
+            // `--order any`/`shuffle` turn on reordering; the library forces the
+            // permutation (keep_order) back on for grouped input, so paired
+            // archives still round-trip in order regardless. `shuffle` additionally
+            // opts into name regeneration (reorder-lossy) for single-end input.
+            let reorders = order != ReadOrder::Preserve;
             let params = fqxv::Params {
                 seq_order: level_to_order(level),
                 block_reads: level_to_block(level),
                 quality_binning: quality_bin.into(),
-                reorder: order == ReadOrder::Any,
-                keep_order: keep_order && order == ReadOrder::Any,
-                rescue: rescue && order == ReadOrder::Any,
+                reorder: reorders,
+                keep_order: keep_order && reorders,
+                rescue: rescue && reorders,
+                regenerate_names: order == ReadOrder::Shuffle,
                 threads: cli.threads,
             };
             let in_size: u64 = inputs

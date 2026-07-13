@@ -224,6 +224,193 @@ fn natural_digits(value: i64) -> usize {
     }
 }
 
+/// One column of a regenerable read-name template.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TemplateColumn {
+    /// Constant bytes (separators, prefixes, and constant numeric fields).
+    Const(Vec<u8>),
+    /// A per-read counter: the value at position `j` is `start + j`, rendered in
+    /// decimal and left-zero-padded to `pad` (0 = the natural, unpadded width).
+    Counter { start: i64, pad: usize },
+}
+
+/// A read-name template that regenerates each name purely from its position — a
+/// name is the concatenation of its columns with counters evaluated at the
+/// position. It is detected (see [`detect_template`]) only when every name shares
+/// one digit/non-digit structure and each numeric column is either constant or a
+/// `start + row_index` counter, i.e. the names carry nothing but read order (as
+/// with SRA `@RUN.N N …` headers). Regenerating them makes the names stream
+/// essentially free — at the cost of renumbering reads, so it is reorder-lossy
+/// and must be opt-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameTemplate {
+    columns: Vec<TemplateColumn>,
+}
+
+/// Upper bound on template columns (bounds header size; names with more
+/// digit/non-digit runs are treated as not regenerable).
+const MAX_TEMPLATE_COLS: usize = 64;
+
+impl NameTemplate {
+    /// Regenerate the name at position `index` (counters evaluated at `index`).
+    #[must_use]
+    pub fn regenerate(&self, index: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for col in &self.columns {
+            match col {
+                TemplateColumn::Const(b) => out.extend_from_slice(b),
+                TemplateColumn::Counter { start, pad } => {
+                    let s = (start + index as i64).to_string();
+                    if s.len() < *pad {
+                        out.extend(std::iter::repeat_n(b'0', pad - s.len()));
+                    }
+                    out.extend_from_slice(s.as_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Serialize the template for storage in a container header.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_varint(&mut out, self.columns.len() as u64);
+        for col in &self.columns {
+            match col {
+                TemplateColumn::Const(b) => {
+                    out.push(0);
+                    write_varint(&mut out, b.len() as u64);
+                    out.extend_from_slice(b);
+                }
+                TemplateColumn::Counter { start, pad } => {
+                    out.push(1);
+                    write_varint(&mut out, zigzag(*start));
+                    write_varint(&mut out, *pad as u64);
+                }
+            }
+        }
+        out
+    }
+
+    /// Deserialize a template written by [`NameTemplate::to_bytes`].
+    pub fn from_bytes(src: &[u8]) -> Result<Self> {
+        let mut r = Cursor::new(src);
+        let ncol = r.varint()? as usize;
+        if ncol > MAX_TEMPLATE_COLS {
+            return Err(Error::Malformed("name template too large"));
+        }
+        let mut columns = Vec::with_capacity(ncol);
+        for _ in 0..ncol {
+            match r.u8()? {
+                0 => {
+                    let len = r.varint()? as usize;
+                    columns.push(TemplateColumn::Const(r.take(len)?.to_vec()));
+                }
+                1 => {
+                    let start = unzigzag(r.varint()?);
+                    let pad = r.varint()? as usize;
+                    columns.push(TemplateColumn::Counter { start, pad });
+                }
+                _ => return Err(Error::Malformed("bad name-template column tag")),
+            }
+        }
+        Ok(NameTemplate { columns })
+    }
+}
+
+/// Detect a regenerable counter template over `names` (given in ORIGINAL order),
+/// or `None` if the names carry more than their position. Every name must share
+/// the same digit/non-digit column structure; each column must be either
+/// identical across all names, or a numeric `first + row_index` counter (natural
+/// or fixed-zero-padded width). This is the common SRA case (`@RUN.N N length=L`)
+/// where the number is just the read index; other schemes (Illumina tile/x/y)
+/// return `None`.
+#[must_use]
+pub fn detect_template(names: &[&[u8]]) -> Option<NameTemplate> {
+    let first = tokenize(names.first()?);
+    let ncol = first.len();
+    if ncol == 0 || ncol > MAX_TEMPLATE_COLS {
+        return None;
+    }
+    struct Col {
+        first_bytes: Vec<u8>,
+        first_val: i64,
+        is_num: bool,
+        const_ok: bool,
+        nat_ok: bool,   // natural-width counter still possible
+        fixed_ok: bool, // fixed-width (leading-zero) counter still possible
+        width: usize,
+    }
+    let mut cols: Vec<Col> = first
+        .iter()
+        .map(|t| Col {
+            first_bytes: t.bytes.to_vec(),
+            first_val: t.value,
+            is_num: t.is_num,
+            const_ok: true,
+            nat_ok: t.is_num,
+            fixed_ok: t.is_num,
+            width: t.bytes.len(),
+        })
+        .collect();
+
+    for (row, name) in names.iter().enumerate() {
+        let toks = tokenize(name);
+        if toks.len() != ncol {
+            return None;
+        }
+        for (c, t) in cols.iter_mut().zip(&toks) {
+            if t.is_num != c.is_num {
+                return None; // structure must be stable across all names
+            }
+            if c.const_ok && t.bytes.as_ref() != c.first_bytes.as_slice() {
+                c.const_ok = false;
+            }
+            if c.is_num && (c.nat_ok || c.fixed_ok) {
+                if c.first_val.checked_add(row as i64) != Some(t.value) {
+                    c.nat_ok = false;
+                    c.fixed_ok = false;
+                    continue;
+                }
+                let s = t.value.to_string();
+                if t.bytes.as_ref() != s.as_bytes() {
+                    c.nat_ok = false;
+                }
+                if t.bytes.len() != c.width || s.len() > c.width {
+                    c.fixed_ok = false;
+                } else if c.fixed_ok {
+                    let mut b = vec![b'0'; c.width - s.len()];
+                    b.extend_from_slice(s.as_bytes());
+                    if t.bytes.as_ref() != b.as_slice() {
+                        c.fixed_ok = false;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut columns = Vec::with_capacity(ncol);
+    for c in cols {
+        if c.const_ok {
+            columns.push(TemplateColumn::Const(c.first_bytes));
+        } else if c.nat_ok {
+            columns.push(TemplateColumn::Counter {
+                start: c.first_val,
+                pad: 0,
+            });
+        } else if c.fixed_ok {
+            columns.push(TemplateColumn::Counter {
+                start: c.first_val,
+                pad: c.width,
+            });
+        } else {
+            return None; // this column carries more than position
+        }
+    }
+    Some(NameTemplate { columns })
+}
+
 /// Encode a list of read names.
 ///
 /// Tokens are split into separate role streams — per-column ops, string lengths,
@@ -509,6 +696,58 @@ mod tests {
     #[test]
     fn roundtrip_empty() {
         roundtrip(&[]);
+    }
+
+    /// A detected template must regenerate the names in ORIGINAL order exactly.
+    fn assert_template_regenerates(names: &[&[u8]]) -> NameTemplate {
+        let t = detect_template(names).expect("expected a regenerable template");
+        // Round-trips through serialization.
+        let t2 = NameTemplate::from_bytes(&t.to_bytes()).expect("template deser");
+        assert_eq!(t, t2, "template serialization round-trip");
+        for (i, name) in names.iter().enumerate() {
+            assert_eq!(t.regenerate(i), *name, "regenerate[{i}] mismatch");
+        }
+        t
+    }
+
+    #[test]
+    fn detect_sra_counter_names() {
+        // The common SRA pattern: prefix + counter, repeated, + constant suffix.
+        let names: Vec<Vec<u8>> = (1..=2000)
+            .map(|i| format!("@DRR174812.{i} {i} length=150").into_bytes())
+            .collect();
+        let refs: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
+        let t = assert_template_regenerates(&refs);
+        // Renumbering (regenerate at a different position) stays well-formed.
+        assert_eq!(t.regenerate(0), b"@DRR174812.1 1 length=150");
+        assert!(t.to_bytes().len() < 64, "template must be tiny");
+    }
+
+    #[test]
+    fn detect_zero_padded_counter() {
+        let names: Vec<Vec<u8>> = (0..1500)
+            .map(|i| format!("read{:06}", i).into_bytes())
+            .collect();
+        let refs: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
+        assert_template_regenerates(&refs);
+    }
+
+    #[test]
+    fn reject_illumina_tile_coordinates() {
+        // x/y coordinates are not a per-read counter — not regenerable.
+        let names: &[&[u8]] = &[
+            b"INST:1:FC:1:1101:1000:2000",
+            b"INST:1:FC:1:1101:1005:2050",
+            b"INST:1:FC:1:1101:1010:2100",
+        ];
+        assert!(detect_template(names).is_none());
+    }
+
+    #[test]
+    fn reject_non_counter_number() {
+        // A number that isn't first+index (jumps) is not regenerable.
+        let names: &[&[u8]] = &[b"r.1", b"r.2", b"r.9"];
+        assert!(detect_template(names).is_none());
     }
 
     #[test]
