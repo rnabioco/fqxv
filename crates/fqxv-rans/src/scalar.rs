@@ -22,7 +22,7 @@
 use crate::model::{EncSym, Model, N_STATES, RANS_L, SCALE_BITS, TOTFREQ};
 use crate::{Error, Result};
 
-const ORDER0: u8 = 0;
+pub(crate) const ORDER0: u8 = 0;
 const ORDER1: u8 = 1;
 
 /// Encode `src` with an order-0 model using the scalar coder.
@@ -117,7 +117,7 @@ pub(crate) fn encode_order1(src: &[u8]) -> Vec<u8> {
 /// renormalization into `[x_max >> 16, x_max)` so the result lands back in
 /// `[RANS_L, RANS_L << 16)`. `x_max` can reach 2^32, hence the u64 compare.
 #[inline]
-fn encode_symbol(x: &mut u32, sym: &EncSym, renorm: &mut Vec<u16>) {
+pub(crate) fn encode_symbol(x: &mut u32, sym: &EncSym, renorm: &mut Vec<u16>) {
     let mut v = *x;
     while u64::from(v) >= sym.x_max {
         renorm.push((v & 0xffff) as u16);
@@ -127,7 +127,7 @@ fn encode_symbol(x: &mut u32, sym: &EncSym, renorm: &mut Vec<u16>) {
 }
 
 /// Write the final states and the (reversed) renorm words.
-fn finish(out: &mut Vec<u8>, states: &[u32; N_STATES], renorm: &mut [u16]) {
+pub(crate) fn finish(out: &mut Vec<u8>, states: &[u32; N_STATES], renorm: &mut [u16]) {
     for x in states {
         out.extend_from_slice(&x.to_le_bytes());
     }

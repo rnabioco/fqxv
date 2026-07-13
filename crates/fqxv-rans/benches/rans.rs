@@ -42,17 +42,45 @@ fn bench_decode(c: &mut Criterion) {
             b.iter(|| bench_api::decode_avx2(std::hint::black_box(&enc)).unwrap())
         });
     }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") {
+        assert_eq!(bench_api::decode_avx512(&enc).unwrap(), data);
+        g.bench_function(BenchmarkId::new("avx512", n), |b| {
+            b.iter(|| bench_api::decode_avx512(std::hint::black_box(&enc)).unwrap())
+        });
+    }
     g.finish();
 }
 
 fn bench_encode(c: &mut Criterion) {
     let n = 8 << 20;
     let data = quality_like(n);
+    // Scalar and AVX2 order-0 encoders must agree byte-for-byte.
+    assert_eq!(
+        bench_api::encode_order0_scalar(&data),
+        encode(&data, Order::Zero).unwrap()
+    );
     let mut g = c.benchmark_group("encode_8MiB");
     g.throughput(Throughput::Bytes(n as u64));
-    g.bench_function("order0", |b| {
-        b.iter(|| encode(std::hint::black_box(&data), Order::Zero).unwrap())
+    g.bench_function("order0_scalar", |b| {
+        b.iter(|| bench_api::encode_order0_scalar(std::hint::black_box(&data)))
     });
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        g.bench_function("order0_avx2", |b| {
+            b.iter(|| bench_api::encode_order0_avx2(std::hint::black_box(&data)))
+        });
+    }
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") {
+        assert_eq!(
+            bench_api::encode_order0_avx512(&data),
+            encode(&data, Order::Zero).unwrap()
+        );
+        g.bench_function("order0_avx512", |b| {
+            b.iter(|| bench_api::encode_order0_avx512(std::hint::black_box(&data)))
+        });
+    }
     g.bench_function("order1", |b| {
         b.iter(|| encode(std::hint::black_box(&data), Order::One).unwrap())
     });
