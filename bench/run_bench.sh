@@ -26,7 +26,7 @@ INPUT_MODE="${FQXV_INPUT:-r1}"
 # (`-q binary`, 2-level) are SPRING's lossy quality modes — the only field tools
 # with Illumina-comparable binning, so they are the like-for-like lossy rivals to
 # fqxv-bin8 and fqxv-bin2 (fqz_comp/fqzcomp5 have no Illumina binning mode).
-ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-max fqxv-bin8 fqxv-bin4 fqxv-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary colord"
+ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-max fqxv-bin8 fqxv-bin4 fqxv-bin2 fqxv-reorder-bin8 fqxv-reorder-bin4 fqxv-reorder-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary colord"
 TOOLS="${FQXV_TOOLS:-$ALL_TOOLS}"
 # The fqxv binary (built with `cargo build --release`). Cargo honors
 # CARGO_TARGET_DIR (set to $SCRATCH on this HPC), so the build lands there, NOT
@@ -140,15 +140,17 @@ qual_distortion() {  # orig rt  ->  "mae rmse pct"
 }
 
 is_fqxv() { [[ "$1" == fqxv || "$1" == fqxv-* || "$1" == fqxv[0-9] ]]; }
-# Lossy-quality tools (quality changed on purpose).
-is_lossy() { [[ "$1" == fqxv-bin* || "$1" == spring-illbin || "$1" == spring-binary ]]; }
+# Lossy-quality tools (quality changed on purpose). Covers both the plain
+# fqxv-bin* points and the fqxv-reorder-bin* combos (reorder + binning).
+is_lossy() { [[ "$1" == fqxv*bin* || "$1" == spring-illbin || "$1" == spring-binary ]]; }
 # The exact fqxv bin table a tool applies, for the binned-expected round-trip;
 # `none` for tools whose internal table we don't assert (the SPRING rivals).
+# Match on the bin suffix so fqxv-bin8 and fqxv-reorder-bin8 map alike.
 bin_scheme() {
   case "$1" in
-    fqxv-bin8) echo bin8 ;;
-    fqxv-bin4) echo bin4 ;;
-    fqxv-bin2) echo bin2 ;;
+    *bin8) echo bin8 ;;
+    *bin4) echo bin4 ;;
+    *bin2) echo bin2 ;;
     *) echo none ;;
   esac
 }
@@ -166,6 +168,12 @@ compress() {  # tool input out_prefix
     fqxv-bin8)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin8 --threads "$THREADS" ;;
     fqxv-bin4)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin4 --threads "$THREADS" ;;
     fqxv-bin2)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin2 --threads "$THREADS" ;;
+    # reorder + binning combined — the like-for-like rivals to SPRING's lossy
+    # modes (spring-illbin vs fqxv-reorder-bin8, spring-binary vs -bin2), since
+    # SPRING always reorders. The plain fqxv-bin* rows keep original order.
+    fqxv-reorder-bin8) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --order any --quality-bin bin8 --threads "$THREADS" ;;
+    fqxv-reorder-bin4) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --order any --quality-bin bin4 --threads "$THREADS" ;;
+    fqxv-reorder-bin2) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --order any --quality-bin bin2 --threads "$THREADS" ;;
     gzip)     COMP="$pfx.gz";  measure bash -c "pigz -p $THREADS -6 -c '$in' > '$COMP'" ;;
     zstd19)   COMP="$pfx.zst"; measure bash -c "zstd -19 --long=27 -T$THREADS -q -f -o '$COMP' '$in'" ;;
     xz9)      COMP="$pfx.xz";  measure bash -c "xz -9 -T$THREADS -c '$in' > '$COMP'" ;;
@@ -185,7 +193,7 @@ compress() {  # tool input out_prefix
 decompress() {  # tool comp out_rt
   local tool="$1" comp="$2" rt="$3"
   case "$tool" in
-    fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-bin8|fqxv-bin4|fqxv-bin2) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" ;;
+    fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-bin8|fqxv-bin4|fqxv-bin2|fqxv-reorder-bin8|fqxv-reorder-bin4|fqxv-reorder-bin2) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" ;;
     gzip)     measure bash -c "pigz -d -p $THREADS -c '$comp' > '$rt'" ;;
     zstd19)   measure bash -c "zstd -d -q -f -o '$rt' '$comp'" ;;
     xz9)      measure bash -c "xz -d -T$THREADS -c '$comp' > '$rt'" ;;
@@ -263,7 +271,7 @@ for row in "${rows[@]}"; do
     # Map tool label -> binary name to probe availability.
     case "$tool" in
       gzip) bin=pigz ;; zstd19) bin=zstd ;; xz9) bin=xz ;; pgrc) bin=PgRC ;;
-      fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-bin8|fqxv-bin4|fqxv-bin2) bin="$FQXV_BIN" ;;
+      fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-bin8|fqxv-bin4|fqxv-bin2|fqxv-reorder-bin8|fqxv-reorder-bin4|fqxv-reorder-bin2) bin="$FQXV_BIN" ;;
       spring-illbin|spring-binary) bin=spring ;;
       *) bin="$tool" ;;
     esac
@@ -338,6 +346,9 @@ for row in "${rows[@]}"; do
         fqxv-bin8)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin4)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin2)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-reorder-bin8) "$FQXV_BIN" compress "$in" -o "$det1" --order any --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-reorder-bin4) "$FQXV_BIN" compress "$in" -o "$det1" --order any --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-reorder-bin2) "$FQXV_BIN" compress "$in" -o "$det1" --order any --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;
       esac
       if [[ -f "$det1" ]] && cmp -s "$det1" "$COMP"; then deterministic="yes"; else deterministic="no"; fi
       rm -f "$det1"
