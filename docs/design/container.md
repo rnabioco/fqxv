@@ -101,13 +101,17 @@ restores the `G` separate files.
 
 ## Reordered archives
 
-`--reorder` uses a distinct whole-file, globally-clustered layout (flag bit3)
+`--order any` uses a distinct whole-file, globally-clustered layout (flag bit3)
 that is self-describing and carries no footer or terminator — decode dispatches
 on the flag before reading any block, so the footer index applies only to the
-plain layout. Both reorder modes share this one path: with `--keep-order`
+plain layout. Both reorder modes share this one path: with keep-order
 (flag bit2) names/quality are coded in original order and a permutation restores
 it; without it they follow the clustered order and no permutation is written.
-See [Read Reordering](reordering.md).
+Grouped (paired / single-cell) input reorders too: the reads are clustered
+ignoring mate structure, but the group size is recorded in the header and the
+permutation reconstructs the original spot interleaving, so keep-order is forced
+on and the archive de-interleaves cleanly on `--split`. See
+[Read Reordering](reordering.md).
 
 ## Losslessness
 

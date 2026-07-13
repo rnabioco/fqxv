@@ -59,7 +59,7 @@ sequence length.
 `rt` is a **content** round-trip check, not just a record count: the decompressed
 output is reduced to a sorted multiset of `name / sequence / quality` tuples and
 hashed against the input, so any corrupted base or quality fails it. It is
-order-independent (SPRING and `fqxv --reorder` reorder reads), and it excludes
+order-independent (SPRING and `fqxv --order any` reorder reads), and it excludes
 the `+` line (fqxv normalizes it — the one documented lossy-by-design deviation).
 For **lossy-quality** tools the check verifies the intended lossy output: the
 fqxv `--quality-bin` rows are hashed against the input passed through that exact
@@ -78,7 +78,7 @@ instead of it.
 The fqxv rows also print a per-stream breakdown (`names / seq / qual` bytes, from
 `fqxv info --tsv`) so you can see which stream to invest in. The matrix runs
 several fqxv points — `fqxv` (level 5), `fqxv9` (level 9), `fqxv-reorder`
-(`--reorder --keep-order`), and the lossy quality sweep `fqxv-bin8` / `fqxv-bin4`
+(`--order any`), and the lossy quality sweep `fqxv-bin8` / `fqxv-bin4`
 / `fqxv-bin2` — plus a `fqxv-paired` self-check that compresses R1+R2 as one
 spot-interleaved archive. For a **like-for-like** lossy comparison the matrix also
 runs SPRING's own binning: `spring-illbin` (`-q ill_bin`, Illumina 8-level —

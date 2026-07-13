@@ -10,6 +10,23 @@ archives are not guaranteed to be readable across releases until a `1.0.0`.
 
 ## [Unreleased]
 
+### Added
+
+- **Grouped (paired / single-cell) read reordering.** The global-cluster reorder
+  path now accepts interleaved input: reads are clustered ignoring mate
+  structure, the group size is recorded in the header, and a stored permutation
+  reconstructs the original spot interleaving on `decompress` and `--split`.
+  Grouped reorder is therefore always order-preserving.
+
+### Changed
+
+- **CLI: `--reorder`/`--keep-order` replaced by `--order preserve|any`** (an
+  Advanced option; default `preserve`). The flag now names the guarantee the user
+  cares about — whether original read order survives — rather than the reordering
+  mechanism. `any` allows reordering for a better ratio (single-end order may
+  change); grouped input still round-trips in order. The library `Params.reorder`
+  / `Params.keep_order` fields are unchanged.
+
 ## [0.1.0] - 2026-07-12
 
 Initial release of `fqxv`, a Rust toolkit for lossless (opt-in lossy) archiving
