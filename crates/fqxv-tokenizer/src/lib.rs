@@ -214,7 +214,14 @@ fn read_op_rle(r: &mut Cursor<'_>, n_records: usize) -> Result<Vec<Vec<u8>>> {
 /// used to derive a token's width from its value (only genuine leading-zero
 /// padding then needs to be stored).
 fn natural_digits(value: i64) -> usize {
-    value.to_string().len()
+    // Arithmetic digit count avoids a per-token `String` allocation in the
+    // hot encode/decode paths. Tokens are parsed from digit runs, so `value`
+    // is non-negative; `ilog10` is undefined at 0, hence the special case.
+    if value <= 0 {
+        1
+    } else {
+        value.ilog10() as usize + 1
+    }
 }
 
 /// Encode a list of read names.

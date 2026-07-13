@@ -36,6 +36,8 @@
 //! assert_eq!(out_quals, quals);
 //! ```
 
+use std::borrow::Cow;
+
 use fqxv_range::{Decoder, Encoder, SimpleModel};
 use thiserror::Error;
 
@@ -190,19 +192,29 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
         });
     }
 
-    // Apply (optional) lossy binning, then map to a dense 0-based alphabet.
-    let binned: Vec<u8> = quals.iter().map(|&b| binning.apply(b)).collect();
+    // Apply (optional) lossy binning, then map to a dense 0-based alphabet. On
+    // the lossless default `apply` is the identity, so borrow `quals` directly
+    // instead of allocating and copying a block-sized duplicate.
+    let binned: Cow<[u8]> = if binning == QualityBinning::Lossless {
+        Cow::Borrowed(quals)
+    } else {
+        Cow::Owned(quals.iter().map(|&b| binning.apply(b)).collect())
+    };
     let (qmin, qsize) = alphabet(&binned)?;
 
     let mut models = vec![SimpleModel::<QMAX>::new(); N_CTX];
     let mut enc = Encoder::new();
-    let mut idx = 0usize;
+    // Walk `binned` as a cursor rather than a running `idx`, so the per-quality
+    // access iterates a slice directly and carries no bounds check. `total`
+    // (checked above) equals `binned.len()`, so every `split_at` is in range.
+    let mut rest: &[u8] = &binned;
     for &l in lens {
+        let (read, tail) = rest.split_at(l as usize);
+        rest = tail;
         let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
         let mut delta = 0u8;
-        for pos in 0..l as usize {
-            let sym = binned[idx] - qmin;
-            idx += 1;
+        for (pos, &b) in read.iter().enumerate() {
+            let sym = b - qmin;
             let c = context(q1, q2, q3, delta, pos);
             debug_assert!(c < N_CTX);
             // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
