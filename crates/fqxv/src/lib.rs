@@ -17,7 +17,8 @@ mod crc;
 
 pub use container::{
     compress, compress_auto, compress_interleaved, compress_multi, decompress, decompress_recover,
-    decompress_split, inspect, peek, verify, verify_quick, Info, Params, Platform, Recovery, Stats,
+    decompress_split, inspect, peek, verify, verify_quick, verify_report, Info, Params, Platform,
+    Recovery, Stats, VerifyCheck, VerifyReport,
 };
 pub use fqxv_fqzcomp::QualityBinning;
 

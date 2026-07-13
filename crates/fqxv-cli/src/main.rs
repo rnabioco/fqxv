@@ -187,7 +187,8 @@ enum Command {
         json: bool,
     },
     /// Verify archive integrity (CRC checks) without writing any output.
-    /// Exits non-zero if the archive is corrupt.
+    /// Prints a table of per-check results; exits non-zero if the archive is
+    /// corrupt.
     Verify {
         /// Input `.fqxv` file.
         input: PathBuf,
@@ -196,6 +197,12 @@ enum Command {
         /// Skips the header, footer, and inter-block framing bytes.
         #[arg(long)]
         quick: bool,
+        /// Emit tab-separated per-check rows instead of the human table.
+        #[arg(long, conflicts_with = "json")]
+        tsv: bool,
+        /// Emit a JSON object instead of the human table.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -440,22 +447,12 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Info { input, tsv, json } => print_info(&input, tsv, json)?,
-        Command::Verify { input, quick } => {
-            let file =
-                File::open(&input).with_context(|| format!("opening input {}", input.display()))?;
-            let result = if quick {
-                fqxv::verify_quick(&file)
-            } else {
-                fqxv::verify(file)
-            };
-            match result {
-                Ok(()) => println!("{}: OK", input.display()),
-                Err(e) => {
-                    eprintln!("{}: CORRUPT — {e}", input.display());
-                    std::process::exit(1);
-                }
-            }
-        }
+        Command::Verify {
+            input,
+            quick,
+            tsv,
+            json,
+        } => print_verify(&input, quick, tsv, json)?,
     }
     Ok(())
 }
@@ -669,6 +666,91 @@ fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
     println!("{streams}");
     if let Some(bpr) = bytes_per_read {
         println!("{bpr:.2} bytes/read");
+    }
+    Ok(())
+}
+
+/// One check row in the machine-readable [`VerifyJson`].
+#[derive(Debug, Serialize)]
+struct VerifyCheckJson {
+    name: String,
+    ok: bool,
+    detail: String,
+}
+
+/// JSON shape emitted by `fqxv verify --json`.
+#[derive(Debug, Serialize)]
+struct VerifyJson {
+    file: String,
+    passed: bool,
+    checks: Vec<VerifyCheckJson>,
+    /// Indices of blocks whose CRC failed (omitted when intact).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    failed_blocks: Vec<u64>,
+}
+
+/// Run `fqxv::verify_report` and render it as a table (default), TSV, or JSON.
+/// Exits the process non-zero when the archive is corrupt so scripts can branch
+/// on `$?` regardless of the chosen format.
+fn print_verify(path: &Path, quick: bool, tsv: bool, json: bool) -> anyhow::Result<()> {
+    let file = File::open(path).with_context(|| format!("opening input {}", path.display()))?;
+    let report = fqxv::verify_report(&file, quick)
+        .with_context(|| format!("{} is not a readable fqxv archive", path.display()))?;
+    let passed = report.passed();
+
+    if json {
+        let out = VerifyJson {
+            file: path.display().to_string(),
+            passed,
+            checks: report
+                .checks
+                .iter()
+                .map(|c| VerifyCheckJson {
+                    name: c.name.clone(),
+                    ok: c.ok,
+                    detail: c.detail.clone(),
+                })
+                .collect(),
+            failed_blocks: report.failed_blocks.clone(),
+        };
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if tsv {
+        println!("check\tresult\tdetail");
+        for c in &report.checks {
+            println!(
+                "{}\t{}\t{}",
+                c.name,
+                if c.ok { "ok" } else { "fail" },
+                c.detail
+            );
+        }
+    } else {
+        let mut table = TableBuilder::default();
+        table.push_record([
+            "check".to_string(),
+            "result".to_string(),
+            "detail".to_string(),
+        ]);
+        for c in &report.checks {
+            table.push_record([
+                c.name.clone(),
+                if c.ok { "ok" } else { "FAIL" }.to_string(),
+                c.detail.clone(),
+            ]);
+        }
+        let mut table = table.build();
+        table.with(Style::rounded());
+        println!("{}", path.display());
+        println!("{table}");
+        println!(
+            "{}: {}",
+            path.display(),
+            if passed { "OK" } else { "CORRUPT" }
+        );
+    }
+
+    if !passed {
+        std::process::exit(1);
     }
     Ok(())
 }

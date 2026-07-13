@@ -2234,6 +2234,227 @@ fn quick_check_blocks(file: &File, _footer: &Footer) -> Result<()> {
     verify(BufReader::new(file))
 }
 
+/// One named integrity check in a [`VerifyReport`].
+#[derive(Debug, Clone)]
+pub struct VerifyCheck {
+    /// What was checked (e.g. `"header"`, `"footer"`, `"block CRCs"`).
+    pub name: String,
+    /// Whether it passed.
+    pub ok: bool,
+    /// Human-readable context (counts, the failure reason, or empty).
+    pub detail: String,
+}
+
+/// Structured result of [`verify_report`]: the individual integrity checks run
+/// against an archive, plus the indices of any blocks whose CRC failed. The
+/// overall verdict is [`VerifyReport::passed`].
+#[derive(Debug, Clone, Default)]
+pub struct VerifyReport {
+    /// The checks performed, in report order.
+    pub checks: Vec<VerifyCheck>,
+    /// Total blocks the archive declares (0 for the reorder layout, which has no
+    /// footer index).
+    pub blocks_total: u64,
+    /// Indices of blocks whose CRC failed (plain layout). In the default check
+    /// this is populated only when the whole-file CRC fails and the archive is
+    /// scanned to localize the damage; in `quick` mode it is always the scan.
+    pub failed_blocks: Vec<u64>,
+}
+
+impl VerifyReport {
+    /// True iff every check passed (the archive is intact).
+    pub fn passed(&self) -> bool {
+        self.checks.iter().all(|c| c.ok)
+    }
+
+    fn push(&mut self, name: &str, ok: bool, detail: impl Into<String>) {
+        self.checks.push(VerifyCheck {
+            name: name.to_string(),
+            ok,
+            detail: detail.into(),
+        });
+    }
+}
+
+/// Verify an archive's integrity and return a per-check [`VerifyReport`] — the
+/// structured form behind the CLI's `verify` table (see [`verify`] for the plain
+/// boolean and [`verify_quick`] for the block-only check).
+///
+/// With `quick == false` (the default) it runs the same checks as [`verify`] —
+/// header, footer, and the parallel whole-file CRC — and, only if that CRC fails,
+/// scans the archive block by block to name the damaged ones in
+/// [`VerifyReport::failed_blocks`]. With `quick == true` it runs the weaker
+/// per-block check of [`verify_quick`] (each block's stored CRC, in parallel via
+/// positioned reads) and skips the whole-file digest. The globally-clustered
+/// reorder layout has no footer, so either mode verifies it by decoding into a
+/// sink (one `streams (decode)` check).
+///
+/// Returns `Err` only when the input is not a readable fqxv container (bad
+/// magic/version); a recognized-but-corrupt archive comes back as a report whose
+/// [`passed`](VerifyReport::passed) is `false`.
+pub fn verify_report(file: &File, quick: bool) -> Result<VerifyReport> {
+    let mut r = BufReader::new(file);
+    let header = read_header(&mut r)?;
+    let mut report = VerifyReport::default();
+
+    if header.flags & FLAG_GLOBAL_REORDER != 0 {
+        report.push("header", true, "format v1, global-cluster reorder layout");
+        // No footer/per-block index; decoding drives every frame CRC.
+        r.seek(SeekFrom::Start(0))?;
+        match verify(r) {
+            Ok(()) => report.push("streams (decode)", true, "all frame CRCs verified"),
+            Err(e) => report.push("streams (decode)", false, e.to_string()),
+        }
+        return Ok(report);
+    }
+
+    report.push("header", true, "format v1, plain layout");
+
+    // Footer (read_footer verifies the footer's own CRC).
+    let footer = match read_footer(&mut r) {
+        Ok(footer) => footer,
+        Err(e) => {
+            report.push("footer", false, e.to_string());
+            return Ok(report);
+        }
+    };
+    report.blocks_total = footer.groups.len() as u64;
+    report.push(
+        "footer",
+        true,
+        format!(
+            "{} blocks, {} reads",
+            report.blocks_total, footer.total_reads
+        ),
+    );
+
+    if quick {
+        // Weaker, faster: only the per-block payload CRCs (parallel).
+        report.failed_blocks = scan_failed_blocks(file, &footer);
+        let ok_blocks = report.blocks_total - report.failed_blocks.len() as u64;
+        let ok = report.failed_blocks.is_empty();
+        let detail = if ok {
+            format!("{ok_blocks}/{} intact", report.blocks_total)
+        } else {
+            format!(
+                "{ok_blocks}/{} intact; failed: {}",
+                report.blocks_total,
+                summarize_indices(&report.failed_blocks)
+            )
+        };
+        report.push("block CRCs", ok, detail);
+        return Ok(report);
+    }
+
+    // Default: parallel whole-file CRC; localize block by block only on failure.
+    r.seek(SeekFrom::Start(0))?;
+    let crc_ok = verify_whole_file_crc(&mut r, footer.covered_len)? == footer.whole_file_crc;
+    if crc_ok {
+        report.push(
+            "block CRCs",
+            true,
+            format!("{}/{} intact", report.blocks_total, report.blocks_total),
+        );
+        report.push("whole-file CRC", true, "");
+    } else {
+        report.failed_blocks = scan_failed_blocks(file, &footer);
+        let ok_blocks = report.blocks_total - report.failed_blocks.len() as u64;
+        let detail = if report.failed_blocks.is_empty() {
+            format!(
+                "{ok_blocks}/{} intact (damage is in the header, framing, or index)",
+                report.blocks_total
+            )
+        } else {
+            format!(
+                "{ok_blocks}/{} intact; failed: {}",
+                report.blocks_total,
+                summarize_indices(&report.failed_blocks)
+            )
+        };
+        report.push("block CRCs", report.failed_blocks.is_empty(), detail);
+        report.push("whole-file CRC", false, "digest mismatch");
+    }
+
+    Ok(report)
+}
+
+/// Scan every block's stored CRC and return the indices that fail, in ascending
+/// order. Parallel positioned reads on Unix (like [`quick_check_blocks`], but
+/// collecting *all* failures rather than stopping at the first); a serial
+/// footer-driven scan elsewhere.
+#[cfg(unix)]
+fn scan_failed_blocks(file: &File, footer: &Footer) -> Vec<u64> {
+    let pool = match build_pool(0) {
+        Ok(pool) => pool,
+        Err(_) => return scan_failed_blocks_serial(file, footer),
+    };
+    pool.install(|| {
+        footer
+            .groups
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, &(off, _read_count))| {
+                let ok = block_crc_ok(file, off).unwrap_or(false);
+                (!ok).then_some(i as u64)
+            })
+            .collect()
+    })
+}
+
+/// True if the block frame at `off` reads back with a matching stored CRC.
+#[cfg(unix)]
+fn block_crc_ok(file: &File, off: u64) -> Result<bool> {
+    use std::os::unix::fs::FileExt;
+
+    let mut frame = [0u8; 8 + CRC_LEN];
+    file.read_exact_at(&mut frame, off)
+        .map_err(|_| Error::Truncated)?;
+    let len = u64::from_le_bytes(frame[..8].try_into().unwrap());
+    if len == 0 || len > MAX_BLOCK_PAYLOAD {
+        return Ok(false);
+    }
+    let expected = u32::from_le_bytes(frame[8..].try_into().unwrap());
+    let mut buf = Vec::new();
+    if buf.try_reserve_exact(len as usize).is_err() {
+        return Ok(false);
+    }
+    buf.resize(len as usize, 0);
+    file.read_exact_at(&mut buf, off + (8 + CRC_LEN) as u64)
+        .map_err(|_| Error::Truncated)?;
+    Ok(crc32c(&buf) == expected)
+}
+
+/// Serial footer-driven block scan (the fallback / non-Unix path).
+fn scan_failed_blocks_serial(file: &File, footer: &Footer) -> Vec<u64> {
+    let mut r = BufReader::new(file);
+    let mut failed = Vec::new();
+    for (i, &(off, _read_count)) in footer.groups.iter().enumerate() {
+        let ok = r.seek(SeekFrom::Start(off)).is_ok()
+            && matches!(read_block(&mut r, i as u64), Ok(Some(_)));
+        if !ok {
+            failed.push(i as u64);
+        }
+    }
+    failed
+}
+
+#[cfg(not(unix))]
+fn scan_failed_blocks(file: &File, footer: &Footer) -> Vec<u64> {
+    scan_failed_blocks_serial(file, footer)
+}
+
+/// Render a list of failed block indices compactly, capping the enumeration so a
+/// pathological archive can't print thousands of numbers (`"3, 91, … (+15)"`).
+fn summarize_indices(indices: &[u64]) -> String {
+    const CAP: usize = 12;
+    let shown: Vec<String> = indices.iter().take(CAP).map(u64::to_string).collect();
+    if indices.len() > CAP {
+        format!("{}, … (+{})", shown.join(", "), indices.len() - CAP)
+    } else {
+        shown.join(", ")
+    }
+}
+
 /// Outcome of a best-effort [`decompress_recover`] run.
 #[derive(Debug, Default, Clone)]
 pub struct Recovery {
@@ -3754,6 +3975,59 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
         let result = verify_quick(&file);
         std::fs::remove_file(&path).ok();
         result.expect("intact reorder archive passes quick verify via fallback");
+    }
+
+    #[test]
+    fn verify_report_intact_lists_passing_checks() {
+        let archive = multiblock_archive(40, 8);
+        let (file, path) = temp_archive(&archive);
+        let report = verify_report(&file, false).expect("readable archive");
+        std::fs::remove_file(&path).ok();
+        assert!(report.passed());
+        assert!(report.failed_blocks.is_empty());
+        let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["header", "footer", "block CRCs", "whole-file CRC"]);
+        assert!(report.blocks_total >= 2, "expected several small blocks");
+    }
+
+    #[test]
+    fn verify_report_localizes_corrupt_block() {
+        let archive = multiblock_archive(40, 8);
+        let footer = read_footer(&mut io::Cursor::new(&archive)).unwrap();
+        assert!(footer.groups.len() >= 3, "need multiple blocks to localize");
+        // Corrupt the payload of the second block (index 1): its footer offset
+        // points at the [8 len][4 crc] frame header, so the payload follows.
+        let mut archive = archive;
+        archive[footer.groups[1].0 as usize + 8 + CRC_LEN] ^= 0xFF;
+        let (file, path) = temp_archive(&archive);
+        let report = verify_report(&file, false).expect("still structurally readable");
+        std::fs::remove_file(&path).ok();
+
+        assert!(!report.passed());
+        assert_eq!(report.failed_blocks, vec![1]);
+        let blocks = report
+            .checks
+            .iter()
+            .find(|c| c.name == "block CRCs")
+            .unwrap();
+        assert!(!blocks.ok);
+        assert!(
+            blocks.detail.contains("failed: 1"),
+            "detail: {}",
+            blocks.detail
+        );
+    }
+
+    #[test]
+    fn verify_report_quick_skips_whole_file_crc() {
+        let archive = multiblock_archive(40, 8);
+        let (file, path) = temp_archive(&archive);
+        let report = verify_report(&file, true).expect("readable archive");
+        std::fs::remove_file(&path).ok();
+        assert!(report.passed());
+        // Quick mode stops at the per-block CRCs; no whole-file digest row.
+        let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["header", "footer", "block CRCs"]);
     }
 
     #[test]
