@@ -411,6 +411,14 @@ fn join_header(name: &[u8], description: &[u8]) -> Vec<u8> {
 pub struct Params {
     /// Sequence context-model order (higher = better ratio, more memory).
     pub seq_order: u8,
+    /// Hashed high-order sequence tier order (`0` = disabled). Adds a third escape
+    /// tier above `seq_order` that captures deeper context on repetitive data;
+    /// gated to top effort levels for its memory cost. Non-reorder path only
+    /// (reorder codes just the residual). Decode auto-detects it per block.
+    pub seq_hash_order: u8,
+    /// Hashed-tier table size in bits: `1 << seq_hash_bits` slots (~`16 << bits`
+    /// bytes per active block). Ignored when `seq_hash_order` is 0.
+    pub seq_hash_bits: u8,
     /// Reads per block. Blocks are the unit of parallelism and random access;
     /// larger blocks give the order-k sequence model more data to train on.
     pub block_reads: usize,
@@ -450,6 +458,8 @@ impl Default for Params {
     fn default() -> Self {
         Params {
             seq_order: 11,
+            seq_hash_order: 0,
+            seq_hash_bits: 0,
             block_reads: DEFAULT_BLOCK_READS,
             quality_binning: QualityBinning::Lossless,
             reorder: false,
@@ -2146,7 +2156,15 @@ fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
         || fqxv_tokenizer::encode(&header_refs),
         || {
             rayon::join(
-                || fqxv_seq::encode(&b.lens, &b.seq, params.seq_order as usize),
+                || {
+                    fqxv_seq::encode_hashed(
+                        &b.lens,
+                        &b.seq,
+                        params.seq_order as usize,
+                        params.seq_hash_order as usize,
+                        u32::from(params.seq_hash_bits),
+                    )
+                },
                 || fqxv_fqzcomp::encode(&b.lens, &b.qual, params.quality_binning),
             )
         },
