@@ -18,6 +18,9 @@ pigz = "*"
 # FASTQ-specific baseline compressors
 spring = "*"
 fqzcomp = "*"
+# Long-read (Nanopore/PacBio) SOTA reference — compresses sequence *and* quality
+# via approximate assembly; the meaningful bar for our ONT sequence stream.
+colord = "*"
 
 # FASTQ utilities (quality histograms, subsampling, stats)
 seqkit = "*"

@@ -24,7 +24,8 @@ CELLS="$RESULTS_DIR/cells.tsv"
 : > "$CELLS"
 while read -r acc label _; do
   [[ -z "${acc:-}" || "$acc" == \#* ]] && continue
-  if [[ ! -f "$DATA_DIR/${acc}_1.fastq" ]]; then
+  # Paired R1, or single-end `${acc}.fastq` (Nanopore etc.).
+  if [[ ! -f "$DATA_DIR/${acc}_1.fastq" && ! -f "$DATA_DIR/${acc}.fastq" ]]; then
     echo "[skip] $label ($acc): no data in $DATA_DIR"
     continue
   fi

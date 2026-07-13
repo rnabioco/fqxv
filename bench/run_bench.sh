@@ -25,7 +25,7 @@ INPUT_MODE="${FQXV_INPUT:-r1}"
 # (`-q binary`, 2-level) are SPRING's lossy quality modes — the only field tools
 # with Illumina-comparable binning, so they are the like-for-like lossy rivals to
 # fqxv-bin8 and fqxv-bin2 (fqz_comp/fqzcomp5 have no Illumina binning mode).
-ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-bin8 fqxv-bin4 fqxv-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary"
+ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-bin8 fqxv-bin4 fqxv-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary colord"
 TOOLS="${FQXV_TOOLS:-$ALL_TOOLS}"
 # The fqxv binary (built with `cargo build --release`).
 FQXV_BIN="${FQXV_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/fqxv}"
@@ -68,14 +68,19 @@ for c in /usr/bin/time "$(command -v time || true)"; do
   if [[ -x "$c" ]] && "$c" -f '%e %M' true >/dev/null 2>&1; then GNU_TIME="$c"; break; fi
 done
 
-# measure CMD... -> sets MEAS_SECS, MEAS_RSS_KB
+# measure CMD... -> sets MEAS_SECS, MEAS_RSS_KB, MEAS_RC (the command's exit
+# code). Never returns non-zero itself, so a tool that fails — e.g. fqz_comp,
+# which cannot parse long-read (Nanopore) FASTQ — is captured in MEAS_RC and
+# recorded rather than aborting the whole run under `set -e`.
 measure() {
-  local tf; tf="$(mktemp)"
+  local tf; tf="$(mktemp)"; MEAS_RC=0
   if [[ -n "$GNU_TIME" ]]; then
-    "$GNU_TIME" -o "$tf" -f '%e %M' "$@"
-    read -r MEAS_SECS MEAS_RSS_KB < "$tf"
+    "$GNU_TIME" -o "$tf" -f '%e %M' "$@" || MEAS_RC=$?
+    # On failure GNU time prepends a "Command exited with non-zero status N"
+    # line before the "%e %M" line, so read the *last* line for the metrics.
+    read -r MEAS_SECS MEAS_RSS_KB < <(tail -n1 "$tf") || { MEAS_SECS=-1; MEAS_RSS_KB=-1; }
   else
-    local t0 t1; t0="$EPOCHREALTIME"; "$@"; t1="$EPOCHREALTIME"
+    local t0 t1; t0="$EPOCHREALTIME"; { "$@" || MEAS_RC=$?; }; t1="$EPOCHREALTIME"
     MEAS_SECS="$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.2f", b-a}')"
     MEAS_RSS_KB="-1"
   fi
@@ -160,6 +165,9 @@ compress() {  # tool input out_prefix
     fqz_comp) COMP="$pfx.fqz"; measure bash -c "fqz_comp < '$in' > '$COMP'" ;;
     fqzcomp5) COMP="$pfx.fqz5"; measure bash -c "fqzcomp5 < '$in' > '$COMP'" ;;
     spring)   COMP="$pfx.spring"; mkdir -p "$WORK/spring_c_$$"; measure spring -c -t "$THREADS" -i "$in" -o "$COMP" -w "$WORK/spring_c_$$/" ;;
+    # CoLoRd long-read SOTA, lossless quality (`-q org`). Compresses sequence and
+    # quality; the meaningful bar for our ONT streams.
+    colord)   COMP="$pfx.colord"; measure bash -c "rm -f '$COMP'; colord compress-ont -t $THREADS -q org '$in' '$COMP'" ;;
     # spring-illbin: Illumina 8-level binning (like-for-like vs fqxv-bin8).
     spring-illbin) COMP="$pfx.spring"; mkdir -p "$WORK/spring_c_$$"; measure spring -c -t "$THREADS" -q ill_bin -i "$in" -o "$COMP" -w "$WORK/spring_c_$$/" ;;
     # spring-binary thr=25 high=37 low=15 mirrors fqxv-bin2 (q<25 -> 15, else 37).
@@ -177,6 +185,7 @@ decompress() {  # tool comp out_rt
     fqz_comp) measure bash -c "fqz_comp -d < '$comp' > '$rt'" ;;
     fqzcomp5) measure bash -c "fqzcomp5 -d < '$comp' > '$rt'" ;;
     spring|spring-illbin|spring-binary)   mkdir -p "$WORK/spring_d_$$"; measure spring -d -t "$THREADS" -i "$comp" -o "$rt" -w "$WORK/spring_d_$$/" ;;
+    colord)   measure bash -c "rm -f '$rt'; colord decompress '$comp' '$rt'" ;;
   esac
 }
 
@@ -197,10 +206,13 @@ for row in "${rows[@]}"; do
   # Array cells process a single dataset.
   [[ -n "${FQXV_ONLY_DATASET:-}" && "$label" != "$FQXV_ONLY_DATASET" ]] && continue
 
-  # Resolve input (R1, or R1+R2 concatenated).
+  # Resolve input (R1, or R1+R2 concatenated). Single-end runs (e.g. Nanopore)
+  # are written by `sracha --split split-3` as `${acc}.fastq` with no `_1`
+  # suffix, so fall back to that name when the paired R1 is absent.
   r1="$DATA_DIR/${acc}_1.fastq"
   r2="$DATA_DIR/${acc}_2.fastq"
-  [[ -f "$r1" ]] || { echo "[skip] $label: $r1 missing (run fetch.sh)"; continue; }
+  [[ -f "$r1" ]] || r1="$DATA_DIR/${acc}.fastq"
+  [[ -f "$r1" ]] || { echo "[skip] $label: $DATA_DIR/${acc}[_1].fastq missing (run fetch.sh)"; continue; }
   if [[ "$INPUT_MODE" == "cat" && -f "$r2" ]]; then
     in="$WORK/${label}.fastq"
     [[ -f "$in" ]] || cat "$r1" "$r2" > "$in"
@@ -256,9 +268,22 @@ for row in "${rows[@]}"; do
     pfx="$WORK/${label}.${tool}"; rt="$WORK/${label}.${tool}.rt.fastq"
     rm -f "$pfx".* "$rt"
 
-    compress "$tool" "$in" "$pfx"; c_secs="$MEAS_SECS"; c_rss="$MEAS_RSS_KB"
-    comp_bytes="$(stat -c %s "$COMP" 2>/dev/null || echo 0)"
-    decompress "$tool" "$COMP" "$rt"; d_secs="$MEAS_SECS"; d_rss="$MEAS_RSS_KB"
+    compress "$tool" "$in" "$pfx"; c_secs="$MEAS_SECS"; c_rss="$MEAS_RSS_KB"; c_rc="$MEAS_RC"
+    # A failed compressor may leave a partial/garbage file; don't report its size
+    # as a real ratio. Record 0 bytes + rt=no so report.py ranks it last.
+    if [[ "$c_rc" -ne 0 ]]; then
+      echo "  [fail] $tool: compress exited $c_rc (recorded rt=no, continuing)"
+      rm -f "$COMP"; comp_bytes=0
+    else
+      comp_bytes="$(stat -c %s "$COMP" 2>/dev/null || echo 0)"
+    fi
+    # Only attempt decompress when compress produced a real archive; a tool that
+    # cannot handle this data (e.g. fqz_comp on long reads) is left as rt=no.
+    d_secs=0; d_rss=-1
+    if [[ "$c_rc" -eq 0 && "$comp_bytes" -gt 0 ]]; then
+      decompress "$tool" "$COMP" "$rt"; d_secs="$MEAS_SECS"; d_rss="$MEAS_RSS_KB"
+      [[ "$MEAS_RC" -ne 0 ]] && echo "  [fail] $tool: decompress exited $MEAS_RC"
+    fi
 
     # Per-stream sizes (fqxv only; others get -1).
     names_b=-1; seq_b=-1; qual_b=-1
