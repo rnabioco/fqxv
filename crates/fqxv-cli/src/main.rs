@@ -198,9 +198,34 @@ fn level_to_block(level: u8) -> usize {
     }
 }
 
+/// Resolve the `--threads` budget to a concrete worker count: 0 means all
+/// available cores, and any explicit request is clamped to what physically
+/// exists so we never oversubscribe. Mirrors the library's compression pool
+/// sizing so decode and compress use the same budget.
+fn resolve_threads(threads: usize) -> usize {
+    let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if threads == 0 {
+        available
+    } else {
+        threads.min(available)
+    }
+}
+
+/// Size rayon's global thread pool to the `--threads` budget. The parallel BGZF
+/// decoder ([`noodles_bgzf::io::MultithreadedReader`]) runs on this global pool,
+/// so this makes `--threads` govern decode as well as compress. Must run before
+/// any rayon use; a re-init error would only occur if the pool were already
+/// built, which never happens this early.
+fn configure_global_pool(threads: usize) -> Result<(), rayon::ThreadPoolBuildError> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(resolve_threads(threads))
+        .build_global()
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose, cli.quiet);
+    configure_global_pool(cli.threads).context("configuring the global thread pool")?;
     match cli.command {
         Command::Compress {
             inputs,
@@ -423,9 +448,10 @@ fn is_bgzf(hdr: &[u8]) -> bool {
 ///
 /// BGZF (block-gzip) input is inflated in parallel: its blocks are independent,
 /// so [`noodles_bgzf::io::MultithreadedReader`] decodes them across rayon's
-/// global thread pool. Plain gzip is a single DEFLATE stream and stays serial.
-/// The decoded byte stream — and therefore the archive — is identical
-/// regardless of how the input was compressed or how many decode workers run.
+/// global thread pool, sized to `--threads` by [`configure_global_pool`]. Plain
+/// gzip is a single DEFLATE stream and stays serial. The decoded byte stream —
+/// and therefore the archive — is identical regardless of how the input was
+/// compressed or how many decode workers run.
 fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
     let mut src: Box<dyn Read + Send> = if path.as_os_str() == "-" {
         Box::new(io::stdin())
@@ -506,5 +532,13 @@ mod tests {
         let mut hdr = BGZF_HEADER;
         hdr[12] = b'X';
         assert!(!is_bgzf(&hdr));
+    }
+
+    #[test]
+    fn resolve_threads_zero_is_all_cores_and_explicit_is_clamped() {
+        let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(resolve_threads(0), available); // 0 = all cores
+        assert_eq!(resolve_threads(1), 1);
+        assert_eq!(resolve_threads(usize::MAX), available); // never oversubscribe
     }
 }

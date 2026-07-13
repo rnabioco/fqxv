@@ -387,6 +387,7 @@ dependencies = [
  "flate2",
  "fqxv",
  "noodles-bgzf",
+ "rayon",
  "tracing",
  "tracing-subscriber",
 ]
