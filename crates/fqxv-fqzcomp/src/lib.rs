@@ -138,8 +138,12 @@ pub enum Error {
 /// The result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Max quality alphabet the model handles.
-const QMAX: usize = 64;
+/// Max quality alphabet the model handles. Covers the full Sanger FASTQ range
+/// (Phred 0..=93, ASCII `!`..=`~`), so long-read (nanopore) data — whose quality
+/// range routinely exceeds Illumina's ~40 levels and can span the whole scale —
+/// is accepted rather than rejected. `context` masks its fields (below) so a
+/// symbol beyond the old 64-cap can never index past `N_CTX`.
+const QMAX: usize = 94;
 /// Loose upper bound on quality symbols the range coder can emit per compressed
 /// byte, used as a decompression-bomb guard in [`decode`]. The adaptive model
 /// caps its total frequency at `1<<13`, so with 64 symbols the most-skewed
@@ -170,13 +174,18 @@ fn pos_bucket(pos: usize) -> usize {
 
 /// Build the context index from the previous three symbols, the running delta
 /// counter, and the position.
+///
+/// Each field is masked to its bit width so the packed context stays within the
+/// 18-bit `N_CTX` bound even when a symbol exceeds 63 (possible now that `QMAX`
+/// spans the full Phred scale). For alphabets that fit the old 64-symbol cap the
+/// masks are no-ops, so short-read output is byte-identical.
 #[inline]
 fn context(q1: u8, q2: u8, q3: u8, delta: u8, pos: usize) -> usize {
-    (q1 as usize)                       // bits 0..5
-        | ((q2 as usize >> 2) << 6)     // bits 6..9   (q2 coarsened)
-        | ((delta as usize) << 10)      // bits 10..11
-        | ((q3 as usize >> 4) << 12)    // bits 12..13 (q3 coarse)
-        | (pos_bucket(pos) << 14) // bits 14..17
+    ((q1 as usize) & 0x3F)                    // bits 0..5   (previous symbol)
+        | (((q2 as usize >> 2) & 0xF) << 6)   // bits 6..9   (q2 coarsened)
+        | (((delta as usize) & 0x3) << 10)    // bits 10..11
+        | (((q3 as usize >> 4) & 0x3) << 12)  // bits 12..13 (q3 coarse)
+        | ((pos_bucket(pos) & 0xF) << 14) // bits 14..17
 }
 
 /// Encode per-read quality strings.
@@ -532,6 +541,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn roundtrip_wide_nanopore_alphabet() {
+        // Nanopore quality spans far more than Illumina's ~40 levels. Exercise
+        // the whole '!'..='~' alphabet (Phred 0..=93, 94 symbols) across long
+        // reads — the old 64-symbol cap rejected this outright.
+        let quals: Vec<u8> = (0..12_000u32).map(|i| b'!' + (i % 94) as u8).collect();
+        roundtrip(&[3000, 3000, 3000, 3000], &quals, QualityBinning::Lossless);
+    }
+
+    #[test]
+    fn accepts_full_sanger_range_rejects_beyond() {
+        // '!' (33) .. '~' (126) is exactly 94 symbols — the widest valid FASTQ
+        // quality alphabet — and must encode.
+        let full: Vec<u8> = (b'!'..=b'~').collect();
+        assert_eq!(full.len(), 94);
+        encode(&[full.len() as u32], &full, QualityBinning::Lossless)
+            .expect("full Sanger range encodes");
+        // A contiguous span of 95 distinct bytes exceeds the model and must be a
+        // clean AlphabetTooLarge error, not a panic or silent corruption.
+        let over: Vec<u8> = (33u8..33 + 95).collect();
+        assert!(matches!(
+            encode(&[over.len() as u32], &over, QualityBinning::Lossless),
+            Err(Error::AlphabetTooLarge(95))
+        ));
+    }
+
     fn push_varint(out: &mut Vec<u8>, mut v: u64) {
         loop {
             let b = (v & 0x7f) as u8;
@@ -570,6 +605,17 @@ mod tests {
         fn roundtrip_arbitrary(
             reads in proptest::collection::vec(
                 proptest::collection::vec(33u8..=74, 0..50), 0..40)
+        ) {
+            let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
+            let quals: Vec<u8> = reads.concat();
+            roundtrip(&lens, &quals, QualityBinning::Lossless);
+        }
+
+        // Full Sanger quality range ('!'..='~'), as long-read basecallers emit.
+        #[test]
+        fn roundtrip_wide_alphabet_arbitrary(
+            reads in proptest::collection::vec(
+                proptest::collection::vec(33u8..=126, 0..80), 0..30)
         ) {
             let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
             let quals: Vec<u8> = reads.concat();
