@@ -29,8 +29,8 @@ Examples:
   # Paired-end: mates are interleaved per spot into one archive
   fqxv compress R1.fastq.gz R2.fastq.gz -o sample.fqxv
 
-  # Squeeze harder: top level plus read reordering (does not preserve order)
-  fqxv compress reads.fastq.gz -o reads.fqxv -l 9 --reorder
+  # Squeeze harder: top level plus read reordering (single-end order may change)
+  fqxv compress reads.fastq.gz -o reads.fqxv -l 9 --order any
 
   # Decompress to stdout and pipe straight into an aligner
   fqxv decompress sample.fqxv | bwa mem -p ref.fa -
@@ -123,13 +123,13 @@ enum Command {
         /// as from `sracha get -Z`). Ignored with multiple inputs.
         #[arg(long, value_name = "N", help_heading = "Advanced")]
         interleaved: Option<u8>,
-        /// Reorder reads to exploit depth redundancy (may not preserve order).
-        #[arg(long, help_heading = "Advanced")]
-        reorder: bool,
-        /// With `--reorder`, store a permutation so the original order is
-        /// restored on decompress.
-        #[arg(long, requires = "reorder", help_heading = "Advanced")]
-        keep_order: bool,
+        /// Read-order guarantee. `preserve` (default) restores the original order
+        /// on decompress. `any` allows read reordering to exploit depth redundancy
+        /// for a better ratio — single-end reads may come back in a different
+        /// order; paired/grouped input still round-trips in order (the mate
+        /// interleaving requires it), it just costs a stored permutation.
+        #[arg(long, value_enum, default_value_t = ReadOrder::Preserve, help_heading = "Advanced")]
+        order: ReadOrder,
         /// Opt-in lossy quality binning (changes the data; default is lossless).
         #[arg(long, value_enum, default_value_t = QualityBin::Lossless, help_heading = "Advanced")]
         quality_bin: QualityBin,
@@ -155,6 +155,17 @@ enum Command {
         #[arg(long)]
         tsv: bool,
     },
+}
+
+/// Read-order guarantee exposed on the CLI. Reordering (`Any`) is a compression
+/// technique, not a user-facing knob — the user picks the property they care
+/// about (does my order survive?), and the library chooses the mechanism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ReadOrder {
+    /// Original read order is restored on decompress (default).
+    Preserve,
+    /// Allow reordering for a better ratio; single-end order may change.
+    Any,
 }
 
 /// Lossy quality quantization choices exposed on the CLI.
@@ -232,26 +243,22 @@ fn main() -> anyhow::Result<()> {
             output,
             level,
             interleaved,
-            reorder,
-            keep_order,
+            order,
             quality_bin,
         } => {
             if inputs.is_empty() {
                 anyhow::bail!("at least one input FASTQ is required");
             }
-            if reorder && inputs.len() > 1 {
-                anyhow::bail!("--reorder is single-end only (would break spot grouping)");
-            }
             let interleaved = interleaved.filter(|_| inputs.len() == 1);
-            if reorder && interleaved.is_some_and(|g| g > 1) {
-                anyhow::bail!("--reorder cannot combine with --interleaved (would break spots)");
-            }
+            // `--order any` turns on reordering; the library forces the permutation
+            // (keep_order) back on for grouped input, so paired archives still
+            // round-trip in order regardless.
             let params = fqxv::Params {
                 seq_order: level_to_order(level),
                 block_reads: level_to_block(level),
                 quality_binning: quality_bin.into(),
-                reorder,
-                keep_order,
+                reorder: order == ReadOrder::Any,
+                keep_order: false,
                 threads: cli.threads,
             };
             let in_size: u64 = inputs

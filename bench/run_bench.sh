@@ -19,7 +19,7 @@ DATA_DIR="${FQXV_DATA_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/data}"
 RESULTS_DIR="${FQXV_RESULTS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/results}"
 THREADS="${FQXV_THREADS:-$(nproc)}"
 INPUT_MODE="${FQXV_INPUT:-r1}"
-# fqxv, fqxv9 (level 9), fqxv-reorder (--reorder --keep-order), and the lossy
+# fqxv, fqxv9 (level 9), fqxv-reorder (--order any), and the lossy
 # quality points fqxv-bin8/bin4/bin2 all share one binary; the rest are external
 # baselines. spring-illbin (`-q ill_bin`, Illumina 8-level) and spring-binary
 # (`-q binary`, 2-level) are SPRING's lossy quality modes — the only field tools
@@ -87,7 +87,7 @@ fastq_records() { echo $(( $(wc -l < "$1") / 4 )); }
 # Order-independent record-multiset digest: emit name<TAB>seq[<TAB>qual] per
 # record, sort, and hash. This verifies *content* losslessness (names, bases,
 # and — unless mode=noqual — qualities), and because it sorts, it is invariant
-# to read reordering (SPRING, `fqxv --reorder`). The `+` line (record line 3) is
+# to read reordering (SPRING, `fqxv --order any`). The `+` line (record line 3) is
 # deliberately excluded: fqxv normalizes it, which is the one documented, lossy-
 # by-design deviation. mode=noqual drops quality for lossy-quality tools.
 record_digest() {  # file mode(full|noqual)
@@ -150,7 +150,7 @@ compress() {  # tool input out_prefix
   case "$tool" in
     fqxv)          COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --threads "$THREADS" ;;
     fqxv9)         COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" -l 9 --threads "$THREADS" ;;
-    fqxv-reorder)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --reorder --keep-order --threads "$THREADS" ;;
+    fqxv-reorder)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --order any --threads "$THREADS" ;;
     fqxv-bin8)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin8 --threads "$THREADS" ;;
     fqxv-bin4)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin4 --threads "$THREADS" ;;
     fqxv-bin2)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin2 --threads "$THREADS" ;;
@@ -301,7 +301,7 @@ for row in "${rows[@]}"; do
       case "$tool" in
         fqxv)         "$FQXV_BIN" compress "$in" -o "$det1" --threads 1 >/dev/null 2>&1 || true ;;
         fqxv9)        "$FQXV_BIN" compress "$in" -o "$det1" -l 9 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-reorder) "$FQXV_BIN" compress "$in" -o "$det1" --reorder --keep-order --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-reorder) "$FQXV_BIN" compress "$in" -o "$det1" --order any --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin8)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin4)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin2)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;

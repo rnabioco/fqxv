@@ -35,7 +35,11 @@
 //! for parallelism without hurting ratio. Both `--reorder` modes share this one
 //! path — with `--keep-order` (flag bit2) names/quality are coded in ORIGINAL
 //! order and a permutation restores it; without it they are coded in CLUSTERED
-//! order and no permutation is written. Layout after the header:
+//! order and no permutation is written. Grouped (paired / single-cell, `G > 1`)
+//! input reorders too: the reads are clustered ignoring mate structure, but the
+//! permutation reconstructs the original spot interleaving, so `keep_order` is
+//! forced on and the archive de-interleaves cleanly on `decompress_split`.
+//! Layout after the header:
 //! `[8] n  [ ] flip  [ ] perm  [4] n_blocks  [seq block]*n  [ [names][qual] ]*n`
 //! (each `[ ]` is a `[u32 len][bytes]` frame; `perm` is empty without keep-order).
 //! This layout is self-describing and carries no footer/terminator — decode
@@ -99,10 +103,12 @@ pub struct Params {
     /// Quality quantization (lossless by default).
     pub quality_binning: QualityBinning,
     /// Cluster reads (reverse-complement aware) and differentially code the
-    /// sequence — captures cross-read duplicate redundancy. Single-end only.
+    /// sequence — captures cross-read duplicate redundancy. Works for grouped
+    /// (paired / single-cell) input too; grouped reorder always preserves order.
     pub reorder: bool,
     /// In reorder mode, store a permutation so the original read order is
-    /// restored (otherwise reads emerge in clustered order).
+    /// restored (otherwise reads emerge in clustered order). Forced on for grouped
+    /// input (`group_size > 1`), where the permutation reconstructs the spots.
     pub keep_order: bool,
     /// Worker threads (0 = all available cores); clamped to available cores.
     pub threads: usize,
@@ -237,7 +243,7 @@ pub fn compress<R: Read + Send, W: Write>(
     params: Params,
 ) -> Result<Stats> {
     if params.reorder {
-        return compress_reordered_whole(reader, writer, params);
+        return compress_reordered_whole(reader, writer, params, 1);
     }
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
@@ -298,19 +304,15 @@ fn detect_group_size(peeked: &[noodles_fastq::Record]) -> u8 {
 /// what the CLI uses by default for a lone input so `sracha get -Z … | fqxv
 /// compress -` archives paired downloads with the right spot grouping and no
 /// flag. Detection only ever promotes to paired on unambiguous mate names;
-/// otherwise it behaves exactly like [`compress`]. In `reorder` mode the stream
-/// is always treated as single-end (reorder is single-end only).
+/// otherwise it behaves exactly like [`compress`]. `reorder` mode honours the
+/// detected grouping too: paired input is globally clustered and a permutation
+/// restores the mate interleaving (see [`encode_reordered`]).
 #[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, reorder = params.reorder, threads = params.threads))]
 pub fn compress_auto<R: Read + Send, W: Write>(
     mut reader: R,
     writer: W,
     params: Params,
 ) -> Result<Stats> {
-    if params.reorder {
-        // Global-cluster reorder buffers all reads itself; skip peek/autodetect
-        // (reorder is single-end, so there is no group size to detect).
-        return compress_reordered_whole(reader, writer, params);
-    }
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
 
@@ -325,12 +327,11 @@ pub fn compress_auto<R: Read + Send, W: Write>(
         }
         peeked.push(rec);
     }
-    let g = if params.reorder {
-        1
-    } else {
-        detect_group_size(&peeked)
-    };
-    info!(group_size = g, "detected layout");
+    let g = detect_group_size(&peeked);
+    info!(group_size = g, reorder = params.reorder, "detected layout");
+    if params.reorder {
+        return encode_reordered(buffer_records(&buf)?, writer, params, g);
+    }
     compress_buffered(&buf, writer, params, g)
 }
 
@@ -354,13 +355,17 @@ pub fn compress_interleaved<R: Read + Send, W: Write>(
     if g == 1 {
         return compress(reader, writer, params);
     }
-    if params.reorder {
-        return Err(Error::Malformed(
-            "reorder is single-end only (would break spot grouping)",
-        ));
-    }
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
+    if params.reorder {
+        let all = buffer_records(&buf)?;
+        if all.n_reads() % g as usize != 0 {
+            return Err(Error::Malformed(
+                "interleaved stream ended mid-spot (record count not a multiple of group size)",
+            ));
+        }
+        return encode_reordered(all, writer, params, g);
+    }
     compress_buffered(&buf, writer, params, g)
 }
 
@@ -382,16 +387,31 @@ pub fn compress_multi<'a, W: Write>(
     if g > u8::MAX as usize {
         return Err(Error::Malformed("too many interleaved inputs"));
     }
-    if params.reorder && g > 1 {
-        return Err(Error::Malformed(
-            "reorder is single-end only (would break spot grouping)",
-        ));
-    }
     let mut fqs: Vec<_> = readers
         .into_iter()
         .map(|r| noodles_fastq::io::Reader::new(BufReader::new(r)))
         .collect();
     let mut recs: Vec<_> = (0..g).map(|_| noodles_fastq::Record::default()).collect();
+
+    if params.reorder {
+        // Buffer every spot in interleaved order (m0₀, m1₀, …), then globally
+        // cluster; the stored permutation restores this spot order on decode, so
+        // grouped reorder is order-preserving and de-interleaves cleanly.
+        let mut all = RawBlock::default();
+        loop {
+            for j in 0..g {
+                if fqs[j].read_record(&mut recs[j])? == 0 {
+                    if j == 0 {
+                        return encode_reordered(all, writer, params, g as u8);
+                    }
+                    return Err(Error::Malformed("inputs have unequal read counts"));
+                }
+            }
+            for r in &recs {
+                all.push(r.name(), r.description(), r.sequence(), r.quality_scores());
+            }
+        }
+    }
 
     // Keep whole spots together: round the block target down to a multiple of g.
     let block_reads = (params.block_reads / g).max(1) * g;
@@ -951,40 +971,73 @@ fn read_framed<R: Read>(r: &mut R) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Whole-file reorder with GLOBAL clustering (SPRING-style). Buffers all reads,
-/// clusters them once, then codes the clustered sequence in independent moderate
-/// blocks that fan out across cores. This is the single path for BOTH `--reorder`
-/// modes (clustering is global, so block size is free to be moderate for
-/// parallelism without hurting ratio):
-///
-/// - `keep_order` (default off): names+quality are coded in ORIGINAL order and a
-///   global permutation (byte-plane rANS) restores it, so the reads come back
-///   byte-exact in their input order.
-/// - without `keep_order`: names+quality are coded in CLUSTERED order alongside
-///   the sequence and NO permutation is written, so decode emits reads in
-///   clustered order (records preserved as a set). This strictly dominates the
-///   old per-block free reorder — same "no permutation", but global clustering.
+/// Buffer every record of a single (possibly interleaved) FASTQ stream into one
+/// [`RawBlock`], preserving input order. Used by the reorder path, which needs the
+/// whole file resident before it can cluster globally.
+fn buffer_records(buf: &[u8]) -> Result<RawBlock> {
+    let mut all = RawBlock::default();
+    let mut fq = noodles_fastq::io::Reader::new(buf);
+    let mut rec = noodles_fastq::Record::default();
+    while fq.read_record(&mut rec)? != 0 {
+        all.push(
+            rec.name(),
+            rec.description(),
+            rec.sequence(),
+            rec.quality_scores(),
+        );
+    }
+    Ok(all)
+}
+
+/// Buffer a single reader and hand off to [`encode_reordered`] (single-end when
+/// `group_size == 1`, or an already-interleaved stream for `group_size > 1`).
 fn compress_reordered_whole<R: Read + Send, W: Write>(
     reader: R,
     writer: W,
     params: Params,
+    group_size: u8,
 ) -> Result<Stats> {
-    let pool = build_pool(params.threads)?;
-
-    // 1. Buffer every read.
+    // Buffer every read; input order is preserved, so an interleaved stream stays
+    // interleaved and the permutation can restore that spot order on decode.
     let mut all = RawBlock::default();
-    {
-        let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
-        let mut rec = noodles_fastq::Record::default();
-        while fq.read_record(&mut rec)? != 0 {
-            all.push(
-                rec.name(),
-                rec.description(),
-                rec.sequence(),
-                rec.quality_scores(),
-            );
-        }
+    let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
+    let mut rec = noodles_fastq::Record::default();
+    while fq.read_record(&mut rec)? != 0 {
+        all.push(
+            rec.name(),
+            rec.description(),
+            rec.sequence(),
+            rec.quality_scores(),
+        );
     }
+    encode_reordered(all, writer, params, group_size)
+}
+
+/// Globally cluster the buffered reads (SPRING-style) and write the whole-file
+/// reorder archive: cluster once, then code the clustered sequence in independent
+/// moderate blocks that fan out across cores (clustering is global, so block size
+/// trades only against parallelism, not ratio). Two modes:
+///
+/// - `keep_order`: names+quality are coded in ORIGINAL order and a global
+///   permutation (byte-plane rANS) restores it, so reads come back byte-exact in
+///   input order.
+/// - without `keep_order`: names+quality are coded in CLUSTERED order and NO
+///   permutation is written, so decode emits reads in clustered order (records
+///   preserved as a set) — smaller, but order is not restorable.
+///
+/// `group_size` is the mate interleaving (1 = single-end). When `group_size > 1`
+/// the original spot order *is* the mate interleaving, so the permutation is
+/// required to reconstruct it: `keep_order` is forced on regardless of
+/// `params.keep_order`, making grouped reorder order-preserving.
+fn encode_reordered<W: Write>(
+    all: RawBlock,
+    writer: W,
+    params: Params,
+    group_size: u8,
+) -> Result<Stats> {
+    let g = group_size.max(1);
+    let keep_order = params.keep_order || g > 1;
+    let pool = build_pool(params.threads)?;
     let n = all.n_reads();
 
     // Cumulative byte offsets into the concatenated seq/qual.
@@ -1060,7 +1113,7 @@ fn compress_reordered_whole<R: Read + Send, W: Write>(
         ranges
             .par_iter()
             .map(|&(s, e)| -> Result<(Vec<u8>, Vec<u8>)> {
-                if params.keep_order {
+                if keep_order {
                     let headers: Vec<&[u8]> = (s..e).map(|i| all.header(i)).collect();
                     let names = fqxv_tokenizer::encode(&headers)?;
                     let qual = fqxv_fqzcomp::encode(
@@ -1095,7 +1148,7 @@ fn compress_reordered_whole<R: Read + Send, W: Write>(
     // 6. Global permutation (byte-plane split → rANS) — only with keep_order.
     // Without it, reads emerge clustered, so no permutation is needed; an empty
     // frame keeps the on-disk layout uniform.
-    let perm_c = if params.keep_order {
+    let perm_c = if keep_order {
         let mut planes = vec![0u8; n * 4];
         for (i, &x) in plan.order.iter().enumerate() {
             planes[i] = x as u8;
@@ -1111,7 +1164,7 @@ fn compress_reordered_whole<R: Read + Send, W: Write>(
     // 7. Write: header, then n / flip / perm / seq blocks / name+qual blocks.
     let mut w = BufWriter::new(writer);
     let mut flags = FLAG_PLUS_NORMALIZED | FLAG_REORDERED | FLAG_GLOBAL_REORDER;
-    if params.keep_order {
+    if keep_order {
         flags |= FLAG_KEEP_ORDER;
     }
     w.write_all(&MAGIC)?;
@@ -1120,7 +1173,7 @@ fn compress_reordered_whole<R: Read + Send, W: Write>(
         params.seq_order,
         binning_tag(params.quality_binning),
         flags,
-        1,
+        g,
     ])?;
     w.write_all(&(n as u64).to_le_bytes())?;
     write_framed(&mut w, &flip_bits)?;
@@ -1151,21 +1204,28 @@ fn compress_reordered_whole<R: Read + Send, W: Write>(
         reads: n as u64,
         blocks: ranges.len() as u64,
         out_bytes,
-        group_size: 1,
+        group_size: g,
     })
 }
 
-/// Decode a whole-file globally-clustered reorder archive (see
-/// [`compress_reordered_whole`]). `r` is positioned just past the header.
-/// `keep_order` (from the header's `FLAG_KEEP_ORDER`) selects the mode: un-permute
-/// into original order, or emit in clustered order.
-fn decode_reordered_whole<R: Read, W: Write>(
-    mut r: R,
-    writer: W,
-    threads: usize,
-    keep_order: bool,
-) -> Result<Stats> {
-    let pool = build_pool(threads)?;
+/// The decoded whole-file reorder streams, before any un-permutation. `cl_reads`
+/// is in clustered order; `names`/`lens`/`quals` are in clustered order without
+/// `keep_order` and in original order with it (see [`encode_reordered`]).
+struct ReorderStreams {
+    n: usize,
+    n_blocks: usize,
+    flip: Vec<u8>,
+    perm_c: Vec<u8>,
+    cl_reads: Vec<Vec<u8>>,
+    names: Vec<Vec<u8>>,
+    lens: Vec<u32>,
+    quals: Vec<u8>,
+}
+
+/// Read and entropy-decode the whole-file reorder layout. `r` is positioned just
+/// past the header. Shared by [`decode_reordered_whole`] and
+/// [`decode_reordered_split`].
+fn read_reordered_streams<R: Read>(mut r: R, pool: &rayon::ThreadPool) -> Result<ReorderStreams> {
     let mut n_buf = [0u8; 8];
     r.read_exact(&mut n_buf)?;
     let n = u64::from_le_bytes(n_buf) as usize;
@@ -1204,7 +1264,7 @@ fn decode_reordered_whole<R: Read, W: Write>(
             .collect::<Result<_>>()
     })?;
 
-    // Flatten: clustered reads (clustered order); names/lens/quals (original).
+    // Flatten the per-block vectors into whole-file streams.
     let mut cl_reads: Vec<Vec<u8>> = Vec::with_capacity(n);
     for blk in seq_dec {
         cl_reads.extend(blk);
@@ -1220,43 +1280,80 @@ fn decode_reordered_whole<R: Read, W: Write>(
     if cl_reads.len() != n || names.len() != n || lens.len() != n {
         return Err(Error::Malformed("reordered stream length disagreement"));
     }
+    Ok(ReorderStreams {
+        n,
+        n_blocks,
+        flip,
+        perm_c,
+        cl_reads,
+        names,
+        lens,
+        quals,
+    })
+}
 
+/// Un-permute a `keep_order` reorder archive: place each clustered sequence
+/// (un-flipped) at its original position via the stored permutation, yielding the
+/// sequences in original order. Consumes `s.cl_reads`.
+fn unpermute_sequences(s: &mut ReorderStreams) -> Result<Vec<Vec<u8>>> {
+    let n = s.n;
+    let perm: Vec<u32> = {
+        let pb = fqxv_rans::decode(&s.perm_c).map_err(|_| Error::Malformed("bad permutation"))?;
+        if pb.len() != n * 4 {
+            return Err(Error::Malformed("permutation length mismatch"));
+        }
+        (0..n)
+            .map(|i| u32::from_le_bytes([pb[i], pb[n + i], pb[2 * n + i], pb[3 * n + i]]))
+            .collect()
+    };
+    let mut seq_orig: Vec<Vec<u8>> = vec![Vec::new(); n];
+    for (j, mut seq) in std::mem::take(&mut s.cl_reads).into_iter().enumerate() {
+        if s.flip.get(j / 8).copied().unwrap_or(0) >> (j % 8) & 1 == 1 {
+            seq = fqxv_reorder::revcomp(&seq);
+        }
+        let dest = perm[j] as usize;
+        *seq_orig
+            .get_mut(dest)
+            .ok_or(Error::Malformed("permutation out of range"))? = seq;
+    }
+    Ok(seq_orig)
+}
+
+/// Decode a whole-file globally-clustered reorder archive to interleaved FASTQ on
+/// a single writer (see [`compress_reordered_whole`]). `r` is positioned just past
+/// the header. `keep_order` (from `FLAG_KEEP_ORDER`) selects the mode: un-permute
+/// into original order, or emit in clustered order. `group_size` is recorded in
+/// the returned [`Stats`]; grouped archives are always `keep_order`, so their
+/// records emerge in original spot-interleaved order.
+fn decode_reordered_whole<R: Read, W: Write>(
+    r: R,
+    writer: W,
+    threads: usize,
+    keep_order: bool,
+    group_size: u8,
+) -> Result<Stats> {
+    let pool = build_pool(threads)?;
+    let mut s = read_reordered_streams(r, &pool)?;
+    let n = s.n;
+    let n_blocks = s.n_blocks;
     let mut w = BufWriter::new(writer);
     if keep_order {
-        // Un-permute: place each clustered sequence at its original position
-        // (un-flipped) via the permutation, then emit in original order against
-        // the original-order names/quality.
-        let perm: Vec<u32> = {
-            let pb = fqxv_rans::decode(&perm_c).map_err(|_| Error::Malformed("bad permutation"))?;
-            if pb.len() != n * 4 {
-                return Err(Error::Malformed("permutation length mismatch"));
-            }
-            (0..n)
-                .map(|i| u32::from_le_bytes([pb[i], pb[n + i], pb[2 * n + i], pb[3 * n + i]]))
-                .collect()
-        };
-        let mut seq_orig: Vec<Vec<u8>> = vec![Vec::new(); n];
-        for (j, mut s) in cl_reads.into_iter().enumerate() {
-            if flip.get(j / 8).copied().unwrap_or(0) >> (j % 8) & 1 == 1 {
-                s = fqxv_reorder::revcomp(&s);
-            }
-            let dest = perm[j] as usize;
-            *seq_orig
-                .get_mut(dest)
-                .ok_or(Error::Malformed("permutation out of range"))? = s;
-        }
+        // Un-permute, then emit in original order against the original-order
+        // names/quality.
+        let seq_orig = unpermute_sequences(&mut s)?;
         let mut qoff = 0usize;
         for i in 0..n {
-            let l = lens[i] as usize;
-            let qual = quals
+            let l = s.lens[i] as usize;
+            let qual = s
+                .quals
                 .get(qoff..qoff + l)
                 .ok_or(Error::Malformed("quality underrun"))?;
             qoff += l;
             if seq_orig[i].len() != l {
                 return Err(Error::Malformed("reordered sequence length mismatch"));
             }
-            let mut rec = Vec::with_capacity(l * 2 + names[i].len() + 8);
-            write_record(&mut rec, &names[i], &seq_orig[i], qual);
+            let mut rec = Vec::with_capacity(l * 2 + s.names[i].len() + 8);
+            write_record(&mut rec, &s.names[i], &seq_orig[i], qual);
             w.write_all(&rec)?;
         }
     } else {
@@ -1264,22 +1361,23 @@ fn decode_reordered_whole<R: Read, W: Write>(
         // Un-flip the reverse-complemented reads (sequence and quality) to restore
         // each record's original content, then emit in clustered order.
         let mut qoff = 0usize;
-        for (j, mut s) in cl_reads.into_iter().enumerate() {
-            let l = lens[j] as usize;
-            let mut qual = quals
+        for (j, mut seq) in std::mem::take(&mut s.cl_reads).into_iter().enumerate() {
+            let l = s.lens[j] as usize;
+            let mut qual = s
+                .quals
                 .get(qoff..qoff + l)
                 .ok_or(Error::Malformed("quality underrun"))?
                 .to_vec();
             qoff += l;
-            if s.len() != l {
+            if seq.len() != l {
                 return Err(Error::Malformed("reordered sequence length mismatch"));
             }
-            if flip.get(j / 8).copied().unwrap_or(0) >> (j % 8) & 1 == 1 {
-                s = fqxv_reorder::revcomp(&s);
+            if s.flip.get(j / 8).copied().unwrap_or(0) >> (j % 8) & 1 == 1 {
+                seq = fqxv_reorder::revcomp(&seq);
                 qual.reverse();
             }
-            let mut rec = Vec::with_capacity(l * 2 + names[j].len() + 8);
-            write_record(&mut rec, &names[j], &s, &qual);
+            let mut rec = Vec::with_capacity(l * 2 + s.names[j].len() + 8);
+            write_record(&mut rec, &s.names[j], &seq, &qual);
             w.write_all(&rec)?;
         }
     }
@@ -1288,8 +1386,52 @@ fn decode_reordered_whole<R: Read, W: Write>(
         reads: n as u64,
         blocks: n_blocks as u64,
         out_bytes: 0,
-        group_size: 1,
+        group_size: group_size.max(1),
     })
+}
+
+/// Decode a grouped whole-file reorder archive, splitting the reads back into `g`
+/// writers by their per-spot member. Only valid for `keep_order` archives (the
+/// permutation reconstructs the mate interleaving); the caller guarantees this.
+/// Record `i` in restored original order belongs to member `i % g`.
+fn decode_reordered_split<R: Read, W: Write>(
+    r: R,
+    writers: &mut [W],
+    threads: usize,
+    g: usize,
+) -> Result<Stats> {
+    let pool = build_pool(threads)?;
+    let mut s = read_reordered_streams(r, &pool)?;
+    let n = s.n;
+    let n_blocks = s.n_blocks;
+    let seq_orig = unpermute_sequences(&mut s)?;
+    let mut bufs: Vec<BufWriter<&mut W>> = writers.iter_mut().map(BufWriter::new).collect();
+    let mut stats = Stats {
+        reads: n as u64,
+        blocks: n_blocks as u64,
+        group_size: g as u8,
+        ..Stats::default()
+    };
+    let mut qoff = 0usize;
+    for i in 0..n {
+        let l = s.lens[i] as usize;
+        let qual = s
+            .quals
+            .get(qoff..qoff + l)
+            .ok_or(Error::Malformed("quality underrun"))?;
+        qoff += l;
+        if seq_orig[i].len() != l {
+            return Err(Error::Malformed("reordered sequence length mismatch"));
+        }
+        let mut rec = Vec::with_capacity(l * 2 + s.names[i].len() + 8);
+        write_record(&mut rec, &s.names[i], &seq_orig[i], qual);
+        bufs[i % g].write_all(&rec)?;
+        stats.out_bytes += rec.len() as u64;
+    }
+    for b in &mut bufs {
+        b.flush()?;
+    }
+    Ok(stats)
 }
 
 /// Code one non-reorder block: names (tokenizer), sequence (order-k), and quality
@@ -1336,7 +1478,7 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
     // permutation — not the per-block loop below.
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
         let keep_order = header.flags & FLAG_KEEP_ORDER != 0;
-        return decode_reordered_whole(r, writer, threads, keep_order);
+        return decode_reordered_whole(r, writer, threads, keep_order, header.group_size);
     }
     let mut w = BufWriter::new(writer);
 
@@ -1377,15 +1519,24 @@ pub fn decompress_split<R: Read, W: Write>(
     let batch = pool.current_num_threads().max(1);
     let mut r = BufReader::new(reader);
     let header = read_header(&mut r)?;
-    if header.flags & FLAG_REORDERED != 0 {
-        return Err(Error::Malformed(
-            "reordered archive: use decompress, not split",
-        ));
-    }
     let g = header.group_size as usize;
     if writers.len() != g {
         return Err(Error::Malformed(
             "output count does not match archive group size",
+        ));
+    }
+    if header.flags & FLAG_REORDERED != 0 {
+        // Grouped global-reorder archives are always `keep_order`, so the
+        // permutation restores the original spot interleaving and we can
+        // de-interleave into the G writers. Single-end clustered-output archives
+        // (no preserved order) cannot be split.
+        let global = header.flags & FLAG_GLOBAL_REORDER != 0;
+        let keep_order = header.flags & FLAG_KEEP_ORDER != 0;
+        if global && keep_order {
+            return decode_reordered_split(r, writers, threads, g);
+        }
+        return Err(Error::Malformed(
+            "reordered archive without preserved order: use decompress, not split",
         ));
     }
 
@@ -2078,16 +2229,111 @@ NNGGCCTA\n\
         assert_eq!(record_set(&out), record_set(&input));
     }
 
+    /// Duplicate-rich reads for one mate of a paired set (`n` spots), sharing
+    /// sequences across spots so clustering has real work — including a
+    /// reverse-complement so the flip path is exercised.
+    fn dup_rich_mate(mate: u8, n: u32) -> Vec<u8> {
+        let a = b"ACGTTTGACCGATTGCAACGT";
+        let ra = fqxv_reorder::revcomp(a);
+        let mut v = Vec::new();
+        for i in 0..n {
+            let s = match (i + mate as u32) % 3 {
+                0 => a.to_vec(),
+                1 => ra.clone(),
+                _ => b"TTTTGGGGCCCCAAAATTTTG".to_vec(),
+            };
+            v.extend_from_slice(format!("@spot.{i}/{mate}\n").as_bytes());
+            v.extend_from_slice(&s);
+            v.extend_from_slice(format!("\n+\n{}\n", "I".repeat(s.len())).as_bytes());
+        }
+        v
+    }
+
+    fn paired_readers<'a>(r1: &'a [u8], r2: &'a [u8]) -> Vec<Box<dyn Read + Send + 'a>> {
+        vec![Box::new(r1) as Box<dyn Read + Send>, Box::new(r2)]
+    }
+
     #[test]
-    fn reorder_rejects_paired() {
-        let r: &[u8] = b"@r.1 a\nACGT\n+\nIIII\n";
+    fn reorder_paired_preserves_order_and_splits() {
+        let r1 = dup_rich_mate(1, 30);
+        let r2 = dup_rich_mate(2, 30);
         let params = Params {
             reorder: true,
             ..Params::default()
         };
-        let readers: Vec<Box<dyn Read + Send>> = vec![Box::new(r), Box::new(r)];
-        let err = compress_multi(readers, &mut Vec::new(), params);
-        assert!(matches!(err, Err(Error::Malformed(_))));
+        let mut archive = Vec::new();
+        compress_multi(paired_readers(&r1, &r2), &mut archive, params).unwrap();
+
+        // Grouped reorder records the real group size and stays a reorder archive.
+        assert_eq!(peek(&archive[..]).unwrap().group_size, 2);
+        assert!(inspect(io::Cursor::new(&archive[..])).unwrap().reordered);
+
+        // Interleaved decode matches a plain (non-reorder) archive byte-for-byte,
+        // i.e. the permutation fully restored the original spot interleaving.
+        let mut plain = Vec::new();
+        compress_multi(paired_readers(&r1, &r2), &mut plain, Params::default()).unwrap();
+        let (mut expected, mut got) = (Vec::new(), Vec::new());
+        decompress(&plain[..], &mut expected, 1).unwrap();
+        decompress(&archive[..], &mut got, 1).unwrap();
+        assert_eq!(got, expected, "grouped reorder must restore spot order");
+
+        // Split decode reconstructs each mate file exactly.
+        let (mut o1, mut o2) = (Vec::new(), Vec::new());
+        {
+            let mut outs: Vec<&mut Vec<u8>> = vec![&mut o1, &mut o2];
+            decompress_split(&archive[..], &mut outs, 1).unwrap();
+        }
+        assert_eq!(o1, r1);
+        assert_eq!(o2, r2);
+    }
+
+    #[test]
+    fn reorder_paired_is_thread_count_deterministic() {
+        let r1 = dup_rich_mate(1, 50);
+        let r2 = dup_rich_mate(2, 50);
+        let mut archives = Vec::new();
+        for threads in [1usize, 4] {
+            let params = Params {
+                reorder: true,
+                threads,
+                ..Params::default()
+            };
+            let mut archive = Vec::new();
+            compress_multi(paired_readers(&r1, &r2), &mut archive, params).unwrap();
+            archives.push(archive);
+        }
+        assert_eq!(
+            archives[0], archives[1],
+            "reorder output must not vary by threads"
+        );
+    }
+
+    #[test]
+    fn reorder_interleaved_single_stream_splits() {
+        // One already-interleaved stream (as `sracha get -Z` emits), reordered.
+        let mut stream = Vec::new();
+        for i in 0..20u32 {
+            for mate in 1..=2u8 {
+                let s = if (i + mate as u32).is_multiple_of(2) {
+                    "ACGTACGTAC"
+                } else {
+                    "TTTTGGGGCC"
+                };
+                stream.extend_from_slice(
+                    format!("@spot.{i}/{mate}\n{s}\n+\nIIIIIIIIII\n").as_bytes(),
+                );
+            }
+        }
+        let params = Params {
+            reorder: true,
+            ..Params::default()
+        };
+        let mut archive = Vec::new();
+        compress_interleaved(&stream[..], &mut archive, params, 2).unwrap();
+        assert_eq!(peek(&archive[..]).unwrap().group_size, 2);
+        let mut out = Vec::new();
+        decompress(&archive[..], &mut out, 1).unwrap();
+        assert_eq!(out, stream, "interleaved reorder must be byte-exact");
     }
 
     #[test]
