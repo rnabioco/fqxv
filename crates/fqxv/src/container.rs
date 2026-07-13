@@ -11,6 +11,8 @@
 //!                   3-4 single-cell R1/R2/I1[/I2], ...)
 //! repeated until the terminator:
 //!   [8] block payload length (LE, nonzero)
+//!   [4] CRC-32C of the payload (LE) -- verified before decode, so corruption is
+//!       caught and localized to one block instead of decoded into garbage
 //!   [ ] block payload
 //! [8] 0  (zero-length terminator block: a streaming, non-seekable decoder
 //!         stops here; seekable readers jump to the footer via the trailer)
@@ -19,6 +21,10 @@
 //!   per row group: [8] byte_offset (LE, points at the group's length field)
 //!                  [4] read_count  (LE)
 //!   [8] total_reads (LE)
+//!   [4] whole_file_crc (LE)  -- CRC-32C of the archive from byte 0 through the
+//!       total_reads field; a one-pass end-to-end integrity check (`verify`)
+//!   [4] footer_crc (LE)      -- CRC-32C of the footer body above, checked before
+//!       any offset in the index is trusted
 //! trailer (fixed, at EOF):
 //!   [8] footer_offset (LE)   -- seek straight to the footer
 //!   [4] magic "FQXF"
@@ -41,7 +47,8 @@
 //! forced on and the archive de-interleaves cleanly on `decompress_split`.
 //! Layout after the header:
 //! `[8] n  [ ] flip  [ ] perm  [4] n_blocks  [seq block]*n  [ [names][qual] ]*n`
-//! (each `[ ]` is a `[u32 len][bytes]` frame; `perm` is empty without keep-order).
+//! (each `[ ]` is a `[u32 len][u32 crc32c][bytes]` frame, CRC-verified on decode;
+//! `perm` is empty without keep-order).
 //! This layout is self-describing and carries no footer/terminator — decode
 //! dispatches on flag bit3 before ever reading a block, so the block-region
 //! terminator and footer index above apply only to the plain layout.
@@ -57,8 +64,9 @@
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 use rayon::prelude::*;
-use tracing::{debug, info, instrument, trace};
+use tracing::{debug, info, instrument, trace, warn};
 
+use crate::crc::{crc32c, CrcWriter, Hasher};
 use crate::{Error, Result, FORMAT_VERSION, MAGIC};
 use fqxv_fqzcomp::QualityBinning;
 
@@ -73,6 +81,16 @@ const DEFAULT_BLOCK_READS: usize = 1 << 20;
 /// the binding limit and this never triggers.
 const MAX_BLOCK_SEQ_BYTES: usize = 256 << 20;
 const HEADER_LEN: usize = 10;
+/// Bytes of CRC-32C appended after a frame's length field (plain block frames)
+/// or after a `[u32 len]` framed slice (reorder layout).
+const CRC_LEN: usize = 4;
+/// Upper bound on a single block payload's declared length. A block holds at most
+/// `block_reads` reads and `MAX_BLOCK_SEQ_BYTES` of raw sequence, and the three
+/// compressed streams are each smaller than their raw input in the common case,
+/// so a real payload is comfortably under this. It exists only so a corrupted
+/// length field can't drive a multi-exabyte allocation before the CRC is even
+/// checked; anything larger is rejected as malformed.
+const MAX_BLOCK_PAYLOAD: u64 = (MAX_BLOCK_SEQ_BYTES as u64) * 8;
 /// Magic at the very end of a v1 archive, just after the `[8] footer_offset`
 /// back-pointer, so a reader can confirm it found a real footer.
 const FOOTER_MAGIC: [u8; 4] = *b"FQXF";
@@ -745,7 +763,7 @@ fn compress_buffered<W: Write>(
     );
     let (chunks, gstart, _n) = parse_chunks(buf, g, &pool)?;
 
-    let mut w = BufWriter::new(writer);
+    let mut w = CrcWriter::new(BufWriter::new(writer));
     write_header(&mut w, &params, group_size)?;
     let mut stats = Stats {
         group_size,
@@ -806,7 +824,7 @@ where
         backend = ?fqxv_rans::Backend::detect(),
         "compress pool ready"
     );
-    let mut w = BufWriter::new(writer);
+    let mut w = CrcWriter::new(BufWriter::new(writer));
     write_header(&mut w, &params, group_size)?;
 
     let mut stats = Stats {
@@ -904,24 +922,41 @@ impl FooterIndex {
 ///
 /// A zero-length block terminates the region so a streaming, non-seekable
 /// decoder stops before the footer; seekable readers ([`inspect`], random
-/// access) instead seek to the footer via the trailer's back-pointer.
-fn write_footer<W: Write>(w: &mut W, index: &FooterIndex, total_reads: u64) -> Result<u64> {
-    // Zero-length terminator block.
+/// access) instead seek to the footer via the trailer's back-pointer. The footer
+/// carries two checksums: `whole_file_crc` (the running CRC of every byte written
+/// so far, read from the [`CrcWriter`] tee) and `footer_crc` (over the footer
+/// body itself), so a reader can both trust the index and detect archive-wide
+/// corruption.
+fn write_footer<W: Write>(
+    w: &mut CrcWriter<W>,
+    index: &FooterIndex,
+    total_reads: u64,
+) -> Result<u64> {
+    // Zero-length terminator block (fed through the tee like everything else).
     w.write_all(&0u64.to_le_bytes())?;
     let footer_offset = index.offset + 8;
 
-    let mut body = Vec::with_capacity(4 + index.entries.len() * 12 + 8);
+    let mut body = Vec::with_capacity(4 + index.entries.len() * 12 + 8 + FOOTER_CRC_TAIL);
     body.extend_from_slice(&(index.entries.len() as u32).to_le_bytes());
     for &(off, read_count) in &index.entries {
         body.extend_from_slice(&off.to_le_bytes());
         body.extend_from_slice(&read_count.to_le_bytes());
     }
     body.extend_from_slice(&total_reads.to_le_bytes());
+    // Feed the body-so-far through the tee; the tee's CRC is now the digest of
+    // everything preceding the whole_file_crc field — exactly what it records.
     w.write_all(&body)?;
+    let whole_file_crc = w.crc();
+    body.extend_from_slice(&whole_file_crc.to_le_bytes());
+    // footer_crc covers the footer body up to but not including itself.
+    let footer_crc = crc32c(&body);
+    w.write_all(&whole_file_crc.to_le_bytes())?;
+    w.write_all(&footer_crc.to_le_bytes())?;
 
     w.write_all(&footer_offset.to_le_bytes())?;
     w.write_all(&FOOTER_MAGIC)?;
-    Ok(8 + body.len() as u64 + TRAILER_LEN as u64)
+    // body = n_groups..whole_file_crc; +CRC_LEN for footer_crc, +8 terminator.
+    Ok(8 + body.len() as u64 + CRC_LEN as u64 + TRAILER_LEN as u64)
 }
 
 /// Write a batch's compressed payloads in order, updating `stats` and recording
@@ -936,9 +971,12 @@ fn write_blocks<W: Write>(
     for (b, payload) in blocks.iter().zip(compressed) {
         let payload = payload?;
         index.entries.push((index.offset, b.n_reads() as u32));
+        // Frame: [8 payload_len][4 crc32c(payload)][payload].
         w.write_all(&(payload.len() as u64).to_le_bytes())?;
+        w.write_all(&crc32c(&payload).to_le_bytes())?;
         w.write_all(&payload)?;
-        index.offset += 8 + payload.len() as u64;
+        let framed = (8 + CRC_LEN + payload.len()) as u64;
+        index.offset += framed;
         trace!(
             reads = b.n_reads(),
             payload = payload.len(),
@@ -946,28 +984,38 @@ fn write_blocks<W: Write>(
         );
         stats.reads += b.n_reads() as u64;
         stats.blocks += 1;
-        stats.out_bytes += 8 + payload.len() as u64;
+        stats.out_bytes += framed;
     }
     Ok(())
 }
 
-/// Write `[u32 len][bytes]`.
+/// Write `[u32 len][u32 crc32c][bytes]`.
 fn write_framed<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
     w.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    w.write_all(&crc32c(bytes).to_le_bytes())?;
     w.write_all(bytes)?;
     Ok(())
 }
 
-/// Read a `[u32 len][bytes]` frame, guarding the length allocation.
-fn read_framed<R: Read>(r: &mut R) -> Result<Vec<u8>> {
+/// Read a `[u32 len][u32 crc32c][bytes]` frame, guarding the length allocation and
+/// verifying the CRC. `what` names the frame in any corruption error.
+fn read_framed<R: Read>(r: &mut R, what: &str) -> Result<Vec<u8>> {
     let mut lb = [0u8; 4];
     r.read_exact(&mut lb)?;
     let len = u32::from_le_bytes(lb) as usize;
+    let mut cb = [0u8; CRC_LEN];
+    r.read_exact(&mut cb)?;
+    let expected = u32::from_le_bytes(cb);
     let mut buf = Vec::new();
     buf.try_reserve_exact(len)
         .map_err(|_| Error::Malformed("framed slice too large to allocate"))?;
     buf.resize(len, 0);
     r.read_exact(&mut buf)?;
+    if crc32c(&buf) != expected {
+        return Err(Error::Corrupt {
+            what: what.to_string(),
+        });
+    }
     Ok(buf)
 }
 
@@ -1188,17 +1236,17 @@ fn encode_reordered<W: Write>(
     }
     w.flush()?;
 
+    // Each framed slice is [4 len][4 crc][bytes]; n_blocks is a bare [4].
+    let frame = |len: usize| 4 + CRC_LEN + len;
     let out_bytes = (HEADER_LEN
         + 8
+        + frame(flip_bits.len())
+        + frame(perm_c.len())
         + 4
-        + flip_bits.len()
-        + 4
-        + perm_c.len()
-        + 4
-        + seq_blocks.iter().map(|p| 4 + p.len()).sum::<usize>()
+        + seq_blocks.iter().map(|p| frame(p.len())).sum::<usize>()
         + nq_blocks
             .iter()
-            .map(|(nm, q)| 8 + nm.len() + q.len())
+            .map(|(nm, q)| frame(nm.len()) + frame(q.len()))
             .sum::<usize>()) as u64;
     Ok(Stats {
         reads: n as u64,
@@ -1229,20 +1277,20 @@ fn read_reordered_streams<R: Read>(mut r: R, pool: &rayon::ThreadPool) -> Result
     let mut n_buf = [0u8; 8];
     r.read_exact(&mut n_buf)?;
     let n = u64::from_le_bytes(n_buf) as usize;
-    let flip = read_framed(&mut r)?;
-    let perm_c = read_framed(&mut r)?;
+    let flip = read_framed(&mut r, "reorder flip bitmap")?;
+    let perm_c = read_framed(&mut r, "reorder permutation")?;
     let mut nb = [0u8; 4];
     r.read_exact(&mut nb)?;
     let n_blocks = u32::from_le_bytes(nb) as usize;
 
     let mut seq_payloads: Vec<Vec<u8>> = Vec::with_capacity(n_blocks.min(1 << 20));
-    for _ in 0..n_blocks {
-        seq_payloads.push(read_framed(&mut r)?);
+    for i in 0..n_blocks {
+        seq_payloads.push(read_framed(&mut r, &format!("reorder sequence block {i}"))?);
     }
     let mut nq_payloads: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(n_blocks.min(1 << 20));
-    for _ in 0..n_blocks {
-        let names = read_framed(&mut r)?;
-        let qual = read_framed(&mut r)?;
+    for i in 0..n_blocks {
+        let names = read_framed(&mut r, &format!("reorder name block {i}"))?;
+        let qual = read_framed(&mut r, &format!("reorder quality block {i}"))?;
         nq_payloads.push((names, qual));
     }
 
@@ -1573,16 +1621,135 @@ pub fn decompress_split<R: Read, W: Write>(
     Ok(stats)
 }
 
+/// Verify an archive's integrity without materializing the decoded FASTQ.
+///
+/// For the plain layout this checks the footer's own CRC, then re-hashes the
+/// archive prefix and compares against the stored whole-file CRC-32C — a single
+/// linear pass that catches any corruption in the header, any block payload,
+/// framing, or the index. For the globally-clustered reorder layout (which has no
+/// footer) it decodes into a sink, so every frame CRC and cross-stream length
+/// check is exercised. Returns `Ok(())` iff the archive is intact.
+pub fn verify<R: Read + Seek>(reader: R) -> Result<()> {
+    let mut r = BufReader::new(reader);
+    let header = read_header(&mut r)?;
+    if header.flags & FLAG_GLOBAL_REORDER != 0 {
+        // No footer/whole-file digest here; decoding drives every frame CRC.
+        let keep_order = header.flags & FLAG_KEEP_ORDER != 0;
+        decode_reordered_whole(r, io::sink(), 0, keep_order, header.group_size)?;
+        return Ok(());
+    }
+    let footer = read_footer(&mut r)?;
+    r.seek(SeekFrom::Start(0))?;
+    let mut hasher = Hasher::new();
+    let mut remaining = footer.covered_len;
+    let mut buf = [0u8; 1 << 16];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        r.read_exact(&mut buf[..want])?;
+        hasher.update(&buf[..want]);
+        remaining -= want as u64;
+    }
+    if hasher.finalize() != footer.whole_file_crc {
+        return Err(Error::Corrupt {
+            what: "archive (whole-file crc)".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Outcome of a best-effort [`decompress_recover`] run.
+#[derive(Debug, Default, Clone)]
+pub struct Recovery {
+    /// Reads and bytes actually recovered (in the intact blocks).
+    pub stats: Stats,
+    /// Blocks decoded successfully.
+    pub blocks_recovered: u64,
+    /// Blocks skipped because their CRC failed or they would not decode.
+    pub blocks_skipped: u64,
+    /// Reads lost to the skipped blocks (from the footer's per-group counts).
+    pub reads_lost: u64,
+}
+
+/// Decompress as much of a corrupted archive as possible, skipping bad blocks.
+///
+/// Blocks are independent, and the footer's row-group index gives each block's
+/// absolute offset, so a corrupt block can be skipped by seeking straight to the
+/// next one — one bad byte costs a single row group, not the whole archive. Each
+/// skipped block is logged (with its lost read count) and reported in
+/// [`Recovery`]. Output is interleaved FASTQ (as [`decompress`]).
+///
+/// Only the plain layout is recoverable this way; the globally-clustered reorder
+/// layout is all-or-nothing (its streams are mutually dependent) and returns an
+/// error directing the caller to plain [`decompress`]. If the footer itself is
+/// unreadable (e.g. a truncated download), this returns the footer error; callers
+/// wanting the intact prefix of such a file can fall back to streaming
+/// [`decompress`], which decodes every whole block before the truncation.
+pub fn decompress_recover<R: Read + Seek, W: Write>(
+    reader: R,
+    writer: W,
+    threads: usize,
+) -> Result<Recovery> {
+    let pool = build_pool(threads)?;
+    let mut r = BufReader::new(reader);
+    let header = read_header(&mut r)?;
+    if header.flags & FLAG_GLOBAL_REORDER != 0 {
+        return Err(Error::Malformed(
+            "recover supports only the plain layout; reordered archives decode all-or-nothing",
+        ));
+    }
+    let footer = read_footer(&mut r)?;
+    let mut rec = Recovery::default();
+    let mut w = BufWriter::new(writer);
+    for (i, &(off, read_count)) in footer.groups.iter().enumerate() {
+        r.seek(SeekFrom::Start(off))?;
+        // read_block bounds the length and verifies the block CRC; any failure —
+        // bad CRC, truncation, or a decode error below — drops just this group.
+        let outcome = match read_block(&mut r, i as u64) {
+            Ok(Some(payload)) => pool.install(|| decode_block(&payload)),
+            Ok(None) => Err(Error::Malformed(
+                "row-group offset points at the terminator",
+            )),
+            Err(e) => Err(e),
+        };
+        match outcome {
+            Ok((reads, fastq)) => {
+                w.write_all(&fastq)?;
+                rec.stats.reads += reads;
+                rec.stats.blocks += 1;
+                rec.stats.out_bytes += fastq.len() as u64;
+                rec.blocks_recovered += 1;
+            }
+            Err(e) => {
+                warn!(block = i, off, reads_lost = read_count, error = %e, "skipping corrupt block");
+                rec.blocks_skipped += 1;
+                rec.reads_lost += read_count as u64;
+            }
+        }
+    }
+    w.flush()?;
+    info!(
+        recovered = rec.blocks_recovered,
+        skipped = rec.blocks_skipped,
+        reads_lost = rec.reads_lost,
+        "recovery complete"
+    );
+    Ok(rec)
+}
+
 /// Read blocks in batches of `batch`, invoking `f` on each batch.
 fn for_each_block_batch<R: Read, F>(r: &mut R, batch: usize, mut f: F) -> Result<()>
 where
     F: FnMut(&[Vec<u8>]) -> Result<()>,
 {
+    let mut block_index = 0u64;
     loop {
         let mut raw_blocks: Vec<Vec<u8>> = Vec::with_capacity(batch);
         for _ in 0..batch {
-            match read_block(r)? {
-                Some(block) => raw_blocks.push(block),
+            match read_block(r, block_index)? {
+                Some(block) => {
+                    raw_blocks.push(block);
+                    block_index += 1;
+                }
                 None => break,
             }
         }
@@ -1637,10 +1804,33 @@ fn decode_block(buf: &[u8]) -> Result<(u64, Vec<u8>)> {
     let mut off = 0usize;
     for i in 0..n_reads {
         let l = lens[i] as usize;
-        write_record(&mut out, &names[i], &seq[off..off + l], &qual[off..off + l]);
+        // Checked slicing: a block whose per-read lengths overrun the decoded
+        // sequence/quality buffers is malformed, not a reason to panic.
+        let (s, q) = read_slices(&seq, &qual, off, l)?;
+        write_record(&mut out, &names[i], s, q);
         off += l;
     }
     Ok((n_reads as u64, out))
+}
+
+/// Bounds-checked `(seq, qual)` slices for one read at `off..off+l`, erroring
+/// instead of panicking when corrupted lengths overrun either buffer.
+fn read_slices<'a>(
+    seq: &'a [u8],
+    qual: &'a [u8],
+    off: usize,
+    l: usize,
+) -> Result<(&'a [u8], &'a [u8])> {
+    let end = off
+        .checked_add(l)
+        .ok_or(Error::Malformed("read length overflow"))?;
+    let s = seq.get(off..end).ok_or(Error::Malformed(
+        "sequence shorter than declared read lengths",
+    ))?;
+    let q = qual.get(off..end).ok_or(Error::Malformed(
+        "quality shorter than declared read lengths",
+    ))?;
+    Ok((s, q))
 }
 
 /// Split a grouped block into `g` FASTQ buffers by local read index mod `g`.
@@ -1650,12 +1840,8 @@ fn decode_block_group(buf: &[u8], g: usize) -> Result<(u64, Vec<Vec<u8>>)> {
     let mut off = 0usize;
     for i in 0..n_reads {
         let l = lens[i] as usize;
-        write_record(
-            &mut outs[i % g],
-            &names[i],
-            &seq[off..off + l],
-            &qual[off..off + l],
-        );
+        let (s, q) = read_slices(&seq, &qual, off, l)?;
+        write_record(&mut outs[i % g], &names[i], s, q);
         off += l;
     }
     Ok((n_reads as u64, outs))
@@ -1676,13 +1862,17 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
     })
 }
 
-/// Read a `[u32 len][bytes]` frame's length and skip its bytes without
-/// allocating them (for metadata-only scans).
+/// Read a `[u32 len][u32 crc][bytes]` frame's length and skip the CRC + bytes
+/// without allocating them (for metadata-only scans; the CRC is not verified
+/// since the payload is discarded). Returns the payload length.
 fn skip_framed<R: Read>(r: &mut R) -> Result<usize> {
     let mut lb = [0u8; 4];
     r.read_exact(&mut lb)?;
     let len = u32::from_le_bytes(lb) as usize;
-    io::copy(&mut r.by_ref().take(len as u64), &mut io::sink())?;
+    io::copy(
+        &mut r.by_ref().take((CRC_LEN + len) as u64),
+        &mut io::sink(),
+    )?;
     Ok(len)
 }
 
@@ -1727,31 +1917,75 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         return Ok(info);
     }
 
-    let footer = read_footer(&mut r)?;
-    info.reads = footer.total_reads;
-    info.blocks = footer.groups.len() as u64;
-    for &(off, _) in &footer.groups {
-        // Skip the [8] payload length, then walk the block header: [4] n_reads,
-        // an optional reorder preamble, and the three [4 len][bytes] stream
-        // frames. We read each stream's length and seek past its bytes.
-        r.seek(SeekFrom::Start(off + 8))?;
-        let n = read_u32(&mut r)? as usize;
-        if info.reordered {
-            r.seek(SeekFrom::Current(n.div_ceil(8) as i64))?; // flip bitmap
-            let perm_len = read_u32(&mut r)? as i64;
-            r.seek(SeekFrom::Current(perm_len))?;
+    // Prefer the footer's O(row groups) index. If it's unreadable — a truncated
+    // download loses the EOF trailer, corruption can fail its CRC — fall back to
+    // scanning block frames forward from the header so a partial file still
+    // reports what it contains.
+    match read_footer(&mut r) {
+        Ok(footer) => {
+            info.reads = footer.total_reads;
+            info.blocks = footer.groups.len() as u64;
+            for &(off, _) in &footer.groups {
+                // Position past the [8] payload length and [4] block CRC, at the
+                // block header, then walk its stream frames.
+                r.seek(SeekFrom::Start(off + 8 + CRC_LEN as u64))?;
+                scan_block_header(&mut r, info.reordered, &mut info)?;
+            }
         }
-        for bytes in [
-            &mut info.names_bytes,
-            &mut info.seq_bytes,
-            &mut info.qual_bytes,
-        ] {
-            let len = read_u32(&mut r)?;
-            *bytes += len as u64;
-            r.seek(SeekFrom::Current(len as i64))?;
-        }
+        Err(_) => scan_blocks_sequentially(&mut r, &mut info)?,
     }
     Ok(info)
+}
+
+/// Walk one block's header at the current position — `[4] n_reads`, an optional
+/// reorder preamble, and the three `[4 len][bytes]` stream frames — accumulating
+/// per-stream sizes into `info` and seeking past each payload. Returns the
+/// block's read count. Leaves the cursor at the end of the block's payload.
+fn scan_block_header<R: Read + Seek>(r: &mut R, reordered: bool, info: &mut Info) -> Result<u64> {
+    let n = u64::from(read_u32(r)?);
+    if reordered {
+        r.seek(SeekFrom::Current(n.div_ceil(8) as i64))?; // flip bitmap
+        let perm_len = read_u32(r)? as i64;
+        r.seek(SeekFrom::Current(perm_len))?;
+    }
+    for bytes in [
+        &mut info.names_bytes,
+        &mut info.seq_bytes,
+        &mut info.qual_bytes,
+    ] {
+        let len = read_u32(r)?;
+        *bytes += u64::from(len);
+        r.seek(SeekFrom::Current(i64::from(len)))?;
+    }
+    Ok(n)
+}
+
+/// Footer-less fallback for [`inspect`]: scan block frames forward from the
+/// header until the terminator, a clean EOF, or the first structurally
+/// implausible frame (a truncated download's boundary). Best-effort — the block
+/// CRCs are not checked here, only the framing is followed.
+fn scan_blocks_sequentially<R: Read + Seek>(r: &mut R, info: &mut Info) -> Result<()> {
+    let mut off = HEADER_LEN as u64;
+    loop {
+        r.seek(SeekFrom::Start(off))?;
+        let mut lenb = [0u8; 8];
+        if r.read_exact(&mut lenb).is_err() {
+            break; // clean EOF at a frame boundary
+        }
+        let plen = u64::from_le_bytes(lenb);
+        if plen == 0 || plen > MAX_BLOCK_PAYLOAD {
+            break; // terminator, or a length too large to be a real frame
+        }
+        r.seek(SeekFrom::Start(off + 8 + CRC_LEN as u64))?;
+        let n = match scan_block_header(r, info.reordered, info) {
+            Ok(n) => n,
+            Err(_) => break, // ran off the end of a truncated block
+        };
+        info.reads += n;
+        info.blocks += 1;
+        off += 8 + CRC_LEN as u64 + plen;
+    }
+    Ok(())
 }
 
 // --- header / block framing --------------------------------------------------
@@ -1782,39 +2016,77 @@ fn read_header<R: Read>(r: &mut R) -> Result<Header> {
     })
 }
 
-/// Read one length-prefixed block, or `None` at the terminator / a clean EOF.
+/// Read one length-prefixed, CRC-checked block, or `None` at the terminator /
+/// a clean EOF. `index` names the block in any corruption error.
 ///
-/// A zero-length block is the v1 terminator that separates the block region from
+/// A zero-length block is the terminator that separates the block region from
 /// the footer, so a streaming (non-seekable) decoder stops here without reading
 /// into the footer. A clean EOF (no length at all) is also treated as the end,
-/// which keeps truncated pre-footer streams decoding what they can.
-fn read_block<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
+/// which keeps truncated pre-footer streams decoding what they can. The frame is
+/// `[8 payload_len][4 crc32c(payload)][payload]`; the CRC is verified before the
+/// payload is handed to the entropy decoders so corruption surfaces as a clean
+/// [`Error::Corrupt`] rather than garbage output.
+fn read_block<R: Read>(r: &mut R, index: u64) -> Result<Option<Vec<u8>>> {
     let mut len = [0u8; 8];
     match r.read_exact(&mut len) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     }
-    let len = u64::from_le_bytes(len) as usize;
+    let len = u64::from_le_bytes(len);
     if len == 0 {
         return Ok(None);
     }
-    let mut buf = vec![0u8; len];
+    if len > MAX_BLOCK_PAYLOAD {
+        return Err(Error::Malformed("block payload length exceeds the maximum"));
+    }
+    let mut crc = [0u8; CRC_LEN];
+    r.read_exact(&mut crc).map_err(|_| Error::Truncated)?;
+    let expected = u32::from_le_bytes(crc);
+    // Fallible allocation: a corrupted-but-in-range length still shouldn't abort
+    // the process with an allocation failure.
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len as usize)
+        .map_err(|_| Error::Malformed("block payload too large to allocate"))?;
+    buf.resize(len as usize, 0);
     r.read_exact(&mut buf).map_err(|_| Error::Truncated)?;
+    if crc32c(&buf) != expected {
+        return Err(Error::Corrupt {
+            what: format!("block {index}"),
+        });
+    }
     Ok(Some(buf))
 }
 
-/// The v1 footer index: per row group `(byte_offset, read_count)` plus the total
-/// read count, located via the EOF trailer's back-pointer. Only the plain and
-/// per-block-reorder layouts carry a footer (the globally-clustered layout is
-/// self-describing — see the module docs).
+/// The footer index: per row group `(byte_offset, read_count)`, the total read
+/// count, and the whole-archive CRC-32C, located via the EOF trailer's
+/// back-pointer. Only the plain and per-block-reorder layouts carry a footer (the
+/// globally-clustered layout is self-describing — see the module docs).
+///
+/// On-disk body (at `footer_offset`, i.e. just past the terminator):
+/// `[4 n_groups] [8 off][4 read_count]* [8 total_reads] [4 whole_file_crc] [4 footer_crc]`.
+/// `footer_crc` covers the body up to (not including) itself, so the index can be
+/// trusted without rereading the whole archive; `whole_file_crc` covers every
+/// byte from the header through `total_reads` and is checked only by the
+/// whole-archive verify/recover path.
 struct Footer {
     /// `(byte offset of the row group's [8] length field, its read count)`.
     groups: Vec<(u64, u32)>,
     total_reads: u64,
+    /// CRC-32C of the archive from byte 0 through the `total_reads` field.
+    whole_file_crc: u32,
+    /// Number of leading bytes that `whole_file_crc` covers (the offset of the
+    /// `whole_file_crc` field itself), so a verifier can re-hash exactly that
+    /// prefix.
+    covered_len: u64,
 }
 
-/// Read the footer by seeking to the EOF trailer and following its back-pointer.
+/// Bytes appended to the footer body after `total_reads`: `[4 whole_file_crc]
+/// [4 footer_crc]`.
+const FOOTER_CRC_TAIL: usize = 8;
+
+/// Read the footer by seeking to the EOF trailer and following its back-pointer,
+/// then verify the footer's own CRC before trusting any offset in it.
 fn read_footer<R: Read + Seek>(r: &mut R) -> Result<Footer> {
     let end = r.seek(SeekFrom::End(0))?;
     if end < (HEADER_LEN + TRAILER_LEN) as u64 {
@@ -1827,35 +2099,60 @@ fn read_footer<R: Read + Seek>(r: &mut R) -> Result<Footer> {
         return Err(Error::Malformed("missing footer trailer magic"));
     }
     let footer_offset = u64::from_le_bytes(trailer[..8].try_into().unwrap());
-    if footer_offset < HEADER_LEN as u64 || footer_offset > end - TRAILER_LEN as u64 {
+    let body_end = end - TRAILER_LEN as u64;
+    // Body must hold at least n_groups(4) + total_reads(8) + the crc tail(8).
+    if footer_offset < HEADER_LEN as u64
+        || footer_offset + (4 + 8 + FOOTER_CRC_TAIL as u64) > body_end
+    {
         return Err(Error::Malformed("footer offset out of range"));
     }
+    // Read the whole footer body in one shot, then parse and CRC-check it from
+    // memory — cheaper and simpler than incremental reads, and lets the CRC guard
+    // the index before any offset is dereferenced.
+    let body_len = (body_end - footer_offset) as usize;
+    let mut body = Vec::new();
+    body.try_reserve_exact(body_len)
+        .map_err(|_| Error::Malformed("footer too large to allocate"))?;
+    body.resize(body_len, 0);
     r.seek(SeekFrom::Start(footer_offset))?;
-    let mut nb = [0u8; 4];
-    r.read_exact(&mut nb)?;
-    let n_groups = u32::from_le_bytes(nb) as usize;
-    // The declared group count could be hostile; cap the eager allocation to the
-    // number of 12-byte entries that could possibly fit before the trailer.
-    let max_groups = ((end - TRAILER_LEN as u64 - footer_offset).saturating_sub(4) / 12) as usize;
+    r.read_exact(&mut body)?;
+
+    let (covered, footer_crc_bytes) = body.split_at(body_len - CRC_LEN);
+    let footer_crc = u32::from_le_bytes(footer_crc_bytes.try_into().unwrap());
+    if crc32c(covered) != footer_crc {
+        return Err(Error::Corrupt {
+            what: "footer".to_string(),
+        });
+    }
+
+    let mut c = Cursor::new(covered);
+    let n_groups = c.u32()? as usize;
+    // `covered` = [4 n_groups][12*n_groups][8 total_reads][4 whole_file_crc]; the
+    // CRC just passed already implies a self-consistent length, but bound the
+    // allocation independently in case of a hash collision.
+    let max_groups = covered.len().saturating_sub(4 + 8 + CRC_LEN) / 12;
     if n_groups > max_groups {
-        return Err(Error::Malformed("footer group count exceeds file size"));
+        return Err(Error::Malformed("footer group count exceeds footer size"));
     }
     let mut groups = Vec::with_capacity(n_groups);
     for _ in 0..n_groups {
-        let mut eb = [0u8; 12];
-        r.read_exact(&mut eb)?;
-        let off = u64::from_le_bytes(eb[..8].try_into().unwrap());
-        let rc = u32::from_le_bytes(eb[8..].try_into().unwrap());
+        let off = u64::from_le_bytes(c.take(8)?.try_into().unwrap());
+        let rc = u32::from_le_bytes(c.take(4)?.try_into().unwrap());
         if off < HEADER_LEN as u64 || off >= footer_offset {
             return Err(Error::Malformed("footer row-group offset out of range"));
         }
         groups.push((off, rc));
     }
-    let mut tr = [0u8; 8];
-    r.read_exact(&mut tr)?;
+    let total_reads = u64::from_le_bytes(c.take(8)?.try_into().unwrap());
+    let whole_file_crc = c.u32()?;
+    // whole_file_crc covers everything up to its own field: the archive prefix
+    // plus the footer body through total_reads.
+    let covered_len = footer_offset + (body_len - FOOTER_CRC_TAIL) as u64;
     Ok(Footer {
         groups,
-        total_reads: u64::from_le_bytes(tr),
+        total_reads,
+        whole_file_crc,
+        covered_len,
     })
 }
 
@@ -2399,11 +2696,15 @@ NNGGCCTA\n\
     }
 
     #[test]
-    fn inspect_rejects_missing_trailer() {
+    fn inspect_falls_back_without_trailer() {
         let archive = compress_bytes(SAMPLE, Params::default());
-        // Drop the trailing "FQXF" magic.
+        // Drop the trailing "FQXF" magic so the footer can't be located — a
+        // partial download loses the EOF trailer this way. inspect must fall back
+        // to a forward scan and still report the intact blocks rather than error.
         let truncated = &archive[..archive.len() - 4];
-        assert!(inspect(io::Cursor::new(truncated)).is_err());
+        let info = inspect(io::Cursor::new(truncated)).expect("fallback scan");
+        assert_eq!(info.reads, 2);
+        assert_eq!(info.blocks, 1);
     }
 
     #[test]
@@ -2426,5 +2727,137 @@ NNGGCCTA\n\
         let mut out = Vec::new();
         decompress(&archive[..], &mut out, 1).unwrap();
         assert_eq!(out, input, "ragged variable-length reads must round-trip");
+    }
+
+    // --- integrity: CRC detection, recovery, truncation --------------------
+
+    /// Build a multi-block archive of `n` uniform reads (small block target).
+    fn multiblock_archive(n: usize, block_reads: usize) -> Vec<u8> {
+        let input = make_reads("x", n);
+        compress_bytes(
+            &input,
+            Params {
+                block_reads,
+                ..Params::default()
+            },
+        )
+    }
+
+    #[test]
+    fn verify_accepts_intact_archive() {
+        let archive = multiblock_archive(40, 8);
+        verify(io::Cursor::new(&archive)).expect("intact archive verifies");
+    }
+
+    #[test]
+    fn verify_rejects_payload_bit_flip() {
+        let mut archive = multiblock_archive(40, 8);
+        // Header(10) + [8 len][4 crc]; the first payload byte is at offset 22.
+        archive[HEADER_LEN + 8 + CRC_LEN] ^= 0x01;
+        let err = verify(io::Cursor::new(&archive)).unwrap_err();
+        assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn verify_rejects_footer_bit_flip() {
+        let mut archive = multiblock_archive(40, 8);
+        // Flip a byte inside the footer body (just before the EOF trailer).
+        let i = archive.len() - TRAILER_LEN - 1;
+        archive[i] ^= 0x01;
+        let err = verify(io::Cursor::new(&archive)).unwrap_err();
+        assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn decompress_detects_block_corruption() {
+        let mut archive = multiblock_archive(40, 8);
+        archive[HEADER_LEN + 8 + CRC_LEN] ^= 0xFF;
+        let mut out = Vec::new();
+        let err = decompress(&archive[..], &mut out, 1).unwrap_err();
+        assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn oversized_block_length_is_rejected_not_allocated() {
+        let mut archive = multiblock_archive(40, 8);
+        // Overwrite the first block's [8] length with a hostile value; the reader
+        // must reject it up front instead of trying to allocate exabytes.
+        archive[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        let mut out = Vec::new();
+        let err = decompress(&archive[..], &mut out, 1).unwrap_err();
+        assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn recover_skips_corrupt_block_and_keeps_the_rest() {
+        let mut archive = multiblock_archive(40, 8);
+        let footer = read_footer(&mut io::Cursor::new(&archive)).unwrap();
+        assert!(
+            footer.groups.len() >= 3,
+            "need several blocks for this test"
+        );
+        let (off1, rc1) = footer.groups[1];
+        // Corrupt one byte in block 1's payload (past its [8 len][4 crc]).
+        archive[off1 as usize + 8 + CRC_LEN] ^= 0xFF;
+
+        let mut out = Vec::new();
+        let rec = decompress_recover(io::Cursor::new(&archive), &mut out, 1).unwrap();
+        assert_eq!(rec.blocks_skipped, 1);
+        assert_eq!(rec.reads_lost, u64::from(rc1));
+        assert_eq!(rec.stats.reads, footer.total_reads - u64::from(rc1));
+        assert_eq!(
+            rec.blocks_recovered,
+            footer.groups.len() as u64 - 1,
+            "every other block recovered"
+        );
+        // Output is valid FASTQ for the recovered reads (4 lines each).
+        assert_eq!(
+            out.iter().filter(|&&b| b == b'\n').count() as u64,
+            rec.stats.reads * 4
+        );
+    }
+
+    #[test]
+    fn truncated_at_block_boundary_streams_prefix() {
+        let full = multiblock_archive(40, 8);
+        // The trailer's back-pointer gives footer_offset; the 8-byte terminator
+        // sits just before it, so footer_offset - 8 is a clean block boundary.
+        let n = full.len();
+        let footer_offset =
+            u64::from_le_bytes(full[n - TRAILER_LEN..n - 4].try_into().unwrap()) as usize;
+        let truncated = &full[..footer_offset - 8];
+
+        // Streaming decode reads every whole block, then stops at the clean EOF.
+        let mut out_trunc = Vec::new();
+        decompress(truncated, &mut out_trunc, 1).expect("prefix decodes");
+        let mut out_full = Vec::new();
+        decompress(&full[..], &mut out_full, 1).unwrap();
+        assert_eq!(
+            out_trunc, out_full,
+            "boundary-truncated file yields all blocks"
+        );
+    }
+
+    #[test]
+    fn reorder_archive_detects_frame_corruption() {
+        let input = make_reads("y", 200);
+        let mut archive = Vec::new();
+        compress(
+            &input[..],
+            &mut archive,
+            Params {
+                reorder: true,
+                keep_order: true,
+                block_reads: 64,
+                ..Params::default()
+            },
+        )
+        .unwrap();
+        // Flip a byte well past the header, inside a framed payload. The frame
+        // CRC (or a downstream consistency check) must catch it — never a silent
+        // wrong decode.
+        let mid = archive.len() / 2;
+        archive[mid] ^= 0xFF;
+        assert!(verify(io::Cursor::new(&archive)).is_err());
     }
 }
