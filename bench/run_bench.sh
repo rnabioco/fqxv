@@ -19,16 +19,20 @@ DATA_DIR="${FQXV_DATA_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/data}"
 RESULTS_DIR="${FQXV_RESULTS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/results}"
 THREADS="${FQXV_THREADS:-$(nproc)}"
 INPUT_MODE="${FQXV_INPUT:-r1}"
-# fqxv, fqxv9 (level 9), fqxv-reorder (--order any), and the lossy
-# quality points fqxv-bin8/bin4/bin2 all share one binary; the rest are external
+# fqxv, fqxv9 (level 9), fqxv-reorder (--order any), fqxv-max (--max, i.e.
+# `-l 9 --order any` — the advertised best-ratio preset), and the lossy quality
+# points fqxv-bin8/bin4/bin2 all share one binary; the rest are external
 # baselines. spring-illbin (`-q ill_bin`, Illumina 8-level) and spring-binary
 # (`-q binary`, 2-level) are SPRING's lossy quality modes — the only field tools
 # with Illumina-comparable binning, so they are the like-for-like lossy rivals to
 # fqxv-bin8 and fqxv-bin2 (fqz_comp/fqzcomp5 have no Illumina binning mode).
-ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-bin8 fqxv-bin4 fqxv-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary colord"
+ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-max fqxv-bin8 fqxv-bin4 fqxv-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary colord"
 TOOLS="${FQXV_TOOLS:-$ALL_TOOLS}"
-# The fqxv binary (built with `cargo build --release`).
-FQXV_BIN="${FQXV_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/fqxv}"
+# The fqxv binary (built with `cargo build --release`). Cargo honors
+# CARGO_TARGET_DIR (set to $SCRATCH on this HPC), so the build lands there, NOT
+# in ROOT/target — resolve the same location cargo actually wrote to, else the
+# harness silently measures a stale ROOT/target/release leftover.
+FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target}/release/fqxv}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$RESULTS_DIR/work"
 
@@ -156,6 +160,9 @@ compress() {  # tool input out_prefix
     fqxv)          COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --threads "$THREADS" ;;
     fqxv9)         COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" -l 9 --threads "$THREADS" ;;
     fqxv-reorder)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --order any --threads "$THREADS" ;;
+    # fqxv-max: the advertised best-ratio preset (`--max` == `-l 9 --order any`):
+    # deepest sequence context AND read reordering together.
+    fqxv-max)      COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --max --threads "$THREADS" ;;
     fqxv-bin8)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin8 --threads "$THREADS" ;;
     fqxv-bin4)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin4 --threads "$THREADS" ;;
     fqxv-bin2)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin2 --threads "$THREADS" ;;
@@ -178,7 +185,7 @@ compress() {  # tool input out_prefix
 decompress() {  # tool comp out_rt
   local tool="$1" comp="$2" rt="$3"
   case "$tool" in
-    fqxv|fqxv9|fqxv-reorder|fqxv-bin8|fqxv-bin4|fqxv-bin2) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" ;;
+    fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-bin8|fqxv-bin4|fqxv-bin2) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" ;;
     gzip)     measure bash -c "pigz -d -p $THREADS -c '$comp' > '$rt'" ;;
     zstd19)   measure bash -c "zstd -d -q -f -o '$rt' '$comp'" ;;
     xz9)      measure bash -c "xz -d -T$THREADS -c '$comp' > '$rt'" ;;
@@ -256,7 +263,7 @@ for row in "${rows[@]}"; do
     # Map tool label -> binary name to probe availability.
     case "$tool" in
       gzip) bin=pigz ;; zstd19) bin=zstd ;; xz9) bin=xz ;; pgrc) bin=PgRC ;;
-      fqxv|fqxv9|fqxv-reorder|fqxv-bin8|fqxv-bin4|fqxv-bin2) bin="$FQXV_BIN" ;;
+      fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-bin8|fqxv-bin4|fqxv-bin2) bin="$FQXV_BIN" ;;
       spring-illbin|spring-binary) bin=spring ;;
       *) bin="$tool" ;;
     esac
@@ -327,6 +334,7 @@ for row in "${rows[@]}"; do
         fqxv)         "$FQXV_BIN" compress "$in" -o "$det1" --threads 1 >/dev/null 2>&1 || true ;;
         fqxv9)        "$FQXV_BIN" compress "$in" -o "$det1" -l 9 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-reorder) "$FQXV_BIN" compress "$in" -o "$det1" --order any --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-max)     "$FQXV_BIN" compress "$in" -o "$det1" --max --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin8)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin4)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin2)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;

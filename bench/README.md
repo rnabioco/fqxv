@@ -78,7 +78,9 @@ instead of it.
 The fqxv rows also print a per-stream breakdown (`names / seq / qual` bytes, from
 `fqxv info --tsv`) so you can see which stream to invest in. The matrix runs
 several fqxv points — `fqxv` (level 5), `fqxv9` (level 9), `fqxv-reorder`
-(`--order any`), and the lossy quality sweep `fqxv-bin8` / `fqxv-bin4`
+(`--order any`), `fqxv-max` (`--max`, i.e. `-l 9 --order any` — the advertised
+best-ratio preset combining the deepest sequence context *and* read reordering),
+and the lossy quality sweep `fqxv-bin8` / `fqxv-bin4`
 / `fqxv-bin2` — plus a `fqxv-paired` self-check that compresses R1+R2 as one
 spot-interleaved archive. For a **like-for-like** lossy comparison the matrix also
 runs SPRING's own binning: `spring-illbin` (`-q ill_bin`, Illumina 8-level —
