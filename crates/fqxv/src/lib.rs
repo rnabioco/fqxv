@@ -28,14 +28,20 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 
 /// The container format version this build writes.
 ///
-/// v1 appends a footer index (`[u32 n_row_groups]`, per-group `[u64 offset]
-/// [u32 read_count]`, `[u64 total_reads]`, `[u32 whole_file_crc]`,
+/// The container appends a footer index (`[u32 n_row_groups]`, per-group
+/// `[u64 offset][u32 read_count]`, `[u64 total_reads]`, `[u32 whole_file_crc]`,
 /// `[u32 footer_crc]`) plus an EOF trailer (`[u64 footer_offset]["FQXF"]`) after a
 /// zero-length terminator block, so `inspect` and random access can seek straight
-/// to the row-group index. Every coded payload carries a CRC-32C so corruption is
-/// detected and localized rather than silently decoded; see `container.rs` for
-/// the full layout. Nothing on disk is stable yet (alpha).
-pub const FORMAT_VERSION: u16 = 1;
+/// to the row-group index. Every coded payload carries a CRC-32C so on-disk
+/// corruption is detected and localized rather than silently decoded.
+///
+/// v2 additionally prepends an xxh3-64 digest of each block's *decoded* content
+/// (names, sequence, post-binning quality) to the block payload, verified after
+/// decode — so a codec bug that turns CRC-valid bytes into wrong-but-in-bounds
+/// output is caught at runtime, not just in tests. See `container.rs` for the
+/// full layout. Nothing on disk is stable yet (alpha); this build reads only its
+/// own version.
+pub const FORMAT_VERSION: u16 = 2;
 
 /// Errors returned by the archiver.
 #[derive(Debug, Error)]

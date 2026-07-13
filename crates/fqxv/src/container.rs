@@ -31,6 +31,11 @@
 //!   [8] footer_offset (LE)   -- seek straight to the footer
 //!   [4] magic "FQXF"
 //! block payload:
+//!   [8] content_digest (LE) -- xxh3-64 of this block's DECODED content (names,
+//!       sequence, post-binning quality), verified after decode so a codec bug
+//!       that decodes CRC-valid bytes into wrong-but-in-bounds output is caught
+//!       at runtime. Distinct from the frame CRC, which only covers stored bytes.
+//!       Sits inside the payload, so the frame CRC covers it too.
 //!   [4] n_reads (LE)
 //!   [4] names_len (LE)  [ ] names   (fqxv-tokenizer)
 //!   [4] seq_len   (LE)  [ ] seq     (fqxv-seq)
@@ -63,11 +68,13 @@
 //! spot adjacent for the sequence model. [`decompress`] streams interleaved
 //! FASTQ (pipe to an aligner); [`decompress_split`] restores the `G` files.
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
 use rayon::prelude::*;
 use tracing::{debug, info, instrument, trace, warn};
+use xxhash_rust::xxh3::Xxh3;
 
 use crate::crc::{crc32c, crc32c_combine, CrcWriter};
 use crate::{Error, Result, FORMAT_VERSION, MAGIC};
@@ -87,6 +94,11 @@ const HEADER_LEN: usize = 10;
 /// Bytes of CRC-32C appended after a frame's length field (plain block frames)
 /// or after a `[u32 len]` framed slice (reorder layout).
 const CRC_LEN: usize = 4;
+/// Bytes of xxh3-64 content digest prepended to each plain block payload — an
+/// end-to-end round-trip check over the block's *decoded* content, distinct from
+/// the frame CRC (which only covers stored/compressed bytes). See
+/// [`content_digest`].
+const DIGEST_LEN: usize = 8;
 /// Upper bound on a single block payload's declared length. A block holds at most
 /// `block_reads` reads and `MAX_BLOCK_SEQ_BYTES` of raw sequence, and the three
 /// compressed streams are each smaller than their raw input in the common case,
@@ -1940,8 +1952,42 @@ fn decode_reordered_split<R: Read, W: Write>(
     Ok(stats)
 }
 
+/// xxh3-64 over a block's *decoded canonical form*: the exact (name, sequence,
+/// quality) bytes `decompress` reconstructs, structured so no byte can silently
+/// cross a name/seq/quality boundary. Computed identically on the encode side
+/// (from the post-`QualityBinning` quality — the values actually stored) and the
+/// decode side (from the reconstructed streams). A mismatch means some codec
+/// round-tripped this block into wrong-but-in-bounds output — corruption the
+/// per-payload CRC cannot catch, because the stored bytes were never altered.
+///
+/// The digest is over the *stored* (post-binning) form, not the original input,
+/// so a lossy archive verifies against what it emits, not against data it never
+/// promised to reproduce. Name/quality lengths are folded in explicitly to pin
+/// the per-read boundaries; `qual` shares each read's `lens[i]` with `seq`.
+fn content_digest<'a>(
+    n_reads: usize,
+    names: impl Iterator<Item = &'a [u8]>,
+    lens: &[u32],
+    seq: &[u8],
+    qual: &[u8],
+) -> u64 {
+    let mut h = Xxh3::new();
+    h.update(&(n_reads as u64).to_le_bytes());
+    for name in names {
+        h.update(&(name.len() as u32).to_le_bytes());
+        h.update(name);
+    }
+    for &l in lens {
+        h.update(&l.to_le_bytes());
+    }
+    h.update(seq);
+    h.update(qual);
+    h.digest()
+}
+
 /// Code one non-reorder block: names (tokenizer), sequence (order-k), and quality
-/// (fqzcomp), each length-prefixed. Reorder uses the whole-file path instead.
+/// (fqzcomp), each length-prefixed, behind a leading [`content_digest`]. Reorder
+/// uses the whole-file path instead.
 fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
     let header_refs = b.header_refs();
     // The three streams are independent; code them concurrently so a block's
@@ -1960,7 +2006,23 @@ fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
     );
     let (names_c, seq_c, qual_c) = (names_c?, seq_c?, qual_c?);
 
-    let mut out = Vec::with_capacity(16 + names_c.len() + seq_c.len() + qual_c.len());
+    // End-to-end round-trip check: digest the block's decoded content (post-binning
+    // quality, so lossy archives verify against what they emit) and store it at the
+    // head of the payload. Lossless is the common case and borrows without a copy.
+    let binned: Cow<[u8]> = match params.quality_binning {
+        QualityBinning::Lossless => Cow::Borrowed(&b.qual),
+        binning => Cow::Owned(b.qual.iter().map(|&q| binning.apply(q)).collect()),
+    };
+    let digest = content_digest(
+        b.n_reads(),
+        b.header_refs().into_iter(),
+        &b.lens,
+        &b.seq,
+        &binned,
+    );
+
+    let mut out = Vec::with_capacity(DIGEST_LEN + 16 + names_c.len() + seq_c.len() + qual_c.len());
+    out.extend_from_slice(&digest.to_le_bytes());
     out.extend_from_slice(&(b.n_reads() as u32).to_le_bytes());
     for stream in [&names_c, &seq_c, &qual_c] {
         // Stream lengths are stored as u32. The MAX_BLOCK_SEQ_BYTES row-group
@@ -2348,6 +2410,7 @@ type BlockParts = (usize, Vec<Vec<u8>>, Vec<u32>, Vec<u8>, Vec<u8>);
 /// Decode a block's streams and slice out each read's (name, seq, qual).
 fn decode_block_parts(buf: &[u8]) -> Result<BlockParts> {
     let mut c = Cursor::new(buf);
+    let expected_digest = c.u64()?;
     let n_reads = c.u32()? as usize;
     // Slice out the three compressed streams (cheap, sequential), then decode
     // them concurrently — same rationale as the encode side.
@@ -2361,6 +2424,21 @@ fn decode_block_parts(buf: &[u8]) -> Result<BlockParts> {
     let (_qlens, qual) = qual_r?;
     if names.len() != n_reads || seq_lens.len() != n_reads {
         return Err(Error::Malformed("block stream length disagreement"));
+    }
+    // End-to-end check: the reconstructed content must digest to the value the
+    // encoder stored. A mismatch here (with the frame CRC intact) means a codec
+    // decoded valid bytes into wrong output — the failure mode CRC cannot see.
+    let digest = content_digest(
+        n_reads,
+        names.iter().map(Vec::as_slice),
+        &seq_lens,
+        &seq,
+        &qual,
+    );
+    if digest != expected_digest {
+        return Err(Error::Corrupt {
+            what: "block content digest".to_string(),
+        });
     }
     Ok((n_reads, names, seq_lens, seq, qual))
 }
@@ -2522,11 +2600,14 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
     Ok(info)
 }
 
-/// Walk one block's header at the current position — `[4] n_reads`, an optional
-/// reorder preamble, and the three `[4 len][bytes]` stream frames — accumulating
-/// per-stream sizes into `info` and seeking past each payload. Returns the
-/// block's read count. Leaves the cursor at the end of the block's payload.
+/// Walk one block's header at the current position — the `[8] content_digest`
+/// prefix, `[4] n_reads`, an optional reorder preamble, and the three
+/// `[4 len][bytes]` stream frames — accumulating per-stream sizes into `info` and
+/// seeking past each payload. Returns the block's read count. Leaves the cursor at
+/// the end of the block's payload.
 fn scan_block_header<R: Read + Seek>(r: &mut R, reordered: bool, info: &mut Info) -> Result<u64> {
+    // Skip the payload's leading content digest (see the block-payload layout).
+    r.seek(SeekFrom::Current(DIGEST_LEN as i64))?;
     let n = u64::from(read_u32(r)?);
     if reordered {
         r.seek(SeekFrom::Current(n.div_ceil(8) as i64))?; // flip bitmap
@@ -2789,6 +2870,12 @@ impl<'a> Cursor<'a> {
         let s = self.buf.get(self.pos..end).ok_or(Error::Truncated)?;
         self.pos = end;
         Ok(u32::from_le_bytes(s.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64> {
+        let end = self.pos + 8;
+        let s = self.buf.get(self.pos..end).ok_or(Error::Truncated)?;
+        self.pos = end;
+        Ok(u64::from_le_bytes(s.try_into().unwrap()))
     }
     fn slice_u32(&mut self) -> Result<&'a [u8]> {
         let n = self.u32()? as usize;
@@ -3763,6 +3850,78 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
         let mut out = Vec::new();
         let err = decompress(&archive[..], &mut out, 1).unwrap_err();
         assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn content_digest_distinguishes_streams_and_boundaries() {
+        let d = |names: &[&[u8]], lens: &[u32], seq: &[u8], qual: &[u8]| {
+            content_digest(names.len(), names.iter().copied(), lens, seq, qual)
+        };
+        let base = d(&[b"r1", b"r2"], &[3, 3], b"ACGTTT", b"IIIFFF");
+        // Sensitive to each of the three decoded streams.
+        assert_ne!(
+            base,
+            d(&[b"r1", b"rX"], &[3, 3], b"ACGTTT", b"IIIFFF"),
+            "name"
+        );
+        assert_ne!(
+            base,
+            d(&[b"r1", b"r2"], &[3, 3], b"ACGTTA", b"IIIFFF"),
+            "seq"
+        );
+        assert_ne!(
+            base,
+            d(&[b"r1", b"r2"], &[3, 3], b"ACGTTT", b"IIIFF#"),
+            "qual"
+        );
+        // Boundary pinning: the same concatenated bytes split differently between
+        // name and sequence must not collide (a byte "sliding" across a stream
+        // boundary is exactly the silent-corruption shape the length folds catch).
+        assert_ne!(
+            d(&[b"AB"], &[2], b"CD", b"II"),
+            d(&[b"ABC"], &[1], b"D", b"I"),
+            "boundary"
+        );
+    }
+
+    #[test]
+    fn decompress_detects_content_digest_mismatch() {
+        // The failure mode CRC cannot see: frame CRC intact, but the decoded
+        // content does not match the stored digest (a codec round-trip bug).
+        // Simulate by flipping a byte in the payload's leading digest and repairing
+        // the frame CRC, so only the content-digest check can reject it.
+        let mut archive = multiblock_archive(20, 64); // block_reads > n => one block
+        let payload_start = HEADER_LEN + 8 + CRC_LEN;
+        archive[payload_start] ^= 0xFF; // first byte of the content digest
+        let len =
+            u64::from_le_bytes(archive[HEADER_LEN..HEADER_LEN + 8].try_into().unwrap()) as usize;
+        let repaired = crc32c(&archive[payload_start..payload_start + len]);
+        archive[HEADER_LEN + 8..payload_start].copy_from_slice(&repaired.to_le_bytes());
+
+        let mut out = Vec::new();
+        let err = decompress(&archive[..], &mut out, 1).unwrap_err();
+        assert!(
+            matches!(&err, Error::Corrupt { what } if what.contains("content digest")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn content_digest_accepts_lossy_binning_roundtrip() {
+        // The encode-side digest is over the POST-binning quality, so a lossy
+        // archive must decode without a false digest failure (guards the scoping:
+        // the digest checks the round-trip, not the lossy transform).
+        let input = make_reads("x", 30);
+        let archive = compress_bytes(
+            &input,
+            Params {
+                quality_binning: QualityBinning::Bin4,
+                ..Params::default()
+            },
+        );
+        let mut out = Vec::new();
+        decompress(&archive[..], &mut out, 1)
+            .expect("lossy archive round-trips without a false content-digest failure");
     }
 
     #[test]
