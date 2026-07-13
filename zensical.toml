@@ -17,6 +17,7 @@ nav = [
     { "Overview" = "cli/index.md" },
     { "compress" = "cli/compress.md" },
     { "decompress" = "cli/decompress.md" },
+    { "verify" = "cli/verify.md" },
     { "info" = "cli/info.md" },
   ] },
   { "Design" = [
