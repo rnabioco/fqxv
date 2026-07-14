@@ -1384,17 +1384,79 @@ fn run_estimate(inputs: &[PathBuf], params: fqxv::Params, reorders: bool) -> any
         }
     }
     let streams = names + seq + qual;
+    let name_of = |p: &Path| {
+        if p.as_os_str() == "-" {
+            "stdin".to_string()
+        } else {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string())
+        }
+    };
 
     let mut out = String::new();
     use std::fmt::Write as _;
-    let _ = writeln!(
-        out,
-        "Estimated from a {}-read sample ({} of uncompressed FASTQ):\n",
-        group_digits(reads),
-        human_bytes(sample_raw),
-    );
-    // Per-stream breakdown: compressed size, share of the coded streams, and the
-    // natural rate for each (names amortize over reads; seq/qual over bases).
+
+    // Lead with the punchline: input size(s) -> estimated fqxv size, % smaller.
+    if projectable && proj_archive > 0.0 && disk_in > 0 {
+        let ratio_disk = disk_in as f64 / proj_archive;
+        let pct = (1.0 - proj_archive / disk_in as f64) * 100.0;
+        let archive = human_bytes(proj_archive as u64);
+        if inputs.len() == 1 {
+            let _ = writeln!(
+                out,
+                "{} ({})  \u{2192}  estimated fqxv ~{}  ({:.0}% smaller, ~{:.2}x)",
+                name_of(&inputs[0]),
+                human_bytes(disk_in),
+                archive,
+                pct,
+                ratio_disk,
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "{} FASTQ files ({} total)  \u{2192}  estimated fqxv ~{}  ({:.0}% smaller, ~{:.2}x)",
+                inputs.len(),
+                human_bytes(disk_in),
+                archive,
+                pct,
+                ratio_disk,
+            );
+            for (path, part) in inputs.iter().zip(&parts) {
+                let d = part.disk.unwrap_or(part.consumed);
+                let _ = writeln!(out, "    {:<28} {:>11}", name_of(path), human_bytes(d));
+            }
+        }
+    } else {
+        // Streaming input of unknown length: no on-disk total to reduce against,
+        // so lead with the sample's own reduction (vs uncompressed FASTQ).
+        let sample_ratio = if sample_archive == 0 {
+            0.0
+        } else {
+            sample_raw as f64 / sample_archive as f64
+        };
+        let pct = if sample_raw > 0 {
+            (1.0 - sample_archive as f64 / sample_raw as f64) * 100.0
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            out,
+            "sample: {} uncompressed FASTQ  \u{2192}  ~{} fqxv  ({:.0}% smaller, ~{:.2}x)",
+            human_bytes(sample_raw),
+            human_bytes(sample_archive),
+            pct,
+            sample_ratio,
+        );
+        let _ = writeln!(
+            out,
+            "(streaming input has no on-disk size; give a file to project the whole-file total)"
+        );
+    }
+
+    // Per-stream breakdown from the sample: compressed size, share of the coded
+    // streams, and the natural rate for each (names amortize over reads; seq/qual
+    // over bases).
     let share = |b: u64| {
         if streams == 0 {
             0.0
@@ -1416,6 +1478,12 @@ fn run_estimate(inputs: &[PathBuf], params: fqxv::Params, reorders: bool) -> any
             b as f64 * 8.0 / bases as f64
         }
     };
+    let _ = writeln!(
+        out,
+        "\nEstimated from a {}-read sample ({} uncompressed FASTQ):",
+        group_digits(reads),
+        human_bytes(sample_raw),
+    );
     let _ = writeln!(out, "  stream      compressed     share   rate");
     let _ = writeln!(
         out,
@@ -1439,67 +1507,22 @@ fn run_estimate(inputs: &[PathBuf], params: fqxv::Params, reorders: bool) -> any
         per_base(qual),
     );
 
-    let sample_ratio = if sample_archive == 0 {
-        0.0
-    } else {
-        sample_raw as f64 / sample_archive as f64
-    };
-
+    // Secondary figure: the vs-uncompressed-FASTQ ratio — the data-level
+    // compression, distinct from the vs-on-disk reduction in the headline.
     if projectable && proj_archive > 0.0 {
-        let ratio_raw = proj_raw / proj_archive;
-        let ratio_disk = disk_in as f64 / proj_archive;
-        let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "  input (on disk)              {:>11}",
-            human_bytes(disk_in)
-        );
-        let _ = writeln!(
-            out,
-            "  input (uncompressed FASTQ)  ~{:>11}",
-            human_bytes(proj_raw as u64)
-        );
-        let _ = writeln!(
-            out,
-            "  estimated archive           ~{:>11}",
-            human_bytes(proj_archive as u64)
-        );
-        let _ = writeln!(
-            out,
-            "  estimated ratio             ~{:.2}x  (vs uncompressed FASTQ)",
-            ratio_raw
-        );
-        let _ = writeln!(
-            out,
-            "                              ~{:.2}x  (vs input on disk)",
-            ratio_disk
-        );
-    } else {
-        // Streaming input of unknown length: the ratio is still meaningful, only
-        // the projected total size is not.
-        let _ = writeln!(out);
-        let _ = writeln!(
-            out,
-            "  sample     {} -> {} archive",
-            human_bytes(sample_raw),
-            human_bytes(sample_archive),
-        );
-        let _ = writeln!(
-            out,
-            "  estimated ratio             ~{:.2}x  (vs uncompressed FASTQ)",
-            sample_ratio
-        );
-        let _ = writeln!(
-            out,
-            "  (give a file input instead of a stream to project the total size)"
+            "  vs uncompressed FASTQ (~{}):  ~{:.2}x",
+            human_bytes(proj_raw as u64),
+            proj_raw / proj_archive,
         );
     }
 
     if reorders {
         let _ = writeln!(
             out,
-            "\n  note: --order/--max reordering is not modeled; the real archive\n  \
-             will be this size or smaller."
+            "\nnote: --order/--max reordering is not modeled; the real archive will\n\
+             be this size or smaller."
         );
     }
 
