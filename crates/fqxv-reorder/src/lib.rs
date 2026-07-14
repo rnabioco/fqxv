@@ -1292,6 +1292,13 @@ pub struct Place4 {
 /// clustered order.
 #[must_use]
 pub fn assemble_global(reads: &[&[u8]], anchors: &[u32]) -> (GlobalReference, Vec<Place4>) {
+    assemble_window(reads, anchors)
+}
+
+/// The serial greedy fold over one window of reads: place each read on the
+/// growing multi-contig assembly (or seed a new contig), then freeze the
+/// consensus. Contig ids in the returned placements are local to this window.
+fn assemble_window(reads: &[&[u8]], anchors: &[u32]) -> (GlobalReference, Vec<Place4>) {
     let mut asm = Assembler::default();
     let mut places: Vec<Place4> = Vec::with_capacity(reads.len());
     for (i, &cur) in reads.iter().enumerate() {
@@ -1327,6 +1334,61 @@ pub fn assemble_global(reads: &[&[u8]], anchors: &[u32]) -> (GlobalReference, Ve
             seq.push(col.base);
         }
         offs.push(seq.len());
+    }
+    (GlobalReference { seq, offs }, places)
+}
+
+/// Parallel windowed assembly: split the clustered reads into `n_windows`
+/// contiguous windows (by read index — fixed, so the result is byte-identical
+/// regardless of thread count), assemble each **in parallel** with the serial
+/// [`assemble_window`], then concatenate their frozen references (remapping each
+/// window's local contig ids by a running offset). Windowing costs cross-window
+/// deduplication, but a following [`merge_reference`] recovers most of it by
+/// chaining duplicate contigs — so this is a near-ratio-neutral speedup of the
+/// otherwise-serial [`assemble_global`] fold. `n_windows == 1` reproduces
+/// [`assemble_global`] exactly.
+#[must_use]
+pub fn assemble_global_windowed(
+    reads: &[&[u8]],
+    anchors: &[u32],
+    n_windows: usize,
+) -> (GlobalReference, Vec<Place4>) {
+    let n = reads.len();
+    if n == 0 {
+        return (
+            GlobalReference {
+                seq: Vec::new(),
+                offs: vec![0],
+            },
+            Vec::new(),
+        );
+    }
+    let per = n.div_ceil(n_windows.clamp(1, n));
+    let ranges: Vec<(usize, usize)> = (0..n)
+        .step_by(per.max(1))
+        .map(|s| (s, (s + per).min(n)))
+        .collect();
+    let windows: Vec<(GlobalReference, Vec<Place4>)> = ranges
+        .par_iter()
+        .map(|&(s, e)| assemble_window(&reads[s..e], &anchors[s..e]))
+        .collect();
+
+    let mut seq = Vec::new();
+    let mut offs = vec![0usize];
+    let mut places = Vec::with_capacity(n);
+    let mut contig_off = 0u32;
+    for (gref, wplaces) in windows {
+        seq.extend_from_slice(&gref.seq);
+        for w in 1..gref.offs.len() {
+            offs.push(offs[offs.len() - 1] + (gref.offs[w] - gref.offs[w - 1]));
+        }
+        for p in wplaces {
+            places.push(Place4 {
+                ci: p.ci + contig_off,
+                off: p.off,
+            });
+        }
+        contig_off += gref.n_contigs() as u32;
     }
     (GlobalReference { seq, offs }, places)
 }
@@ -1573,6 +1635,63 @@ pub fn merge_reference(
     merge_reference_with(reads, reference, places, MergeConfig::default())
 }
 
+/// Number of contig chunks the merge k-mer index is built over in parallel.
+/// The combined index is invariant to this (chunks are combined in contig order),
+/// so it affects only parallelism, not the output.
+const MERGE_INDEX_CHUNKS: usize = 64;
+
+/// Build the prefix-k-mer index for [`merge_reference_with`], in parallel. Each
+/// contig chunk builds a partial (fan-out-capped) map; the partials are combined
+/// in contig order and re-capped, giving the exact same first-N entries per
+/// k-mer as a serial build — so the result is deterministic regardless of thread
+/// count. This is the merge's hottest step, so parallelizing it matters most.
+fn build_merge_index(
+    contigs: &[&[u8]],
+    prefix: usize,
+    fanout: usize,
+) -> IntMap<u64, Vec<(u32, u32)>> {
+    let nc = contigs.len();
+    let chunk = nc.div_ceil(MERGE_INDEX_CHUNKS.clamp(1, nc.max(1))).max(1);
+    let partials: Vec<IntMap<u64, Vec<(u32, u32)>>> = (0..nc)
+        .step_by(chunk)
+        .collect::<Vec<_>>()
+        .par_iter()
+        .map(|&start| {
+            let end = (start + chunk).min(nc);
+            let mut m: IntMap<u64, Vec<(u32, u32)>> = IntMap::default();
+            for ci in start..end {
+                let c = contigs[ci];
+                let hi = c.len().min(prefix);
+                let mut s = 0usize;
+                while s + MERGE_K <= hi {
+                    if let Some(code) = kmer_at(c, s, MERGE_K) {
+                        let e = m.entry(code).or_default();
+                        if e.len() < fanout {
+                            e.push((ci as u32, s as u32));
+                        }
+                    }
+                    s += 1;
+                }
+            }
+            m
+        })
+        .collect();
+    let mut index: IntMap<u64, Vec<(u32, u32)>> = IntMap::default();
+    for part in partials {
+        for (code, list) in part {
+            let e = index.entry(code).or_default();
+            for item in list {
+                if e.len() < fanout {
+                    e.push(item);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    index
+}
+
 /// Overlap-merge a greedy reference (see the module note): returns a new
 /// `(reference, placements)` with fewer, longer contigs, usable by
 /// [`encode_global_block`] unchanged. After chaining, the merged consensus is
@@ -1596,20 +1715,10 @@ pub fn merge_reference_with(
     let contigs: Vec<&[u8]> = (0..nc).map(|c| reference.contig(c)).collect();
 
     // 1. Index each contig's PREFIX k-mers -> [(contig, pos)] (capped fan-out).
-    let mut index: IntMap<u64, Vec<(u32, u32)>> = IntMap::default();
-    for (ci, c) in contigs.iter().enumerate() {
-        let hi = c.len().min(cfg.prefix);
-        let mut s = 0usize;
-        while s + MERGE_K <= hi {
-            if let Some(code) = kmer_at(c, s, MERGE_K) {
-                let e = index.entry(code).or_default();
-                if e.len() < cfg.fanout {
-                    e.push((ci as u32, s as u32));
-                }
-            }
-            s += 1;
-        }
-    }
+    // Built over contig CHUNKS in parallel and combined in contig order, so the
+    // fan-out cap keeps the same first-N entries as a serial build — the combined
+    // index is independent of the chunk count, hence of the thread count.
+    let index = build_merge_index(&contigs, cfg.prefix, cfg.fanout);
 
     // 2. For each contig A, find its best successor B: A's suffix overlaps B's
     //    prefix (B starts at offset `s` inside A, overlap = A.len - s reaches A's

@@ -17,6 +17,11 @@ pub(crate) const REORDER_K: usize = 15;
 /// so block size no longer trades against ratio — only parallelism and the
 /// per-block model reset (cheap, since clustered duplicates collapse to MATCH).
 pub(crate) const REORDER_BLOCK_READS: usize = 1 << 18;
+/// Windows the global assembly is split into for parallel building. Fixed (never
+/// derived from the thread count) so the reference is byte-identical regardless of
+/// `--threads`. Enough to saturate a many-core node; cross-window dedup lost to
+/// the split is recovered by the overlap-merge that follows.
+pub(crate) const ASSEMBLY_WINDOWS: usize = 8;
 
 /// Buffer every record of a single (possibly interleaved) FASTQ stream into one
 /// [`RawBlock`], preserving input order. Used by the reorder path, which needs the
@@ -209,14 +214,17 @@ pub(crate) fn encode_reordered<W: Write>(
     // global assembly entirely. Ties keep the lower version for determinism.
     let order = params.seq_order as usize;
 
-    // Pass 1: one global assembly over every clustered read → a frozen reference
-    // plus per-read placements. Sequential (a deterministic fold over clustered
-    // order), so it is the throughput floor of this path; only run when v4 is a
-    // candidate (the adaptive `rescue` path).
+    // Pass 1: assemble every clustered read into a frozen reference plus per-read
+    // placements. The greedy fold is serial, so it runs over a fixed set of
+    // windows IN PARALLEL (`assemble_global_windowed`) and the overlap-merge below
+    // reclaims the cross-window deduplication — a near-ratio-neutral speedup of
+    // what used to be the compress-time floor. Only run when v4 is a candidate
+    // (the adaptive `rescue` path).
     let global = if params.rescue && n > 0 {
         let refs_all: Vec<&[u8]> = cl_reads.iter().map(Vec::as_slice).collect();
-        let (reference, places) =
-            pool.install(|| fqxv_reorder::assemble_global(&refs_all, &cl_anchors));
+        let (reference, places) = pool.install(|| {
+            fqxv_reorder::assemble_global_windowed(&refs_all, &cl_anchors, ASSEMBLY_WINDOWS)
+        });
         // Overlap-merge the greedy reference: chain contigs whose suffix overlaps
         // another's prefix into fewer, longer super-contigs, store the shared
         // sequence once, and remap placements. Format-transparent (encode_global_block
