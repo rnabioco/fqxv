@@ -15,6 +15,7 @@ categories.workspace = true
 workspace = true
 
 [dependencies]
+fqxv-bytes.workspace = true
 fqxv-rans.workspace = true
 fqxv-seq.workspace = true
 thiserror.workspace = true

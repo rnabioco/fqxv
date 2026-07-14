@@ -32,6 +32,7 @@
 
 use std::borrow::Cow;
 
+use fqxv_bytes::{unzigzag, write_varint, zigzag};
 use fqxv_rans::Order;
 use thiserror::Error;
 
@@ -619,26 +620,6 @@ fn num_tok(value: i64, width: usize) -> Tok<'static> {
     }
 }
 
-fn zigzag(d: i64) -> u64 {
-    ((d << 1) ^ (d >> 63)) as u64
-}
-
-fn unzigzag(z: u64) -> i64 {
-    ((z >> 1) as i64) ^ -((z & 1) as i64)
-}
-
-fn write_varint(out: &mut Vec<u8>, mut v: u64) {
-    loop {
-        let byte = (v & 0x7f) as u8;
-        v >>= 7;
-        if v == 0 {
-            out.push(byte);
-            break;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -666,19 +647,7 @@ impl<'a> Cursor<'a> {
         Ok(s)
     }
     fn varint(&mut self) -> Result<u64> {
-        let mut v = 0u64;
-        let mut shift = 0u32;
-        loop {
-            let byte = self.u8()?;
-            v |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(v);
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err(Error::Malformed("varint too long"));
-            }
-        }
+        fqxv_bytes::read_varint(self.buf, &mut self.pos).ok_or(Error::Malformed("varint too long"))
     }
 }
 

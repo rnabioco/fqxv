@@ -386,6 +386,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fqxv-bytes"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "fqxv-cli"
 version = "0.0.0"
 dependencies = [
@@ -407,6 +414,7 @@ name = "fqxv-fqzcomp"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "fqxv-bytes",
  "fqxv-range",
  "proptest",
  "thiserror",
@@ -434,6 +442,7 @@ name = "fqxv-reorder"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "fqxv-bytes",
  "fqxv-rans",
  "fqxv-seq",
  "proptest",
@@ -446,6 +455,7 @@ name = "fqxv-seq"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "fqxv-bytes",
  "fqxv-range",
  "proptest",
  "thiserror",
@@ -456,6 +466,7 @@ name = "fqxv-tokenizer"
 version = "0.0.0"
 dependencies = [
  "criterion",
+ "fqxv-bytes",
  "fqxv-rans",
  "proptest",
  "thiserror",
