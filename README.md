@@ -63,6 +63,7 @@ fqxv decompress sample.fqxv --split s --no-gzip --mate-style num  # s_1.fastq, s
 fqxv decompress sample.fqxv -Z | bwa mem -p ref.fa -          # interleaved, raw, to stdout
 
 fqxv info sample.fqxv                                          # layout, reads, per-stream sizes (--tsv/--json)
+fqxv info sample.fqxv --stats                                  # + read-length, GC%, quality dist (decodes)
 fqxv verify sample.fqxv                                        # CRC integrity check (exit non-zero if corrupt)
 ```
 

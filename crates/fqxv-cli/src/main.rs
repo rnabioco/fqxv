@@ -46,6 +46,8 @@ Examples:
 
   # Inspect an archive without decompressing it (add --json or --tsv for scripts)
   fqxv info sample.fqxv
+  # ...with content stats (read-length spread, GC%, quality dist); decodes fully
+  fqxv info sample.fqxv --stats
 
   # Download from SRA with sracha (rnabioco/sracha-rs) and archive in one pass,
   # nothing hitting disk: -Z streams interleaved FASTQ to stdout, '-' reads it,
@@ -216,6 +218,12 @@ enum Command {
         /// Emit a JSON object instead of the human report.
         #[arg(long)]
         json: bool,
+        /// Also report content statistics — read-length spread, base
+        /// composition, GC%, and the quality distribution. This decodes the whole
+        /// archive (unlike the default metadata-only report, which just reads the
+        /// header and footer index), so it costs a full decompress.
+        #[arg(long, short = 's')]
+        stats: bool,
     },
     /// Verify archive integrity (CRC checks) without writing any output.
     /// Prints a table of per-check results; exits non-zero if the archive is
@@ -537,7 +545,12 @@ fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        Command::Info { input, tsv, json } => print_info(&input, tsv, json)?,
+        Command::Info {
+            input,
+            tsv,
+            json,
+            stats,
+        } => print_info(&input, tsv, json, stats, cli.threads)?,
         Command::Verify {
             input,
             quick,
@@ -554,6 +567,10 @@ struct StreamJson {
     bytes: u64,
     /// Share of the three compressed streams, in percent (0 when empty).
     pct: f64,
+    /// This stream's compressed bytes divided by read count (null when there are
+    /// no reads).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    per_read: Option<f64>,
 }
 
 /// JSON shape emitted by `fqxv info --json`. Mirrors the human report and adds
@@ -583,6 +600,58 @@ struct InfoReport {
     /// Compressed stream bytes divided by read count (null when there are none).
     #[serde(skip_serializing_if = "Option::is_none")]
     bytes_per_read: Option<f64>,
+    /// On-disk container format version.
+    format_version: u16,
+    /// Stored whole-file CRC-32C as lowercase hex (absent for the footer-less
+    /// whole-file-reorder layout and truncated archives). The value `verify`
+    /// recomputes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    whole_file_crc: Option<String>,
+    /// Content statistics from a full decode; present only with `--stats`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<StatsJson>,
+}
+
+/// Content statistics nested in [`InfoReport`] under `--stats` — mirrors
+/// [`fqxv::ContentStats`] with derived percentages precomputed.
+#[derive(Debug, Serialize)]
+struct StatsJson {
+    reads: u64,
+    bases: u64,
+    min_length: u32,
+    max_length: u32,
+    /// Null when there are no reads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean_length: Option<f64>,
+    /// True when every read shares one length.
+    fixed_length: bool,
+    /// `(G + C) / (A + C + G + T)`; null for an all-N or empty archive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gc_fraction: Option<f64>,
+    /// Mean Phred quality over every base; null when there are no bases.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mean_quality: Option<f64>,
+    base_composition: BaseCompositionJson,
+    /// Per-Phred quality counts, only for values that occur (ascending).
+    quality_histogram: Vec<QualBucketJson>,
+}
+
+/// Absolute base counts nested in [`StatsJson`].
+#[derive(Debug, Serialize)]
+struct BaseCompositionJson {
+    a: u64,
+    c: u64,
+    g: u64,
+    t: u64,
+    n: u64,
+    other: u64,
+}
+
+/// One occupied Phred bucket in [`StatsJson::quality_histogram`].
+#[derive(Debug, Serialize)]
+struct QualBucketJson {
+    phred: u8,
+    count: u64,
 }
 
 /// The `streams` object nested in [`InfoReport`].
@@ -594,21 +663,42 @@ struct InfoStreams {
     total: StreamJson,
 }
 
-fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
+fn print_info(
+    path: &Path,
+    tsv: bool,
+    json: bool,
+    stats: bool,
+    threads: usize,
+) -> anyhow::Result<()> {
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let info = fqxv::inspect(
         File::open(path).with_context(|| format!("opening input {}", path.display()))?,
     )?;
     let total = info.names_bytes + info.seq_bytes + info.qual_bytes;
+    // `--stats` requires a full decode (unlike the metadata above, which comes
+    // from the header + footer index); do it once and share across formats.
+    let content = if stats {
+        Some(
+            fqxv::content_stats(
+                File::open(path).with_context(|| format!("opening input {}", path.display()))?,
+                threads,
+            )
+            .with_context(|| format!("decoding {} for --stats", path.display()))?,
+        )
+    } else {
+        None
+    };
+    let crc_hex = info.whole_file_crc.map(|c| format!("{c:08x}"));
 
     if tsv {
         // Stable, tab-separated columns for scripts. Keep field order fixed;
-        // append new fields at the end so existing parsers don't break.
-        println!(
-            "file_size\treads\tblocks\tgroup_size\tseq_order\tquality_binning\treordered\tnames_bytes\tseq_bytes\tqual_bytes\tplatform"
+        // append new fields at the end so existing parsers don't break. The
+        // `--stats` columns are appended only when that flag is set.
+        let mut header = String::from(
+            "file_size\treads\tblocks\tgroup_size\tseq_order\tquality_binning\treordered\tnames_bytes\tseq_bytes\tqual_bytes\tplatform\tformat_version\twhole_file_crc",
         );
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        let mut row = format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             file_size,
             info.reads,
             info.blocks,
@@ -620,7 +710,26 @@ fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
             info.seq_bytes,
             info.qual_bytes,
             info.platform.token(),
+            info.format_version,
+            crc_hex.as_deref().unwrap_or(""),
         );
+        if let Some(cs) = &content {
+            header.push_str("\tbases\tmin_len\tmax_len\tgc_fraction\tmean_quality");
+            row.push_str(&format!(
+                "\t{}\t{}\t{}\t{}\t{}",
+                cs.bases,
+                cs.min_len,
+                cs.max_len,
+                cs.gc_fraction()
+                    .map(|x| format!("{x:.6}"))
+                    .unwrap_or_default(),
+                cs.mean_quality()
+                    .map(|x| format!("{x:.4}"))
+                    .unwrap_or_default(),
+            ));
+        }
+        println!("{header}");
+        println!("{row}");
         return Ok(());
     }
 
@@ -631,6 +740,7 @@ fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
             0.0
         }
     };
+    let per_read = |x: u64| (info.reads > 0).then(|| x as f64 / info.reads as f64);
     let layout = match info.group_size {
         1 => "single-end".to_string(),
         2 => "paired".to_string(),
@@ -647,6 +757,11 @@ fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
     let bytes_per_read = (info.reads > 0).then(|| total as f64 / info.reads as f64);
 
     if json {
+        let stream = |bytes: u64| StreamJson {
+            bytes,
+            pct: pct(bytes),
+            per_read: per_read(bytes),
+        };
         let report = InfoReport {
             file: path.display().to_string(),
             file_size,
@@ -664,30 +779,49 @@ fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
             read_order_preserved: info.keep_order,
             plus_normalized: info.plus_normalized,
             streams: InfoStreams {
-                names: StreamJson {
-                    bytes: info.names_bytes,
-                    pct: pct(info.names_bytes),
-                },
-                sequence: StreamJson {
-                    bytes: info.seq_bytes,
-                    pct: pct(info.seq_bytes),
-                },
-                quality: StreamJson {
-                    bytes: info.qual_bytes,
-                    pct: pct(info.qual_bytes),
-                },
-                total: StreamJson {
-                    bytes: total,
-                    pct: pct(total),
-                },
+                names: stream(info.names_bytes),
+                sequence: stream(info.seq_bytes),
+                quality: stream(info.qual_bytes),
+                total: stream(total),
             },
             bytes_per_read,
+            format_version: info.format_version,
+            whole_file_crc: crc_hex.clone(),
+            stats: content.as_ref().map(|cs| StatsJson {
+                reads: cs.reads,
+                bases: cs.bases,
+                min_length: cs.min_len,
+                max_length: cs.max_len,
+                mean_length: cs.mean_len(),
+                fixed_length: cs.fixed_length(),
+                gc_fraction: cs.gc_fraction(),
+                mean_quality: cs.mean_quality(),
+                base_composition: BaseCompositionJson {
+                    a: cs.a,
+                    c: cs.c,
+                    g: cs.g,
+                    t: cs.t,
+                    n: cs.n,
+                    other: cs.other,
+                },
+                quality_histogram: cs
+                    .qual_hist
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &count)| count > 0)
+                    .map(|(phred, &count)| QualBucketJson {
+                        phred: phred as u8,
+                        count,
+                    })
+                    .collect(),
+            }),
         };
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
-    // Human report: a metadata table plus a per-stream size table.
+    // Human report: a metadata table, a per-stream size table, and — with
+    // `--stats` — a content-statistics table plus a quality histogram.
     let read_order = if info.keep_order {
         "preserved (permutation stored)"
     } else if info.regenerated_names {
@@ -706,7 +840,17 @@ fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
     if let Some(spots) = spots {
         meta_row("spots", group_digits(spots));
     }
-    meta_row("blocks", group_digits(info.blocks));
+    // Blocks, annotated with the average reads per block when both are known.
+    let blocks = if info.blocks > 0 && info.reads > 0 {
+        format!(
+            "{} (avg {} reads)",
+            group_digits(info.blocks),
+            group_digits(info.reads / info.blocks)
+        )
+    } else {
+        group_digits(info.blocks)
+    };
+    meta_row("blocks", blocks);
     meta_row("platform", info.platform.label().to_string());
     meta_row("sequence order", info.seq_order.to_string());
     meta_row("quality", quality.to_string());
@@ -717,6 +861,11 @@ fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
     meta_row(
         "plus line",
         bool_word(info.plus_normalized, "normalized", "verbatim"),
+    );
+    meta_row("format", format!("v{}", info.format_version));
+    meta_row(
+        "whole-file crc",
+        crc_hex.clone().unwrap_or_else(|| "—".to_string()),
     );
     meta_row(
         "file size",
@@ -734,6 +883,7 @@ fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
         "stream".to_string(),
         "bytes".to_string(),
         "share".to_string(),
+        "bytes/read".to_string(),
     ]);
     for (label, bytes) in [
         ("names", info.names_bytes),
@@ -745,6 +895,7 @@ fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
             label.to_string(),
             group_digits(bytes),
             format!("{:.1}%", pct(bytes)),
+            per_read(bytes).map_or_else(|| "—".to_string(), |x| format!("{x:.3}")),
         ]);
     }
     let mut streams = streams.build();
@@ -758,7 +909,111 @@ fn print_info(path: &Path, tsv: bool, json: bool) -> anyhow::Result<()> {
     if let Some(bpr) = bytes_per_read {
         println!("{bpr:.2} bytes/read");
     }
+    if let Some(cs) = &content {
+        print!("{}", render_content_stats(cs));
+    }
     Ok(())
+}
+
+/// Render the `--stats` content-statistics table and quality histogram as a
+/// printable block (trailing newline included). Kept separate from
+/// [`print_info`] so the metadata report stays readable.
+fn render_content_stats(cs: &fqxv::ContentStats) -> String {
+    use std::fmt::Write as _;
+
+    let frac_of_bases = |x: u64| {
+        if cs.bases > 0 {
+            100.0 * x as f64 / cs.bases as f64
+        } else {
+            0.0
+        }
+    };
+    let mut t = TableBuilder::default();
+    t.push_record(["content".to_string(), "value".to_string()]);
+    let mut row = |k: &str, v: String| t.push_record([k.to_string(), v]);
+    row("reads", group_digits(cs.reads));
+    row("bases", group_digits(cs.bases));
+    let length = if cs.reads == 0 {
+        "—".to_string()
+    } else if cs.fixed_length() {
+        format!("{} (fixed)", cs.min_len)
+    } else {
+        format!(
+            "{}–{} (mean {:.1})",
+            cs.min_len,
+            cs.max_len,
+            cs.mean_len().unwrap_or(0.0)
+        )
+    };
+    row("read length", length);
+    row(
+        "GC content",
+        cs.gc_fraction()
+            .map_or_else(|| "—".to_string(), |g| format!("{:.1}%", 100.0 * g)),
+    );
+    row(
+        "A / C / G / T",
+        format!(
+            "{:.1}% / {:.1}% / {:.1}% / {:.1}%",
+            frac_of_bases(cs.a),
+            frac_of_bases(cs.c),
+            frac_of_bases(cs.g),
+            frac_of_bases(cs.t),
+        ),
+    );
+    row(
+        "N bases",
+        format!("{} ({:.2}%)", group_digits(cs.n), frac_of_bases(cs.n)),
+    );
+    if cs.other > 0 {
+        row(
+            "other bases",
+            format!(
+                "{} ({:.2}%)",
+                group_digits(cs.other),
+                frac_of_bases(cs.other)
+            ),
+        );
+    }
+    row(
+        "mean quality",
+        cs.mean_quality()
+            .map_or_else(|| "—".to_string(), |q| format!("Q{q:.1}")),
+    );
+    let mut table = t.build();
+    table.with(Style::rounded());
+
+    let mut out = format!("{table}\n");
+    // Quality distribution, bucketed into width-5 Phred ranges; only occupied
+    // ranges are shown, each with a bar scaled to the busiest range.
+    let mut buckets: Vec<(usize, u64)> = Vec::new();
+    let mut lo = 0;
+    while lo < fqxv::QUAL_MAX {
+        let hi = (lo + 5).min(fqxv::QUAL_MAX);
+        let count: u64 = cs.qual_hist[lo..hi].iter().sum();
+        if count > 0 {
+            buckets.push((lo, count));
+        }
+        lo = hi;
+    }
+    // Buckets are only pushed when non-empty, so `max` is > 0 whenever the loop
+    // runs — no division guard needed.
+    let max = buckets.iter().map(|&(_, c)| c).max().unwrap_or(0);
+    if !buckets.is_empty() {
+        out.push_str("quality distribution\n");
+        for (lo, count) in buckets {
+            let bar = (24 * count / max) as usize;
+            let _ = writeln!(
+                out,
+                "  Q{:>2}–{:<2} {:<24} {:>5.1}%",
+                lo,
+                lo + 4,
+                "█".repeat(bar),
+                frac_of_bases(count),
+            );
+        }
+    }
+    out
 }
 
 /// One check row in the machine-readable [`VerifyJson`].
