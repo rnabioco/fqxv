@@ -43,7 +43,11 @@ fqxv-fqzcomp  = { git = "https://github.com/rnabioco/fqxv.git" }  # quality mode
 fqxv-seq      = { git = "https://github.com/rnabioco/fqxv.git" }  # sequence model
 fqxv-tokenizer= { git = "https://github.com/rnabioco/fqxv.git" }  # read-name tokenizer
 fqxv-reorder  = { git = "https://github.com/rnabioco/fqxv.git" }  # read clustering
+fqxv-bytes    = { git = "https://github.com/rnabioco/fqxv.git" }  # shared byte primitives
 ```
+
+(`fqxv-bytes` is a leaf crate of the LEB128/zig-zag primitives the codec crates
+share; the codecs pull it in transitively, so you rarely depend on it directly.)
 
 Every crate is dual-licensed **MIT OR Apache-2.0**.
 

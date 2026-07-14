@@ -30,25 +30,31 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 
 /// The container format version this build writes.
 ///
-/// The container appends a footer index (`[u32 n_row_groups]`, per-group
-/// `[u64 offset][u32 read_count]`, `[u64 total_reads]`, `[u32 whole_file_crc]`,
-/// `[u32 footer_crc]`) plus an EOF trailer (`[u64 footer_offset]["FQXF"]`) after a
-/// zero-length terminator block, so `inspect` and random access can seek straight
-/// to the row-group index. Every coded payload carries a CRC-32C so on-disk
-/// corruption is detected and localized rather than silently decoded.
+/// **Nothing on disk is stable yet (alpha): this build reads only its own
+/// version.** Because of that, the format has not accreted numbered revisions —
+/// every change lands in v1 until a first stable release freezes it. (The
+/// "v2/v3/v4" you see elsewhere are the per-block *sequence codec* versions,
+/// which are independent of this container version.)
 ///
-/// v2 additionally prepends an xxh3-64 digest of each block's *decoded* content
-/// (names, sequence, post-binning quality) to the block payload, verified after
-/// decode — so a codec bug that turns CRC-valid bytes into wrong-but-in-bounds
-/// output is caught at runtime, not just in tests. See `container.rs` for the
-/// full layout. Nothing on disk is stable yet (alpha); this build reads only its
-/// own version.
+/// The v1 container:
+/// - appends a footer index (`[u32 n_row_groups]`, per-group
+///   `[u64 offset][u32 read_count]`, `[u64 total_reads]`, `[u32 whole_file_crc]`,
+///   `[u32 footer_crc]`) plus an EOF trailer (`[u64 footer_offset]["FQXF"]`) after
+///   a zero-length terminator block, so `inspect` and random access can seek
+///   straight to the row-group index;
+/// - carries a CRC-32C on every coded payload, so on-disk corruption is detected
+///   and localized rather than silently decoded;
+/// - prepends an xxh3-64 digest of each block's *decoded* content (names,
+///   sequence, post-binning quality) to the block payload, verified after decode
+///   — so a codec bug that turns CRC-valid bytes into wrong-but-in-bounds output
+///   is caught at runtime, not just in tests;
+/// - tags the `FLAG_GLOBAL_REFERENCE` frame with a leading method byte so the
+///   shared reference can be coded by either the clean-room order-k model or an
+///   xz pass (whichever is smaller), exploiting long-range repeat structure the
+///   order-k model can't see.
 ///
-/// v3 tags the `FLAG_GLOBAL_REFERENCE` frame with a leading method byte so the
-/// shared reference can be coded by either the clean-room order-k model or an xz
-/// pass (whichever is smaller), exploiting long-range repeat structure the
-/// order-k model can't see.
-pub const FORMAT_VERSION: u16 = 3;
+/// See `container.rs` for the full layout.
+pub const FORMAT_VERSION: u16 = 1;
 
 /// Errors returned by the archiver.
 #[derive(Debug, Error)]

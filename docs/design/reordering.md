@@ -34,7 +34,30 @@ the reordered stream:
 - **LITERAL** — everything else, coded with the `fqxv-seq` context model.
 
 Duplicates collapse to a single op; the unique reads still get the context
-model. Measured on the sequence stream:
+model. These block-local sequence codecs are versioned on disk (v2 single-contig,
+v3 adds block-local literal-rescue) and the container keeps whichever is smaller
+per block.
+
+**Global reference (v4).** Beyond the block-local codecs, the container can also
+assemble **one frozen whole-file reference** (SPRING-style) over every clustered
+read and code reads as `(contig, offset, mismatches)` positions on it, so the
+cross-block overlaps the block-local codecs strand as literals collapse to a cheap
+back-reference. The assembly runs the greedy fold over a fixed set of windows **in
+parallel** (a fixed count, never derived from `--threads`, so the reference is
+byte-identical regardless of thread count); the reference is then **overlap-merged**
+— contigs whose suffix overlaps another's prefix are chained into fewer, longer
+super-contigs, reclaiming the cross-window deduplication the split gave up — and
+stored once. It is coded with the **same clean-room order-k `fqxv-seq` model** as
+the reads, split into a fixed number of contig blocks compressed **in parallel**.
+There is no external/C compressor in this path — the earlier xz (`liblzma`)
+reference coder was removed; the whole codec stack is pure-Rust clean-room. This is
+the adaptive `rescue` path (default under `--order any`; `--no-rescue` turns it
+off). It is adopted only when the reference frame plus the v4 blocks beat the
+block-local total, so it can only ever shrink the archive. See [Container Format →
+Reordered archives](container.md#reordered-archives) for the on-disk frame layout
+and the reference-frame method byte.
+
+Measured on the sequence stream:
 
 | dataset | `fqxv-seq` order-11 | reorder + delta + ctx-literals | gain |
 | --- | --- | --- | --- |
@@ -46,13 +69,16 @@ not preserved.
 
 ## End to end, and the real-world caveats
 
-`fqxv compress --order any` turns on read reordering. On single-end input the
-reads emerge clustered (order not preserved). On grouped (paired / single-cell)
-input a permutation is stored so the mate interleaving is reconstructed on
-decompress and `--split` — grouped reorder is therefore always order-preserving.
-The library also exposes an order-preserving single-end reorder (a stored
-permutation, `Params.keep_order`), but the CLI does not surface it — the user
-picks the property (`preserve` vs `any`), not the mechanism. All modes round-trip
+`fqxv compress --order any` (or `--max`) turns on read reordering. On single-end
+input the reads emerge clustered (order not preserved). On grouped (paired /
+single-cell) input a permutation is stored so the mate interleaving is
+reconstructed on decompress and `--split` — grouped reorder is therefore always
+order-preserving. For single-end input, whether the original order is kept is
+picked adaptively (a stored permutation wins for counter-style names that
+delta-code to almost nothing in original order); the Advanced `--keep-order` flag
+forces it on, and `--order shuffle` opts into discarding order entirely by
+regenerating purely positional names from a template (reorder-lossy — reads are
+renumbered, sequence and quality preserved exactly). All modes round-trip
 exactly (or exactly as a set for single-end `any`). On a **full, real** deep
 dataset (E. coli, 2.19 M variable-length reads) the whole-archive gain is modest:
 

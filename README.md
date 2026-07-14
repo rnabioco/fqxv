@@ -3,8 +3,11 @@
 A Rust toolkit for archiving short-read FASTQ, built as a workspace of
 one-crate-per-algorithm codecs plus a container format and CLI.
 
-> Status: **early development.** Nothing is stable yet. See
-> [the plan](#milestones) below.
+> Status: **v0.1.0 — early release.** The library and CLI work end-to-end and are
+> [benchmarked against the field](docs/benchmarks.md), but the on-disk `.fqxv`
+> format (`FORMAT_VERSION` 1) is **not yet frozen** — each build reads only its
+> own version, so pin a version if you need archives to survive upgrades. See
+> [the roadmap](#milestones).
 
 ## Why
 
@@ -21,16 +24,34 @@ No mature FASTQ-domain compressor exists as a Rust crate today. `fqxv` fills tha
 niche with clean-room implementations from the [CRAM 3.1 codecs
 spec](https://samtools.github.io/hts-specs/CRAMcodecs.pdf) and the source papers.
 
+## How it compares
+
+On 4M-read RNA-seq subsets (see [benchmarks](docs/benchmarks.md)), `fqxv --max`
+is the **#2 compressor after SPRING** — within ~6–12% on ratio, and *faster* than
+SPRING on full-range data — while beating `fqz_comp`, `zstd -19`, `xz -9`, and
+`gzip`. Two things are `fqxv`'s alone: every archive is **deterministic**
+(byte-identical regardless of thread count) and **verified lossless** on decode.
+The default mode trades ratio for speed cleanly (~115 MB/s, still ahead of
+`fqz_comp`/`zstd`/`xz` on ratio). Pure Rust, no external/C compressor.
+
+| NovaSeq (binned), 4M reads | ratio | compress |
+| --- | ---: | ---: |
+| SPRING | 21.9× | 66 MB/s |
+| **`fqxv --max`** | **19.4×** | 40 MB/s |
+| fqz_comp | 9.6× | (fails round-trip) |
+| zstd -19 / xz -9 | 9.4× / 8.9× | 10 / 9 MB/s |
+
 ## Workspace
 
 | Crate | Role |
 | --- | --- |
-| `fqxv-rans` | rANS Nx16 entropy coder — scalar + SSE4.2 + AVX2, runtime dispatch |
+| `fqxv-rans` | rANS Nx16 entropy coder — scalar + AVX2 + AVX-512 order-0 paths, runtime dispatch |
 | `fqxv-range` | binary range coder + adaptive models (serial) |
 | `fqxv-fqzcomp` | quality context model over `fqxv-range`; opt-in lossy binning |
 | `fqxv-tokenizer` | positional read-name tokenizer; entropy backend = `fqxv-rans` |
-| `fqxv-seq` | 2-bit / variable-length base packing + order-k model |
+| `fqxv-seq` | order-k adaptive context model over 2-bit ACGT symbols (non-ACGT → exception list) |
 | `fqxv-reorder` | PgRC2/SPRING-class read reordering engine |
+| `fqxv-bytes` | shared byte-serialization primitives (LEB128 varint, zig-zag) used by the codecs |
 | `fqxv` | container format library; composes the above |
 | `fqxv-cli` | the `fqxv` command-line binary |
 
@@ -71,6 +92,11 @@ Combining mates/index reads shrinks the archive (near-identical mate names
 collapse; the sequence model sees a spot's related reads together) and keeps one
 file per sample. `compress`/`decompress` are `rayon`-parallel (`--threads`).
 Lossless by default; `--quality-bin {bin8,bin4,bin2}` opts into lossy quality.
+Read name + description, sequence, and quality are preserved exactly; the one
+documented deviation is that the optional repeated `+` separator line is
+normalized to a bare `+` (as SPRING and fqz_comp do). `--order any`/`--max` may
+reorder single-end reads for a better ratio (paired/grouped input always
+round-trips in order).
 
 `decompress` needs an explicit destination — `-o FILE`, `--split PREFIX`, or
 `-Z/--stdout` — so a bare invocation never floods the terminal. `--split` writes

@@ -46,8 +46,9 @@ A FASTQ record splits into three streams that compress very differently, and
 | Sequence | `fqxv-seq` | order-k adaptive base model over a 2-bit alphabet |
 | Read names | `fqxv-tokenizer` | positional tokens (match / delta / literal), rANS-coded |
 
-The entropy backends — `fqxv-rans` (rANS Nx16, with an AVX2 path) and
-`fqxv-range` (a Subbotin range coder) — are themselves standalone crates.
+The entropy backends — `fqxv-rans` (rANS Nx16, with AVX2 and AVX-512 order-0
+paths) and `fqxv-range` (a Subbotin range coder) — are themselves standalone
+crates.
 
 ## Where to go next
 
