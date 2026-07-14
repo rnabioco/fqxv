@@ -228,10 +228,13 @@ pub(crate) fn encode_reordered<W: Write>(
         // only -3.1%. The whole-file decision below still gates the reference
         // layout, so this can only ever shrink the archive.
         let (reference, places) = fqxv_reorder::merge_reference(&refs_all, &reference, &places);
-        // The reference is coded once; the plain dense order-k model sits at/near
-        // its entropy floor here (the hashed high-order tier buys ~0.3% for a
-        // ~1 GB table on real RNA-seq), so keep it simple and cheap.
-        let ref_payload = reference.encode(order, 0, 0)?;
+        // The reference is coded once for the whole file, so it is worth trying a
+        // second, stronger coder: the clean-room order-k model captures local
+        // context, but the reference carries long-range repeat structure it can't
+        // see (near-duplicate contigs — paralogs/isoforms), which a match-based
+        // compressor exploits (~-16% on 4M NovaSeq). `encode_reference_frame`
+        // keeps whichever is smaller, so this can only shrink the archive.
+        let ref_payload = encode_reference_frame(&reference, order)?;
         Some((reference, places, ref_payload))
     } else {
         None
@@ -548,6 +551,94 @@ pub(crate) struct ReorderStreams {
     output_digest: u64,
 }
 
+/// Reference-frame coding method (first byte of the `FLAG_GLOBAL_REFERENCE`
+/// frame). The container tries both and keeps the smaller, so which one an
+/// archive uses is a size decision, not a capability.
+const REF_METHOD_SEQ: u8 = 0; // clean-room order-k [`fqxv_seq`] context coder
+const REF_METHOD_XZ: u8 = 1; // `liblzma` (xz) over `[n][lens..][seq]`
+
+/// xz preset for the reference: level 9 + EXTREME (max ratio). The reference is
+/// coded once per file, so encode time is a fair trade for the smaller frame.
+const REF_XZ_PRESET: u32 = 9 | 0x8000_0000;
+
+/// Encode the global reference frame: pick the smaller of the clean-room order-k
+/// coder ([`GlobalReference::encode`]) and an xz pass over the raw bases, tagged
+/// with a leading method byte. `order` is the [`fqxv_seq`] context order for the
+/// order-k path. Never larger than the order-k coder alone (plus one tag byte).
+fn encode_reference_frame(
+    reference: &fqxv_reorder::GlobalReference,
+    order: usize,
+) -> Result<Vec<u8>> {
+    let seq_coded = reference.encode(order, 0, 0)?;
+    let xz = encode_reference_xz(reference)?;
+    let (method, payload) = if xz.len() < seq_coded.len() {
+        (REF_METHOD_XZ, xz)
+    } else {
+        (REF_METHOD_SEQ, seq_coded)
+    };
+    let mut out = Vec::with_capacity(1 + payload.len());
+    out.push(method);
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
+/// Decode a reference frame written by [`encode_reference_frame`].
+fn decode_reference_frame(bytes: &[u8]) -> Result<fqxv_reorder::GlobalReference> {
+    match bytes.split_first() {
+        Some((&REF_METHOD_SEQ, rest)) => Ok(fqxv_reorder::GlobalReference::decode(rest)?),
+        Some((&REF_METHOD_XZ, rest)) => decode_reference_xz(rest),
+        _ => Err(Error::Malformed("reorder reference: bad method tag")),
+    }
+}
+
+/// xz-code the reference as `[n: u32-le][len_i: u32-le]*[concatenated bases]`,
+/// then compress the whole buffer. The per-contig lengths ride inside the xz
+/// stream (they compress with the bases), so the frame is self-describing.
+fn encode_reference_xz(reference: &fqxv_reorder::GlobalReference) -> Result<Vec<u8>> {
+    let lens = reference.contig_lens();
+    let seq = reference.raw_bases();
+    let mut buf = Vec::with_capacity(4 + 4 * lens.len() + seq.len());
+    buf.extend_from_slice(&(lens.len() as u32).to_le_bytes());
+    for l in &lens {
+        buf.extend_from_slice(&l.to_le_bytes());
+    }
+    buf.extend_from_slice(seq);
+    xz_compress(&buf)
+}
+
+/// Reverse of [`encode_reference_xz`].
+fn decode_reference_xz(payload: &[u8]) -> Result<fqxv_reorder::GlobalReference> {
+    let buf = xz_decompress(payload)?;
+    let bad = || Error::Malformed("reorder reference: truncated xz frame");
+    let n = u32::from_le_bytes(buf.get(0..4).ok_or_else(bad)?.try_into().unwrap()) as usize;
+    let seq_start = 4 + 4 * n;
+    let lens_bytes = buf.get(4..seq_start).ok_or_else(bad)?;
+    let lens: Vec<u32> = lens_bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let seq = buf.get(seq_start..).ok_or_else(bad)?.to_vec();
+    Ok(fqxv_reorder::GlobalReference::from_lens_seq(&lens, seq)?)
+}
+
+/// Compress with xz at [`REF_XZ_PRESET`]. `liblzma`'s Write API surfaces failures
+/// as `io::Error`, which converts into our error type.
+fn xz_compress(data: &[u8]) -> Result<Vec<u8>> {
+    let stream =
+        liblzma::stream::Stream::new_easy_encoder(REF_XZ_PRESET, liblzma::stream::Check::Crc32)
+            .map_err(|_| Error::Malformed("reorder reference: xz encoder init"))?;
+    let mut enc = liblzma::write::XzEncoder::new_stream(Vec::new(), stream);
+    enc.write_all(data)?;
+    Ok(enc.finish()?)
+}
+
+/// Reverse of [`xz_compress`].
+fn xz_decompress(data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    liblzma::read::XzDecoder::new(data).read_to_end(&mut out)?;
+    Ok(out)
+}
+
 /// Read and entropy-decode the whole-file reorder layout. `r` is positioned just
 /// past the header. Shared by [`decode_reordered_whole`] and
 /// [`decode_reordered_split`]. `has_reference` (the `FLAG_GLOBAL_REFERENCE` bit)
@@ -574,7 +665,7 @@ pub(crate) fn read_reordered_streams<R: Read>(
     // once, then every version-4 block indexes into it.
     let reference = if has_reference {
         let ref_bytes = read_framed(&mut r, "reorder global reference")?;
-        Some(fqxv_reorder::GlobalReference::decode(&ref_bytes)?)
+        Some(decode_reference_frame(&ref_bytes)?)
     } else {
         None
     };
@@ -886,5 +977,50 @@ pub(crate) fn apply_binning(qual: &[u8], binning: QualityBinning) -> Cow<'_, [u8
     match binning {
         QualityBinning::Lossless => Cow::Borrowed(qual),
         b => Cow::Owned(qual.iter().map(|&q| b.apply(q)).collect()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fqxv_reorder::GlobalReference;
+
+    fn sample_reference() -> GlobalReference {
+        // Three ACGT contigs; from_lens_seq validates the lengths sum to seq.len().
+        let seq = b"ACGTACGTACGTTTTTGGGGCCCCAAAATTTTACACACACGTGTGTGT".to_vec();
+        GlobalReference::from_lens_seq(&[16, 16, 16], seq).unwrap()
+    }
+
+    #[test]
+    fn reference_frame_roundtrips_both_methods() {
+        let r = sample_reference();
+
+        // Auto-selected frame (order-k vs xz, whichever is smaller) round-trips.
+        let frame = encode_reference_frame(&r, 8).unwrap();
+        let back = decode_reference_frame(&frame).unwrap();
+        assert_eq!(back.raw_bases(), r.raw_bases());
+        assert_eq!(back.contig_lens(), r.contig_lens());
+
+        // Force the order-k method and round-trip.
+        let mut seq_frame = vec![REF_METHOD_SEQ];
+        seq_frame.extend_from_slice(&r.encode(8, 0, 0).unwrap());
+        assert_eq!(
+            decode_reference_frame(&seq_frame).unwrap().raw_bases(),
+            r.raw_bases()
+        );
+
+        // Force the xz method and round-trip (exercises the liblzma path
+        // deterministically, regardless of which the selector would pick).
+        let mut xz_frame = vec![REF_METHOD_XZ];
+        xz_frame.extend_from_slice(&encode_reference_xz(&r).unwrap());
+        let xz_back = decode_reference_frame(&xz_frame).unwrap();
+        assert_eq!(xz_back.raw_bases(), r.raw_bases());
+        assert_eq!(xz_back.contig_lens(), r.contig_lens());
+    }
+
+    #[test]
+    fn reference_frame_rejects_bad_method() {
+        assert!(decode_reference_frame(&[]).is_err());
+        assert!(decode_reference_frame(&[0xff, 1, 2, 3]).is_err());
     }
 }

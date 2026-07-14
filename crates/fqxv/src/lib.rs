@@ -43,7 +43,12 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 /// output is caught at runtime, not just in tests. See `container.rs` for the
 /// full layout. Nothing on disk is stable yet (alpha); this build reads only its
 /// own version.
-pub const FORMAT_VERSION: u16 = 2;
+///
+/// v3 tags the `FLAG_GLOBAL_REFERENCE` frame with a leading method byte so the
+/// shared reference can be coded by either the clean-room order-k model or an xz
+/// pass (whichever is smaller), exploiting long-range repeat structure the
+/// order-k model can't see.
+pub const FORMAT_VERSION: u16 = 3;
 
 /// Errors returned by the archiver.
 #[derive(Debug, Error)]
