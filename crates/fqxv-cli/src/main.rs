@@ -3,6 +3,8 @@
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::Context;
@@ -176,6 +178,14 @@ enum Command {
         /// conventions the detector doesn't recognize).
         #[arg(long, value_enum, help_heading = "Advanced")]
         platform: Option<Platform>,
+        /// Estimate the compression ratio and archive size from a sample of the
+        /// input, then exit without writing anything. Codes the leading reads
+        /// with the real codecs at the chosen `--level`/`--quality-bin` and
+        /// projects the whole-file archive. Reordering (`--order any`/`--max`) is
+        /// not modeled, so with it the estimate is a conservative lower bound —
+        /// the real archive comes out this size or smaller.
+        #[arg(long)]
+        estimate: bool,
     },
     /// Decompress a `.fqxv` file to FASTQ.
     Decompress {
@@ -392,14 +402,11 @@ fn main() -> anyhow::Result<()> {
             keep_order,
             quality_bin,
             platform,
+            estimate,
         } => {
             if inputs.is_empty() {
                 anyhow::bail!("at least one input FASTQ is required");
             }
-            let output = match output {
-                Some(p) => p,
-                None => default_archive_name(&inputs[0])?,
-            };
             // `--max` is the best-ratio preset so users don't have to know the
             // knobs: top effort level plus a request to reorder. The library then
             // decides *dynamically* whether reordering actually pays off for the
@@ -427,9 +434,17 @@ fn main() -> anyhow::Result<()> {
                 threads: cli.threads,
                 platform: platform.map(Into::into),
             };
-            // Surface the lossy-binning footgun before doing the work: binning
-            // an already-binned quality stream only adds distortion.
             warn_redundant_binning(&inputs, params.quality_binning);
+            // `--estimate` samples the input and reports a projected ratio/size
+            // without writing an archive, so it short-circuits the whole compress
+            // path (no output file is resolved or created).
+            if estimate {
+                return run_estimate(&inputs, params, reorders);
+            }
+            let output = match output {
+                Some(p) => p,
+                None => default_archive_name(&inputs[0])?,
+            };
             let in_size: u64 = inputs
                 .iter()
                 .filter_map(|p| std::fs::metadata(p).ok())
@@ -1230,11 +1245,23 @@ fn warn_redundant_binning(inputs: &[PathBuf], binning: fqxv::QualityBinning) {
 }
 
 fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
-    let mut src: Box<dyn Read + Send> = if path.as_os_str() == "-" {
-        Box::new(io::stdin())
+    decode_input(raw_input(path)?)
+}
+
+/// The raw (still-compressed) input source: stdin for `-`, else the file.
+fn raw_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
+    if path.as_os_str() == "-" {
+        Ok(Box::new(io::stdin()))
     } else {
-        Box::new(File::open(path).with_context(|| format!("opening input {}", path.display()))?)
-    };
+        Ok(Box::new(File::open(path).with_context(|| {
+            format!("opening input {}", path.display())
+        })?))
+    }
+}
+
+/// Wrap a raw source in the right decoder, sniffing gzip/BGZF from the leading
+/// magic bytes (identical decoded stream either way — see the module note above).
+fn decode_input(mut src: Box<dyn Read + Send>) -> anyhow::Result<Box<dyn Read + Send>> {
     // Peek enough to classify: 2 bytes for gzip magic, 18 for a full BGZF header.
     let mut magic = [0u8; 18];
     let n = read_up_to(&mut src, &mut magic)?;
@@ -1249,6 +1276,235 @@ fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
     } else {
         Ok(Box::new(chained))
     }
+}
+
+/// Like [`open_input`], but tallies bytes pulled from the *raw* (pre-decode)
+/// source into the returned counter. `--estimate` uses this to learn how much
+/// on-disk input a sample consumed, so it can project the whole-file archive
+/// size — for a gzip input the count is on-disk (compressed) bytes.
+fn open_input_counted(path: &Path) -> anyhow::Result<(Box<dyn Read + Send>, Arc<AtomicU64>)> {
+    let count = Arc::new(AtomicU64::new(0));
+    let counted: Box<dyn Read + Send> = Box::new(CountingReader {
+        inner: raw_input(path)?,
+        count: Arc::clone(&count),
+    });
+    Ok((decode_input(counted)?, count))
+}
+
+/// A pass-through reader that adds every byte it yields to a shared counter.
+struct CountingReader<R> {
+    inner: R,
+    count: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// Cap on the number of reads coded for `--estimate`. One default-level block is
+/// `1 << 20` reads; a sample this size codes in well under a second and warms the
+/// context models the same way a real block does, so the sample's ratio tracks
+/// the full run. Split across inputs so grouped input still samples ~one block.
+const ESTIMATE_SAMPLE_READS: usize = 1 << 20;
+
+/// One input's estimate: the coded sample sizes, the on-disk bytes the sample
+/// consumed (compressed, for a gzip input), and the input's total on-disk size
+/// (`None` for stdin, which has no length).
+struct InputEstimate {
+    est: fqxv::Estimate,
+    consumed: u64,
+    disk: Option<u64>,
+}
+
+/// Run `--estimate`: sample each input, code it with the real codecs, and print a
+/// projected ratio and archive size without writing an archive. `reorders` is the
+/// resolved `--order any`/`--max` flag; when set the estimate is a lower bound
+/// (reordering is not modeled — see the note in the report and `fqxv::estimate`).
+fn run_estimate(inputs: &[PathBuf], params: fqxv::Params, reorders: bool) -> anyhow::Result<()> {
+    let g = inputs.len().max(1);
+    // Keep the aggregate sample ~one block: split the cap across grouped inputs.
+    let per_input = (ESTIMATE_SAMPLE_READS / g).max(1);
+
+    // Sample every input, tracking whether a whole-file size projection is
+    // possible (it is unless a non-exhausted stdin stream hides the total).
+    let mut parts = Vec::with_capacity(inputs.len());
+    for path in inputs {
+        let (reader, counter) = open_input_counted(path)?;
+        let est = fqxv::estimate(reader, params, per_input)
+            .with_context(|| format!("estimating {}", path.display()))?;
+        let consumed = counter.load(Ordering::Relaxed);
+        let disk = if path.as_os_str() == "-" {
+            None
+        } else {
+            std::fs::metadata(path).ok().map(|m| m.len())
+        };
+        parts.push(InputEstimate {
+            est,
+            consumed,
+            disk,
+        });
+    }
+
+    // Aggregate the sample, and project each input's whole-file contribution by
+    // the fraction of its bytes the sample consumed (an exhausted input needs no
+    // projection — its sample *is* the whole file).
+    let mut reads = 0u64;
+    let mut bases = 0u64;
+    let (mut names, mut seq, mut qual) = (0u64, 0u64, 0u64);
+    let mut sample_raw = 0u64;
+    let mut sample_archive = 0u64;
+    let (mut proj_raw, mut proj_archive, mut disk_in) = (0f64, 0f64, 0u64);
+    let mut projectable = true;
+    for p in &parts {
+        let e = &p.est;
+        reads += e.sample_reads;
+        bases += e.sample_bases;
+        names += e.names_bytes;
+        seq += e.seq_bytes;
+        qual += e.qual_bytes;
+        sample_raw += e.raw_bytes;
+        sample_archive += e.archive_bytes;
+        if e.exhausted {
+            // Whole input coded: exact, and its on-disk size is what we consumed.
+            proj_raw += e.raw_bytes as f64;
+            proj_archive += e.archive_bytes as f64;
+            disk_in += p.disk.unwrap_or(p.consumed);
+        } else if let Some(d) = p.disk.filter(|&d| d > 0 && p.consumed > 0) {
+            let frac = (p.consumed as f64 / d as f64).min(1.0);
+            proj_raw += e.raw_bytes as f64 / frac;
+            proj_archive += e.archive_bytes as f64 / frac;
+            disk_in += d;
+        } else {
+            // A non-exhausted stream with no known length: report the sample only.
+            projectable = false;
+        }
+    }
+    let streams = names + seq + qual;
+
+    let mut out = String::new();
+    use std::fmt::Write as _;
+    let _ = writeln!(
+        out,
+        "Estimated from a {}-read sample ({} of uncompressed FASTQ):\n",
+        group_digits(reads),
+        human_bytes(sample_raw),
+    );
+    // Per-stream breakdown: compressed size, share of the coded streams, and the
+    // natural rate for each (names amortize over reads; seq/qual over bases).
+    let share = |b: u64| {
+        if streams == 0 {
+            0.0
+        } else {
+            b as f64 / streams as f64 * 100.0
+        }
+    };
+    let per_read = |b: u64| {
+        if reads == 0 {
+            0.0
+        } else {
+            b as f64 * 8.0 / reads as f64
+        }
+    };
+    let per_base = |b: u64| {
+        if bases == 0 {
+            0.0
+        } else {
+            b as f64 * 8.0 / bases as f64
+        }
+    };
+    let _ = writeln!(out, "  stream      compressed     share   rate");
+    let _ = writeln!(
+        out,
+        "  names     {:>11}   {:>5.1}%   {:.2} bits/read",
+        human_bytes(names),
+        share(names),
+        per_read(names),
+    );
+    let _ = writeln!(
+        out,
+        "  sequence  {:>11}   {:>5.1}%   {:.3} bits/base",
+        human_bytes(seq),
+        share(seq),
+        per_base(seq),
+    );
+    let _ = writeln!(
+        out,
+        "  quality   {:>11}   {:>5.1}%   {:.3} bits/base",
+        human_bytes(qual),
+        share(qual),
+        per_base(qual),
+    );
+
+    let sample_ratio = if sample_archive == 0 {
+        0.0
+    } else {
+        sample_raw as f64 / sample_archive as f64
+    };
+
+    if projectable && proj_archive > 0.0 {
+        let ratio_raw = proj_raw / proj_archive;
+        let ratio_disk = disk_in as f64 / proj_archive;
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  input (on disk)              {:>11}",
+            human_bytes(disk_in)
+        );
+        let _ = writeln!(
+            out,
+            "  input (uncompressed FASTQ)  ~{:>11}",
+            human_bytes(proj_raw as u64)
+        );
+        let _ = writeln!(
+            out,
+            "  estimated archive           ~{:>11}",
+            human_bytes(proj_archive as u64)
+        );
+        let _ = writeln!(
+            out,
+            "  estimated ratio             ~{:.2}x  (vs uncompressed FASTQ)",
+            ratio_raw
+        );
+        let _ = writeln!(
+            out,
+            "                              ~{:.2}x  (vs input on disk)",
+            ratio_disk
+        );
+    } else {
+        // Streaming input of unknown length: the ratio is still meaningful, only
+        // the projected total size is not.
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "  sample     {} -> {} archive",
+            human_bytes(sample_raw),
+            human_bytes(sample_archive),
+        );
+        let _ = writeln!(
+            out,
+            "  estimated ratio             ~{:.2}x  (vs uncompressed FASTQ)",
+            sample_ratio
+        );
+        let _ = writeln!(
+            out,
+            "  (give a file input instead of a stream to project the total size)"
+        );
+    }
+
+    if reorders {
+        let _ = writeln!(
+            out,
+            "\n  note: --order/--max reordering is not modeled; the real archive\n  \
+             will be this size or smaller."
+        );
+    }
+
+    print!("{out}");
+    Ok(())
 }
 
 /// A FASTQ output sink: raw bytes, or BGZF (block-gzip) compression.

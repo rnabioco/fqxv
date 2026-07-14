@@ -86,6 +86,7 @@ pub(crate) use xxhash_rust::xxh3::Xxh3;
 mod block;
 mod compress;
 mod decompress;
+mod estimate;
 mod format;
 mod inspect;
 mod parse;
@@ -108,6 +109,7 @@ pub(crate) use reorder::*;
 // external API is preserved.
 pub use compress::{compress, compress_auto, compress_interleaved, compress_multi, Params, Stats};
 pub use decompress::{content_stats, decompress, decompress_recover, decompress_split, Recovery};
+pub use estimate::{estimate, Estimate};
 pub use inspect::{inspect, peek, ContentStats, Info, Platform, QUAL_MAX};
 pub use verify::{expected_reads, verify, verify_quick, verify_report, VerifyCheck, VerifyReport};
 
