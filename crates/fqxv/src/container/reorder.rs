@@ -229,12 +229,10 @@ pub(crate) fn encode_reordered<W: Write>(
         // layout, so this can only ever shrink the archive.
         let (reference, places) =
             pool.install(|| fqxv_reorder::merge_reference(&refs_all, &reference, &places));
-        // The reference is coded once for the whole file, so it is worth trying a
-        // second, stronger coder: the clean-room order-k model captures local
-        // context, but the reference carries long-range repeat structure it can't
-        // see (near-duplicate contigs — paralogs/isoforms), which a match-based
-        // compressor exploits (~-16% on 4M NovaSeq). `encode_reference_frame`
-        // keeps whichever is smaller, so this can only shrink the archive.
+        // Code the reference once with our clean-room order-k model, split into
+        // fixed blocks compressed in parallel (`encode_reference_frame`). This is
+        // fast — it replaces the single-threaded xz pass that used to dominate
+        // compress time — and adds no external-compressor dependency.
         let ref_payload = pool.install(|| encode_reference_frame(&reference, order))?;
         Some((reference, places, ref_payload))
     } else {
@@ -553,41 +551,30 @@ pub(crate) struct ReorderStreams {
 }
 
 /// Reference-frame coding method (first byte of the `FLAG_GLOBAL_REFERENCE`
-/// frame). The container tries both and keeps the smaller, so which one an
-/// archive uses is a size decision, not a capability.
-const REF_METHOD_SEQ: u8 = 0; // clean-room order-k [`fqxv_seq`] context coder
-const REF_METHOD_XZ: u8 = 1; // `liblzma` (xz) over `[n][lens..][seq]`
+/// frame). The reference is coded once per file with our own clean-room order-k
+/// [`fqxv_seq`] model; the default splits it into fixed blocks coded in parallel.
+const REF_METHOD_SEQ: u8 = 0; // whole-reference order-k `fqxv_seq` (single pass)
+const REF_METHOD_SEQPAR: u8 = 1; // block-parallel order-k `fqxv_seq`
 
-/// xz preset for the reference: level 9 + EXTREME (max ratio). The reference is
-/// coded once per file, so encode time is a fair trade for the smaller frame.
-const REF_XZ_PRESET: u32 = 9 | 0x8000_0000;
+/// Fixed number of contig blocks the reference is split into for parallel coding.
+/// Fixed (never derived from the thread count) so the coded bytes are identical
+/// regardless of `--threads`. Enough blocks to keep many cores busy; the
+/// per-block context reset is a small ratio cost amortized over ~1M+ bases each
+/// on real references.
+const REF_SEQ_BLOCKS: usize = 64;
 
-/// Encode the global reference frame: pick the smaller of the clean-room order-k
-/// coder ([`GlobalReference::encode`]) and an xz pass over the raw bases, tagged
-/// with a leading method byte. `order` is the [`fqxv_seq`] context order for the
-/// order-k path. Never larger than the order-k coder alone (plus one tag byte).
+/// Encode the global reference frame: block-parallel order-k `fqxv_seq`, tagged
+/// with a leading method byte. `order` is the context order. Fast — each block is
+/// a small independent pass fanned across cores — and fully clean-room (no
+/// external compressor). Replaces the old single-threaded xz pass, which was
+/// ~60% of the whole compress time.
 fn encode_reference_frame(
     reference: &fqxv_reorder::GlobalReference,
     order: usize,
 ) -> Result<Vec<u8>> {
-    // Encode the two candidates concurrently: both are pure functions of the same
-    // immutable reference (the only coupling is the length comparison below), so a
-    // join cuts the slower one's full cost off the critical path — the order-k
-    // coder finishes while xz (the longer pole) is still running. The tie-break is
-    // fixed (xz only on a strictly-smaller length), so the chosen bytes — and thus
-    // the archive — are byte-identical regardless of thread count.
-    let (seq_coded, xz) = rayon::join(
-        || reference.encode(order, 0, 0),
-        || encode_reference_xz(reference),
-    );
-    let (seq_coded, xz) = (seq_coded?, xz?);
-    let (method, payload) = if xz.len() < seq_coded.len() {
-        (REF_METHOD_XZ, xz)
-    } else {
-        (REF_METHOD_SEQ, seq_coded)
-    };
+    let payload = reference.encode_blocked(order, REF_SEQ_BLOCKS)?;
     let mut out = Vec::with_capacity(1 + payload.len());
-    out.push(method);
+    out.push(REF_METHOD_SEQPAR);
     out.extend_from_slice(&payload);
     Ok(out)
 }
@@ -596,57 +583,11 @@ fn encode_reference_frame(
 fn decode_reference_frame(bytes: &[u8]) -> Result<fqxv_reorder::GlobalReference> {
     match bytes.split_first() {
         Some((&REF_METHOD_SEQ, rest)) => Ok(fqxv_reorder::GlobalReference::decode(rest)?),
-        Some((&REF_METHOD_XZ, rest)) => decode_reference_xz(rest),
+        Some((&REF_METHOD_SEQPAR, rest)) => {
+            Ok(fqxv_reorder::GlobalReference::decode_blocked(rest)?)
+        }
         _ => Err(Error::Malformed("reorder reference: bad method tag")),
     }
-}
-
-/// xz-code the reference as `[n: u32-le][len_i: u32-le]*[concatenated bases]`,
-/// then compress the whole buffer. The per-contig lengths ride inside the xz
-/// stream (they compress with the bases), so the frame is self-describing.
-fn encode_reference_xz(reference: &fqxv_reorder::GlobalReference) -> Result<Vec<u8>> {
-    let lens = reference.contig_lens();
-    let seq = reference.raw_bases();
-    let mut buf = Vec::with_capacity(4 + 4 * lens.len() + seq.len());
-    buf.extend_from_slice(&(lens.len() as u32).to_le_bytes());
-    for l in &lens {
-        buf.extend_from_slice(&l.to_le_bytes());
-    }
-    buf.extend_from_slice(seq);
-    xz_compress(&buf)
-}
-
-/// Reverse of [`encode_reference_xz`].
-fn decode_reference_xz(payload: &[u8]) -> Result<fqxv_reorder::GlobalReference> {
-    let buf = xz_decompress(payload)?;
-    let bad = || Error::Malformed("reorder reference: truncated xz frame");
-    let n = u32::from_le_bytes(buf.get(0..4).ok_or_else(bad)?.try_into().unwrap()) as usize;
-    let seq_start = 4 + 4 * n;
-    let lens_bytes = buf.get(4..seq_start).ok_or_else(bad)?;
-    let lens: Vec<u32> = lens_bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
-        .collect();
-    let seq = buf.get(seq_start..).ok_or_else(bad)?.to_vec();
-    Ok(fqxv_reorder::GlobalReference::from_lens_seq(&lens, seq)?)
-}
-
-/// Compress with xz at [`REF_XZ_PRESET`]. `liblzma`'s Write API surfaces failures
-/// as `io::Error`, which converts into our error type.
-fn xz_compress(data: &[u8]) -> Result<Vec<u8>> {
-    let stream =
-        liblzma::stream::Stream::new_easy_encoder(REF_XZ_PRESET, liblzma::stream::Check::Crc32)
-            .map_err(|_| Error::Malformed("reorder reference: xz encoder init"))?;
-    let mut enc = liblzma::write::XzEncoder::new_stream(Vec::new(), stream);
-    enc.write_all(data)?;
-    Ok(enc.finish()?)
-}
-
-/// Reverse of [`xz_compress`].
-fn xz_decompress(data: &[u8]) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    liblzma::read::XzDecoder::new(data).read_to_end(&mut out)?;
-    Ok(out)
 }
 
 /// Read and entropy-decode the whole-file reorder layout. `r` is positioned just
@@ -1005,27 +946,29 @@ mod tests {
     fn reference_frame_roundtrips_both_methods() {
         let r = sample_reference();
 
-        // Auto-selected frame (order-k vs xz, whichever is smaller) round-trips.
+        // Default frame (block-parallel order-k) round-trips.
         let frame = encode_reference_frame(&r, 8).unwrap();
+        assert_eq!(frame[0], REF_METHOD_SEQPAR);
         let back = decode_reference_frame(&frame).unwrap();
         assert_eq!(back.raw_bases(), r.raw_bases());
         assert_eq!(back.contig_lens(), r.contig_lens());
 
-        // Force the order-k method and round-trip.
+        // The whole-reference (single-pass) method still decodes.
         let mut seq_frame = vec![REF_METHOD_SEQ];
         seq_frame.extend_from_slice(&r.encode(8, 0, 0).unwrap());
-        assert_eq!(
-            decode_reference_frame(&seq_frame).unwrap().raw_bases(),
-            r.raw_bases()
-        );
+        let seq_back = decode_reference_frame(&seq_frame).unwrap();
+        assert_eq!(seq_back.raw_bases(), r.raw_bases());
+        assert_eq!(seq_back.contig_lens(), r.contig_lens());
 
-        // Force the xz method and round-trip (exercises the liblzma path
-        // deterministically, regardless of which the selector would pick).
-        let mut xz_frame = vec![REF_METHOD_XZ];
-        xz_frame.extend_from_slice(&encode_reference_xz(&r).unwrap());
-        let xz_back = decode_reference_frame(&xz_frame).unwrap();
-        assert_eq!(xz_back.raw_bases(), r.raw_bases());
-        assert_eq!(xz_back.contig_lens(), r.contig_lens());
+        // Block-parallel output is identical regardless of the block count
+        // (fixed contig-index boundaries) — spot-check a couple of block counts
+        // decode to the same reference.
+        for nb in [1usize, 3, 7] {
+            let payload = r.encode_blocked(8, nb).unwrap();
+            let rt = GlobalReference::decode_blocked(&payload).unwrap();
+            assert_eq!(rt.raw_bases(), r.raw_bases());
+            assert_eq!(rt.contig_lens(), r.contig_lens());
+        }
     }
 
     #[test]
