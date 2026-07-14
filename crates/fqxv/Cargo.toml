@@ -26,6 +26,7 @@ thiserror.workspace = true
 noodles-fastq.workspace = true
 memchr.workspace = true
 xxhash-rust.workspace = true
+liblzma.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

@@ -35,6 +35,10 @@ noodles-fastq = "0.23"
 noodles-bgzf = "0.48"
 memchr = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# Long-range compressor for the v4 global reference (coded once; the container
+# keeps it only when it beats the clean-room order-k coder). Maintained fork of
+# the stale `xz2` crate.
+liblzma = "0.4.7"
 bitstream-io = "4"
 flate2 = "1"
 tracing = "0.1"

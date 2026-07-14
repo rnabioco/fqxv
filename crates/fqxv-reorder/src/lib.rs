@@ -1123,6 +1123,16 @@ impl GlobalReference {
         &self.seq[self.offs[ci]..self.offs[ci + 1]]
     }
 
+    /// The concatenated consensus of every contig — the exact bytes [`encode`]
+    /// codes. Exposed for analysis (e.g. comparing the order-k coder against a
+    /// long-range compressor on the raw reference).
+    ///
+    /// [`encode`]: GlobalReference::encode
+    #[must_use]
+    pub fn raw_bases(&self) -> &[u8] {
+        &self.seq
+    }
+
     /// Serialize the reference: contig count, then the concatenated consensus
     /// context-coded by [`fqxv_seq`] with per-contig lengths (so contigs are
     /// deduplicated and modeled as sequence, not stored raw). The reference is
@@ -1139,6 +1149,35 @@ impl GlobalReference {
         write_varint(&mut out, coded.len() as u64);
         out.extend_from_slice(&coded);
         Ok(out)
+    }
+
+    /// Per-contig consensus lengths, in contig order. Together with
+    /// [`raw_bases`](GlobalReference::raw_bases) these fully describe the
+    /// reference, so an external coder can compress the bases and round-trip via
+    /// [`from_lens_seq`](GlobalReference::from_lens_seq).
+    #[must_use]
+    pub fn contig_lens(&self) -> Vec<u32> {
+        (0..self.n_contigs())
+            .map(|c| (self.offs[c + 1] - self.offs[c]) as u32)
+            .collect()
+    }
+
+    /// Rebuild a reference from per-contig lengths and the concatenated
+    /// consensus (the inverse of [`contig_lens`](GlobalReference::contig_lens) +
+    /// [`raw_bases`](GlobalReference::raw_bases)). Errors if the lengths do not
+    /// sum to `seq.len()`.
+    pub fn from_lens_seq(lens: &[u32], seq: Vec<u8>) -> Result<GlobalReference> {
+        let mut offs = Vec::with_capacity(lens.len() + 1);
+        let mut acc = 0usize;
+        offs.push(0);
+        for &l in lens {
+            acc += l as usize;
+            offs.push(acc);
+        }
+        if acc != seq.len() {
+            return Err(Error::Malformed("reference length disagreement"));
+        }
+        Ok(GlobalReference { seq, offs })
     }
 
     /// Reverse of [`GlobalReference::encode`].
