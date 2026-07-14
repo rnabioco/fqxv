@@ -15,6 +15,7 @@ environments:
       linux-64:
       - conda: https://conda.anaconda.org/bioconda/linux-64/bcftools-1.24-h487d631_0.conda
       - conda: https://conda.anaconda.org/bioconda/linux-64/bwa-0.7.19-h577a1d6_1.tar.bz2
+      - conda: https://conda.anaconda.org/bioconda/linux-64/colord-1.1.0-h9ee0642_1.tar.bz2
       - conda: https://conda.anaconda.org/bioconda/linux-64/fqzcomp-4.6-h077b44d_6.tar.bz2
       - conda: https://conda.anaconda.org/bioconda/linux-64/htslib-1.23.1-h633afcb_0.conda
       - conda: https://conda.anaconda.org/bioconda/linux-64/samtools-1.23.1-ha83d96e_0.conda
@@ -129,6 +130,14 @@ packages:
     - bwa >=0.7.19,<0.8.0a0
   size: 654258
   timestamp: 1747108676418
+- conda: https://conda.anaconda.org/bioconda/linux-64/colord-1.1.0-h9ee0642_1.tar.bz2
+  sha256: 3881838c4231d492e66530d3a59541db506d6fef7fe5287ee736ae9a9a9475c0
+  md5: 300f3351ee33683a46a7ce1d7b653e71
+  license: GPL-3
+  license_family: GPL
+  run_exports: {}
+  size: 7803484
+  timestamp: 1647300048157
 - conda: https://conda.anaconda.org/bioconda/linux-64/fqzcomp-4.6-h077b44d_6.tar.bz2
   sha256: f89668eb960bd6cf5bf6d0e06bb90ee70c6fcd5ea1162cf2ad14dd84f797eb3e
   md5: 4777ebd60ed22b5bd949fc784cfe029f
