@@ -1429,6 +1429,46 @@ fn uf_find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
+/// Tunable thresholds for [`merge_reference_with`]. [`MergeConfig::default`]
+/// reproduces [`merge_reference`] byte-for-byte, so sweeping these is a pure
+/// encoder-side experiment — the decoder never sees the reference shape.
+#[derive(Debug, Clone, Copy)]
+pub struct MergeConfig {
+    /// Shortest contig-contig overlap worth merging.
+    pub min_ovl: usize,
+    /// Index each contig's first `prefix` bases as successor entry points.
+    pub prefix: usize,
+    /// Probe each contig's last `suffix` bases for overlaps into a successor.
+    pub suffix: usize,
+    /// Cap candidates kept per k-mer so a repetitive k-mer can't blow up cost.
+    pub fanout: usize,
+    /// Mismatch budget for an overlap is `overlap / mism_div` (larger = stricter).
+    pub mism_div: usize,
+}
+
+impl Default for MergeConfig {
+    fn default() -> Self {
+        Self {
+            min_ovl: MIN_MERGE_OVL,
+            prefix: MERGE_PREFIX,
+            suffix: MERGE_SUFFIX,
+            fanout: MERGE_FANOUT,
+            mism_div: 8,
+        }
+    }
+}
+
+/// Overlap-merge with default thresholds ([`MergeConfig::default`]). See
+/// [`merge_reference_with`] for the full semantics.
+#[must_use]
+pub fn merge_reference(
+    reads: &[&[u8]],
+    reference: &GlobalReference,
+    places: &[Place4],
+) -> (GlobalReference, Vec<Place4>) {
+    merge_reference_with(reads, reference, places, MergeConfig::default())
+}
+
 /// Overlap-merge a greedy reference (see the module note): returns a new
 /// `(reference, placements)` with fewer, longer contigs, usable by
 /// [`encode_global_block`] unchanged. After chaining, the merged consensus is
@@ -1437,11 +1477,13 @@ fn uf_find(parent: &mut [u32], mut x: u32) -> u32 {
 /// per-read mismatch cost down. `reads` are the clustered, oriented reads that
 /// produced `places` (read `i` has placement `places[i]`). Purely additive
 /// refinement — never splits a contig, so every read keeps a valid placement.
+/// `cfg` tunes the overlap-search thresholds ([`MergeConfig`]).
 #[must_use]
-pub fn merge_reference(
+pub fn merge_reference_with(
     reads: &[&[u8]],
     reference: &GlobalReference,
     places: &[Place4],
+    cfg: MergeConfig,
 ) -> (GlobalReference, Vec<Place4>) {
     let nc = reference.n_contigs();
     if nc < 2 {
@@ -1452,12 +1494,12 @@ pub fn merge_reference(
     // 1. Index each contig's PREFIX k-mers -> [(contig, pos)] (capped fan-out).
     let mut index: IntMap<u64, Vec<(u32, u32)>> = IntMap::default();
     for (ci, c) in contigs.iter().enumerate() {
-        let hi = c.len().min(MERGE_PREFIX);
+        let hi = c.len().min(cfg.prefix);
         let mut s = 0usize;
         while s + MERGE_K <= hi {
             if let Some(code) = kmer_at(c, s, MERGE_K) {
                 let e = index.entry(code).or_default();
-                if e.len() < MERGE_FANOUT {
+                if e.len() < cfg.fanout {
                     e.push((ci as u32, s as u32));
                 }
             }
@@ -1474,7 +1516,7 @@ pub fn merge_reference(
         if a.len() < MERGE_K {
             continue;
         }
-        let lo = a.len().saturating_sub(MERGE_SUFFIX);
+        let lo = a.len().saturating_sub(cfg.suffix);
         // best key: (usize::MAX - ovl, mism, bi, s) minimised.
         let mut best_key = (usize::MAX, usize::MAX, usize::MAX, usize::MAX);
         let mut best: Option<(u32, u32)> = None;
@@ -1497,10 +1539,10 @@ pub fn merge_reference(
                         }
                         let ovl = a.len() - s;
                         let b = contigs[bi];
-                        if ovl < MIN_MERGE_OVL || ovl > b.len() {
+                        if ovl < cfg.min_ovl || ovl > b.len() {
                             continue;
                         }
-                        let budget = ovl / 8;
+                        let budget = ovl / cfg.mism_div;
                         let mut mism = 0usize;
                         for t in 0..ovl {
                             if a[s + t] != b[t] {
