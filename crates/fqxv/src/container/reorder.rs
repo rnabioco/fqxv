@@ -227,7 +227,8 @@ pub(crate) fn encode_reordered<W: Write>(
         // reference shrinks 26.8 -> 23.8 MB), where the plain assembly alone was
         // only -3.1%. The whole-file decision below still gates the reference
         // layout, so this can only ever shrink the archive.
-        let (reference, places) = fqxv_reorder::merge_reference(&refs_all, &reference, &places);
+        let (reference, places) =
+            pool.install(|| fqxv_reorder::merge_reference(&refs_all, &reference, &places));
         // The reference is coded once for the whole file, so it is worth trying a
         // second, stronger coder: the clean-room order-k model captures local
         // context, but the reference carries long-range repeat structure it can't

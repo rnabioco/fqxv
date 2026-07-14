@@ -1550,62 +1550,69 @@ pub fn merge_reference_with(
     //    prefix (B starts at offset `s` inside A, overlap = A.len - s reaches A's
     //    end and matches B[0..overlap] within a small mismatch budget). Prefer the
     //    longest overlap, then fewest mismatches, then smallest ids (determinism).
-    let mut succ: Vec<Option<(u32, u32)>> = vec![None; nc]; // (contig B, shift s)
-    for (ai, a) in contigs.iter().enumerate() {
-        if a.len() < MERGE_K {
-            continue;
-        }
-        let lo = a.len().saturating_sub(cfg.suffix);
-        // best key: (usize::MAX - ovl, mism, bi, s) minimised.
-        let mut best_key = (usize::MAX, usize::MAX, usize::MAX, usize::MAX);
-        let mut best: Option<(u32, u32)> = None;
-        let mut pos_a = lo;
-        while pos_a + MERGE_K <= a.len() {
-            if let Some(code) = kmer_at(a, pos_a, MERGE_K) {
-                if let Some(list) = index.get(&code) {
-                    for &(bi_u, pos_b_u) in list {
-                        let bi = bi_u as usize;
-                        if bi == ai {
-                            continue;
-                        }
-                        let pos_b = pos_b_u as usize;
-                        if pos_a < pos_b {
-                            continue;
-                        }
-                        let s = pos_a - pos_b;
-                        if s == 0 || s >= a.len() {
-                            continue;
-                        }
-                        let ovl = a.len() - s;
-                        let b = contigs[bi];
-                        if ovl < cfg.min_ovl || ovl > b.len() {
-                            continue;
-                        }
-                        let budget = ovl / cfg.mism_div;
-                        let mut mism = 0usize;
-                        for t in 0..ovl {
-                            if a[s + t] != b[t] {
-                                mism += 1;
-                                if mism > budget {
-                                    break;
+    // Each contig's best successor depends only on the immutable `contigs` and
+    // `index`, so compute them in parallel — this is the merge's hottest loop
+    // (per-contig suffix probing + mismatch scans). `best_key` is a total order
+    // ((MAX-ovl, mism, bi, s) minimised), so the winner — and the whole result —
+    // is independent of thread count. `succ[ai] = (contig B, shift s)`.
+    let succ: Vec<Option<(u32, u32)>> = (0..nc)
+        .into_par_iter()
+        .map(|ai| {
+            let a = contigs[ai];
+            if a.len() < MERGE_K {
+                return None;
+            }
+            let lo = a.len().saturating_sub(cfg.suffix);
+            let mut best_key = (usize::MAX, usize::MAX, usize::MAX, usize::MAX);
+            let mut best: Option<(u32, u32)> = None;
+            let mut pos_a = lo;
+            while pos_a + MERGE_K <= a.len() {
+                if let Some(code) = kmer_at(a, pos_a, MERGE_K) {
+                    if let Some(list) = index.get(&code) {
+                        for &(bi_u, pos_b_u) in list {
+                            let bi = bi_u as usize;
+                            if bi == ai {
+                                continue;
+                            }
+                            let pos_b = pos_b_u as usize;
+                            if pos_a < pos_b {
+                                continue;
+                            }
+                            let s = pos_a - pos_b;
+                            if s == 0 || s >= a.len() {
+                                continue;
+                            }
+                            let ovl = a.len() - s;
+                            let b = contigs[bi];
+                            if ovl < cfg.min_ovl || ovl > b.len() {
+                                continue;
+                            }
+                            let budget = ovl / cfg.mism_div;
+                            let mut mism = 0usize;
+                            for t in 0..ovl {
+                                if a[s + t] != b[t] {
+                                    mism += 1;
+                                    if mism > budget {
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        if mism > budget {
-                            continue;
-                        }
-                        let key = (usize::MAX - ovl, mism, bi, s);
-                        if key < best_key {
-                            best_key = key;
-                            best = Some((bi as u32, s as u32));
+                            if mism > budget {
+                                continue;
+                            }
+                            let key = (usize::MAX - ovl, mism, bi, s);
+                            if key < best_key {
+                                best_key = key;
+                                best = Some((bi as u32, s as u32));
+                            }
                         }
                     }
                 }
+                pos_a += 1;
             }
-            pos_a += 1;
-        }
-        succ[ai] = best;
-    }
+            best
+        })
+        .collect();
 
     // 3. Resolve successor edges into simple chains: each contig gets at most one
     //    successor and one predecessor, no cycles (union-find). Deterministic:
@@ -1694,14 +1701,20 @@ pub fn merge_reference_with(
             }
         }
     }
-    for (pos, v) in votes.iter().enumerate() {
-        if v.iter().any(|&x| x > 0) {
-            let best = (0..4)
-                .max_by_key(|&k| (v[k], std::cmp::Reverse(k)))
-                .unwrap();
-            new_seq[pos] = b"ACGT"[best];
-        }
-    }
+    // Per-column plurality is independent per position, so resolve in parallel.
+    // Deterministic: each output byte is a pure function of that column's votes
+    // (ties to the lowest base via `Reverse(k)`).
+    new_seq
+        .par_iter_mut()
+        .zip(votes.par_iter())
+        .for_each(|(byte, v)| {
+            if v.iter().any(|&x| x > 0) {
+                let best = (0..4)
+                    .max_by_key(|&k| (v[k], std::cmp::Reverse(k)))
+                    .unwrap();
+                *byte = b"ACGT"[best];
+            }
+        });
 
     let merged = GlobalReference {
         seq: new_seq,
