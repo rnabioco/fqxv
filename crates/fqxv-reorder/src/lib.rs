@@ -973,15 +973,31 @@ pub fn decode_clustered_rescue(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     Ok(reads)
 }
 
-/// Decode a clustered sequence block written by either [`encode_clustered`]
-/// (version 2) or [`encode_clustered_rescue`] (version 3), dispatching on the
-/// leading version byte so the container need not track which codec produced it.
-pub fn decode_clustered_auto(src: &[u8]) -> Result<Vec<Vec<u8>>> {
+/// Decode a clustered sequence block written by [`encode_clustered`] (version 2),
+/// [`encode_clustered_rescue`] (version 3), or [`encode_global_block`] (version
+/// 4), dispatching on the leading version byte. A version-4 block references the
+/// shared frozen [`GlobalReference`], so `reference` must be `Some` for it;
+/// versions 2/3 are self-contained and ignore it. Blocks may mix versions freely
+/// within one archive.
+pub fn decode_clustered_any(
+    src: &[u8],
+    reference: Option<&GlobalReference>,
+) -> Result<Vec<Vec<u8>>> {
     match src.first() {
         Some(2) => decode_clustered(src),
         Some(3) => decode_clustered_rescue(src),
+        Some(4) => {
+            let r = reference.ok_or(Error::Malformed("version-4 block without reference"))?;
+            decode_global_block(src, r)
+        }
         _ => Err(Error::Malformed("unsupported version")),
     }
+}
+
+/// Back-compat shim: dispatch a version-2/3 block with no shared reference.
+/// Equivalent to [`decode_clustered_any`] with `None`; version-4 blocks error.
+pub fn decode_clustered_auto(src: &[u8]) -> Result<Vec<Vec<u8>>> {
+    decode_clustered_any(src, None)
 }
 
 /// Op-mix tally for the literal-rescue codec — the [`op_stats`] analogue for
@@ -1015,6 +1031,329 @@ pub fn op_stats_rescue(reads: &[&[u8]], anchors: &[u32]) -> OpStats {
         }
     }
     st
+}
+
+// --- global-reference contig-assembly codec (prototype, version 4) -----------
+//
+// The v3 codec keeps assembly BLOCK-LOCAL: its multi-contig `Assembler` resets
+// at every 256Ki-read block, so cross-block overlaps are lost, and enlarging the
+// block only trades that gain against an exploding per-read `cref` recency
+// back-reference over the growing contig set (see issue #52). v4 inverts the
+// structure, SPRING-style: assemble ONE global reference over all clustered
+// reads, freeze its final consensus, store it once (context-coded via
+// `fqxv_seq`, deduplicated by construction), and code every read as a *position*
+// on that shared reference — `(contig_id, offset, few mismatches)` — with the
+// contig id DELTA-coded in clustered order rather than a global recency
+// back-reference. Because clustering keeps same-contig reads adjacent, the id
+// delta is mostly zero with rare jumps for reads a k-mer rescued onto a far
+// contig; that is the lever that kills the `cref` blowup.
+//
+// Unlike v2/v3 a v4 block is NOT self-contained: it references the frozen
+// global reference, which lives once at the whole-file level. Encoding is a
+// two-pass whole-file mode: [`assemble_global`] builds+freezes the reference and
+// the per-read placements, then [`encode_global_block`] codes each (parallel)
+// block against the frozen reference. [`decode_global_block`] replays reads
+// against the same reference — no vote/consensus reconstruction needed, so
+// decode is a straight slice-and-patch.
+
+/// The frozen global reference produced by [`assemble_global`]: the final
+/// plurality-consensus bytes of every contig, concatenated, with per-contig
+/// offsets. Reads are coded as positions on it and decoded by slicing it.
+#[derive(Debug, Default, Clone)]
+pub struct GlobalReference {
+    /// Concatenated final consensus bytes of all contigs.
+    seq: Vec<u8>,
+    /// Byte offset of each contig in `seq`; `offs.len() == n_contigs + 1`.
+    offs: Vec<usize>,
+}
+
+impl GlobalReference {
+    /// Number of contigs in the reference.
+    #[must_use]
+    pub fn n_contigs(&self) -> usize {
+        self.offs.len().saturating_sub(1)
+    }
+
+    /// Total reference bytes (the from-scratch content, stored once).
+    #[must_use]
+    pub fn total_bases(&self) -> usize {
+        self.seq.len()
+    }
+
+    /// Consensus bytes of contig `ci`.
+    fn contig(&self, ci: usize) -> &[u8] {
+        &self.seq[self.offs[ci]..self.offs[ci + 1]]
+    }
+
+    /// Serialize the reference: contig count, then the concatenated consensus
+    /// context-coded by [`fqxv_seq`] with per-contig lengths (so contigs are
+    /// deduplicated and modeled as sequence, not stored raw). The reference is
+    /// coded once for the whole file, so it is worth an aggressive hashed
+    /// high-order tier (`hash_order`/`hash_bits`, as in [`fqxv_seq::encode_hashed`]);
+    /// pass `hash_order == 0` for the plain dense order-`seq_order` model.
+    pub fn encode(&self, seq_order: usize, hash_order: usize, hash_bits: u32) -> Result<Vec<u8>> {
+        let lens: Vec<u32> = (0..self.n_contigs())
+            .map(|c| (self.offs[c + 1] - self.offs[c]) as u32)
+            .collect();
+        let coded = fqxv_seq::encode_hashed(&lens, &self.seq, seq_order, hash_order, hash_bits)?;
+        let mut out = Vec::new();
+        write_varint(&mut out, self.n_contigs() as u64);
+        write_varint(&mut out, coded.len() as u64);
+        out.extend_from_slice(&coded);
+        Ok(out)
+    }
+
+    /// Reverse of [`GlobalReference::encode`].
+    pub fn decode(src: &[u8]) -> Result<GlobalReference> {
+        let mut r = Cursor::new(src);
+        let n = r.varint()? as usize;
+        let coded = r.take_stream()?;
+        let (lens, seq) = fqxv_seq::decode(coded)?;
+        if lens.len() != n {
+            return Err(Error::Malformed("reference contig count mismatch"));
+        }
+        let mut offs = Vec::with_capacity(n + 1);
+        let mut acc = 0usize;
+        offs.push(0);
+        for l in &lens {
+            acc += *l as usize;
+            offs.push(acc);
+        }
+        if acc != seq.len() {
+            return Err(Error::Malformed("reference length disagreement"));
+        }
+        Ok(GlobalReference { seq, offs })
+    }
+}
+
+/// Where one read sits on the frozen reference: contig `ci`, starting at column
+/// `off`. The read length (hence overlap) comes from the read itself, so this is
+/// all the placement state a read needs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Place4 {
+    /// Contig index in the [`GlobalReference`].
+    pub ci: u32,
+    /// Start column of the read on that contig.
+    pub off: u32,
+}
+
+/// Pass 1 of the v4 codec: assemble ALL clustered reads into one global set of
+/// contigs (the multi-contig [`Assembler`], never reset), freeze the final
+/// consensus into a [`GlobalReference`], and record each read's placement.
+///
+/// Exact duplicates of the previous read are not re-folded (they inherit the
+/// previous read's placement), matching v3's `MATCH` short-circuit so the
+/// reference structure is the global analogue of v3's per-block contigs. Every
+/// read gets a valid `(ci, off)` so a read that lands at a parallel-block
+/// boundary in pass 2 still has a reference position even when it can't be a
+/// block-local `MATCH`. Deterministic: a sequential fold over the deterministic
+/// clustered order.
+#[must_use]
+pub fn assemble_global(reads: &[&[u8]], anchors: &[u32]) -> (GlobalReference, Vec<Place4>) {
+    let mut asm = Assembler::default();
+    let mut places: Vec<Place4> = Vec::with_capacity(reads.len());
+    for (i, &cur) in reads.iter().enumerate() {
+        if i > 0 && cur == reads[i - 1] {
+            places.push(places[i - 1]);
+            continue;
+        }
+        match asm.place(cur, anchors[i]) {
+            Some(p) => {
+                places.push(Place4 {
+                    ci: p.ci as u32,
+                    off: p.off as u32,
+                });
+                asm.commit(p.ci, cur, p.off, p.overlap);
+            }
+            None => {
+                let ci = asm.contigs.len();
+                asm.seed(cur, anchors[i]);
+                places.push(Place4 {
+                    ci: ci as u32,
+                    off: 0,
+                });
+            }
+        }
+    }
+    // Freeze: concatenate every contig's final consensus byte.
+    let total: usize = asm.contigs.iter().map(Vec::len).sum();
+    let mut seq = Vec::with_capacity(total);
+    let mut offs = Vec::with_capacity(asm.contigs.len() + 1);
+    offs.push(0);
+    for c in &asm.contigs {
+        for col in c {
+            seq.push(col.base);
+        }
+        offs.push(seq.len());
+    }
+    (GlobalReference { seq, offs }, places)
+}
+
+/// Pass 2 of the v4 codec: code one block of clustered reads as positions on the
+/// frozen `reference`, using the placements from [`assemble_global`]. Each read
+/// is `MATCH` (byte-identical to the block-previous read) or `CONTIG` — a
+/// delta-coded contig id, a per-contig delta-coded offset, and the substitutions
+/// versus the frozen consensus. `places` is the slice for this block (same range
+/// as `reads`). Byte-exactly reversible by [`decode_global_block`] given the
+/// same reference.
+pub fn encode_global_block(
+    reads: &[&[u8]],
+    places: &[Place4],
+    reference: &GlobalReference,
+) -> Result<Vec<u8>> {
+    let mut ops = Vec::with_capacity(reads.len());
+    let (mut cid, mut offdelta, mut slen) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut nmis, mut pos, mut subs, mut tail) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+
+    let mut prev_cid: i64 = 0;
+    // Per-contig previous offset (delta-coded within a contig). Bounded by the
+    // distinct contigs a single block references, so a map stays small.
+    let mut last_off: HashMap<u32, i64> = HashMap::new();
+
+    for (i, &cur) in reads.iter().enumerate() {
+        if i > 0 && cur == reads[i - 1] {
+            ops.push(OP_MATCH);
+            continue;
+        }
+        ops.push(OP_CONTIG);
+        let p = places[i];
+        let ci = p.ci as i64;
+        write_varint(&mut cid, zigzag(ci - prev_cid));
+        prev_cid = ci;
+        let off = p.off as usize;
+        let lo = last_off.entry(p.ci).or_insert(0);
+        write_varint(&mut offdelta, zigzag(off as i64 - *lo));
+        *lo = off as i64;
+        write_varint(&mut slen, cur.len() as u64);
+
+        let contig = reference.contig(p.ci as usize);
+        let overlap = cur.len().min(contig.len().saturating_sub(off));
+        let mism: Vec<usize> = (0..overlap)
+            .filter(|&j| cur[j] != contig[off + j])
+            .collect();
+        write_varint(&mut nmis, mism.len() as u64);
+        let mut last = 0usize;
+        for &m in &mism {
+            write_varint(&mut pos, (m - last) as u64);
+            last = m;
+            subs.push(cur[m]);
+        }
+        // On real short-read data every placed read fits within its frozen
+        // contig, so `tail` stays empty; keep it as a safety valve for edge
+        // cases (short reference slices) so the codec never loses bytes.
+        tail.extend_from_slice(&cur[overlap..]);
+    }
+
+    let ops_c = fqxv_rans::encode(&ops, fqxv_rans::Order::One)?;
+    let cid_c = fqxv_rans::encode(&cid, fqxv_rans::Order::Zero)?;
+    let offdelta_c = fqxv_rans::encode(&offdelta, fqxv_rans::Order::Zero)?;
+    let slen_c = fqxv_rans::encode(&slen, fqxv_rans::Order::Zero)?;
+    let nmis_c = fqxv_rans::encode(&nmis, fqxv_rans::Order::Zero)?;
+    let pos_c = fqxv_rans::encode(&pos, fqxv_rans::Order::Zero)?;
+    let subs_c = fqxv_rans::encode(&subs, fqxv_rans::Order::One)?;
+    let tail_c = fqxv_rans::encode(&tail, fqxv_rans::Order::One)?;
+
+    let mut out = Vec::new();
+    out.push(4u8); // version 4: global-reference layout
+    write_varint(&mut out, reads.len() as u64);
+    for s in [
+        &ops_c,
+        &cid_c,
+        &offdelta_c,
+        &slen_c,
+        &nmis_c,
+        &pos_c,
+        &subs_c,
+        &tail_c,
+    ] {
+        write_varint(&mut out, s.len() as u64);
+        out.extend_from_slice(s);
+    }
+    Ok(out)
+}
+
+/// Decode a block written by [`encode_global_block`] against the same frozen
+/// `reference`, returning the reads in clustered order. No consensus is rebuilt:
+/// each read is a slice of the reference with its substitutions patched in.
+pub fn decode_global_block(src: &[u8], reference: &GlobalReference) -> Result<Vec<Vec<u8>>> {
+    let mut r = Cursor::new(src);
+    if r.u8()? != 4 {
+        return Err(Error::Malformed("unsupported version"));
+    }
+    let n = r.varint()? as usize;
+    let ops = fqxv_rans::decode(r.take_stream()?)?;
+    let cid = fqxv_rans::decode(r.take_stream()?)?;
+    let offdelta = fqxv_rans::decode(r.take_stream()?)?;
+    let slen = fqxv_rans::decode(r.take_stream()?)?;
+    let nmis = fqxv_rans::decode(r.take_stream()?)?;
+    let pos = fqxv_rans::decode(r.take_stream()?)?;
+    let subs = fqxv_rans::decode(r.take_stream()?)?;
+    let tail = fqxv_rans::decode(r.take_stream()?)?;
+
+    let mut c_cid = Cursor::new(&cid);
+    let mut c_offdelta = Cursor::new(&offdelta);
+    let mut c_slen = Cursor::new(&slen);
+    let mut c_nmis = Cursor::new(&nmis);
+    let mut c_pos = Cursor::new(&pos);
+    let (mut subs_pos, mut tail_pos) = (0usize, 0usize);
+    let mut reads: Vec<Vec<u8>> = Vec::with_capacity(n.min(1 << 22));
+
+    let mut prev_cid: i64 = 0;
+    let mut last_off: HashMap<u32, i64> = HashMap::new();
+
+    for i in 0..n {
+        let op = *ops.get(i).ok_or(Error::Malformed("op underrun"))?;
+        match op {
+            OP_MATCH => {
+                let read = reads
+                    .last()
+                    .ok_or(Error::Malformed("MATCH with no previous"))?
+                    .clone();
+                reads.push(read);
+            }
+            OP_CONTIG => {
+                let ci_i = prev_cid + unzigzag(c_cid.varint()?);
+                prev_cid = ci_i;
+                let ci = u32::try_from(ci_i).map_err(|_| Error::Malformed("bad contig id"))?;
+                if ci as usize >= reference.n_contigs() {
+                    return Err(Error::Malformed("contig id out of range"));
+                }
+                let lo = last_off.entry(ci).or_insert(0);
+                let off = usize::try_from(*lo + unzigzag(c_offdelta.varint()?))
+                    .map_err(|_| Error::Malformed("bad contig offset"))?;
+                *lo = off as i64;
+                let cur_len = c_slen.varint()? as usize;
+                let contig = reference.contig(ci as usize);
+                if off > contig.len() {
+                    return Err(Error::Malformed("contig offset past reference"));
+                }
+                let overlap = cur_len.min(contig.len() - off);
+                let mut read = vec![0u8; cur_len];
+                read[..overlap].copy_from_slice(&contig[off..off + overlap]);
+                let m = c_nmis.varint()? as usize;
+                let mut p = 0usize;
+                for _ in 0..m {
+                    p += c_pos.varint()? as usize;
+                    let b = *subs
+                        .get(subs_pos)
+                        .ok_or(Error::Malformed("subs underrun"))?;
+                    subs_pos += 1;
+                    *read
+                        .get_mut(p)
+                        .ok_or(Error::Malformed("mismatch position out of range"))? = b;
+                }
+                for slot in read.iter_mut().skip(overlap) {
+                    *slot = *tail
+                        .get(tail_pos)
+                        .ok_or(Error::Malformed("tail underrun"))?;
+                    tail_pos += 1;
+                }
+                reads.push(read);
+            }
+            _ => return Err(Error::Malformed("unknown op")),
+        }
+    }
+    Ok(reads)
 }
 
 struct Cursor<'a> {
@@ -1231,6 +1570,109 @@ mod tests {
         assert_eq!(st.literals, 2, "expected only the two seeds to be literals");
     }
 
+    /// Encode a whole read set with the two-pass v4 codec as a single block and
+    /// decode it against the frozen reference; must be byte-exact.
+    fn v4_roundtrip_one_block(reads: &[&[u8]], anchors: &[u32]) -> Vec<Vec<u8>> {
+        let (reference, places) = assemble_global(reads, anchors);
+        // Reference must serialize/deserialize losslessly too.
+        let ref_bytes = reference.encode(6, 0, 0).expect("ref encode");
+        let reference = GlobalReference::decode(&ref_bytes).expect("ref decode");
+        let enc = encode_global_block(reads, &places, &reference).expect("v4 encode");
+        // Determinism: re-encoding the same input is byte-identical.
+        assert_eq!(
+            encode_global_block(reads, &places, &reference).expect("v4 again"),
+            enc,
+            "v4 encode not deterministic"
+        );
+        decode_global_block(&enc, &reference).expect("v4 decode")
+    }
+
+    #[test]
+    fn global_roundtrip() {
+        let reads: Vec<&[u8]> = vec![
+            b"ACGTACGTACGT",
+            b"ACGTACGTACGT", // match
+            b"ACGTAAGTACGT", // 1 mismatch
+            b"ACGTACGTNCGT", // mismatch incl. N
+            b"TTTTGGGGCCCC", // seeds a second contig
+            b"",             // empty
+            b"",             // match (empty == empty)
+        ];
+        let dec = v4_roundtrip_one_block(&reads, &vec![0u32; reads.len()]);
+        let expect: Vec<Vec<u8>> = reads.iter().map(|r| r.to_vec()).collect();
+        assert_eq!(dec, expect);
+    }
+
+    #[test]
+    fn global_attaches_to_earlier_contig() {
+        // The A,B,A,B,A interleave that strands the third A as a LITERAL under
+        // v2: v4's global reference has one A contig every A read maps onto, so
+        // there are exactly two contigs (one A, one B) — the reference dedups.
+        let a = b"ACGTTGCAACCGGTTACGTAGCTAGCATCGATCGATCGTAGCATGC";
+        let b = b"TTAGGCCATTACAGGTACCATGACATTGGACATTACAGGTTCAAGT";
+        let reads: Vec<&[u8]> = vec![&a[..], &b[..], &a[..], &b[..], &a[..]];
+        let anchors = vec![0u32; reads.len()];
+        let (reference, _places) = assemble_global(&reads, &anchors);
+        assert_eq!(
+            reference.n_contigs(),
+            2,
+            "reference should hold two contigs"
+        );
+        let dec = v4_roundtrip_one_block(&reads, &anchors);
+        let expect: Vec<Vec<u8>> = reads.iter().map(|r| r.to_vec()).collect();
+        assert_eq!(dec, expect);
+    }
+
+    #[test]
+    fn global_multi_block_shares_reference() {
+        // Assemble globally, then code in several small blocks against the one
+        // frozen reference (the container's parallel-block shape). Reads at block
+        // boundaries can't be block-local MATCH, so this exercises the `(ci, off)`
+        // fallback placement for every read.
+        let reference_seq = b"ACGTTGCAACCGGTTACGTAGCTAGCATCGATCGATCGTAGCATGCATCGATCGTAGCTAGCAT";
+        let win = 30usize;
+        let (mut lens, mut seq) = (Vec::new(), Vec::new());
+        for start in 0..=(reference_seq.len() - win) {
+            seq.extend_from_slice(&reference_seq[start..start + win]);
+            lens.push(win as u32);
+        }
+        let p = plan(&lens, &seq, DEFAULT_K);
+        let mut offs = vec![0usize];
+        for &l in &lens {
+            offs.push(offs.last().unwrap() + l as usize);
+        }
+        let cl: Vec<Vec<u8>> = p
+            .order
+            .iter()
+            .map(|&oi| {
+                let oi = oi as usize;
+                let s = &seq[offs[oi]..offs[oi + 1]];
+                if p.flip[oi] {
+                    revcomp(s)
+                } else {
+                    s.to_vec()
+                }
+            })
+            .collect();
+        let refs: Vec<&[u8]> = cl.iter().map(Vec::as_slice).collect();
+        let anchors: Vec<u32> = p.order.iter().map(|&oi| p.anchor[oi as usize]).collect();
+
+        let (reference, places) = assemble_global(&refs, &anchors);
+        let ref_bytes = reference.encode(8, 0, 0).expect("ref encode");
+        let reference = GlobalReference::decode(&ref_bytes).expect("ref decode");
+        // Cut into 4-read blocks and code/decode each against the shared ref.
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        let mut s = 0usize;
+        while s < refs.len() {
+            let e = (s + 4).min(refs.len());
+            let enc = encode_global_block(&refs[s..e], &places[s..e], &reference).expect("enc");
+            got.extend(decode_global_block(&enc, &reference).expect("dec"));
+            s = e;
+        }
+        let expect: Vec<Vec<u8>> = refs.iter().map(|r| r.to_vec()).collect();
+        assert_eq!(got, expect);
+    }
+
     proptest::proptest! {
         #[test]
         fn rescue_roundtrip_arbitrary(
@@ -1292,6 +1734,47 @@ mod tests {
             let enc = encode_clustered(&refs, &vec![0u32; refs.len()], 4).expect("encode");
             let dec = decode_clustered(&enc).expect("decode");
             proptest::prop_assert_eq!(dec, reads);
+        }
+
+        // v4 two-pass: assemble globally, serialize+reload the reference, then
+        // code the whole set as one block and as several small blocks (the
+        // parallel-decode shape) — both against the shared frozen reference. Uses
+        // non-uniform anchors so the anchor-implied candidate path is exercised.
+        #[test]
+        fn global_roundtrip_arbitrary(
+            reads in proptest::collection::vec(
+                proptest::collection::vec(proptest::sample::select(b"ACGTN".to_vec()), 0..80),
+                0..80)
+        ) {
+            let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+            let anchors: Vec<u32> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| ((r.len() * 7 + i * 3) % 41) as u32)
+                .collect();
+            let (reference, places) = assemble_global(&refs, &anchors);
+            let ref_bytes = reference.encode(4, 0, 0).expect("ref encode");
+            proptest::prop_assert_eq!(
+                reference.encode(4, 0, 0).expect("ref again"), ref_bytes.clone(),
+                "reference encode not deterministic"
+            );
+            let reference = GlobalReference::decode(&ref_bytes).expect("ref decode");
+            // Single block.
+            let enc = encode_global_block(&refs, &places, &reference).expect("v4 encode");
+            proptest::prop_assert_eq!(
+                decode_global_block(&enc, &reference).expect("v4 decode"),
+                reads.clone()
+            );
+            // Several small blocks sharing the reference.
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            let mut s = 0usize;
+            while s < refs.len() {
+                let e = (s + 7).min(refs.len());
+                let b = encode_global_block(&refs[s..e], &places[s..e], &reference).expect("enc");
+                got.extend(decode_global_block(&b, &reference).expect("dec"));
+                s = e;
+            }
+            proptest::prop_assert_eq!(got, reads);
         }
 
         #[test]

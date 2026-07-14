@@ -39,13 +39,17 @@ pub struct Params {
     /// restored (otherwise reads emerge in clustered order). Forced on for grouped
     /// input (`group_size > 1`), where the permutation reconstructs the spots.
     pub keep_order: bool,
-    /// In reorder mode, adaptively use the literal-rescue sequence codec: each
-    /// clustered block is coded with both the single-contig (v2) and the
+    /// In reorder mode, adaptively use the assembly-aware sequence codecs: each
+    /// clustered block is coded with the single-contig (v2), the block-local
     /// literal-rescue (v3, keeps every contig alive and re-attaches would-be
-    /// literals via a k-mer-indexed assembly step) assemblers, and the smaller is
-    /// kept — never worse than either alone. Default `true`; set `false` for the
-    /// faster v2-only path. Ignored when `reorder` is false. Decode auto-detects
-    /// the codec per block from a version byte, so blocks may mix versions.
+    /// literals via a k-mer-indexed assembly step), and — over a whole-file frozen
+    /// global reference (v4, SPRING-style) — the smaller is kept. When the shared
+    /// reference nets a whole-file win it is written once and the v4 blocks index
+    /// it; otherwise the archive is exactly the v2/v3 layout, so the choice is
+    /// never worse than the block-local codecs. Default `true`; set `false` for the
+    /// faster v2-only path (which also skips the global assembly). Ignored when
+    /// `reorder` is false. Decode dispatches the codec per block from a version
+    /// byte, so blocks may mix versions.
     pub rescue: bool,
     /// In single-end reorder mode, if the read names are purely positional (a
     /// counter, e.g. SRA `@RUN.N N`), discard the original order and regenerate

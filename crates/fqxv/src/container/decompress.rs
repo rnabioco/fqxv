@@ -19,7 +19,15 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
     // permutation — not the per-block loop below.
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
         let keep_order = header.flags & FLAG_KEEP_ORDER != 0;
-        return decode_reordered_whole(r, writer, threads, keep_order, header.group_size);
+        let has_reference = header.flags & FLAG_GLOBAL_REFERENCE != 0;
+        return decode_reordered_whole(
+            r,
+            writer,
+            threads,
+            keep_order,
+            header.group_size,
+            has_reference,
+        );
     }
     let mut w = BufWriter::new(writer);
 
@@ -170,7 +178,8 @@ pub fn decompress_split<R: Read, W: Write>(
         let global = header.flags & FLAG_GLOBAL_REORDER != 0;
         let keep_order = header.flags & FLAG_KEEP_ORDER != 0;
         if global && keep_order {
-            return decode_reordered_split(r, writers, threads, g);
+            let has_reference = header.flags & FLAG_GLOBAL_REFERENCE != 0;
+            return decode_reordered_split(r, writers, threads, g, has_reference);
         }
         return Err(Error::Malformed(
             "reordered archive without preserved order: use decompress, not split",

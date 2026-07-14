@@ -452,8 +452,10 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         ..Info::default()
     };
     // Whole-file global-cluster layout: [u64 n][flip][perm][name template]
-    // [u32 n_blocks][seq blocks][name+qual blocks]. Permutation is charged to seq;
-    // the name template (non-empty only in discard-order mode) to names.
+    // [global reference?][u32 n_blocks][seq blocks][name+qual blocks]. Permutation
+    // is charged to seq; the name template (non-empty only in discard-order mode)
+    // to names; the shared global reference (present iff FLAG_GLOBAL_REFERENCE) to
+    // seq, since every version-4 block decodes against it.
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
         let mut n8 = [0u8; 8];
         r.read_exact(&mut n8)?;
@@ -461,6 +463,9 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         skip_framed(&mut r)?; // flip bitmap
         info.seq_bytes += skip_framed(&mut r)? as u64; // permutation
         info.names_bytes += skip_framed(&mut r)? as u64; // name template (regen mode)
+        if header.flags & FLAG_GLOBAL_REFERENCE != 0 {
+            info.seq_bytes += skip_framed(&mut r)? as u64; // shared global reference
+        }
         let mut nb = [0u8; 4];
         r.read_exact(&mut nb)?;
         let n_blocks = u32::from_le_bytes(nb) as usize;
