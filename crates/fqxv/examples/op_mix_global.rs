@@ -22,6 +22,7 @@ use std::io::BufReader;
 use std::time::Instant;
 
 use fqxv_reorder::{GlobalReference, Place4};
+use rayon::prelude::*;
 
 /// Minimizer k for clustering — matches the container's `REORDER_K`.
 const REORDER_K: usize = 15;
@@ -219,6 +220,181 @@ fn main() {
         v4_s,
         delta,
     );
+
+    // ---- overlap-merge refinement (A): threshold sweep ----------------------
+    //
+    // The greedy reference fragments into many short contigs (~1.4 reads each);
+    // `merge_reference` chains contigs whose suffix overlaps another's prefix into
+    // longer super-contigs, storing shared sequence once and remapping the reads.
+    // A single pass captures ~all the gain (iterating to convergence adds <0.3%),
+    // but it merges only ~18% of contigs — the other 82% never find a qualifying
+    // successor. This sweeps the overlap-search thresholds to tell WHY: if looser
+    // criteria (shorter min overlap, higher mismatch budget, wider prefix window)
+    // merge substantially more with the ratio still improving, the default
+    // thresholds are the limiter; if not, the remaining contigs are genuinely
+    // distinct sequence and need a different mechanism (containment absorption).
+    // Each config is ONE pass, format-transparent, round-tripped on real data.
+    let global_ref_plain = reference
+        .encode(SEQ_ORDER, 0, 0)
+        .expect("plain ref enc")
+        .len();
+    let global_total_plain = global_ref_plain + v4_block_bytes;
+    let default_cfg = fqxv_reorder::MergeConfig::default();
+    let sweep: [(&str, fqxv_reorder::MergeConfig); 6] = [
+        ("default    ", default_cfg),
+        (
+            "ovl16      ",
+            fqxv_reorder::MergeConfig {
+                min_ovl: 16,
+                ..default_cfg
+            },
+        ),
+        (
+            "mism/5     ",
+            fqxv_reorder::MergeConfig {
+                mism_div: 5,
+                ..default_cfg
+            },
+        ),
+        (
+            "prefix128  ",
+            fqxv_reorder::MergeConfig {
+                prefix: 128,
+                ..default_cfg
+            },
+        ),
+        (
+            "fanout32   ",
+            fqxv_reorder::MergeConfig {
+                fanout: 32,
+                ..default_cfg
+            },
+        ),
+        (
+            "loose-all  ",
+            fqxv_reorder::MergeConfig {
+                min_ovl: 16,
+                mism_div: 5,
+                prefix: 128,
+                fanout: 32,
+                ..default_cfg
+            },
+        ),
+    ];
+    println!("\n== overlap-merge refinement (A): single-pass threshold sweep ==");
+    println!("  config        contigs     %merged    refMB    blkMB   v4totMB   vs-v3    time(s)");
+    println!(
+        "  {:12}  {:>7}   {:>7}   {:>8.2} {:>7.2} {:>8.2}   {:+5.1}%   {:>6}",
+        "none(v4)",
+        reference.n_contigs(),
+        "-",
+        mb(global_ref_plain),
+        mb(v4_block_bytes),
+        mb(global_total_plain),
+        100.0 * (global_total_plain as f64 - v3_bytes as f64) / v3_bytes.max(1) as f64,
+        "-",
+    );
+    let base_contigs = reference.n_contigs();
+    for (name, cfg) in sweep {
+        let t = Instant::now();
+        let (merged, mplaces) =
+            fqxv_reorder::merge_reference_with(&refs_all, &reference, &places, cfg);
+        let merge_s = t.elapsed().as_secs_f64();
+        let mref_payload = merged.encode(SEQ_ORDER, 0, 0).expect("merged ref enc");
+        let mref = GlobalReference::decode(&mref_payload).expect("merged ref dec");
+        let t = Instant::now();
+        let mut merged_block_bytes = 0usize;
+        for &(s, e) in &ranges {
+            let payload = fqxv_reorder::encode_global_block(&refs_all[s..e], &mplaces[s..e], &mref)
+                .expect("merged v4 enc");
+            let dec = fqxv_reorder::decode_global_block(&payload, &mref).expect("merged v4 dec");
+            for (a, b) in dec.iter().zip(refs_all[s..e].iter()) {
+                assert_eq!(a.as_slice(), *b, "merged round-trip mismatch");
+            }
+            merged_block_bytes += payload.len();
+        }
+        let code_s = t.elapsed().as_secs_f64();
+        let merged_total = merged_block_bytes + mref_payload.len();
+        let contigs = merged.n_contigs();
+        let pct_merged = 100.0 * (base_contigs - contigs) as f64 / base_contigs.max(1) as f64;
+        println!(
+            "  {name}  {:>7}   {:>6.1}%   {:>8.2} {:>7.2} {:>8.2}   {:+5.1}%   {:>6.1}",
+            contigs,
+            pct_merged,
+            mb(mref_payload.len()),
+            mb(merged_block_bytes),
+            mb(merged_total),
+            100.0 * (merged_total as f64 - v3_bytes as f64) / v3_bytes.max(1) as f64,
+            merge_s + code_s,
+        );
+    }
+
+    // ---- windowed parallel assembly sweep -----------------------------------
+    //
+    // Pass-1 global assembly is an inherently-sequential fold (each read placed
+    // against the growing reference), so it is the compress-time floor. Splitting
+    // the clustered reads into W non-overlapping windows lets the windows assemble
+    // CONCURRENTLY across cores — and each window's smaller working set stays in
+    // cache — at the cost of losing cross-WINDOW overlaps (a read near a window
+    // edge can't attach to a contig in another window). W=1 is the current global
+    // codec. This measures the ratio/speed trade so the container can pick W.
+    let window_counts = [1usize, 2, 4, 8, 16, 32];
+    println!("\n== windowed parallel assembly (W windows, assembled concurrently) ==");
+    println!("   W   windows   contigs      refMB    blkMB    totMB     Δ-ratio    wall(s)");
+    let mut global_tot = 0f64;
+    for (wi, &w) in window_counts.iter().enumerate() {
+        let wsz = n.div_ceil(w);
+        let wins: Vec<(usize, usize)> = (0..w)
+            .map(|i| (i * wsz, ((i + 1) * wsz).min(n)))
+            .filter(|(s, e)| s < e)
+            .collect();
+        let t = Instant::now();
+        // Each window is independent: assemble it, code its reference once, then
+        // code its reads in 256Ki blocks against that reference (round-tripping).
+        let per_window: Vec<(usize, usize, usize)> = wins
+            .par_iter()
+            .map(|&(ws, we)| {
+                let wrefs = &refs_all[ws..we];
+                let wanch = &cl_anchors[ws..we];
+                let (reference, places) = fqxv_reorder::assemble_global(wrefs, wanch);
+                let ref_payload = reference.encode(SEQ_ORDER, 0, 0).expect("ref enc");
+                let refl = GlobalReference::decode(&ref_payload).expect("ref dec");
+                let m = we - ws;
+                let mut blk_bytes = 0usize;
+                let mut s = 0usize;
+                while s < m {
+                    let e = (s + REORDER_BLOCK_READS).min(m);
+                    let payload =
+                        fqxv_reorder::encode_global_block(&wrefs[s..e], &places[s..e], &refl)
+                            .expect("v4 enc");
+                    let dec = fqxv_reorder::decode_global_block(&payload, &refl).expect("v4 dec");
+                    for (a, b) in dec.iter().zip(wrefs[s..e].iter()) {
+                        assert_eq!(a.as_slice(), *b, "windowed v4 round-trip mismatch");
+                    }
+                    blk_bytes += payload.len();
+                    s = e;
+                }
+                (reference.n_contigs(), ref_payload.len(), blk_bytes)
+            })
+            .collect();
+        let wall = t.elapsed().as_secs_f64();
+        let contigs: usize = per_window.iter().map(|x| x.0).sum();
+        let ref_b: usize = per_window.iter().map(|x| x.1).sum();
+        let blk_b: usize = per_window.iter().map(|x| x.2).sum();
+        let tot = mb(ref_b + blk_b);
+        if wi == 0 {
+            global_tot = tot;
+        }
+        let dratio = 100.0 * (tot - global_tot) / global_tot.max(1e-9);
+        println!(
+            "  {w:>3}   {:>7}   {contigs:>7}   {:>8.2} {:>8.2} {:>8.2}   {:+7.2}%   {wall:>7.1}",
+            wins.len(),
+            mb(ref_b),
+            mb(blk_b),
+            tot,
+            dratio,
+        );
+    }
     // Keep `Place4` import meaningful even if the compiler prunes it otherwise.
     let _ = std::mem::size_of::<Place4>();
 }
