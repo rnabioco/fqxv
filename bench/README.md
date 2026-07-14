@@ -147,6 +147,34 @@ free. Only DNA-resequencing datasets carry a reference; RNA-seq needs
 splice-aware calling and is left out (`-` in `datasets.tsv`). Extra pixi deps:
 `bwa`, `bcftools` (`samtools` was already present).
 
+## Downstream fidelity — BAM round-trip (`bam_identity.sh`)
+
+Where `concordance.sh` asks "do variant calls change?", `bam_identity.sh` asks
+the sharper question: **is the aligned BAM itself identical before vs after
+fqxv?** It aligns the original reads and each fqxv round-trip (`bwa mem`) and
+compares the alignments with `bamcmp` — an `rustc -O` streaming tool (sibling of
+`fqdigest.rs`) that emits order-independent multiset digests of `samtools view`
+in one pass (no `samtools sort`, no `sort | md5sum`), plus a fast `qualdelta`.
+Three digests per BAM: `content` (whole record), `body` (drop QNAME — survives
+renaming), `place` (FLAG..SEQ — survives renaming *and* quality binning).
+
+```bash
+# inside an srun/sbatch allocation:
+sbatch bam_identity.sbatch              # default dataset (ecoli_miseq)
+sbatch bam_identity.sbatch ecoli_miseq  # any datasets.tsv row with a reference
+# results -> $FQXV_RESULTS_DIR/bam_identity.tsv
+```
+
+On E. coli MiSeq (2.19 M reads): **lossless is byte-identical at the BAM level**
+(content/body/place and the coordinate-sorted file all match); the reorder modes
+preserve output order on real SRA data (`order_changed=no`) so they are identical
+too; and lossy `--quality-bin` never moves a read (`place` matches) — only QUAL
+changes, by a bounded amount (`qualdelta`). A `reorder-forced` control shuffles
+the identical read set and realigns: it exposes that **`bwa mem` itself is
+order-sensitive** (~1.2% of reads realign differently — deterministic, not
+threading, unaffected by `-K`), which is why preserving read order is what makes
+a BAM reproducible. Tools: `bwa`, `samtools`, `rustc`.
+
 ## Robustness corpus (`corpus.sh`) — correctness, not ratio
 
 `run_bench.sh` is a curated *ratio* comparison against the field.
