@@ -525,6 +525,17 @@ pub struct Info {
     /// Sequencing platform recorded at compress time (from read-name grammar or
     /// an explicit override); [`Platform::Unknown`] if none was recorded.
     pub platform: Platform,
+    /// On-disk container format version. Always equals [`crate::FORMAT_VERSION`]
+    /// for a readable archive (`read_header` rejects any other), but surfaced so
+    /// tooling can report it without re-parsing the header.
+    pub format_version: u16,
+    /// The archive's stored whole-file CRC-32C (footer field), a stable
+    /// fingerprint of the on-disk bytes through the `total_reads` field. `None`
+    /// for the footer-less whole-file-reorder layout and for truncated archives
+    /// whose footer could not be read (metadata then comes from a forward scan).
+    /// This is the value `verify` recomputes and checks; reporting it lets a user
+    /// record the expected checksum without a full pass.
+    pub whole_file_crc: Option<u32>,
 }
 
 /// One block of parsed FASTQ records. Header text is packed into a single arena
@@ -2309,6 +2320,191 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
     Ok(stats)
 }
 
+/// Highest Phred quality value tracked in [`ContentStats::qual_hist`]. Raw
+/// quality bytes are printable ASCII (33..=126), so the Phred value (`byte - 33`)
+/// tops out at 93; values are clamped into `0..QUAL_MAX` defensively.
+pub const QUAL_MAX: usize = 94;
+
+/// Content-level statistics over an archive's *decoded* reads — the data the
+/// `--stats` pass reports (read-length spread, base composition, quality
+/// distribution). Distinct from [`Info`], which is container metadata read from
+/// the header and footer without decoding; computing these requires a full
+/// decode, so [`content_stats`] runs the normal decompressor and folds its
+/// output rather than re-implementing any codec.
+///
+/// Base counts are over the stored (post-binning for quality; sequence is never
+/// lossy) content and are order-independent, so they match regardless of any
+/// reordering. `a`/`c`/`g`/`t`/`n` count uppercase ACGT/N; every other byte
+/// (IUPAC ambiguity codes, lowercase) falls in `other`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentStats {
+    /// Number of reads decoded.
+    pub reads: u64,
+    /// Total sequence bases across all reads.
+    pub bases: u64,
+    /// Shortest / longest read length seen (both 0 when there are no reads).
+    pub min_len: u32,
+    /// Longest read length seen (0 when there are no reads).
+    pub max_len: u32,
+    /// Uppercase `A` base count.
+    pub a: u64,
+    /// Uppercase `C` base count.
+    pub c: u64,
+    /// Uppercase `G` base count.
+    pub g: u64,
+    /// Uppercase `T` base count.
+    pub t: u64,
+    /// Uppercase `N` base count.
+    pub n: u64,
+    /// Bases that are not uppercase A/C/G/T/N (IUPAC codes, lowercase, etc.).
+    pub other: u64,
+    /// Sum of every quality byte's Phred value (raw byte − 33), for the mean.
+    pub qual_sum: u64,
+    /// Count of quality bytes at each Phred value `0..QUAL_MAX`.
+    pub qual_hist: [u64; QUAL_MAX],
+}
+
+impl Default for ContentStats {
+    fn default() -> Self {
+        ContentStats {
+            reads: 0,
+            bases: 0,
+            min_len: 0,
+            max_len: 0,
+            a: 0,
+            c: 0,
+            g: 0,
+            t: 0,
+            n: 0,
+            other: 0,
+            qual_sum: 0,
+            qual_hist: [0; QUAL_MAX],
+        }
+    }
+}
+
+impl ContentStats {
+    /// GC fraction over unambiguous bases: `(G + C) / (A + C + G + T)`. `None`
+    /// when there are no A/C/G/T bases (an all-`N` or empty archive).
+    pub fn gc_fraction(&self) -> Option<f64> {
+        let acgt = self.a + self.c + self.g + self.t;
+        (acgt > 0).then(|| (self.g + self.c) as f64 / acgt as f64)
+    }
+
+    /// Mean read length, or `None` when there are no reads.
+    pub fn mean_len(&self) -> Option<f64> {
+        (self.reads > 0).then(|| self.bases as f64 / self.reads as f64)
+    }
+
+    /// Mean Phred quality over every base, or `None` when there are no bases.
+    pub fn mean_quality(&self) -> Option<f64> {
+        (self.bases > 0).then(|| self.qual_sum as f64 / self.bases as f64)
+    }
+
+    /// Whether every read has the same length (fixed-length run). True for the
+    /// empty archive vacuously; check [`reads`](Self::reads) first if that
+    /// matters.
+    pub fn fixed_length(&self) -> bool {
+        self.min_len == self.max_len
+    }
+}
+
+/// A [`Write`] sink that folds a decoded interleaved-FASTQ stream into
+/// [`ContentStats`] on the fly. Fed by [`content_stats`] as the decompressor's
+/// output writer, it parses the four-line records incrementally — buffering only
+/// the current line — so a multi-GB archive is summarized without ever holding
+/// the decoded FASTQ in memory. Record lines cycle name → sequence → `+` →
+/// quality; only sequence and quality are inspected.
+#[derive(Default)]
+struct StatsSink {
+    stats: ContentStats,
+    /// Bytes of the current line seen so far (newline excluded).
+    line: Vec<u8>,
+    /// Which line of the current record we are on: 0 name, 1 seq, 2 `+`, 3 qual.
+    line_no: u8,
+    /// Whether any read has been counted (so `min_len` starts from the first).
+    seen: bool,
+}
+
+impl StatsSink {
+    /// Fold one complete line (a trailing `\r` stripped) at the current record
+    /// position, then advance to the next record line.
+    fn commit_line(&mut self) {
+        let mut line = &self.line[..];
+        if line.last() == Some(&b'\r') {
+            line = &line[..line.len() - 1];
+        }
+        match self.line_no {
+            1 => {
+                // Sequence: length spread + base composition.
+                let len = line.len() as u32;
+                if !self.seen || len < self.stats.min_len {
+                    self.stats.min_len = len;
+                }
+                if !self.seen || len > self.stats.max_len {
+                    self.stats.max_len = len;
+                }
+                self.seen = true;
+                self.stats.reads += 1;
+                self.stats.bases += line.len() as u64;
+                for &b in line {
+                    match b {
+                        b'A' => self.stats.a += 1,
+                        b'C' => self.stats.c += 1,
+                        b'G' => self.stats.g += 1,
+                        b'T' => self.stats.t += 1,
+                        b'N' => self.stats.n += 1,
+                        _ => self.stats.other += 1,
+                    }
+                }
+            }
+            3 => {
+                // Quality: mean + per-Phred histogram.
+                for &b in line {
+                    let phred = (b.saturating_sub(33) as usize).min(QUAL_MAX - 1);
+                    self.stats.qual_sum += phred as u64;
+                    self.stats.qual_hist[phred] += 1;
+                }
+            }
+            _ => {} // name / `+` line: ignored
+        }
+        self.line.clear();
+        self.line_no = (self.line_no + 1) % 4;
+    }
+}
+
+impl Write for StatsSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // Decompressor output arrives in arbitrary-sized chunks; reassemble lines
+        // across chunk boundaries by buffering up to each newline.
+        let mut rest = buf;
+        while let Some(nl) = rest.iter().position(|&b| b == b'\n') {
+            self.line.extend_from_slice(&rest[..nl]);
+            self.commit_line();
+            rest = &rest[nl + 1..];
+        }
+        self.line.extend_from_slice(rest);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Compute [`ContentStats`] for an archive by decoding it in full.
+///
+/// This drives the ordinary [`decompress`] path into a folding sink, so it
+/// handles every layout (plain, per-block and whole-file reorder, grouped) with
+/// no codec-specific logic and is guaranteed consistent with what `decompress`
+/// would actually emit. Cost is O(archive) — a real decode — unlike [`inspect`],
+/// which is O(row groups). `threads` matches [`decompress`].
+pub fn content_stats<R: Read>(reader: R, threads: usize) -> Result<ContentStats> {
+    let mut sink = StatsSink::default();
+    decompress(reader, &mut sink, threads)?;
+    Ok(sink.stats)
+}
+
 /// Decompress a grouped archive, splitting reads back into `G` writers by their
 /// per-spot member. `writers.len()` must equal the archive's group size.
 #[instrument(skip_all, fields(threads, outputs = writers.len()))]
@@ -2988,6 +3184,7 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
         regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
         platform: Platform::from_flags(header.flags),
+        format_version: FORMAT_VERSION,
         ..Info::default()
     })
 }
@@ -3026,6 +3223,7 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
         regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
         platform: Platform::from_flags(header.flags),
+        format_version: FORMAT_VERSION,
         ..Info::default()
     };
     // Whole-file global-cluster layout: [u64 n][flip][perm][name template]
@@ -3060,6 +3258,7 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         Ok(footer) => {
             info.reads = footer.total_reads;
             info.blocks = footer.groups.len() as u64;
+            info.whole_file_crc = Some(footer.whole_file_crc);
             for &(off, _) in &footer.groups {
                 // Position past the [8] payload length and [4] block CRC, at the
                 // block header, then walk its stream frames.
@@ -3514,6 +3713,43 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
             v.extend_from_slice(format!("@r.{i} {tag}\nACGT\n+\nIIII\n").as_bytes());
         }
         v
+    }
+
+    #[test]
+    fn content_stats_and_metadata() {
+        // Two reads of different lengths with hand-countable content.
+        let input = b"@r0 x\nACGTACGT\n+\nIIIIIIII\n@r1 x\nACGTN\n+\n!!!!!\n";
+        let archive = compress_bytes(
+            input,
+            Params {
+                threads: 1,
+                ..Params::default()
+            },
+        );
+
+        // Metadata is read from the header + footer without decoding.
+        let info = inspect(io::Cursor::new(&archive)).unwrap();
+        assert_eq!(info.format_version, FORMAT_VERSION);
+        assert!(info.whole_file_crc.is_some(), "plain layout stores the CRC");
+        assert_eq!(info.reads, 2);
+
+        // Content stats require a full decode.
+        let cs = content_stats(&archive[..], 1).unwrap();
+        assert_eq!(cs.reads, 2);
+        assert_eq!(cs.bases, 13);
+        assert_eq!((cs.min_len, cs.max_len), (5, 8));
+        assert!(!cs.fixed_length());
+        assert_eq!((cs.a, cs.c, cs.g, cs.t, cs.n, cs.other), (3, 3, 3, 3, 1, 0));
+        assert_eq!(cs.gc_fraction(), Some(0.5));
+        assert_eq!(cs.mean_len(), Some(6.5));
+        // 'I' is Phred 40, '!' is Phred 0.
+        assert_eq!(cs.qual_hist[40], 8);
+        assert_eq!(cs.qual_hist[0], 5);
+        assert_eq!(cs.qual_sum, 8 * 40);
+        assert!((cs.mean_quality().unwrap() - 320.0 / 13.0).abs() < 1e-9);
+
+        // Thread count must not change the summary (decode is deterministic).
+        assert_eq!(content_stats(&archive[..], 4).unwrap(), cs);
     }
 
     #[test]
