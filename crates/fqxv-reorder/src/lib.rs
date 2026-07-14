@@ -1201,6 +1201,71 @@ impl GlobalReference {
         }
         Ok(GlobalReference { seq, offs })
     }
+
+    /// Block-parallel variant of [`encode`](GlobalReference::encode): split the
+    /// contigs into up to `n_blocks` contiguous groups (by contig index — fixed,
+    /// so the output is byte-identical regardless of thread count) and code each
+    /// group's `(lens, bases)` with a plain order-`seq_order` [`fqxv_seq`] model
+    /// **in parallel**. Far faster than one whole-reference pass (and than xz) at
+    /// a small ratio cost from the per-block context resets. Frame:
+    /// `[varint n_blocks]` then, per block, `[varint n_contigs][varint len][coded]`.
+    pub fn encode_blocked(&self, seq_order: usize, n_blocks: usize) -> Result<Vec<u8>> {
+        let nc = self.n_contigs();
+        let per = nc.div_ceil(n_blocks.clamp(1, nc.max(1)));
+        let bounds: Vec<(usize, usize)> = (0..nc)
+            .step_by(per.max(1))
+            .map(|s| (s, (s + per).min(nc)))
+            .collect();
+        let coded: Vec<Vec<u8>> = bounds
+            .par_iter()
+            .map(|&(s, e)| -> Result<Vec<u8>> {
+                let lens: Vec<u32> = (s..e)
+                    .map(|c| (self.offs[c + 1] - self.offs[c]) as u32)
+                    .collect();
+                Ok(fqxv_seq::encode(
+                    &lens,
+                    &self.seq[self.offs[s]..self.offs[e]],
+                    seq_order,
+                )?)
+            })
+            .collect::<Result<_>>()?;
+        let mut out = Vec::new();
+        write_varint(&mut out, bounds.len() as u64);
+        for (&(s, e), c) in bounds.iter().zip(&coded) {
+            write_varint(&mut out, (e - s) as u64);
+            write_varint(&mut out, c.len() as u64);
+            out.extend_from_slice(c);
+        }
+        Ok(out)
+    }
+
+    /// Reverse of [`encode_blocked`](GlobalReference::encode_blocked).
+    pub fn decode_blocked(src: &[u8]) -> Result<GlobalReference> {
+        let mut r = Cursor::new(src);
+        let nb = r.varint()? as usize;
+        let mut blocks: Vec<(usize, &[u8])> = Vec::with_capacity(nb);
+        for _ in 0..nb {
+            let ncb = r.varint()? as usize;
+            blocks.push((ncb, r.take_stream()?));
+        }
+        let decoded: Vec<(Vec<u32>, Vec<u8>)> = blocks
+            .par_iter()
+            .map(|&(ncb, coded)| -> Result<(Vec<u32>, Vec<u8>)> {
+                let (lens, seq) = fqxv_seq::decode(coded)?;
+                if lens.len() != ncb {
+                    return Err(Error::Malformed("blocked reference contig count mismatch"));
+                }
+                Ok((lens, seq))
+            })
+            .collect::<Result<_>>()?;
+        let mut lens = Vec::new();
+        let mut seq = Vec::new();
+        for (bl, bs) in decoded {
+            lens.extend_from_slice(&bl);
+            seq.extend_from_slice(&bs);
+        }
+        Self::from_lens_seq(&lens, seq)
+    }
 }
 
 /// Where one read sits on the frozen reference: contig `ci`, starting at column
