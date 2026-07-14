@@ -31,6 +31,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
+use fqxv_bytes::{unzigzag, write_varint, zigzag};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -236,13 +237,6 @@ const MIN_CONTIG_OVERLAP: usize = 16;
 /// offset is stored explicitly, so widening the search is purely an
 /// encoder-side choice the decoder never sees.
 const OFF_SEARCH: i64 = 8;
-
-fn zigzag(d: i64) -> u64 {
-    ((d << 1) ^ (d >> 63)) as u64
-}
-fn unzigzag(z: u64) -> i64 {
-    ((z >> 1) as i64) ^ -((z & 1) as i64)
-}
 
 /// A contig column: per-base A/C/G/T vote counts plus the current consensus
 /// byte (the plurality base, or a first-seen non-ACGT byte until an ACGT wins).
@@ -1023,18 +1017,6 @@ pub fn op_stats_rescue(reads: &[&[u8]], anchors: &[u32]) -> OpStats {
     st
 }
 
-fn write_varint(out: &mut Vec<u8>, mut v: u64) {
-    loop {
-        let byte = (v & 0x7f) as u8;
-        v >>= 7;
-        if v == 0 {
-            out.push(byte);
-            break;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -1053,18 +1035,7 @@ impl<'a> Cursor<'a> {
         Ok(b)
     }
     fn varint(&mut self) -> Result<u64> {
-        let (mut v, mut shift) = (0u64, 0u32);
-        loop {
-            let b = self.u8()?;
-            v |= u64::from(b & 0x7f) << shift;
-            if b & 0x80 == 0 {
-                return Ok(v);
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err(Error::Malformed("varint too long"));
-            }
-        }
+        fqxv_bytes::read_varint(self.buf, &mut self.pos).ok_or(Error::Malformed("varint too long"))
     }
     fn take_stream(&mut self) -> Result<&'a [u8]> {
         let n = self.varint()? as usize;

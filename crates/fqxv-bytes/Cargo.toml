@@ -1,6 +1,6 @@
 [package]
-name = "fqxv-tokenizer"
-description = "Positional read-name tokenizer for FASTQ headers — clean-room CRAM 3.1 name codec"
+name = "fqxv-bytes"
+description = "Shared byte-serialization primitives (LEB128 varints and zig-zag) for the fqxv FASTQ toolkit"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,15 +14,5 @@ categories.workspace = true
 [lints]
 workspace = true
 
-[dependencies]
-fqxv-bytes.workspace = true
-fqxv-rans.workspace = true
-thiserror.workspace = true
-
 [dev-dependencies]
 proptest.workspace = true
-criterion.workspace = true
-
-[[bench]]
-name = "tokenizer"
-harness = false

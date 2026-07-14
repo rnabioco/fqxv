@@ -30,6 +30,7 @@
 //! assert_eq!(out_seq, seq);
 //! ```
 
+use fqxv_bytes::write_varint;
 use fqxv_range::{Decoder, Encoder};
 use thiserror::Error;
 
@@ -552,18 +553,6 @@ fn read_exceptions(r: &mut ByteReader<'_>) -> Result<Vec<(usize, u8)>> {
     Ok(v)
 }
 
-fn write_varint(out: &mut Vec<u8>, mut v: u64) {
-    loop {
-        let byte = (v & 0x7f) as u8;
-        v >>= 7;
-        if v == 0 {
-            out.push(byte);
-            break;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
 struct ByteReader<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -582,19 +571,7 @@ impl<'a> ByteReader<'a> {
         Ok(b)
     }
     fn varint(&mut self) -> Result<u64> {
-        let mut v = 0u64;
-        let mut shift = 0u32;
-        loop {
-            let byte = self.u8()?;
-            v |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                return Ok(v);
-            }
-            shift += 7;
-            if shift >= 64 {
-                return Err(Error::Malformed("varint too long"));
-            }
-        }
+        fqxv_bytes::read_varint(self.buf, &mut self.pos).ok_or(Error::Malformed("varint too long"))
     }
     fn rest(&self) -> &'a [u8] {
         &self.buf[self.pos..]
