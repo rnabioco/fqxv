@@ -1394,6 +1394,241 @@ pub fn decode_global_block(src: &[u8], reference: &GlobalReference) -> Result<Ve
     Ok(reads)
 }
 
+// --- overlap-merge assembler refinement (prototype) --------------------------
+//
+// The greedy [`assemble_global`] pass never compares contigs to EACH OTHER, so
+// deep short-read data fragments into many contigs barely longer than one read
+// (on 4M NovaSeq reads: 492K contigs averaging ~204 bp, ~1.4 reads each). The
+// reference — which stores that content once — is then most of the v4 seq bytes.
+// [`merge_reference`] is an overlap-layout refinement (OLC-lite): chain contigs
+// whose suffix overlaps another contig's PREFIX into longer super-contigs, store
+// the shared overlap once, and remap every read's placement onto the merged
+// reference. It is format-transparent — [`encode_global_block`] recomputes each
+// read's mismatches against whatever reference it is handed — so it is a pure
+// encoder-side swap the decoder never sees. Deterministic.
+
+/// k-mer length for detecting contig overlaps (matches the assembly minimizer).
+const MERGE_K: usize = RESCUE_K;
+/// Shortest contig-contig overlap worth merging.
+const MIN_MERGE_OVL: usize = 24;
+/// Index each contig's first `MERGE_PREFIX` bases; a successor's start must land
+/// within here for the overlap to be found. Bounds the index to ~one short-read
+/// worth of prefix per contig.
+const MERGE_PREFIX: usize = 64;
+/// Probe each contig's last `MERGE_SUFFIX` bases for overlaps into a successor.
+const MERGE_SUFFIX: usize = 220;
+/// Cap the candidates kept per k-mer so a repetitive k-mer can't blow up cost.
+const MERGE_FANOUT: usize = 16;
+
+/// Union-find root with path halving.
+fn uf_find(parent: &mut [u32], mut x: u32) -> u32 {
+    while parent[x as usize] != x {
+        parent[x as usize] = parent[parent[x as usize] as usize];
+        x = parent[x as usize];
+    }
+    x
+}
+
+/// Overlap-merge a greedy reference (see the module note): returns a new
+/// `(reference, placements)` with fewer, longer contigs, usable by
+/// [`encode_global_block`] unchanged. After chaining, the merged consensus is
+/// RE-VOTED from every read at its remapped position, so overlap columns reflect
+/// all contributing reads (not just the earliest contig's bytes) — that keeps the
+/// per-read mismatch cost down. `reads` are the clustered, oriented reads that
+/// produced `places` (read `i` has placement `places[i]`). Purely additive
+/// refinement — never splits a contig, so every read keeps a valid placement.
+#[must_use]
+pub fn merge_reference(
+    reads: &[&[u8]],
+    reference: &GlobalReference,
+    places: &[Place4],
+) -> (GlobalReference, Vec<Place4>) {
+    let nc = reference.n_contigs();
+    if nc < 2 {
+        return (reference.clone(), places.to_vec());
+    }
+    let contigs: Vec<&[u8]> = (0..nc).map(|c| reference.contig(c)).collect();
+
+    // 1. Index each contig's PREFIX k-mers -> [(contig, pos)] (capped fan-out).
+    let mut index: IntMap<u64, Vec<(u32, u32)>> = IntMap::default();
+    for (ci, c) in contigs.iter().enumerate() {
+        let hi = c.len().min(MERGE_PREFIX);
+        let mut s = 0usize;
+        while s + MERGE_K <= hi {
+            if let Some(code) = kmer_at(c, s, MERGE_K) {
+                let e = index.entry(code).or_default();
+                if e.len() < MERGE_FANOUT {
+                    e.push((ci as u32, s as u32));
+                }
+            }
+            s += 1;
+        }
+    }
+
+    // 2. For each contig A, find its best successor B: A's suffix overlaps B's
+    //    prefix (B starts at offset `s` inside A, overlap = A.len - s reaches A's
+    //    end and matches B[0..overlap] within a small mismatch budget). Prefer the
+    //    longest overlap, then fewest mismatches, then smallest ids (determinism).
+    let mut succ: Vec<Option<(u32, u32)>> = vec![None; nc]; // (contig B, shift s)
+    for (ai, a) in contigs.iter().enumerate() {
+        if a.len() < MERGE_K {
+            continue;
+        }
+        let lo = a.len().saturating_sub(MERGE_SUFFIX);
+        // best key: (usize::MAX - ovl, mism, bi, s) minimised.
+        let mut best_key = (usize::MAX, usize::MAX, usize::MAX, usize::MAX);
+        let mut best: Option<(u32, u32)> = None;
+        let mut pos_a = lo;
+        while pos_a + MERGE_K <= a.len() {
+            if let Some(code) = kmer_at(a, pos_a, MERGE_K) {
+                if let Some(list) = index.get(&code) {
+                    for &(bi_u, pos_b_u) in list {
+                        let bi = bi_u as usize;
+                        if bi == ai {
+                            continue;
+                        }
+                        let pos_b = pos_b_u as usize;
+                        if pos_a < pos_b {
+                            continue;
+                        }
+                        let s = pos_a - pos_b;
+                        if s == 0 || s >= a.len() {
+                            continue;
+                        }
+                        let ovl = a.len() - s;
+                        let b = contigs[bi];
+                        if ovl < MIN_MERGE_OVL || ovl > b.len() {
+                            continue;
+                        }
+                        let budget = ovl / 8;
+                        let mut mism = 0usize;
+                        for t in 0..ovl {
+                            if a[s + t] != b[t] {
+                                mism += 1;
+                                if mism > budget {
+                                    break;
+                                }
+                            }
+                        }
+                        if mism > budget {
+                            continue;
+                        }
+                        let key = (usize::MAX - ovl, mism, bi, s);
+                        if key < best_key {
+                            best_key = key;
+                            best = Some((bi as u32, s as u32));
+                        }
+                    }
+                }
+            }
+            pos_a += 1;
+        }
+        succ[ai] = best;
+    }
+
+    // 3. Resolve successor edges into simple chains: each contig gets at most one
+    //    successor and one predecessor, no cycles (union-find). Deterministic:
+    //    accept edges in contig order.
+    let mut parent: Vec<u32> = (0..nc as u32).collect();
+    let mut pred_taken = vec![false; nc];
+    let mut chosen: Vec<Option<(u32, u32)>> = vec![None; nc];
+    for ai in 0..nc {
+        if let Some((bi, s)) = succ[ai] {
+            let b = bi as usize;
+            if pred_taken[b] {
+                continue;
+            }
+            if uf_find(&mut parent, ai as u32) == uf_find(&mut parent, bi) {
+                continue; // would close a cycle
+            }
+            chosen[ai] = Some((bi, s));
+            pred_taken[b] = true;
+            let ra = uf_find(&mut parent, ai as u32);
+            let rb = uf_find(&mut parent, bi);
+            parent[ra as usize] = rb;
+        }
+    }
+
+    // 4. Walk each chain head (no predecessor) into a super-contig, recording each
+    //    original contig's (super id, offset). Overlap bytes come from the earlier
+    //    contig; only a successor's non-overlapping tail is appended.
+    let mut super_id = vec![u32::MAX; nc];
+    let mut super_off = vec![0u32; nc];
+    let mut new_seq: Vec<u8> = Vec::with_capacity(reference.total_bases());
+    let mut new_offs: Vec<usize> = vec![0];
+    let mut sid = 0u32;
+    for head in 0..nc {
+        if pred_taken[head] {
+            continue;
+        }
+        let super_start = new_seq.len();
+        new_seq.extend_from_slice(contigs[head]);
+        super_id[head] = sid;
+        super_off[head] = 0;
+        let mut cur = head;
+        let mut base = 0usize; // super-offset of `cur` relative to super_start
+        while let Some((bi, s)) = chosen[cur] {
+            let bi = bi as usize;
+            let bbase = base + s as usize;
+            super_id[bi] = sid;
+            super_off[bi] = bbase as u32;
+            let cur_super_len = new_seq.len() - super_start;
+            let b = contigs[bi];
+            if bbase + b.len() > cur_super_len {
+                let new_from = cur_super_len - bbase; // first novel base of B
+                new_seq.extend_from_slice(&b[new_from..]);
+            }
+            base = bbase;
+            cur = bi;
+        }
+        new_offs.push(new_seq.len());
+        sid += 1;
+    }
+
+    // Remap each read onto its merged super-contig.
+    let new_places: Vec<Place4> = places
+        .iter()
+        .map(|p| {
+            let oc = p.ci as usize;
+            Place4 {
+                ci: super_id[oc],
+                off: super_off[oc] + p.off,
+            }
+        })
+        .collect();
+
+    // Re-vote the merged consensus: fold every read into its remapped position and
+    // take the per-column plurality (ties to the lowest base, matching the greedy
+    // assembler). Overlap columns now reflect all reads, so the reads mismatch the
+    // reference less — recovering most of the block-byte cost the layout-only merge
+    // would otherwise add. Columns with no ACGT vote keep their laid-down byte
+    // (preserving non-ACGT reference content).
+    let mut votes = vec![[0u32; 4]; new_seq.len()];
+    for (r, pl) in reads.iter().zip(&new_places) {
+        let start = new_offs[pl.ci as usize] + pl.off as usize;
+        for (j, &byte) in r.iter().enumerate() {
+            let c = code(byte);
+            if c < 4 {
+                votes[start + j][c as usize] += 1;
+            }
+        }
+    }
+    for (pos, v) in votes.iter().enumerate() {
+        if v.iter().any(|&x| x > 0) {
+            let best = (0..4)
+                .max_by_key(|&k| (v[k], std::cmp::Reverse(k)))
+                .unwrap();
+            new_seq[pos] = b"ACGT"[best];
+        }
+    }
+
+    let merged = GlobalReference {
+        seq: new_seq,
+        offs: new_offs,
+    };
+    (merged, new_places)
+}
+
 struct Cursor<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -1625,6 +1860,59 @@ mod tests {
         decode_global_block(&enc, &reference).expect("v4 decode")
     }
 
+    /// Assemble, overlap-merge the reference, then encode/decode every read
+    /// against the MERGED reference — the placement remap must stay byte-exact.
+    fn v4_merged_roundtrip(reads: &[&[u8]], anchors: &[u32]) -> (usize, usize, Vec<Vec<u8>>) {
+        let (reference, places) = assemble_global(reads, anchors);
+        let before = reference.n_contigs();
+        let (merged, mplaces) = merge_reference(reads, &reference, &places);
+        let after = merged.n_contigs();
+        // Merged reference must serialize/reload and every read must round-trip.
+        let ref_bytes = merged.encode(6, 0, 0).expect("ref encode");
+        let merged = GlobalReference::decode(&ref_bytes).expect("ref decode");
+        let enc = encode_global_block(reads, &mplaces, &merged).expect("v4 encode");
+        let dec = decode_global_block(&enc, &merged).expect("v4 decode");
+        (before, after, dec)
+    }
+
+    #[test]
+    fn merge_reference_roundtrips_and_shrinks() {
+        // Overlapping windows of one reference fragment into several contigs under
+        // the greedy pass; overlap-merge should chain them into fewer contigs and
+        // still round-trip byte-exactly.
+        let reference_seq = b"ACGTTGCAACCGGTTACGTAGCTAGCATCGATCGATCGTAGCATGCATCGATCGTAGCTAGCATTTACAGGTACCATGACATTGG";
+        let win = 40usize;
+        let (mut lens, mut seq) = (Vec::new(), Vec::new());
+        for start in (0..=(reference_seq.len() - win)).step_by(3) {
+            seq.extend_from_slice(&reference_seq[start..start + win]);
+            lens.push(win as u32);
+        }
+        let p = plan(&lens, &seq, DEFAULT_K);
+        let mut offs = vec![0usize];
+        for &l in &lens {
+            offs.push(offs.last().unwrap() + l as usize);
+        }
+        let cl: Vec<Vec<u8>> = p
+            .order
+            .iter()
+            .map(|&oi| {
+                let oi = oi as usize;
+                let s = &seq[offs[oi]..offs[oi + 1]];
+                if p.flip[oi] {
+                    revcomp(s)
+                } else {
+                    s.to_vec()
+                }
+            })
+            .collect();
+        let refs: Vec<&[u8]> = cl.iter().map(Vec::as_slice).collect();
+        let anchors: Vec<u32> = p.order.iter().map(|&oi| p.anchor[oi as usize]).collect();
+        let (before, after, dec) = v4_merged_roundtrip(&refs, &anchors);
+        let expect: Vec<Vec<u8>> = refs.iter().map(|r| r.to_vec()).collect();
+        assert_eq!(dec, expect, "merged reference must round-trip");
+        assert!(after <= before, "merge must not increase contig count");
+    }
+
     #[test]
     fn global_roundtrip() {
         let reads: Vec<&[u8]> = vec![
@@ -1813,6 +2101,37 @@ mod tests {
                 s = e;
             }
             proptest::prop_assert_eq!(got, reads);
+        }
+
+        // The overlap-merge refinement must preserve the v4 round-trip: assemble,
+        // merge the reference (remapping placements), then encode/decode every read
+        // against the merged reference. Also pins merge determinism and that it
+        // never grows the contig set.
+        #[test]
+        fn merge_reference_roundtrip_arbitrary(
+            reads in proptest::collection::vec(
+                proptest::collection::vec(proptest::sample::select(b"ACGTN".to_vec()), 0..80),
+                0..80)
+        ) {
+            let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+            let anchors: Vec<u32> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| ((r.len() * 5 + i * 7) % 37) as u32)
+                .collect();
+            let (reference, places) = assemble_global(&refs, &anchors);
+            let (merged, mplaces) = merge_reference(&refs, &reference, &places);
+            proptest::prop_assert!(merged.n_contigs() <= reference.n_contigs());
+            // Merge is deterministic.
+            let (merged2, _) = merge_reference(&refs, &reference, &places);
+            proptest::prop_assert_eq!(merged.total_bases(), merged2.total_bases());
+            let ref_bytes = merged.encode(4, 0, 0).expect("ref encode");
+            let merged = GlobalReference::decode(&ref_bytes).expect("ref decode");
+            let enc = encode_global_block(&refs, &mplaces, &merged).expect("v4 encode");
+            proptest::prop_assert_eq!(
+                decode_global_block(&enc, &merged).expect("v4 decode"),
+                reads.clone()
+            );
         }
 
         #[test]
