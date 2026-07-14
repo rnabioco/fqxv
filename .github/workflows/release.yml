@@ -1,5 +1,14 @@
 name: Release
 
+# Builds portable `fqxv` CLI binaries for every supported platform and attaches
+# them (plus a SHA256SUMS.txt) to the GitHub Release.
+#
+# Coexistence with release-plz: `release-plz.yml` opens the version-bump PR and,
+# on merge, publishes the workspace to crates.io, pushes the `vX.Y.Z` tag, and
+# creates the GitHub Release with changelog notes (`git_release_enable = true`
+# in release-plz.toml). That tag push triggers THIS workflow, which builds the
+# binaries and uploads them to the release release-plz already created. We do
+# NOT generate our own notes here, so release-plz's changelog body is preserved.
 on:
   push:
     tags:
@@ -10,9 +19,26 @@ permissions:
   contents: read
 
 jobs:
+  macos-verify:
+    name: macOS verify
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets
+
   build:
     name: Build ${{ matrix.target }}
+    needs: macos-verify
     runs-on: ${{ matrix.os }}
+    # aarch64-musl (peak ~6 min) also compiles `cross` from git first; 30 is safe.
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -20,20 +46,36 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            rustflags: "-C target-cpu=x86-64-v3"
+            archive: tar.gz
             use_cross: false
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            rustflags: ""
+            archive: tar.gz
             use_cross: true
           - target: x86_64-apple-darwin
             os: macos-latest
-            rustflags: "-C target-cpu=x86-64-v3"
+            archive: tar.gz
             use_cross: false
           - target: aarch64-apple-darwin
             os: macos-latest
-            rustflags: ""
+            archive: tar.gz
             use_cross: false
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            use_cross: false
+
+    # Portable binaries: build for the generic baseline of each target and let
+    # fqxv-rans' runtime `is_x86_feature_detected!` dispatch pick AVX2/AVX-512
+    # at load time. We deliberately do NOT bake in `-C target-cpu=x86-64-v3`
+    # (the pin in `.cargo/config.toml` is scoped to `x86_64-unknown-linux-gnu`,
+    # which none of these targets use, so it never applies) — a baked-in v3
+    # would crash the CLI on pre-AVX2 CPUs for zero benefit over the runtime
+    # dispatch. Setting RUSTFLAGS empty here keeps that guarantee even if a
+    # target is ever switched to a `-gnu` triple.
+    env:
+      RUSTFLAGS: ""
+
     steps:
       - uses: actions/checkout@v7
 
@@ -55,20 +97,24 @@ jobs:
       - name: Build (cross)
         if: matrix.use_cross
         run: cross build --profile dist --target ${{ matrix.target }} -p fqxv-cli
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
 
       - name: Build (cargo)
         if: ${{ !matrix.use_cross }}
         run: cargo build --profile dist --target ${{ matrix.target }} -p fqxv-cli
-        env:
-          RUSTFLAGS: ${{ matrix.rustflags }}
 
-      - name: Package
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
         run: |
           cd target/${{ matrix.target }}/dist
           tar czvf ../../../fqxv-${{ github.ref_name }}-${{ matrix.target }}.tar.gz fqxv
           cd ../../..
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path target/${{ matrix.target }}/dist/fqxv.exe `
+            -DestinationPath fqxv-${{ github.ref_name }}-${{ matrix.target }}.zip
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -77,15 +123,14 @@ jobs:
           path: fqxv-${{ github.ref_name }}-${{ matrix.target }}.*
 
   release:
-    name: Create Release
+    name: Attach binaries to Release
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Only this job needs write — it uploads assets to the GitHub Release.
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
-
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
@@ -98,9 +143,12 @@ jobs:
           cd artifacts
           sha256sum fqxv-* > SHA256SUMS.txt
 
-      - name: Create Release
+      # Uploads the archives + checksums to the Release for this tag. release-plz
+      # creates that Release (with changelog notes) when it pushes the tag; this
+      # step updates it in place. We pass no `body`/`generate_release_notes`, so
+      # the notes release-plz wrote are left untouched.
+      - name: Attach binaries to Release
         uses: softprops/action-gh-release@v3
         with:
-          generate_release_notes: true
           files: |
             artifacts/*

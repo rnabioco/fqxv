@@ -5,29 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The on-disk `.fqxv` format is **not yet stable**: `FORMAT_VERSION` is `0` and
-archives are not guaranteed to be readable across releases until a `1.0.0`.
+The on-disk `.fqxv` format is **not yet stable**: `FORMAT_VERSION` is `1` and
+archives are not guaranteed to be readable across releases until a `1.0.0` (each
+build reads only its own format version).
 
-## [Unreleased]
-
-### Added
-
-- **Grouped (paired / single-cell) read reordering.** The global-cluster reorder
-  path now accepts interleaved input: reads are clustered ignoring mate
-  structure, the group size is recorded in the header, and a stored permutation
-  reconstructs the original spot interleaving on `decompress` and `--split`.
-  Grouped reorder is therefore always order-preserving.
-
-### Changed
-
-- **CLI: `--reorder`/`--keep-order` replaced by `--order preserve|any`** (an
-  Advanced option; default `preserve`). The flag now names the guarantee the user
-  cares about — whether original read order survives — rather than the reordering
-  mechanism. `any` allows reordering for a better ratio (single-end order may
-  change); grouped input still round-trips in order. The library `Params.reorder`
-  / `Params.keep_order` fields are unchanged.
-
-## [0.1.0] - 2026-07-12
+## [0.1.0] - 2026-07-14
 
 Initial release of `fqxv`, a Rust toolkit for lossless (opt-in lossy) archiving
 of short-read FASTQ. Codecs are clean-room implementations from specs and papers
@@ -45,10 +27,14 @@ of short-read FASTQ. Codecs are clean-room implementations from specs and papers
   seeking reader. Public API: `compress`, `compress_auto`, `compress_multi`,
   `compress_interleaved`, `decompress`, `decompress_split`, `inspect`, `peek`,
   and the `Info`/`Params`/`Stats` types.
-- **`fqxv` CLI** — clap front-end (`fqxv` binary) with `compress`,
-  `decompress`, and `info` subcommands. Reads gzip-compressed or plain FASTQ,
-  supports stdin/stdout streaming, and auto-detects interleaved paired streams.
-  `--level 1-9` maps to sequence context order and block size; `--threads`
+- **`fqxv` CLI** — clap front-end (`fqxv` binary) with `compress`, `decompress`,
+  `info`, and `verify` subcommands. Reads gzip-compressed or plain FASTQ, supports
+  stdin/stdout streaming, and auto-detects interleaved paired streams. `--level
+  1-9` maps to sequence context order and block size; `--max` is the best-ratio
+  preset (deepest context plus read reordering, applied where it helps);
+  `--order preserve|any|shuffle` names the order guarantee (`--keep-order`,
+  `--no-rescue`, `--interleaved` refine it); `info --stats` reports content
+  statistics and `verify --quick` does a fast footer-index CRC check. `--threads`
   defaults to 16 and is clamped to available cores.
 - **`fqxv-rans`** — rANS Nx16 entropy coder (CRAM 3.1) with 32 interleaved
   states and order-0/order-1 models. Backends are selected at runtime via CPU
@@ -65,14 +51,22 @@ of short-read FASTQ. Codecs are clean-room implementations from specs and papers
 - **`fqxv-seq`** — order-k adaptive context model over 2-bit ACGT symbols
   (range-coded, variable read lengths); non-ACGT bytes go to an exception list.
 - **`fqxv-reorder`** — PgRC2/SPRING-class read reordering via canonical-minimizer
-  clustering (reverse-complement aware) to exploit cross-read redundancy;
-  clustered differential codec for single-end and paired container modes.
+  clustering (reverse-complement aware) to exploit cross-read redundancy.
+  Includes a whole-file **global-reference** sequence codec: an assembler builds
+  a shared reference over the clustered reads and codes each read as a position
+  on it, an **overlap-merge** pass consolidates the reference, and it is adopted
+  only when it beats the block-local codecs (never worse). Assembly (windowed),
+  the overlap-merge, and the reference coder are all parallel.
+- **`fqxv-bytes`** — shared byte-serialization primitives (LEB128 varints,
+  zig-zag) used across the codec crates.
 - **Spot grouping / interleaving** — N-way grouping for paired mates and 10x
   R1/R2/I1/I2; blocks always hold whole spots and start on member 0 so they
-  split cleanly.
-- **Parallelism** — block-level `rayon` parallelism on both compress and
-  decompress paths, plus parallel FASTQ parsing and a pipelined reader. Output
-  is byte-identical regardless of thread count.
+  split cleanly. Grouped reorder records the group size and stores a permutation,
+  so it is always order-preserving.
+- **Parallelism** — block-level `rayon` parallelism throughout compress and
+  decompress (assembly, overlap-merge, reference coding, per-block codecs, FASTQ
+  parsing), all with **fixed, thread-independent boundaries**, so output is
+  byte-identical regardless of thread count. No external/C compressor dependency.
 - **Logging** — `tracing`-based logging with `-v`/`-vv`/`-vvv` verbosity.
 - **Documentation site** — zensical-based GitHub Pages site.
 - **Benchmark harness** — separate `bench/` harness (pixi env, Slurm) for
@@ -90,5 +84,4 @@ of short-read FASTQ. Codecs are clean-room implementations from specs and papers
   SPRING and fqz_comp do). Name, sequence, and quality are otherwise preserved
   exactly; this is the one documented deviation from byte-losslessness.
 
-[Unreleased]: https://github.com/rnabioco/fqxv/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.1.0

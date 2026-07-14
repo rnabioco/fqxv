@@ -9,12 +9,14 @@ seek to any of them without scanning the file.
 
 ```text
 [4]  magic "FQXV"
-[2]  format version (LE)        (v1)
+[2]  format version (LE)        (currently v1)
 [1]  sequence context order (k)
 [1]  quality binning tag        (0 lossless, 1 bin8, 2 bin4, 3 bin2)
 [1]  flags                      (bit0 '+' normalized; bit1 reordered;
-                                 bit2 keep-order; bit3 global-reorder)
+                                 bit2 keep-order; bit3 global-reorder;
+                                 bit4 regen-names; bit5 global-reference)
 [1]  group size G               (1 single-end, 2 paired, 3-4 single-cell)
+[4]  header CRC-32C (LE)        (over the 10 header-field bytes above)
 repeated until the terminator:
   [8]  block payload length (LE, nonzero)
   [4]  CRC-32C of the payload (LE)       (verified before the block is decoded)
@@ -52,14 +54,14 @@ to the footer, and reads the row-group index directly. The terminator is what
 lets the same file serve both: the streaming reader stops before the footer, the
 seeking reader skips straight past it.
 
-## Footer index, `inspect`, and random access
+## Footer index, `info`, and random access
 
 The footer records, per row group, the byte offset of its length field and its
 read count (read-start is the running sum). It covers the plain layout; reordered
 archives use a distinct self-describing layout (below). This buys two things over
 the old scan-everything approach:
 
-- **`inspect` is O(row groups), not O(bytes).** It reads the footer for the read
+- **`info` is O(row groups), not O(bytes).** It reads the footer for the read
   and block totals, then seeks to each row group and reads only its small block
   header (the `n_reads` and three stream length prefixes), skipping every coded
   payload.
@@ -104,17 +106,63 @@ restores the `G` separate files.
 
 ## Reordered archives
 
-`--order any` uses a distinct whole-file, globally-clustered layout (flag bit3)
-that is self-describing and carries no footer or terminator — decode dispatches
-on the flag before reading any block, so the footer index applies only to the
-plain layout. Both reorder modes share this one path: with keep-order
-(flag bit2) names/quality are coded in original order and a permutation restores
-it; without it they follow the clustered order and no permutation is written.
-Grouped (paired / single-cell) input reorders too: the reads are clustered
-ignoring mate structure, but the group size is recorded in the header and the
-permutation reconstructs the original spot interleaving, so keep-order is forced
-on and the archive de-interleaves cleanly on `--split`. See
+`--order any` uses a distinct whole-file, globally-clustered layout (flag bit3,
+global-reorder) that is self-describing and carries no footer or terminator —
+decode dispatches on the flag before reading any block, so the footer index
+applies only to the plain layout. Both reorder modes share this one path: with
+keep-order (flag bit2) names/quality are coded in original order and a
+permutation restores it; without it they follow the clustered order and no
+permutation is written. Grouped (paired / single-cell) input reorders too: the
+reads are clustered ignoring mate structure, but the group size is recorded in
+the header and the permutation reconstructs the original spot interleaving, so
+keep-order is forced on and the archive de-interleaves cleanly on `--split`. See
 [Read Reordering](reordering.md).
+
+After the shared header, the reorder layout is a run of length-prefixed,
+CRC-guarded frames (each `[4] len · [4] CRC-32C · payload`):
+
+```text
+[8]  n_reads (LE)
+     flip bitmap        (one bit per clustered read: stored reverse-complemented)
+     permutation        (byte-plane split → rANS; empty when order is not kept)
+     name template      (counter template for regenerated names; empty otherwise)
+     global reference   (present only when flag bit5, global-reference, is set)
+[4]  n_blocks (LE)
+     per block: sequence payload
+     per block: names payload, quality payload
+     output digest      (xxh3-64 over the reads in emit order)
+```
+
+**Sequence codecs (chosen per block, smaller wins).** Each sequence block is
+differential-coded against the clustered order and tagged with a leading version
+byte, so blocks may mix versions and decode dispatches on the byte:
+
+- **v2** — single-contig clustered coding (block-local).
+- **v3** — adds literal-rescue (block-local): reads the single-contig codec would
+  strand as literals are recovered against a block-local reference.
+- **v4** — codes reads as `(contig, offset, mismatches)` positions on **one frozen
+  whole-file global reference** assembled (SPRING-style) over every clustered read,
+  so cross-block overlaps v3 strands as literals collapse to a cheap
+  back-reference. The reference is assembled once, then **overlap-merged** (contigs
+  whose suffix overlaps another's prefix are chained into fewer, longer
+  super-contigs) and stored once in the `global reference` frame.
+
+v4 is enabled by the adaptive rescue path (default under `--order any`; disabled by
+`--no-rescue`). It is only ever adopted when `reference frame + Σ min(v2,v3,v4)` is
+strictly smaller than the block-local `Σ min(v2,v3)` total, so the flag bit5
+reference is written only when it nets a whole-file win — v4 can never enlarge the
+archive.
+
+**Reference-frame coding.** The `global reference` frame begins with a method byte.
+Both methods use the **clean-room order-k `fqxv-seq` context coder** — there is no
+external compressor here (the earlier xz/`liblzma` reference path was removed, so
+the whole codec stack is pure-Rust clean-room):
+
+- `0` — the whole reference coded in a single `fqxv-seq` pass.
+- `1` (the default) — the reference split into a fixed number of contig blocks,
+  each coded with `fqxv-seq` **in parallel**. The block count is fixed (never
+  derived from `--threads`), so the coded bytes are byte-identical regardless of
+  thread count.
 
 ## Integrity
 

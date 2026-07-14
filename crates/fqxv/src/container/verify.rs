@@ -247,7 +247,11 @@ pub fn verify_report(file: &File, quick: bool) -> Result<VerifyReport> {
     let mut report = VerifyReport::default();
 
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
-        report.push("header", true, "format v1, global-cluster reorder layout");
+        report.push(
+            "header",
+            true,
+            format!("format v{FORMAT_VERSION}, global-cluster reorder layout"),
+        );
         // No footer/per-block index; decoding drives every frame CRC.
         r.seek(SeekFrom::Start(0))?;
         match verify(r) {
@@ -257,7 +261,11 @@ pub fn verify_report(file: &File, quick: bool) -> Result<VerifyReport> {
         return Ok(report);
     }
 
-    report.push("header", true, "format v1, plain layout");
+    report.push(
+        "header",
+        true,
+        format!("format v{FORMAT_VERSION}, plain layout"),
+    );
 
     // Footer (read_footer verifies the footer's own CRC).
     let footer = match read_footer(&mut r) {

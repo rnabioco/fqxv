@@ -28,7 +28,9 @@ graph TD
 ```
 
 - **`fqxv-rans`** — rANS Nx16 entropy coder (32 interleaved states, 16-bit
-  renormalization), with scalar and AVX2 decode backends selected at runtime.
+  renormalization), with scalar, AVX2, and AVX-512 backends selected at runtime
+  (the widest detected path wins). The AVX2 and AVX-512 paths cover order-0
+  encode and decode; order-1 and everything below AVX2 run the scalar reference.
 - **`fqxv-range`** — a Subbotin carryless range coder plus an adaptive
   frequency model; the backend for the quality and sequence context models.
 - **`fqxv-fqzcomp`** — a fqzcomp-style quality model: each symbol is coded under
@@ -41,6 +43,10 @@ graph TD
   / literal), rANS-coding the op and payload streams.
 - **`fqxv-reorder`** — canonical-minimizer read clustering (see
   [Read Reordering](reordering.md)).
+- **`fqxv-bytes`** — a leaf crate of shared byte-serialization primitives
+  (LEB128 varints, zig-zag) that `fqxv-seq`, `fqxv-reorder`, `fqxv-fqzcomp`, and
+  `fqxv-tokenizer` all read/write on disk; the single source of truth for those
+  encodings.
 
 ## Clean-room provenance
 
@@ -48,6 +54,11 @@ The CRAM-family codecs (rANS Nx16, the fqzcomp quality model, the name
 tokenizer) are implemented from the published CRAM 3.1 codecs specification and
 source papers — not translated from C. See `THIRD-PARTY-NOTICES.md` in the
 repository. Everything is dual-licensed MIT OR Apache-2.0.
+
+Every compression path is pure-Rust and self-contained: there is **no external or
+C compression library** anywhere in the stack. Even the whole-file reference frame
+of the reordering codec (once handed to xz/`liblzma`) is now coded with the
+in-tree order-k `fqxv-seq` model.
 
 ## Design principles
 
