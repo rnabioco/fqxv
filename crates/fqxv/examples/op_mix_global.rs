@@ -221,58 +221,113 @@ fn main() {
         delta,
     );
 
-    // ---- overlap-merge refinement (A) ---------------------------------------
+    // ---- overlap-merge refinement (A): threshold sweep ----------------------
     //
     // The greedy reference fragments into many short contigs (~1.4 reads each);
     // `merge_reference` chains contigs whose suffix overlaps another's prefix into
     // longer super-contigs, storing shared sequence once and remapping the reads.
-    // Format-transparent: the v4 block codec re-derives mismatches against the
-    // merged reference, so this is a pure encoder-side swap. The prize is a
-    // smaller reference (it is 74% of v4's bytes).
-    let t = Instant::now();
-    let (merged, mplaces) = fqxv_reorder::merge_reference(&refs_all, &reference, &places);
-    let merge_s = t.elapsed().as_secs_f64();
-    let mref_payload = merged.encode(SEQ_ORDER, 0, 0).expect("merged ref enc");
-    let mref = GlobalReference::decode(&mref_payload).expect("merged ref dec");
-    let t = Instant::now();
-    let mut merged_block_bytes = 0usize;
-    for &(s, e) in &ranges {
-        let payload = fqxv_reorder::encode_global_block(&refs_all[s..e], &mplaces[s..e], &mref)
-            .expect("merged v4 enc");
-        let dec = fqxv_reorder::decode_global_block(&payload, &mref).expect("merged v4 dec");
-        for (a, b) in dec.iter().zip(refs_all[s..e].iter()) {
-            assert_eq!(a.as_slice(), *b, "merged round-trip mismatch");
-        }
-        merged_block_bytes += payload.len();
-    }
-    let mblk_s = t.elapsed().as_secs_f64();
-    // Compare against a plain-coded global reference so the reference coder matches.
-    let global_ref_plain = reference.encode(SEQ_ORDER, 0, 0).expect("plain ref enc").len();
+    // A single pass captures ~all the gain (iterating to convergence adds <0.3%),
+    // but it merges only ~18% of contigs — the other 82% never find a qualifying
+    // successor. This sweeps the overlap-search thresholds to tell WHY: if looser
+    // criteria (shorter min overlap, higher mismatch budget, wider prefix window)
+    // merge substantially more with the ratio still improving, the default
+    // thresholds are the limiter; if not, the remaining contigs are genuinely
+    // distinct sequence and need a different mechanism (containment absorption).
+    // Each config is ONE pass, format-transparent, round-tripped on real data.
+    let global_ref_plain = reference
+        .encode(SEQ_ORDER, 0, 0)
+        .expect("plain ref enc")
+        .len();
     let global_total_plain = global_ref_plain + v4_block_bytes;
-    let merged_total = merged_block_bytes + mref_payload.len();
+    let default_cfg = fqxv_reorder::MergeConfig::default();
+    let sweep: [(&str, fqxv_reorder::MergeConfig); 6] = [
+        ("default    ", default_cfg),
+        (
+            "ovl16      ",
+            fqxv_reorder::MergeConfig {
+                min_ovl: 16,
+                ..default_cfg
+            },
+        ),
+        (
+            "mism/5     ",
+            fqxv_reorder::MergeConfig {
+                mism_div: 5,
+                ..default_cfg
+            },
+        ),
+        (
+            "prefix128  ",
+            fqxv_reorder::MergeConfig {
+                prefix: 128,
+                ..default_cfg
+            },
+        ),
+        (
+            "fanout32   ",
+            fqxv_reorder::MergeConfig {
+                fanout: 32,
+                ..default_cfg
+            },
+        ),
+        (
+            "loose-all  ",
+            fqxv_reorder::MergeConfig {
+                min_ovl: 16,
+                mism_div: 5,
+                prefix: 128,
+                fanout: 32,
+                ..default_cfg
+            },
+        ),
+    ];
+    println!("\n== overlap-merge refinement (A): single-pass threshold sweep ==");
+    println!("  config        contigs     %merged    refMB    blkMB   v4totMB   vs-v3    time(s)");
     println!(
-        "\n== overlap-merge refinement (A) ==\n  \
-         contigs        : {} -> {}\n  \
-         reference bases: {} -> {}\n  \
-         reference bytes: {:.2} MB -> {:.2} MB\n  \
-         block bytes    : {:.2} MB -> {:.2} MB\n  \
-         v4 seq total   : {:.2} MB -> {:.2} MB   ({:+.1}% vs global v4, {:+.1}% vs v3)\n  \
-         merge {:.1}s, re-code {:.1}s, round-trip: OK",
+        "  {:12}  {:>7}   {:>7}   {:>8.2} {:>7.2} {:>8.2}   {:+5.1}%   {:>6}",
+        "none(v4)",
         reference.n_contigs(),
-        merged.n_contigs(),
-        reference.total_bases(),
-        merged.total_bases(),
+        "-",
         mb(global_ref_plain),
-        mb(mref_payload.len()),
         mb(v4_block_bytes),
-        mb(merged_block_bytes),
         mb(global_total_plain),
-        mb(merged_total),
-        100.0 * (merged_total as f64 - global_total_plain as f64) / global_total_plain as f64,
-        100.0 * (merged_total as f64 - v3_bytes as f64) / v3_bytes.max(1) as f64,
-        merge_s,
-        mblk_s,
+        100.0 * (global_total_plain as f64 - v3_bytes as f64) / v3_bytes.max(1) as f64,
+        "-",
     );
+    let base_contigs = reference.n_contigs();
+    for (name, cfg) in sweep {
+        let t = Instant::now();
+        let (merged, mplaces) =
+            fqxv_reorder::merge_reference_with(&refs_all, &reference, &places, cfg);
+        let merge_s = t.elapsed().as_secs_f64();
+        let mref_payload = merged.encode(SEQ_ORDER, 0, 0).expect("merged ref enc");
+        let mref = GlobalReference::decode(&mref_payload).expect("merged ref dec");
+        let t = Instant::now();
+        let mut merged_block_bytes = 0usize;
+        for &(s, e) in &ranges {
+            let payload = fqxv_reorder::encode_global_block(&refs_all[s..e], &mplaces[s..e], &mref)
+                .expect("merged v4 enc");
+            let dec = fqxv_reorder::decode_global_block(&payload, &mref).expect("merged v4 dec");
+            for (a, b) in dec.iter().zip(refs_all[s..e].iter()) {
+                assert_eq!(a.as_slice(), *b, "merged round-trip mismatch");
+            }
+            merged_block_bytes += payload.len();
+        }
+        let code_s = t.elapsed().as_secs_f64();
+        let merged_total = merged_block_bytes + mref_payload.len();
+        let contigs = merged.n_contigs();
+        let pct_merged = 100.0 * (base_contigs - contigs) as f64 / base_contigs.max(1) as f64;
+        println!(
+            "  {name}  {:>7}   {:>6.1}%   {:>8.2} {:>7.2} {:>8.2}   {:+5.1}%   {:>6.1}",
+            contigs,
+            pct_merged,
+            mb(mref_payload.len()),
+            mb(merged_block_bytes),
+            mb(merged_total),
+            100.0 * (merged_total as f64 - v3_bytes as f64) / v3_bytes.max(1) as f64,
+            merge_s + code_s,
+        );
+    }
 
     // ---- windowed parallel assembly sweep -----------------------------------
     //
@@ -285,9 +340,7 @@ fn main() {
     // codec. This measures the ratio/speed trade so the container can pick W.
     let window_counts = [1usize, 2, 4, 8, 16, 32];
     println!("\n== windowed parallel assembly (W windows, assembled concurrently) ==");
-    println!(
-        "   W   windows   contigs      refMB    blkMB    totMB     Δ-ratio    wall(s)"
-    );
+    println!("   W   windows   contigs      refMB    blkMB    totMB     Δ-ratio    wall(s)");
     let mut global_tot = 0f64;
     for (wi, &w) in window_counts.iter().enumerate() {
         let wsz = n.div_ceil(w);

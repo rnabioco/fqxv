@@ -217,6 +217,17 @@ pub(crate) fn encode_reordered<W: Write>(
         let refs_all: Vec<&[u8]> = cl_reads.iter().map(Vec::as_slice).collect();
         let (reference, places) =
             pool.install(|| fqxv_reorder::assemble_global(&refs_all, &cl_anchors));
+        // Overlap-merge the greedy reference: chain contigs whose suffix overlaps
+        // another's prefix into fewer, longer super-contigs, store the shared
+        // sequence once, and remap placements. Format-transparent (encode_global_block
+        // re-derives mismatches against whatever reference it is handed), so the
+        // decoder and on-disk layout are unchanged. A single default pass captures
+        // ~all the gain (iterating or loosening thresholds adds <=0.1-0.2%); it is
+        // strongly scale-dependent — measured -8.4% vs v3 on 4M NovaSeq (the
+        // reference shrinks 26.8 -> 23.8 MB), where the plain assembly alone was
+        // only -3.1%. The whole-file decision below still gates the reference
+        // layout, so this can only ever shrink the archive.
+        let (reference, places) = fqxv_reorder::merge_reference(&refs_all, &reference, &places);
         // The reference is coded once; the plain dense order-k model sits at/near
         // its entropy floor here (the hashed high-order tier buys ~0.3% for a
         // ~1 GB table on real RNA-seq), so keep it simple and cheap.
