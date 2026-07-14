@@ -234,7 +234,7 @@ pub(crate) fn encode_reordered<W: Write>(
         // see (near-duplicate contigs — paralogs/isoforms), which a match-based
         // compressor exploits (~-16% on 4M NovaSeq). `encode_reference_frame`
         // keeps whichever is smaller, so this can only shrink the archive.
-        let ref_payload = encode_reference_frame(&reference, order)?;
+        let ref_payload = pool.install(|| encode_reference_frame(&reference, order))?;
         Some((reference, places, ref_payload))
     } else {
         None
@@ -569,8 +569,17 @@ fn encode_reference_frame(
     reference: &fqxv_reorder::GlobalReference,
     order: usize,
 ) -> Result<Vec<u8>> {
-    let seq_coded = reference.encode(order, 0, 0)?;
-    let xz = encode_reference_xz(reference)?;
+    // Encode the two candidates concurrently: both are pure functions of the same
+    // immutable reference (the only coupling is the length comparison below), so a
+    // join cuts the slower one's full cost off the critical path — the order-k
+    // coder finishes while xz (the longer pole) is still running. The tie-break is
+    // fixed (xz only on a strictly-smaller length), so the chosen bytes — and thus
+    // the archive — are byte-identical regardless of thread count.
+    let (seq_coded, xz) = rayon::join(
+        || reference.encode(order, 0, 0),
+        || encode_reference_xz(reference),
+    );
+    let (seq_coded, xz) = (seq_coded?, xz?);
     let (method, payload) = if xz.len() < seq_coded.len() {
         (REF_METHOD_XZ, xz)
     } else {
