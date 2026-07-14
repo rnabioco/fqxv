@@ -30,10 +30,48 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use fqxv_bytes::{unzigzag, write_varint, zigzag};
 use rayon::prelude::*;
 use thiserror::Error;
+
+/// A minimal integer hasher for the assembly maps. Their keys are already
+/// well-mixed — 2-bit-packed k-mers and dense contig ids — so a single
+/// multiplicative (Fibonacci) mix beats SipHash on the ~10^8 inserts/probes the
+/// global assembler drives, and it is the throughput bottleneck of the v4 encode
+/// path. Byte-output-preserving: these maps are only ever probed by key (never
+/// iterated), and callers sort any candidate set deterministically, so the hash
+/// choice cannot change the encoded stream.
+#[derive(Default)]
+struct IntHasher(u64);
+
+impl Hasher for IntHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write_u64(&mut self, v: u64) {
+        self.0 = v.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline]
+    fn write_u32(&mut self, v: u32) {
+        self.0 = u64::from(v).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // Only u32/u64 keys are hashed in this crate; keep a correct fallback so
+        // the impl is total regardless of future key types.
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+        self.0 = self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    }
+}
+
+/// A `HashMap` over integer keys using [`IntHasher`].
+type IntMap<K, V> = HashMap<K, V, BuildHasherDefault<IntHasher>>;
 
 /// Errors returned by the reordering engine.
 #[derive(Debug, Error)]
@@ -663,7 +701,7 @@ struct Assembler {
     contigs: Vec<Vec<Column>>,
     ref_anchors: Vec<u32>,
     /// k-mer -> (contig index, column position); most-recent occurrence wins.
-    index: HashMap<u64, (u32, u32)>,
+    index: IntMap<u64, (u32, u32)>,
 }
 
 /// Acceptance test: can `cur` sit on `contig` at `off`? Returns
@@ -1208,7 +1246,7 @@ pub fn encode_global_block(
     let mut prev_cid: i64 = 0;
     // Per-contig previous offset (delta-coded within a contig). Bounded by the
     // distinct contigs a single block references, so a map stays small.
-    let mut last_off: HashMap<u32, i64> = HashMap::new();
+    let mut last_off: IntMap<u32, i64> = IntMap::default();
 
     for (i, &cur) in reads.iter().enumerate() {
         if i > 0 && cur == reads[i - 1] {
@@ -1299,7 +1337,7 @@ pub fn decode_global_block(src: &[u8], reference: &GlobalReference) -> Result<Ve
     let mut reads: Vec<Vec<u8>> = Vec::with_capacity(n.min(1 << 22));
 
     let mut prev_cid: i64 = 0;
-    let mut last_off: HashMap<u32, i64> = HashMap::new();
+    let mut last_off: IntMap<u32, i64> = IntMap::default();
 
     for i in 0..n {
         let op = *ops.get(i).ok_or(Error::Malformed("op underrun"))?;
