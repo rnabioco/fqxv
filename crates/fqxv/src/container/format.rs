@@ -47,6 +47,12 @@ pub(crate) const FLAG_GLOBAL_REORDER: u8 = 0x08;
 /// Names are regenerated from a stored counter template, not coded per read
 /// (reorder-lossy: reads are renumbered). Set only in the discard-order layout.
 pub(crate) const FLAG_REGEN_NAMES: u8 = 0x10;
+/// The whole-file reorder layout carries a shared frozen global reference frame
+/// (SPRING-style), and one or more sequence blocks are version-4 positions on it
+/// (see `fqxv_reorder::GlobalReference`). Only set within a `FLAG_GLOBAL_REORDER`
+/// archive, and only when the reference nets a whole-file byte win over the
+/// block-local (v2/v3) codecs; otherwise no reference frame is written.
+pub(crate) const FLAG_GLOBAL_REFERENCE: u8 = 0x20;
 
 /// Write the `HEADER_FIELDS_LEN` header fields followed by a CRC-32C over them,
 /// so a flipped header byte is caught on read instead of silently altering decode.

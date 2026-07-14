@@ -150,11 +150,14 @@ enum Command {
         /// interleaving requires it), it just costs a stored permutation.
         #[arg(long, value_enum, default_value_t = ReadOrder::Preserve, help_heading = "Advanced")]
         order: ReadOrder,
-        /// With `--order any`, disable adaptive literal-rescue and use the faster
+        /// With `--order any`, disable the adaptive assembly codecs (block-local
+        /// literal-rescue and the whole-file global reference) and use the faster
         /// single-contig sequence codec only. By default reorder codes each block
-        /// with both codecs and keeps the smaller (never worse), which recovers
-        /// reads the single-contig codec would strand as literals at a higher
-        /// encode cost. No effect without `--order any`.
+        /// with every codec and keeps the smaller — plus, when a shared global
+        /// reference nets a whole-file win, stores it once and codes reads as
+        /// positions on it (never worse than block-local) — recovering reads the
+        /// single-contig codec would strand as literals at a higher encode cost.
+        /// No effect without `--order any`.
         #[arg(long = "no-rescue", help_heading = "Advanced")]
         no_rescue: bool,
         /// With `--order any`, force original read order to be restored on

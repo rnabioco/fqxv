@@ -190,30 +190,102 @@ pub(crate) fn encode_reordered<W: Write>(
     };
 
     // 5a. Sequence — clustered order, differential-coded per block, in parallel.
-    // Adaptive rescue (default): code each block with both the single-contig (v2)
-    // and literal-rescue (v3) assemblers and keep the smaller — v3 recovers reads
-    // v2 strands as literals, but adds a back-reference stream that can cost more
-    // than it saves on data v2 already assembles well, so picking per block is
-    // never worse than either alone. The decoder auto-dispatches on the version
-    // byte, so blocks may mix versions freely. `--no-rescue` (`rescue = false`)
-    // forces the faster v2-only path. Ties keep v2 for determinism.
-    let seq_blocks: Vec<Vec<u8>> = pool.install(|| {
+    //
+    // Three coexisting codecs, arranged to be NEVER WORSE than the block-local
+    // baseline:
+    //   * v2 single-contig and v3 literal-rescue are BLOCK-LOCAL (each block is
+    //     self-contained); the container keeps the smaller per block, as before.
+    //   * v4 codes reads as positions on ONE frozen global reference assembled
+    //     over every clustered read (SPRING-style), so the cross-block overlaps v3
+    //     strands as literals collapse to a cheap (contig, offset, mismatches)
+    //     back-reference — at the cost of a whole-file reference frame stored once.
+    // Pass 1 builds the reference; pass 2 codes every block against it in parallel;
+    // then ONE whole-file choice keeps the reference layout only when it pays:
+    //   reference_frame + Σ min(v2, v3, v4)  <  Σ min(v2, v3).
+    // Otherwise no reference frame is written and the archive is byte-for-byte the
+    // v2/v3 layout it was before — so v4 can only ever shrink the output. Blocks
+    // may mix versions freely (decode dispatches on the leading version byte).
+    // `--no-rescue` (`rescue = false`) forces the fast v2-only path and skips the
+    // global assembly entirely. Ties keep the lower version for determinism.
+    let order = params.seq_order as usize;
+
+    // Pass 1: one global assembly over every clustered read → a frozen reference
+    // plus per-read placements. Sequential (a deterministic fold over clustered
+    // order), so it is the throughput floor of this path; only run when v4 is a
+    // candidate (the adaptive `rescue` path).
+    let global = if params.rescue && n > 0 {
+        let refs_all: Vec<&[u8]> = cl_reads.iter().map(Vec::as_slice).collect();
+        let (reference, places) =
+            pool.install(|| fqxv_reorder::assemble_global(&refs_all, &cl_anchors));
+        // The reference is coded once; the plain dense order-k model sits at/near
+        // its entropy floor here (the hashed high-order tier buys ~0.3% for a
+        // ~1 GB table on real RNA-seq), so keep it simple and cheap.
+        let ref_payload = reference.encode(order, 0, 0)?;
+        Some((reference, places, ref_payload))
+    } else {
+        None
+    };
+
+    // Pass 2: per block, the block-local best (v2/v3) and — when a reference
+    // exists — the reference-inclusive best (v2/v3/v4). Both are kept until the
+    // whole-file decision below picks one layout for the archive.
+    struct BlockChoice {
+        block_local: Vec<u8>,
+        with_ref: Vec<u8>,
+    }
+    let choices: Vec<BlockChoice> = pool.install(|| {
         ranges
             .par_iter()
-            .map(|&(s, e)| -> Result<Vec<u8>> {
+            .map(|&(s, e)| -> Result<BlockChoice> {
                 let refs: Vec<&[u8]> = cl_reads[s..e].iter().map(Vec::as_slice).collect();
                 let anch = &cl_anchors[s..e];
-                let order = params.seq_order as usize;
-                let v2 = fqxv_reorder::encode_clustered(&refs, anch, order)?;
+                let mut block_local = fqxv_reorder::encode_clustered(&refs, anch, order)?;
                 if params.rescue {
                     let v3 = fqxv_reorder::encode_clustered_rescue(&refs, anch, order)?;
-                    Ok(if v3.len() < v2.len() { v3 } else { v2 })
-                } else {
-                    Ok(v2)
+                    if v3.len() < block_local.len() {
+                        block_local = v3;
+                    }
                 }
+                let with_ref = match &global {
+                    Some((reference, places, _)) => {
+                        let v4 =
+                            fqxv_reorder::encode_global_block(&refs, &places[s..e], reference)?;
+                        if v4.len() < block_local.len() {
+                            v4
+                        } else {
+                            block_local.clone()
+                        }
+                    }
+                    None => Vec::new(), // unused when there is no reference
+                };
+                Ok(BlockChoice {
+                    block_local,
+                    with_ref,
+                })
             })
             .collect::<Result<_>>()
     })?;
+
+    // Whole-file decision: adopt the reference layout only if it is strictly
+    // smaller than the block-local layout (reference frame included).
+    let (use_reference, seq_blocks, ref_payload): (bool, Vec<Vec<u8>>, Vec<u8>) = match global {
+        Some((_, _, ref_payload)) => {
+            let with_ref_total =
+                ref_payload.len() + choices.iter().map(|c| c.with_ref.len()).sum::<usize>();
+            let block_local_total = choices.iter().map(|c| c.block_local.len()).sum::<usize>();
+            if with_ref_total < block_local_total {
+                let blocks = choices.into_iter().map(|c| c.with_ref).collect();
+                (true, blocks, ref_payload)
+            } else {
+                let blocks = choices.into_iter().map(|c| c.block_local).collect();
+                (false, blocks, Vec::new())
+            }
+        }
+        None => {
+            let blocks = choices.into_iter().map(|c| c.block_local).collect();
+            (false, blocks, Vec::new())
+        }
+    };
 
     // 5b. Names, then the keep_order decision, then quality.
     //
@@ -352,6 +424,9 @@ pub(crate) fn encode_reordered<W: Write>(
     if template.is_some() {
         flags |= FLAG_REGEN_NAMES;
     }
+    if use_reference {
+        flags |= FLAG_GLOBAL_REFERENCE;
+    }
     write_header_prefix(
         &mut w,
         params.seq_order,
@@ -365,6 +440,11 @@ pub(crate) fn encode_reordered<W: Write>(
     // Name-template frame (empty unless regenerating names).
     let tmpl_bytes = template.as_ref().map(|t| t.to_bytes()).unwrap_or_default();
     write_framed(&mut w, &tmpl_bytes)?;
+    // Shared global reference frame (only when the v4 layout was chosen); the
+    // FLAG_GLOBAL_REFERENCE bit tells the decoder whether to expect it here.
+    if use_reference {
+        write_framed(&mut w, &ref_payload)?;
+    }
     w.write_all(&(ranges.len() as u32).to_le_bytes())?;
     for payload in &seq_blocks {
         write_framed(&mut w, payload)?;
@@ -412,10 +492,16 @@ pub(crate) fn encode_reordered<W: Write>(
 
     // Each framed slice is [4 len][4 crc][bytes]; n_blocks is a bare [4].
     let frame = |len: usize| 4 + CRC_LEN + len;
+    let ref_frame = if use_reference {
+        frame(ref_payload.len())
+    } else {
+        0
+    };
     let out_bytes = (HEADER_LEN
         + 8
         + frame(flip_bits.len())
         + frame(perm_c.len())
+        + ref_frame
         + 4
         + seq_blocks.iter().map(|p| frame(p.len())).sum::<usize>()
         + nq_blocks
@@ -453,10 +539,13 @@ pub(crate) struct ReorderStreams {
 
 /// Read and entropy-decode the whole-file reorder layout. `r` is positioned just
 /// past the header. Shared by [`decode_reordered_whole`] and
-/// [`decode_reordered_split`].
+/// [`decode_reordered_split`]. `has_reference` (the `FLAG_GLOBAL_REFERENCE` bit)
+/// says whether a shared global reference frame precedes the block count; when
+/// set, version-4 sequence blocks are decoded as positions on it.
 pub(crate) fn read_reordered_streams<R: Read>(
     mut r: R,
     pool: &rayon::ThreadPool,
+    has_reference: bool,
 ) -> Result<ReorderStreams> {
     let mut n_buf = [0u8; 8];
     r.read_exact(&mut n_buf)?;
@@ -470,6 +559,14 @@ pub(crate) fn read_reordered_streams<R: Read>(
         Some(fqxv_tokenizer::NameTemplate::from_bytes(&tmpl_bytes)?)
     };
     let regen = template.is_some();
+    // Shared global reference frame (present iff FLAG_GLOBAL_REFERENCE) — decoded
+    // once, then every version-4 block indexes into it.
+    let reference = if has_reference {
+        let ref_bytes = read_framed(&mut r, "reorder global reference")?;
+        Some(fqxv_reorder::GlobalReference::decode(&ref_bytes)?)
+    } else {
+        None
+    };
     let mut nb = [0u8; 4];
     r.read_exact(&mut nb)?;
     let n_blocks = u32::from_le_bytes(nb) as usize;
@@ -493,11 +590,16 @@ pub(crate) fn read_reordered_streams<R: Read>(
             .map_err(|_| Error::Malformed("reorder output digest length"))?,
     );
 
-    // Decode both partitions in parallel.
+    // Decode both partitions in parallel. Version-4 blocks index the shared
+    // reference; version-2/3 blocks ignore it (decode dispatches on the version
+    // byte), so an archive may freely mix them.
+    let reference_ref = reference.as_ref();
     let seq_dec: Vec<Vec<Vec<u8>>> = pool.install(|| {
         seq_payloads
             .par_iter()
-            .map(|p| -> Result<Vec<Vec<u8>>> { Ok(fqxv_reorder::decode_clustered_auto(p)?) })
+            .map(|p| -> Result<Vec<Vec<u8>>> {
+                Ok(fqxv_reorder::decode_clustered_any(p, reference_ref)?)
+            })
             .collect::<Result<_>>()
     })?;
     // Per name+quality block: (decoded names, (per-read lengths, quality bytes)).
@@ -585,16 +687,18 @@ pub(crate) fn unpermute_sequences(s: &mut ReorderStreams) -> Result<Vec<Vec<u8>>
 /// the header. `keep_order` (from `FLAG_KEEP_ORDER`) selects the mode: un-permute
 /// into original order, or emit in clustered order. `group_size` is recorded in
 /// the returned [`Stats`]; grouped archives are always `keep_order`, so their
-/// records emerge in original spot-interleaved order.
+/// records emerge in original spot-interleaved order. `has_reference` (the
+/// `FLAG_GLOBAL_REFERENCE` bit) says whether a shared reference frame is present.
 pub(crate) fn decode_reordered_whole<R: Read, W: Write>(
     r: R,
     writer: W,
     threads: usize,
     keep_order: bool,
     group_size: u8,
+    has_reference: bool,
 ) -> Result<Stats> {
     let pool = build_pool(threads)?;
-    let mut s = read_reordered_streams(r, &pool)?;
+    let mut s = read_reordered_streams(r, &pool, has_reference)?;
     let n = s.n;
     let n_blocks = s.n_blocks;
     let expected_digest = s.output_digest;
@@ -675,14 +779,17 @@ pub(crate) fn decode_reordered_whole<R: Read, W: Write>(
 /// writers by their per-spot member. Only valid for `keep_order` archives (the
 /// permutation reconstructs the mate interleaving); the caller guarantees this.
 /// Record `i` in restored original order belongs to member `i % g`.
+/// `has_reference` (the `FLAG_GLOBAL_REFERENCE` bit) says whether a shared
+/// reference frame is present.
 pub(crate) fn decode_reordered_split<R: Read, W: Write>(
     r: R,
     writers: &mut [W],
     threads: usize,
     g: usize,
+    has_reference: bool,
 ) -> Result<Stats> {
     let pool = build_pool(threads)?;
-    let mut s = read_reordered_streams(r, &pool)?;
+    let mut s = read_reordered_streams(r, &pool, has_reference)?;
     let n = s.n;
     let n_blocks = s.n_blocks;
     let expected_digest = s.output_digest;

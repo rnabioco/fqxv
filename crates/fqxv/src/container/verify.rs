@@ -17,7 +17,15 @@ pub fn verify<R: Read + Seek>(reader: R) -> Result<()> {
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
         // No footer/whole-file digest here; decoding drives every frame CRC.
         let keep_order = header.flags & FLAG_KEEP_ORDER != 0;
-        decode_reordered_whole(r, io::sink(), 0, keep_order, header.group_size)?;
+        let has_reference = header.flags & FLAG_GLOBAL_REFERENCE != 0;
+        decode_reordered_whole(
+            r,
+            io::sink(),
+            0,
+            keep_order,
+            header.group_size,
+            has_reference,
+        )?;
         return Ok(());
     }
     let footer = read_footer(&mut r)?;
