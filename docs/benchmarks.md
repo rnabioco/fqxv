@@ -55,6 +55,37 @@ output regardless of thread count.
   quality 30.9 MB (42%). The remaining ratio gap to SPRING is in the sequence
   stream's read-order handling, not the entropy coders.
 
+## Round-trip fidelity (alignment level)
+
+A compression ratio only counts if the reads survive intact. Beyond `fqxv`'s
+internal round-trip digest, the `bench/bam_identity.sh` harness proves fidelity
+*through a real analysis*: it aligns the original reads and the `fqxv`
+round-tripped reads with `bwa mem` and compares the BAMs with an order-independent
+multiset digest (`bench/bamcmp.rs`).
+
+On E. coli MiSeq (SRR2627175, 2.19 M reads, GCF_000005845.2):
+
+| Mode | BAM vs original | Detail |
+| --- | --- | --- |
+| lossless (default) | **byte-identical** | every field, including the coordinate-sorted file |
+| `--order any` / `--order shuffle` | **byte-identical** | output order preserved on real SRA data |
+| `--quality-bin bin8` | reads unmoved; QUAL only | mean \|Δ\| 1.10, max 4 Phred (72.7% of bases) |
+| `--quality-bin bin4` | reads unmoved; QUAL only | mean \|Δ\| 2.79, max 10 Phred (96.7%) |
+| `--quality-bin bin2` | reads unmoved; QUAL only | mean \|Δ\| 1.90, max 13 Phred (78.0%) |
+
+- **Lossless is byte-identical at the BAM level**, not just the FASTQ: placement
+  (FLAG/POS/MAPQ/CIGAR/SEQ), quality, and read names all match.
+- **Lossy quality binning never moves a read.** Placement is identical for every
+  bin; only the quality string changes, by a bounded amount.
+
+!!! note "Read order is load-bearing"
+    A control that shuffles the *identical* read set (same multiset, verified by
+    `fqdigest`) and realigns shows `bwa mem` itself placing **~1.2%** of reads
+    differently — deterministically, independent of thread count and unaffected
+    by `-K`. So a reproducible BAM depends on preserving read order, which `fqxv`
+    does by default and in its reorder/`--max` modes on real data. This is an
+    aligner property, not a `fqxv` effect: the reads going in are byte-identical.
+
 ## Codecs
 
 Every codec is clean-room, pure Rust — there is **no external/C compressor
