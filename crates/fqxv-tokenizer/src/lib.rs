@@ -134,7 +134,12 @@ fn read_delta_planes(r: &mut Cursor<'_>, n_delta: &[usize]) -> Result<Vec<Vec<u6
             cols.push(Vec::new());
             continue;
         }
-        let mut vals = vec![0u64; n];
+        // `n` derives from the untrusted `n_records` header, so reserve fallibly:
+        // a corrupt count must error, not abort on a huge infallible allocation.
+        let mut vals: Vec<u64> = Vec::new();
+        vals.try_reserve_exact(n)
+            .map_err(|_| Error::Malformed("delta plane too large to allocate"))?;
+        vals.resize(n, 0);
         for plane in 0..width {
             let len = r.varint()? as usize;
             let bytes = fqxv_rans::decode(r.take(len)?)?;
@@ -204,6 +209,10 @@ fn read_op_rle(r: &mut Cursor<'_>, n_records: usize) -> Result<Vec<Vec<u8>>> {
             if col.len() + run > n_records {
                 return Err(Error::Malformed("op run too long"));
             }
+            // `n_records` is an untrusted header, so the guard above is not a real
+            // bound; grow fallibly so a crafted run can't abort on a huge alloc.
+            col.try_reserve(run)
+                .map_err(|_| Error::Malformed("op run too large to allocate"))?;
             col.resize(col.len() + run, s);
         }
         cols.push(col);
@@ -251,6 +260,11 @@ pub struct NameTemplate {
 /// Upper bound on template columns (bounds header size; names with more
 /// digit/non-digit runs are treated as not regenerable).
 const MAX_TEMPLATE_COLS: usize = 64;
+
+/// Upper bound on a counter column's zero-pad width. A real read-name numeric
+/// field is a handful of digits; this cap (comfortably above any genuine value)
+/// stops a corrupt template from driving an unbounded fill in [`NameTemplate::regenerate`].
+const MAX_COUNTER_PAD: usize = 1024;
 
 impl NameTemplate {
     /// A synthetic renumbering template: the name at output position `j` is the
@@ -324,6 +338,9 @@ impl NameTemplate {
                 1 => {
                     let start = unzigzag(r.varint()?);
                     let pad = r.varint()? as usize;
+                    if pad > MAX_COUNTER_PAD {
+                        return Err(Error::Malformed("name-template counter pad too large"));
+                    }
                     columns.push(TemplateColumn::Counter { start, pad });
                 }
                 _ => return Err(Error::Malformed("bad name-template column tag")),
@@ -808,5 +825,54 @@ mod tests {
             let out = decode(&enc).expect("decode");
             proptest::prop_assert_eq!(out, names);
         }
+    }
+
+    // --- hardening: corrupt-input allocation guards ---
+
+    #[test]
+    fn from_bytes_rejects_huge_counter_pad() {
+        // A template counter with an absurd zero-pad width would drive an
+        // unbounded fill in `regenerate`; deserialization must reject it.
+        let t = NameTemplate {
+            columns: vec![TemplateColumn::Counter {
+                start: 1,
+                pad: 1 << 40,
+            }],
+        };
+        assert!(NameTemplate::from_bytes(&t.to_bytes()).is_err());
+    }
+
+    #[test]
+    fn read_op_rle_rejects_huge_run_without_aborting() {
+        // One run of an enormous length in column 0. With an equally corrupt
+        // `n_records` the length guard passes, so the fallible reserve is what
+        // must reject it — pre-hardening this was an infallible resize that
+        // aborted the process.
+        let mut counts = Vec::new();
+        write_varint(&mut counts, 1); // column 0: one run
+        for _ in 0..MAX_COL {
+            write_varint(&mut counts, 0); // columns 1..=MAX_COL: no runs
+        }
+        let mut lens = Vec::new();
+        write_varint(&mut lens, 1u64 << 63); // run length past isize::MAX
+        let mut data = Vec::new();
+        push_stream(&mut data, &counts).unwrap();
+        push_stream(&mut data, &[0u8]).unwrap(); // syms: one op byte
+        push_stream(&mut data, &lens).unwrap();
+        let mut r = Cursor::new(&data);
+        let err = read_op_rle(&mut r, usize::MAX).unwrap_err();
+        assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_delta_planes_rejects_huge_count_without_aborting() {
+        // A per-column value count taken from the untrusted `n_records` must size
+        // its plane buffer fallibly rather than aborting.
+        let mut data = Vec::new();
+        write_varint(&mut data, 1); // width = 1 (non-zero)
+        let mut r = Cursor::new(&data);
+        let n_delta = [1usize << 61]; // (1<<61)*8 bytes overflows isize
+        let err = read_delta_planes(&mut r, &n_delta).unwrap_err();
+        assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
     }
 }

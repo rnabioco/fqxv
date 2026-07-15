@@ -159,10 +159,10 @@ fn decode_order0(r: &mut Reader<'_>, n: usize) -> Result<Vec<u8>> {
     for f in &mut freq {
         *f = r.u16()?;
     }
-    let model = Model::from_freqs(freq);
+    let model = Model::from_freqs(freq)?;
 
     let mut states = read_states(r)?;
-    let mut out = vec![0u8; n];
+    let mut out = Model::alloc_output(n)?;
     // Bind `slot2sym` as a fixed-size array so LLVM proves the masked index is
     // in range and drops the per-symbol bounds check on this hot decode loop.
     let s2s: &[u8; TOTFREQ as usize] = (&model.slot2sym[..])
@@ -189,12 +189,12 @@ fn decode_order1(r: &mut Reader<'_>, n: usize) -> Result<Vec<u8>> {
             for f in &mut freq {
                 *f = r.u16()?;
             }
-            models[ctx] = Some(Model::from_freqs(freq));
+            models[ctx] = Some(Model::from_freqs(freq)?);
         }
     }
 
     let mut states = read_states(r)?;
-    let mut out = vec![0u8; n];
+    let mut out = Model::alloc_output(n)?;
     let mut prev = 0u8;
     // `ctx` is a byte, so bind `models` as a fixed 256-entry array to drop the
     // per-symbol bounds check on the context lookup.

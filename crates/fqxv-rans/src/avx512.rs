@@ -42,7 +42,7 @@ pub(crate) fn decode_order0(src: &[u8]) -> Result<Vec<u8>> {
     for f in &mut freq {
         *f = r.u16()?;
     }
-    let model = Model::from_freqs(freq);
+    let model = Model::from_freqs(freq)?;
     let tables = SlotTable::from_model(&model);
 
     let mut states = [0u32; N_STATES];
@@ -51,7 +51,7 @@ pub(crate) fn decode_order0(src: &[u8]) -> Result<Vec<u8>> {
     }
 
     let mut sp = r.pos();
-    let mut out = vec![0u8; n];
+    let mut out = Model::alloc_output(n)?;
     let full_rounds = n / N_STATES;
     // SAFETY: guarded by the AVX-512 feature detection in `crate::decode`.
     unsafe {
