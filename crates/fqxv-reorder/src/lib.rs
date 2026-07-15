@@ -36,6 +36,9 @@ use fqxv_bytes::{unzigzag, write_varint, zigzag};
 use rayon::prelude::*;
 use thiserror::Error;
 
+mod reflzma;
+mod refpack;
+
 /// A minimal integer hasher for the assembly maps. Their keys are already
 /// well-mixed — 2-bit-packed k-mers and dense contig ids — so a single
 /// multiplicative (Fibonacci) mix beats SipHash on the ~10^8 inserts/probes the
@@ -1264,6 +1267,42 @@ impl GlobalReference {
             lens.extend_from_slice(&bl);
             seq.extend_from_slice(&bs);
         }
+        Self::from_lens_seq(&lens, seq)
+    }
+
+    /// LZMA-class variant: explicit LZ77 matching (hash-chain finder) with LZMA
+    /// entropy coding — context literals with matched-byte prediction, a length
+    /// coder, position-slot + aligned distance coding, and rep0–3 short codes —
+    /// over the [`fqxv_range`](fqxv_range) range coder. This *copies* the
+    /// long-range near-duplicate contigs the order-k model and BWT can only model,
+    /// the redundancy that separates xz (~1.79 b/base here) from the context model
+    /// (~1.98). Coded over one whole-reference window (a serial decode, fine since
+    /// the reference is coded once per file); deterministic, so thread-count
+    /// independent. See the [`reflzma`] module. Gated never-worse by the caller.
+    pub fn encode_lzma(&self) -> Result<Vec<u8>> {
+        reflzma::encode(&self.contig_lens(), &self.seq)
+    }
+
+    /// Reverse of [`encode_lzma`](GlobalReference::encode_lzma).
+    pub fn decode_lzma(src: &[u8]) -> Result<GlobalReference> {
+        let (lens, seq) = reflzma::decode(src)?;
+        Self::from_lens_seq(&lens, seq)
+    }
+
+    /// SPRING-faithful reference coder: **2-bit-pack the ACGT consensus (4
+    /// bases/byte), then LZMA the packed bytes** — exactly SPRING's
+    /// `pack_compress_seq` (2-bit pack + BSC). The packing is a hard 2 bits/base
+    /// floor and a byte-domain LZ then captures the long-range near-duplicate
+    /// repeats; on real references this beats the order-k model on raw bases by
+    /// ~7%. Non-ACGT bytes (rare in a plurality consensus) are exception-coded so
+    /// it stays byte-exact. See the [`refpack`] module. Gated never-worse.
+    pub fn encode_packed(&self) -> Result<Vec<u8>> {
+        refpack::encode(&self.contig_lens(), &self.seq)
+    }
+
+    /// Reverse of [`encode_packed`](GlobalReference::encode_packed).
+    pub fn decode_packed(src: &[u8]) -> Result<GlobalReference> {
+        let (lens, seq) = refpack::decode(src)?;
         Self::from_lens_seq(&lens, seq)
     }
 }

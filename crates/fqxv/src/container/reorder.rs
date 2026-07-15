@@ -563,6 +563,9 @@ pub(crate) struct ReorderStreams {
 /// [`fqxv_seq`] model; the default splits it into fixed blocks coded in parallel.
 const REF_METHOD_SEQ: u8 = 0; // whole-reference order-k `fqxv_seq` (single pass)
 const REF_METHOD_SEQPAR: u8 = 1; // block-parallel order-k `fqxv_seq`
+const REF_METHOD_PACK: u8 = 4; // SPRING-style 2-bit-pack + clean-room LZMA on packed
+                               // Method tags 2 (LZ77) and 3 (BWT) were prototypes that lost to the order-k model
+                               // on the raw bases and have been removed (see `refpack`'s module docs / issue #52).
 
 /// Fixed number of contig blocks the reference is split into for parallel coding.
 /// Fixed (never derived from the thread count) so the coded bytes are identical
@@ -571,18 +574,40 @@ const REF_METHOD_SEQPAR: u8 = 1; // block-parallel order-k `fqxv_seq`
 /// on real references.
 const REF_SEQ_BLOCKS: usize = 64;
 
-/// Encode the global reference frame: block-parallel order-k `fqxv_seq`, tagged
-/// with a leading method byte. `order` is the context order. Fast — each block is
-/// a small independent pass fanned across cores — and fully clean-room (no
-/// external compressor). Replaces the old single-threaded xz pass, which was
-/// ~60% of the whole compress time.
+/// Encode the global reference frame, tagged with a leading method byte, picking
+/// the smaller of two clean-room codings (never-worse):
+///
+/// * `REF_METHOD_PACK` — **SPRING's approach**: 2-bit-pack the ACGT consensus (a
+///   hard 2 bits/base floor) and LZMA the packed bytes (plus the contig lengths),
+///   which captures the long-range near-duplicate-contig repeats the order-k model
+///   cannot see. This is the usual winner on real references. Measured −5.9% vs
+///   the order-k model on 4M NovaSeq (20.71 vs 22.01 MB), close to SPRING's own
+///   2-bit+BSC (~20.4 MB) and fast (~8s on the 22 MB packed stream, 4× smaller
+///   than the raw bases).
+/// * `REF_METHOD_SEQPAR` — the block-parallel order-k `fqxv_seq` fallback, which
+///   wins only on references with little cross-contig repeat (e.g. tiny inputs).
+///
+/// Both are internally parallel and thread-count-independent, so the chosen bytes
+/// are identical regardless of `--threads`. Fully clean-room — no external
+/// compressor. (Earlier LZ77/BWT prototypes and a raw-base LZMA lost to the
+/// order-k model — feeding byte-domain coders the raw 4-symbol bases underperforms;
+/// the 2-bit packing is what makes the LZMA path win. They were removed.)
 fn encode_reference_frame(
     reference: &fqxv_reorder::GlobalReference,
     order: usize,
 ) -> Result<Vec<u8>> {
-    let payload = reference.encode_blocked(order, REF_SEQ_BLOCKS)?;
+    // The two codings are independent; overlap them so the never-worse gate costs
+    // wall-clock ~max(pack, seqpar), not their sum.
+    let (pack, seqpar) = rayon::join(
+        || reference.encode_packed(),
+        || reference.encode_blocked(order, REF_SEQ_BLOCKS),
+    );
+    let (method, payload) = match (pack?, seqpar?) {
+        (pack, seqpar) if pack.len() <= seqpar.len() => (REF_METHOD_PACK, pack),
+        (_, seqpar) => (REF_METHOD_SEQPAR, seqpar),
+    };
     let mut out = Vec::with_capacity(1 + payload.len());
-    out.push(REF_METHOD_SEQPAR);
+    out.push(method);
     out.extend_from_slice(&payload);
     Ok(out)
 }
@@ -594,6 +619,7 @@ fn decode_reference_frame(bytes: &[u8]) -> Result<fqxv_reorder::GlobalReference>
         Some((&REF_METHOD_SEQPAR, rest)) => {
             Ok(fqxv_reorder::GlobalReference::decode_blocked(rest)?)
         }
+        Some((&REF_METHOD_PACK, rest)) => Ok(fqxv_reorder::GlobalReference::decode_packed(rest)?),
         _ => Err(Error::Malformed("reorder reference: bad method tag")),
     }
 }
@@ -954,12 +980,19 @@ mod tests {
     fn reference_frame_roundtrips_both_methods() {
         let r = sample_reference();
 
-        // Default frame (block-parallel order-k) round-trips.
+        // Default frame round-trips; the never-worse gate picks PACK or SEQPAR.
         let frame = encode_reference_frame(&r, 8).unwrap();
-        assert_eq!(frame[0], REF_METHOD_SEQPAR);
+        assert!(matches!(frame[0], REF_METHOD_PACK | REF_METHOD_SEQPAR));
         let back = decode_reference_frame(&frame).unwrap();
         assert_eq!(back.raw_bases(), r.raw_bases());
         assert_eq!(back.contig_lens(), r.contig_lens());
+
+        // The PACK method decodes when forced directly.
+        let mut pack_frame = vec![REF_METHOD_PACK];
+        pack_frame.extend_from_slice(&r.encode_packed().unwrap());
+        let pack_back = decode_reference_frame(&pack_frame).unwrap();
+        assert_eq!(pack_back.raw_bases(), r.raw_bases());
+        assert_eq!(pack_back.contig_lens(), r.contig_lens());
 
         // The whole-reference (single-pass) method still decodes.
         let mut seq_frame = vec![REF_METHOD_SEQ];

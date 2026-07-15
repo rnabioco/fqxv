@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 fqxv-bytes.workspace = true
 fqxv-rans.workspace = true
+fqxv-range.workspace = true
 fqxv-seq.workspace = true
 thiserror.workspace = true
 rayon.workspace = true
