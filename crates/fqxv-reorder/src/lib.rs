@@ -731,21 +731,32 @@ impl Assembler {
     /// the index only proposes candidates, [`try_place`] validates against the
     /// live consensus, so staleness costs recall, never correctness.
     fn index_range(&mut self, ci: usize, from: usize, to: usize) {
-        let n = self.contigs[ci].len();
-        let hi = to.min(n.saturating_sub(RESCUE_K - 1));
-        for start in from..hi {
-            let mut v = 0u64;
-            let mut ok = true;
-            for j in 0..RESCUE_K {
-                let c = code(self.contigs[ci][start + j].base);
-                if c >= 4 {
-                    ok = false;
-                    break;
-                }
-                v = (v << 2) | u64::from(c);
+        // Low 2*RESCUE_K bits: the rolling window of the last RESCUE_K bases.
+        const MASK: u64 = (1u64 << (2 * RESCUE_K)) - 1;
+        let Self { contigs, index, .. } = self;
+        let contig = &contigs[ci];
+        let n = contig.len();
+        let hi = to.min(n.saturating_sub(RESCUE_K - 1)); // k-mer starts are `< hi`
+        if from >= hi {
+            return;
+        }
+        // Roll a 2-bit-packed k-mer across the columns instead of recomputing all
+        // RESCUE_K bases at every start (O(bases) not O(bases * k)). A non-ACGT
+        // base resets the run, so only all-ACGT windows are indexed — identical
+        // keys and insert order to the per-start recompute, so output is unchanged.
+        let last = hi + RESCUE_K - 1; // exclusive column bound, `<= n`
+        let mut v = 0u64;
+        let mut run = 0usize;
+        for p in from..last {
+            let c = code(contig[p].base);
+            if c >= 4 {
+                run = 0;
+                continue;
             }
-            if ok {
-                self.index.insert(v, (ci as u32, start as u32));
+            v = ((v << 2) | u64::from(c)) & MASK;
+            run += 1;
+            if run >= RESCUE_K {
+                index.insert(v, (ci as u32, (p + 1 - RESCUE_K) as u32));
             }
         }
     }
@@ -1678,57 +1689,88 @@ pub fn merge_reference(
 /// The combined index is invariant to this (chunks are combined in contig order),
 /// so it affects only parallelism, not the output.
 const MERGE_INDEX_CHUNKS: usize = 64;
+/// The prefix-k-mer index is sharded by k-mer so the per-shard combines run in
+/// parallel (the serial single-map combine of ~26 M keys was the merge's biggest
+/// cost). Lookups route through [`merge_shard`], so this is transparent to callers.
+const MERGE_SHARD_BITS: u32 = 6;
+const MERGE_SHARDS: usize = 1 << MERGE_SHARD_BITS;
 
-/// Build the prefix-k-mer index for [`merge_reference_with`], in parallel. Each
-/// contig chunk builds a partial (fan-out-capped) map; the partials are combined
-/// in contig order and re-capped, giving the exact same first-N entries per
-/// k-mer as a serial build — so the result is deterministic regardless of thread
-/// count. This is the merge's hottest step, so parallelizing it matters most.
-fn build_merge_index(
-    contigs: &[&[u8]],
-    prefix: usize,
-    fanout: usize,
-) -> IntMap<u64, Vec<(u32, u32)>> {
+/// A prefix-k-mer index: `MERGE_SHARDS` maps, keyed by k-mer, each holding up to
+/// `fanout` `(contig, pos)` entries. Look up a k-mer with
+/// `index[merge_shard(kmer)].get(&kmer)`.
+type MergeIndex = Vec<IntMap<u64, Vec<(u32, u32)>>>;
+
+/// Route a k-mer to its shard via the top bits of a multiplicative mix — the low
+/// bits of a 2-bit-packed k-mer are just its last base, so hash for a uniform split.
+#[inline]
+fn merge_shard(kmer: u64) -> usize {
+    (kmer.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - MERGE_SHARD_BITS)) as usize
+}
+
+/// Build the prefix-k-mer index for [`merge_reference_with`], fully in parallel.
+/// Each contig chunk builds one fan-out-capped partial map PER SHARD (parallel
+/// over chunks); then each shard is combined across chunks in contig order and
+/// re-capped (parallel over shards). Both passes are parallel, and the per-shard
+/// combine keeps the exact same first-N entries per k-mer as a serial build — so
+/// the index is byte-for-byte independent of chunk/shard/thread count.
+fn build_merge_index(contigs: &[&[u8]], prefix: usize, fanout: usize) -> MergeIndex {
     let nc = contigs.len();
     let chunk = nc.div_ceil(MERGE_INDEX_CHUNKS.clamp(1, nc.max(1))).max(1);
-    let partials: Vec<IntMap<u64, Vec<(u32, u32)>>> = (0..nc)
+    let partials: Vec<MergeIndex> = (0..nc)
         .step_by(chunk)
         .collect::<Vec<_>>()
         .par_iter()
         .map(|&start| {
             let end = (start + chunk).min(nc);
-            let mut m: IntMap<u64, Vec<(u32, u32)>> = IntMap::default();
+            const MASK: u64 = (1u64 << (2 * MERGE_K)) - 1;
+            let mut shards: MergeIndex = (0..MERGE_SHARDS).map(|_| IntMap::default()).collect();
             for ci in start..end {
                 let c = contigs[ci];
                 let hi = c.len().min(prefix);
-                let mut s = 0usize;
-                while s + MERGE_K <= hi {
-                    if let Some(code) = kmer_at(c, s, MERGE_K) {
-                        let e = m.entry(code).or_default();
+                // Roll the k-mer instead of recomputing all MERGE_K bases per
+                // start (O(bases) not O(bases * k)); a non-ACGT base resets the
+                // run, so keys and insert order match the per-start recompute.
+                let (mut v, mut run) = (0u64, 0usize);
+                for s in 0..hi {
+                    let cb = code(c[s]);
+                    if cb >= 4 {
+                        run = 0;
+                        continue;
+                    }
+                    v = ((v << 2) | u64::from(cb)) & MASK;
+                    run += 1;
+                    if run >= MERGE_K {
+                        let e = shards[merge_shard(v)].entry(v).or_default();
                         if e.len() < fanout {
-                            e.push((ci as u32, s as u32));
+                            e.push((ci as u32, (s + 1 - MERGE_K) as u32));
                         }
                     }
-                    s += 1;
+                }
+            }
+            shards
+        })
+        .collect();
+    // Combine per shard IN PARALLEL: shard `sh` merges every chunk's shard-`sh`
+    // partial in chunk (contig) order, re-capping to `fanout`.
+    (0..MERGE_SHARDS)
+        .into_par_iter()
+        .map(|sh| {
+            let mut m: IntMap<u64, Vec<(u32, u32)>> = IntMap::default();
+            for part in &partials {
+                for (&code, list) in &part[sh] {
+                    let e = m.entry(code).or_default();
+                    for &item in list {
+                        if e.len() < fanout {
+                            e.push(item);
+                        } else {
+                            break;
+                        }
+                    }
                 }
             }
             m
         })
-        .collect();
-    let mut index: IntMap<u64, Vec<(u32, u32)>> = IntMap::default();
-    for part in partials {
-        for (code, list) in part {
-            let e = index.entry(code).or_default();
-            for item in list {
-                if e.len() < fanout {
-                    e.push(item);
-                } else {
-                    break;
-                }
-            }
-        }
-    }
-    index
+        .collect()
 }
 
 /// Overlap-merge a greedy reference (see the module note): returns a new
@@ -1781,7 +1823,7 @@ pub fn merge_reference_with(
             let mut pos_a = lo;
             while pos_a + MERGE_K <= a.len() {
                 if let Some(code) = kmer_at(a, pos_a, MERGE_K) {
-                    if let Some(list) = index.get(&code) {
+                    if let Some(list) = index[merge_shard(code)].get(&code) {
                         for &(bi_u, pos_b_u) in list {
                             let bi = bi_u as usize;
                             if bi == ai {
