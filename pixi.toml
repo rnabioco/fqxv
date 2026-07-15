@@ -12,8 +12,11 @@ platforms = ["linux-64", "osx-arm64"]
 [dependencies]
 rust = ">=1.95"
 vhs = ">=0.11.0,<0.12"
-imagemagick = ">=7.1"
 python = ">=3.12,<3.13"
+# Monospace font for the VHS tapes, plus the fontconfig glue that makes it
+# visible to VHS's headless chromium. The tapes name "Source Code Pro".
+font-ttf-source-code-pro = "*"
+fonts-conda-ecosystem = "*"
 
 [pypi-dependencies]
 # Pinned to match the docs CI (.github/workflows/docs.yml).

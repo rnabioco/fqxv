@@ -2,12 +2,12 @@
 # Generate all VHS gifs for the docs. Run from anywhere; it cds to repo root.
 #
 #   pixi run tapes           # builds the release binary first, then renders
-#   ./docs/tapes/generate.sh # if fqxv + vhs + magick are already on PATH
+#   ./docs/tapes/generate.sh # if fqxv + vhs are already on PATH
 #
-# Tapes set `MarginFill "#fe00fe"` (magenta sentinel) so the margin and
-# rounded-corner pixels can be keyed out to transparent after render, letting
-# the terminal float over any docs background. GIF only supports single-color
-# transparency; the inside of the window keeps Dracula's background.
+# vhs writes the final GIFs directly — no post-processing. The tapes use the
+# Source Code Pro monospace font shipped by the pixi env (VHS's headless
+# chromium reads it via fontconfig); don't rename it to a font that isn't
+# installed or glyphs render with broken metrics.
 
 set -euo pipefail
 
@@ -68,14 +68,6 @@ fqxv --quiet compress demo.fastq.gz -o demo.fqxv
 for tape in docs/tapes/*.tape; do
     echo "Generating: $tape"
     vhs "$tape"
-done
-
-# --- key out the magenta margin --------------------------------------------
-# -fuzz absorbs palette-quantization + border-antialiasing pixels clustered
-# around the sentinel magenta; 25% is well clear of the nearest Dracula colors.
-echo "Making margins transparent…"
-for gif in docs/images/*.gif; do
-    magick "$gif" -fuzz 25% -transparent '#fe00fe' "$gif"
 done
 
 # --- cleanup ----------------------------------------------------------------
