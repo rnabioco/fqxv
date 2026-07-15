@@ -196,12 +196,34 @@ impl<const N: usize> SimpleModel<N> {
     /// Frequency increment applied to the observed symbol.
     const STEP: u16 = 16;
 
-    /// Create a model with uniform frequencies.
+    /// Create a model with uniform frequencies over all `N` symbols.
     #[must_use]
     pub fn new() -> Self {
         SimpleModel {
             freq: [1; N],
             tot: N as u32,
+        }
+    }
+
+    /// Create a model over only the first `active` symbols (`1..=N`); the rest
+    /// carry zero frequency and are never coded. Use this when the true alphabet
+    /// is smaller than the compile-time capacity `N`: the unused ("phantom")
+    /// slots otherwise sit at frequency 1 forever, permanently taxing every coded
+    /// symbol — on a skewed 4-symbol quality stream coded with `N = 94`, those 90
+    /// phantoms cap the dominant symbol's probability and cost several percent.
+    ///
+    /// # Panics
+    /// If `active` is 0 or greater than `N`.
+    #[must_use]
+    pub fn with_active(active: usize) -> Self {
+        assert!(active >= 1 && active <= N, "active {active} out of 1..={N}");
+        let mut freq = [0u16; N];
+        for f in &mut freq[..active] {
+            *f = 1;
+        }
+        SimpleModel {
+            freq,
+            tot: active as u32,
         }
     }
 
