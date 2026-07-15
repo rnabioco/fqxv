@@ -26,6 +26,8 @@ preserved for the split.
 | Option | Description |
 | --- | --- |
 | `-o, --output <PATH>` | Output `.fqxv` path. Defaults to the first input's name with the FASTQ/gzip extension replaced by `.fqxv` (`reads.fastq.gz` → `reads.fqxv`), alongside the input. Required when reading from stdin (`-`). |
+| `-f, --force` | Overwrite the output archive if it already exists. By default `compress` refuses to clobber an existing file and errors before doing any work. |
+| `--verify` | After writing the archive, re-read and fully decode it to confirm it round-trips before reporting success — recommended before deleting the source FASTQ. See [Verifying on write](#verifying-on-write). |
 | `--max` | Maximum-compression preset: deepest sequence context plus read reordering *where it helps* (applied to short reads, auto-skipped for long reads). Overrides `--level`/`--order`. |
 | `--estimate` | Predict the archive size and compression ratio from a sample of the input, then exit **without writing anything**. See [Estimating compression](#estimating-compression). |
 | `--threads <N>` | Worker threads (0 = all cores). |
@@ -60,9 +62,35 @@ fqxv compress reads.fastq -o reads.fqxv --quality-bin bin8
 # maximum compression (deepest context + read reordering where it helps)
 fqxv compress reads.fastq.gz --max
 
+# verify the archive round-trips before trusting (or deleting) the source
+fqxv compress reads.fastq.gz --verify
+
 # estimate the ratio and archive size from a sample, writing nothing
 fqxv compress reads.fastq.gz --estimate
 ```
+
+## Verifying on write
+
+`--verify` closes the window between writing an archive and trusting it. After the
+archive is written, it is reopened and **fully decoded** — exercising every block
+CRC-32C and content digest — and the decoded read count is checked against what was
+written, all before `compress` reports success:
+
+```bash
+fqxv compress reads.fastq.gz --verify
+```
+
+This catches a codec or in-flight memory error that produced a CRC-valid but wrong
+archive, which the archive's own on-disk checksums cannot detect on their own. It
+is the check to run before deleting the source FASTQ.
+
+- On any failure — a decode error or a read-count mismatch — the archive is left
+  in place for inspection and the command exits non-zero. A bad archive is never
+  reported as done.
+- It adds a full decode pass, so expect roughly double the wall time (the
+  `--max` / reorder path is the heaviest).
+- It validates the bytes the encoder emitted, not long-term on-disk durability;
+  for the latter, re-run [`fqxv verify`](verify.md) against the stored file later.
 
 ## Estimating compression
 

@@ -61,7 +61,8 @@ fqxv decompress reads.fqxv -o reads.fastq
 Paired-end and single-cell inputs interleave into one archive
 (`fqxv compress R1.fq.gz R2.fq.gz -o sample.fqxv`). Lossless by default;
 `--quality-bin {bin8,bin4,bin2}` opts into lossy quality and `--max` chases the
-best ratio. Run `fqxv --help` for the full option set.
+best ratio. Add `--verify` to re-decode the new archive and confirm it round-trips
+before you trust (or delete) the source. Run `fqxv --help` for the full option set.
 
 ## Acknowledgments
 
