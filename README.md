@@ -3,6 +3,8 @@
 A Rust toolkit for archiving FASTQ, built as a workspace of
 one-crate-per-algorithm codecs plus a container format and CLI.
 
+![fqxv compress and decompress demo](docs/images/readme.gif)
+
 > Status: **v0.1.0 — early release.** The library and CLI work end-to-end and are
 > [benchmarked against the field](docs/benchmarks.md), but the on-disk `.fqxv`
 > format (`FORMAT_VERSION` 1) is **not yet frozen** — each build reads only its

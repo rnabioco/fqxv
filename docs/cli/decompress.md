@@ -5,6 +5,8 @@ streamed to stdout for a pipe. You must choose exactly one destination
 (`-o`, `--split`, or `-Z`); a bare `decompress` with none errors rather than
 flooding the terminal.
 
+![fqxv decompress demo](../images/decompress.gif)
+
 ## Usage
 
 ```bash

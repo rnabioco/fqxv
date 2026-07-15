@@ -2,6 +2,8 @@
 
 Print container metadata and per-stream compressed sizes for a `.fqxv` archive.
 
+![fqxv info demo](../images/info.gif)
+
 ## Usage
 
 ```bash

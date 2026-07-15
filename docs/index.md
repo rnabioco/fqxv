@@ -5,6 +5,8 @@ tuned to it — a context model for quality, an order-k model for sequence, a
 positional tokenizer for names — and composes them into one parallel,
 block-based container.
 
+![fqxv compress and decompress demo](images/readme.gif)
+
 ## Why fqxv
 
 - **Reference-free & lossless** — no genome required; read name + description,
