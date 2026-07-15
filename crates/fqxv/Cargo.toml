@@ -1,6 +1,6 @@
 [package]
 name = "fqxv"
-description = "Reference-free FASTQ archiver for short-read data — container format library"
+description = "Reference-free FASTQ archiver — container format library"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

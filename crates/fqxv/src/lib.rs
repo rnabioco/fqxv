@@ -1,4 +1,4 @@
-//! `fqxv` — reference-free FASTQ archiver for short-read data.
+//! `fqxv` — reference-free FASTQ archiver.
 //!
 //! Defines the block-based container format and composes the codec crates
 //! ([`fqxv_tokenizer`] for names, [`fqxv_seq`] for sequences, [`fqxv_fqzcomp`]

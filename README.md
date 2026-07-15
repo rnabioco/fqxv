@@ -1,6 +1,6 @@
 # 🗜️ fqxv
 
-A Rust toolkit for archiving short-read FASTQ, built as a workspace of
+A Rust toolkit for archiving FASTQ, built as a workspace of
 one-crate-per-algorithm codecs plus a container format and CLI.
 
 > Status: **v0.1.0 — early release.** The library and CLI work end-to-end and are
@@ -11,7 +11,7 @@ one-crate-per-algorithm codecs plus a container format and CLI.
 
 ## Why
 
-Illumina FASTQ splits into three streams that compress very differently, and the
+FASTQ splits into three streams that compress very differently, and the
 wins are additive:
 
 | Stream | Share of a lossless archive | What moves it |

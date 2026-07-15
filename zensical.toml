@@ -1,6 +1,6 @@
 [project]
 site_name = "fqxv"
-site_description = "A reference-free FASTQ archiver for short-read data, in Rust"
+site_description = "A reference-free FASTQ archiver, in Rust"
 site_url = "https://rnabioco.github.io/fqxv/"
 repo_url = "https://github.com/rnabioco/fqxv"
 repo_name = "rnabioco/fqxv"
