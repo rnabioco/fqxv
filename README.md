@@ -26,20 +26,24 @@ spec](https://samtools.github.io/hts-specs/CRAMcodecs.pdf) and the source papers
 
 ## How it compares
 
-On 4M-read RNA-seq subsets (see [benchmarks](docs/benchmarks.md)), `fqxv --max`
-is the **#2 compressor after SPRING** — within ~6–12% on ratio, and *faster* than
-SPRING on full-range data — while beating `fqz_comp`, `zstd -19`, `xz -9`, and
-`gzip`. Two things are `fqxv`'s alone: every archive is **deterministic**
-(byte-identical regardless of thread count) and **verified lossless** on decode.
-The default mode trades ratio for speed cleanly (~115 MB/s, still ahead of
-`fqz_comp`/`zstd`/`xz` on ratio). Pure Rust, no external/C compressor.
+On 4M-read RNA-seq subsets (see [benchmarks](docs/benchmarks.md)), **`fqxv
+--order shuffle` is the smallest lossless compressor of the field — it beats
+SPRING** on both quality regimes when both reorder and renumber (the trade SPRING
+makes by default). For a *fully* lossless archive that also preserves read order
+and names, `fqxv --max` is the best-ratio option and the #2 overall. Both beat
+`fqz_comp`, `zstd -19`, `xz -9`, and `gzip`. Two things are `fqxv`'s alone: every
+archive is **deterministic** (byte-identical regardless of thread count) and
+**verified lossless** on decode. The default mode trades ratio for speed cleanly
+(>120 MB/s, still ahead of `fqz_comp`/`zstd`/`xz` on ratio). Pure Rust, no
+external/C compressor.
 
-| NovaSeq (binned), 4M reads | ratio | compress |
-| --- | ---: | ---: |
-| SPRING | 21.9× | 66 MB/s |
-| **`fqxv --max`** | **19.4×** | 40 MB/s |
-| fqz_comp | 9.6× | (fails round-trip) |
-| zstd -19 / xz -9 | 9.4× / 8.9× | 10 / 9 MB/s |
+| NovaSeq (binned), 4M reads | ratio | lossless |
+| --- | ---: | :---: |
+| **`fqxv --order shuffle`** | **23.9×** | seq+qual (renumbered) |
+| SPRING | 21.9× | reordered |
+| **`fqxv --max`** | 20.2× | **yes (order-preserving)** |
+| fqz_comp | 9.6× | no (fails round-trip) |
+| zstd -19 / xz -9 | 9.4× / 8.9× | yes |
 
 ## Workspace
 

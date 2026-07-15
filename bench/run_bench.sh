@@ -26,7 +26,7 @@ INPUT_MODE="${FQXV_INPUT:-r1}"
 # (`-q binary`, 2-level) are SPRING's lossy quality modes — the only field tools
 # with Illumina-comparable binning, so they are the like-for-like lossy rivals to
 # fqxv-bin8 and fqxv-bin2 (fqz_comp/fqzcomp5 have no Illumina binning mode).
-ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-max fqxv-bin8 fqxv-bin4 fqxv-bin2 fqxv-reorder-bin8 fqxv-reorder-bin4 fqxv-reorder-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary colord"
+ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-max fqxv-shuffle fqxv-bin8 fqxv-bin4 fqxv-bin2 fqxv-reorder-bin8 fqxv-reorder-bin4 fqxv-reorder-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary colord"
 TOOLS="${FQXV_TOOLS:-$ALL_TOOLS}"
 # The fqxv binary (built with `cargo build --release`). Cargo honors
 # CARGO_TARGET_DIR (set to $SCRATCH on this HPC), so the build lands there, NOT
@@ -111,12 +111,12 @@ fastq_records() { echo $(( $(wc -l < "$1") / 4 )); }
 # Verifies *content* losslessness. The `+` line (record line 3) is excluded:
 # fqxv normalizes it, the one documented lossy-by-design deviation. mode=noqual
 # drops quality (for lossy-quality tools), via `--no-qual`.
-record_digest() {  # file mode(full|noqual)
-  if [[ "$2" == noqual ]]; then
-    "$FQDIGEST" --no-qual "$1"
-  else
-    "$FQDIGEST" "$1"
-  fi
+record_digest() {  # file mode(full|noqual|nonames)
+  case "$2" in
+    noqual)  "$FQDIGEST" --no-qual  "$1" ;;
+    nonames) "$FQDIGEST" --no-names "$1" ;;
+    *)       "$FQDIGEST"            "$1" ;;
+  esac
 }
 
 # Like record_digest with quality, but first pass every quality byte through
@@ -157,6 +157,9 @@ bin_scheme() {
     *) echo none ;;
   esac
 }
+# Name-lossy tools renumber reads: the retained content is the seq+qual multiset,
+# so verify that (`--no-names`), not the names. (`fqxv --order shuffle`.)
+is_name_lossy() { [[ "$1" == *shuffle* ]]; }
 
 # --- per-tool compress/decompress. Each sets COMP (compressed path) then RT. ---
 compress() {  # tool input out_prefix
@@ -168,6 +171,12 @@ compress() {  # tool input out_prefix
     # fqxv-max: the advertised best-ratio preset (`--max` == `-l 9 --order any`):
     # deepest sequence context AND read reordering together.
     fqxv-max)      COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --max --threads "$THREADS" ;;
+    # fqxv-shuffle: best-ratio RENUMBER preset (`-l 9 --order shuffle`) — the
+    # apples-to-apples point vs SPRING, which also renumbers/reorders. Reads come
+    # back as a seq+qual multiset with fresh names (name-lossy); verified below
+    # with a `--no-names` digest, as SPRING's own reordering is verified by a
+    # (order-independent) multiset digest.
+    fqxv-shuffle)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" -l 9 --order shuffle --threads "$THREADS" ;;
     fqxv-bin8)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin8 --threads "$THREADS" ;;
     fqxv-bin4)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin4 --threads "$THREADS" ;;
     fqxv-bin2)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin2 --threads "$THREADS" ;;
@@ -196,7 +205,7 @@ compress() {  # tool input out_prefix
 decompress() {  # tool comp out_rt
   local tool="$1" comp="$2" rt="$3"
   case "$tool" in
-    fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-bin8|fqxv-bin4|fqxv-bin2|fqxv-reorder-bin8|fqxv-reorder-bin4|fqxv-reorder-bin2) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" ;;
+    fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-shuffle|fqxv-bin8|fqxv-bin4|fqxv-bin2|fqxv-reorder-bin8|fqxv-reorder-bin4|fqxv-reorder-bin2) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" ;;
     gzip)     measure bash -c "pigz -d -p $THREADS -c '$comp' > '$rt'" ;;
     zstd19)   measure bash -c "zstd -d -q -f -o '$rt' '$comp'" ;;
     xz9)      measure bash -c "xz -d -T$THREADS -c '$comp' > '$rt'" ;;
@@ -252,6 +261,7 @@ for row in "${rows[@]}"; do
     nbases="$(awk 'NR%4==2{b+=length($0)} END{print b+0}' "$in")"
     in_full="$(record_digest "$in" full)"
     in_noqual="$(record_digest "$in" noqual)"
+    in_nonames="$(record_digest "$in" nonames)"
     if [[ "$PREP_ONLY" == 1 ]]; then
       mkdir -p "$RESULTS_DIR/prep"
       {
@@ -261,6 +271,7 @@ for row in "${rows[@]}"; do
         printf "nbases=%q\n" "$nbases"
         printf "in_full=%q\n" "$in_full"
         printf "in_noqual=%q\n" "$in_noqual"
+        printf "in_nonames=%q\n" "$in_nonames"
       } > "$prep"
     fi
   fi
@@ -274,7 +285,7 @@ for row in "${rows[@]}"; do
     # Map tool label -> binary name to probe availability.
     case "$tool" in
       gzip) bin=pigz ;; zstd19) bin=zstd ;; xz9) bin=xz ;; pgrc) bin=PgRC ;;
-      fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-bin8|fqxv-bin4|fqxv-bin2|fqxv-reorder-bin8|fqxv-reorder-bin4|fqxv-reorder-bin2) bin="$FQXV_BIN" ;;
+      fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-shuffle|fqxv-bin8|fqxv-bin4|fqxv-bin2|fqxv-reorder-bin8|fqxv-reorder-bin4|fqxv-reorder-bin2) bin="$FQXV_BIN" ;;
       spring-illbin|spring-binary) bin=spring ;;
       *) bin="$tool" ;;
     esac
@@ -331,6 +342,9 @@ for row in "${rows[@]}"; do
           [[ "$(record_digest "$rt" noqual)" == "$in_noqual" ]] && rt_ok="yes"
         fi
         read -r qmae qrmse qpct < <(qual_distortion "$in" "$rt")
+      elif is_name_lossy "$tool"; then
+        # Renumbered reads: seq+qual multiset must be preserved exactly.
+        [[ "$(record_digest "$rt" nonames)" == "$in_nonames" ]] && rt_ok="yes"
       else
         [[ "$(record_digest "$rt" full)" == "$in_full" ]] && rt_ok="yes"
       fi
@@ -346,6 +360,7 @@ for row in "${rows[@]}"; do
         fqxv9)        "$FQXV_BIN" compress "$in" -o "$det1" -l 9 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-reorder) "$FQXV_BIN" compress "$in" -o "$det1" --order any --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-max)     "$FQXV_BIN" compress "$in" -o "$det1" --max --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-shuffle) "$FQXV_BIN" compress "$in" -o "$det1" -l 9 --order shuffle --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin8)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin4)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin2)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;
