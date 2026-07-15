@@ -111,7 +111,10 @@ pub use compress::{compress, compress_auto, compress_interleaved, compress_multi
 pub use decompress::{content_stats, decompress, decompress_recover, decompress_split, Recovery};
 pub use estimate::{estimate, Estimate};
 pub use inspect::{inspect, peek, ContentStats, Info, Platform, QUAL_MAX};
-pub use verify::{expected_reads, verify, verify_quick, verify_report, VerifyCheck, VerifyReport};
+pub use verify::{
+    expected_reads, verify, verify_quick, verify_report, verify_roundtrip, VerifyCheck,
+    VerifyReport,
+};
 
 #[cfg(test)]
 mod tests;

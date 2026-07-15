@@ -634,6 +634,19 @@ fn decode_reference_frame(bytes: &[u8]) -> Result<fqxv_reorder::GlobalReference>
     }
 }
 
+/// Reserve a `Vec` of `cap` capacity, returning an error instead of aborting the
+/// process when a corrupt `cap` — e.g. the out-of-range read count read straight
+/// from a damaged stream — would demand an absurd allocation. `cap` is only a
+/// sizing hint (the vectors grow via `extend` regardless), so this never changes
+/// a valid decode; it just fails a bad archive gracefully, mirroring the
+/// `try_reserve_exact` guard in [`read_framed`].
+fn reserve_checked<T>(cap: usize) -> Result<Vec<T>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(cap)
+        .map_err(|_| Error::Malformed("reorder read count too large to allocate"))?;
+    Ok(v)
+}
+
 /// Read and entropy-decode the whole-file reorder layout. `r` is positioned just
 /// past the header. Shared by [`decode_reordered_whole`] and
 /// [`decode_reordered_split`]. `has_reference` (the `FLAG_GLOBAL_REFERENCE` bit)
@@ -717,13 +730,15 @@ pub(crate) fn read_reordered_streams<R: Read>(
             .collect::<Result<_>>()
     })?;
 
-    // Flatten the per-block vectors into whole-file streams.
-    let mut cl_reads: Vec<Vec<u8>> = Vec::with_capacity(n);
+    // Flatten the per-block vectors into whole-file streams. `n` is untrusted
+    // (read straight from the stream), so size these hints fallibly — a corrupt
+    // count must error, not abort the process on a multi-terabyte allocation.
+    let mut cl_reads: Vec<Vec<u8>> = reserve_checked(n)?;
     for blk in seq_dec {
         cl_reads.extend(blk);
     }
-    let mut names: Vec<Vec<u8>> = Vec::with_capacity(if regen { 0 } else { n });
-    let mut lens: Vec<u32> = Vec::with_capacity(n);
+    let mut names: Vec<Vec<u8>> = reserve_checked(if regen { 0 } else { n })?;
+    let mut lens: Vec<u32> = reserve_checked(n)?;
     let mut quals: Vec<u8> = Vec::new();
     for (nm, (ls, qs)) in nq_dec {
         names.extend(nm);

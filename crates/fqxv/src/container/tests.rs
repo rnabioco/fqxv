@@ -1031,6 +1031,104 @@ fn verify_rejects_footer_bit_flip() {
     assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
 }
 
+#[test]
+fn verify_roundtrip_accepts_intact_archive() {
+    // Returns the decoded read count so a caller can cross-check what it wrote.
+    let archive = multiblock_archive(40, 8);
+    let reads = verify_roundtrip(io::Cursor::new(&archive)).expect("intact archive round-trips");
+    assert_eq!(reads, 40);
+}
+
+#[test]
+fn verify_roundtrip_counts_empty_archive() {
+    // An empty input still writes a valid header/terminator/footer; verify must
+    // handle the zero-read case without erroring.
+    let archive = compress_bytes(b"", Params::default());
+    let reads = verify_roundtrip(io::Cursor::new(&archive)).expect("empty archive round-trips");
+    assert_eq!(reads, 0);
+}
+
+#[test]
+fn verify_roundtrip_rejects_payload_bit_flip() {
+    let mut archive = multiblock_archive(40, 8);
+    archive[HEADER_LEN + 8 + CRC_LEN] ^= 0x01;
+    let err = verify_roundtrip(io::Cursor::new(&archive)).unwrap_err();
+    assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
+}
+
+#[test]
+fn verify_roundtrip_accepts_reorder_archive() {
+    // The globally-clustered layout has no whole-file CRC; verify_roundtrip must
+    // decode it (frame CRCs + output digest) and still report the read count.
+    let input = dup_rich_input('q');
+    let mut archive = Vec::new();
+    compress(
+        &input[..],
+        &mut archive,
+        Params {
+            reorder: true,
+            ..Params::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        archive[8] & FLAG_GLOBAL_REORDER,
+        FLAG_GLOBAL_REORDER,
+        "test archive must use the reorder layout"
+    );
+    let reads =
+        verify_roundtrip(io::Cursor::new(&archive)).expect("intact reorder archive round-trips");
+    assert_eq!(reads, 40);
+}
+
+#[test]
+fn verify_roundtrip_rejects_reorder_corruption() {
+    let input = dup_rich_input('q');
+    let mut archive = Vec::new();
+    compress(
+        &input[..],
+        &mut archive,
+        Params {
+            reorder: true,
+            ..Params::default()
+        },
+    )
+    .unwrap();
+    // Flip a content byte in the trailing whole-output digest frame (the last
+    // thing in this layout); its frame CRC must reject it. Deliberately not a
+    // framing length prefix, which is a separate (allocation-guard) path.
+    *archive.last_mut().unwrap() ^= 0xFF;
+    assert!(
+        verify_roundtrip(io::Cursor::new(&archive)).is_err(),
+        "corrupt reorder archive must not round-trip"
+    );
+}
+
+#[test]
+fn verify_roundtrip_rejects_corrupt_reorder_read_count() {
+    // Regression: a corrupt read-count prefix (the u64 immediately past the
+    // header) must fail *gracefully* rather than abort the process on a
+    // multi-terabyte allocation. The reorder decode's capacity hints used to be
+    // infallible `Vec::with_capacity(n)`.
+    let input = dup_rich_input('q');
+    let mut archive = Vec::new();
+    compress(
+        &input[..],
+        &mut archive,
+        Params {
+            reorder: true,
+            ..Params::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(archive[8] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+    // The read count is a little-endian u64 at `HEADER_LEN`; set its top byte to
+    // blow the value past any real dataset.
+    archive[HEADER_LEN + 7] ^= 0xFF;
+    let err = verify_roundtrip(io::Cursor::new(&archive)).unwrap_err();
+    assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
+}
+
 /// Write `bytes` to a fresh temp file and return an open handle plus its path.
 /// The name is unique per process *and* per call so it is safe whether tests
 /// run as separate processes (nextest) or as threads (`cargo test`).
