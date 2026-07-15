@@ -159,7 +159,7 @@ const MAX_SYMBOLS_PER_BYTE: usize = 1 << 16;
 const N_CTX: usize = 1 << 18;
 /// Saturating cap on the running delta counter (2 bits).
 const DELTA_MAX: u8 = 3;
-const FORMAT_VERSION: u8 = 0;
+const FORMAT_VERSION: u8 = 1;
 
 /// Position bucket: fine near the read start, then 32-wide buckets so the
 /// low-quality tail of long reads keeps positional resolution. The old `pos>>3`
@@ -210,9 +210,15 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
     } else {
         Cow::Owned(quals.iter().map(|&b| binning.apply(b)).collect())
     };
-    let (qmin, qsize) = alphabet(&binned)?;
+    let (syms, dense) = dense_alphabet(&binned)?;
+    let qmin = syms[0];
+    let k = syms.len();
 
-    let mut models = vec![SimpleModel::<QMAX>::new(); N_CTX];
+    // Models are sized to the symbols that actually occur (`k`), not the 0..QMAX
+    // capacity — see `SimpleModel::with_active`. Context features stay on the
+    // original Phred scale (`cv = b - qmin`); only the coded symbol is the dense
+    // index (`dv`).
+    let mut models = vec![SimpleModel::<QMAX>::with_active(k); N_CTX];
     let mut enc = Encoder::new();
     // Walk `binned` as a cursor rather than a running `idx`, so the per-quality
     // access iterates a slice directly and carries no bounds check. `total`
@@ -224,26 +230,27 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
         let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
         let mut delta = 0u8;
         for (pos, &b) in read.iter().enumerate() {
-            let sym = b - qmin;
+            let cv = b - qmin; // context value (original Phred scale)
+            let dv = dense[b as usize]; // dense coding symbol
             let c = context(q1, q2, q3, delta, pos);
             debug_assert!(c < N_CTX);
             // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
-            unsafe { models.get_unchecked_mut(c) }.encode(&mut enc, sym as usize);
-            if pos > 0 && sym != q1 {
+            unsafe { models.get_unchecked_mut(c) }.encode(&mut enc, dv as usize);
+            if pos > 0 && cv != q1 {
                 delta = (delta + 1).min(DELTA_MAX);
             }
             q3 = q2;
             q2 = q1;
-            q1 = sym;
+            q1 = cv;
         }
     }
     let payload = enc.finish();
 
-    let mut out = Vec::with_capacity(16 + lens.len() + payload.len());
+    let mut out = Vec::with_capacity(16 + k + lens.len() + payload.len());
     out.push(FORMAT_VERSION);
     out.push(binning.tag());
-    out.push(qmin);
-    out.push(qsize as u8);
+    out.push(k as u8);
+    out.extend_from_slice(&syms);
     write_lens(&mut out, lens);
     out.extend_from_slice(&payload);
     Ok(out)
@@ -257,14 +264,15 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
         return Err(Error::Malformed("unsupported version"));
     }
     let _binning = QualityBinning::from_tag(r.u8()?)?;
-    let qmin = r.u8()?;
-    let qsize = r.u8()? as usize;
-    if qsize > QMAX {
-        return Err(Error::AlphabetTooLarge(qsize));
+    let k = r.u8()? as usize;
+    if k == 0 || k > QMAX {
+        return Err(Error::AlphabetTooLarge(k));
     }
+    let syms = r.take(k)?.to_vec();
+    let qmin = syms[0];
     let lens = read_lens(&mut r)?;
 
-    let mut models = vec![SimpleModel::<QMAX>::new(); N_CTX];
+    let mut models = vec![SimpleModel::<QMAX>::with_active(k); N_CTX];
     let payload_len = r.rest().len();
     // Checked sum: a malformed stream can declare lengths whose total wraps
     // `usize`, which would under-allocate `quals` and then over-push.
@@ -296,38 +304,52 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
             let c = context(q1, q2, q3, delta, pos);
             debug_assert!(c < N_CTX);
             // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
-            let sym = unsafe { models.get_unchecked_mut(c) }.decode(&mut dec) as u8;
-            if sym as usize >= qsize {
-                return Err(Error::Malformed("decoded symbol outside alphabet"));
-            }
-            quals.push(sym + qmin);
-            if pos > 0 && sym != q1 {
+            let dv = unsafe { models.get_unchecked_mut(c) }.decode(&mut dec);
+            // `with_active(k)` only ever assigns probability to symbols `0..k`, so
+            // a well-formed stream decodes within `syms`; guard anyway.
+            let b = *syms
+                .get(dv)
+                .ok_or(Error::Malformed("decoded symbol outside alphabet"))?;
+            let cv = b - qmin;
+            quals.push(b);
+            if pos > 0 && cv != q1 {
                 delta = (delta + 1).min(DELTA_MAX);
             }
             q3 = q2;
             q2 = q1;
-            q1 = sym;
+            q1 = cv;
         }
     }
     Ok((lens, quals))
 }
 
-/// Determine `(min_byte, alphabet_size)` over the quality bytes.
-fn alphabet(quals: &[u8]) -> Result<(u8, usize)> {
-    if quals.is_empty() {
-        return Ok((0, 1));
-    }
-    let mut lo = u8::MAX;
-    let mut hi = 0u8;
+/// The set of quality values actually present, as a compact coding alphabet.
+///
+/// Returns the sorted distinct bytes (`syms`) and a 256-entry map from byte to
+/// its dense index in `syms`. The coder sizes its per-context models to
+/// `syms.len()` — only the values that occur — so a stream using few of the
+/// possible Phred levels (e.g. NovaSeq's 4) pays nothing for the ones it never
+/// uses. `syms[0]` is the minimum byte; it doubles as the context origin so the
+/// context features stay on the original (spread-out) Phred scale rather than the
+/// dense indices, which would collapse together under the context's bit-shifts.
+fn dense_alphabet(quals: &[u8]) -> Result<(Vec<u8>, [u8; 256])> {
+    let mut present = [false; 256];
     for &b in quals {
-        lo = lo.min(b);
-        hi = hi.max(b);
+        present[b as usize] = true;
     }
-    let size = (hi - lo) as usize + 1;
-    if size > QMAX {
-        return Err(Error::AlphabetTooLarge(size));
+    let syms: Vec<u8> = (0..=255u8).filter(|&b| present[b as usize]).collect();
+    if syms.is_empty() {
+        // No symbols (empty input): a single dummy so models are well-formed.
+        return Ok((vec![0], [0u8; 256]));
     }
-    Ok((lo, size))
+    if syms.len() > QMAX {
+        return Err(Error::AlphabetTooLarge(syms.len()));
+    }
+    let mut map = [0u8; 256];
+    for (i, &b) in syms.iter().enumerate() {
+        map[b as usize] = i as u8;
+    }
+    Ok((syms, map))
 }
 
 // --- length stream (LEB128 varints, with a fixed-length fast path) -----------
@@ -392,6 +414,16 @@ impl<'a> ByteReader<'a> {
     }
     fn varint(&mut self) -> Result<u64> {
         fqxv_bytes::read_varint(self.buf, &mut self.pos).ok_or(Error::Malformed("varint too long"))
+    }
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .filter(|&e| e <= self.buf.len())
+            .ok_or(Error::Malformed("truncated header"))?;
+        let s = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(s)
     }
     fn rest(&self) -> &'a [u8] {
         &self.buf[self.pos..]
@@ -561,7 +593,7 @@ mod tests {
     // ~13-byte stream requested hundreds of petabytes via `Vec::with_capacity`.
     #[test]
     fn rejects_huge_length_count() {
-        let mut buf = vec![0u8, 0, 0, 1]; // version, binning, qmin, qsize
+        let mut buf = vec![FORMAT_VERSION, 0, 1, 0]; // version, binning, k=1, syms=[0]
         push_varint(&mut buf, u64::MAX >> 8); // n: absurd length count
         buf.push(1); // fixed = true -> resize(n, f) path
         push_varint(&mut buf, 100); // f
@@ -570,7 +602,7 @@ mod tests {
 
     #[test]
     fn rejects_huge_total_length() {
-        let mut buf = vec![0u8, 0, 0, 1];
+        let mut buf = vec![FORMAT_VERSION, 0, 1, 0]; // version, binning, k=1, syms=[0]
         push_varint(&mut buf, 1000); // n reads
         buf.push(1); // fixed = true
         push_varint(&mut buf, u32::MAX as u64); // each read u32::MAX long
