@@ -4,8 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`fqxv` is a Rust toolkit for lossless (opt-in lossy) archiving of short-read
-FASTQ. It's a Cargo workspace of one-crate-per-algorithm codecs plus a container
+`fqxv` is a Rust toolkit for lossless (opt-in lossy) archiving of FASTQ. It's a Cargo workspace of one-crate-per-algorithm codecs plus a container
 format library and CLI. All codecs are **clean-room** implementations from specs
 and papers (CRAM 3.1 codecs spec, fqzcomp/SPRING/PgRC2), never translated from C
 — see `THIRD-PARTY-NOTICES.md`. Status is early development; `FORMAT_VERSION` is

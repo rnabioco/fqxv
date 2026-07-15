@@ -1,7 +1,6 @@
 # 🗜️ fqxv
 
-A fast, reference-free **FASTQ archiver** for short-read sequencing data,
-written in Rust. `fqxv` compresses each part of a FASTQ record with a codec
+A fast, reference-free **FASTQ archiver**, written in Rust. `fqxv` compresses each part of a FASTQ record with a codec
 tuned to it — a context model for quality, an order-k model for sequence, a
 positional tokenizer for names — and composes them into one parallel,
 block-based container.

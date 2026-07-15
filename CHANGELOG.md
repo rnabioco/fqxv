@@ -12,7 +12,7 @@ build reads only its own format version).
 ## [0.1.0] - 2026-07-14
 
 Initial release of `fqxv`, a Rust toolkit for lossless (opt-in lossy) archiving
-of short-read FASTQ. Codecs are clean-room implementations from specs and papers
+of FASTQ. Codecs are clean-room implementations from specs and papers
 (CRAM 3.1 codecs, fqzcomp/SPRING/PgRC2); see `THIRD-PARTY-NOTICES.md`.
 
 ### Added
