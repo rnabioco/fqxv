@@ -366,11 +366,21 @@ pub(crate) fn encode_reordered<W: Write>(
 
     // Discard-order (opt-in, single-end): if the names are purely positional (a
     // counter), regenerate them from a tiny template instead of coding them — no
-    // name stream, no permutation. Reorder-lossy (reads are renumbered), so it is
-    // gated on `params.regenerate_names` AND a successful template detection.
+    // name stream, no permutation. Reorder-lossy (reads are renumbered), gated on
+    // `params.regenerate_names`. When the names ARE a regenerable counter we
+    // reproduce them exactly; otherwise (Illumina tile/x/y, spliced counters that
+    // reset, …) we still renumber — with a fresh synthetic 1..n counter — rather
+    // than falling back to storing a full permutation. This is SPRING's behavior:
+    // discarding read identity is exactly what the caller opted into, and it drops
+    // the ~read-count-sized permutation that otherwise dominates a reordered
+    // archive. Only whole-file order-preserving inputs (`keep_order`, grouped)
+    // keep the permutation.
     let template = if params.regenerate_names && !(params.keep_order || g > 1) {
         let orig_names: Vec<&[u8]> = (0..n).map(|i| all.header(i)).collect();
-        fqxv_tokenizer::detect_template(&orig_names)
+        Some(
+            fqxv_tokenizer::detect_template(&orig_names)
+                .unwrap_or_else(fqxv_tokenizer::NameTemplate::renumber),
+        )
     } else {
         None
     };

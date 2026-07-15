@@ -253,6 +253,19 @@ pub struct NameTemplate {
 const MAX_TEMPLATE_COLS: usize = 64;
 
 impl NameTemplate {
+    /// A synthetic renumbering template: the name at output position `j` is the
+    /// bare decimal counter `j + 1`. Used by the reorder-lossy renumber path when
+    /// [`detect_template`] finds no regenerable structure in the original names, so
+    /// the name stream AND the order permutation are both dropped (SPRING-style
+    /// renumbering) rather than stored losslessly. The reads themselves (sequence
+    /// and quality) are preserved exactly; only the original names are discarded.
+    #[must_use]
+    pub fn renumber() -> Self {
+        NameTemplate {
+            columns: vec![TemplateColumn::Counter { start: 1, pad: 0 }],
+        }
+    }
+
     /// Regenerate the name at position `index` (counters evaluated at `index`).
     #[must_use]
     pub fn regenerate(&self, index: usize) -> Vec<u8> {
@@ -690,6 +703,18 @@ mod tests {
         // Renumbering (regenerate at a different position) stays well-formed.
         assert_eq!(t.regenerate(0), b"@DRR174812.1 1 length=150");
         assert!(t.to_bytes().len() < 64, "template must be tiny");
+    }
+
+    #[test]
+    fn renumber_template_is_a_bare_counter() {
+        // The synthetic renumber template: position j -> "j+1", and it survives a
+        // storage round-trip (it is written to / read from the container header).
+        let t = NameTemplate::renumber();
+        assert_eq!(t.regenerate(0), b"1");
+        assert_eq!(t.regenerate(41), b"42");
+        let rt = NameTemplate::from_bytes(&t.to_bytes()).unwrap();
+        assert_eq!(rt, t);
+        assert!(t.to_bytes().len() < 16, "renumber template must be tiny");
     }
 
     #[test]
