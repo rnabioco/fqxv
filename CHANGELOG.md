@@ -9,6 +9,42 @@ The on-disk `.fqxv` format is **not yet stable**: `FORMAT_VERSION` is `1` and
 archives are not guaranteed to be readable across releases until a `1.0.0` (each
 build reads only its own format version).
 
+## [0.2.0] - 2026-07-15
+
+### Added
+
+- **`compress --estimate`** — predict the compression ratio and archive size
+  for a FASTQ without writing an archive. `--estimate tsv` emits machine-readable
+  output, and `info`/`verify` now accept multiple files or directories for batch
+  reporting.
+- **Reference sequence coder for `--max`/reorder** — a SPRING-style codec that
+  2-bit-packs the assembled global reference and entropy-codes it with a
+  clean-room LZMA, adopted only when it beats the raw representation.
+- **`--order shuffle` renumber mode** — a true SPRING-style read renumbering that
+  discards the input permutation, reaching SPRING-competitive ratios on datasets
+  where read order carries no information.
+- **CLI run feedback** — a TTY-aware progress spinner and human-readable
+  compress/decompress run summaries (suppressed under `--quiet` and when stderr
+  is not a terminal).
+
+### Changed
+
+- **Quality coding** — fqzcomp now models quality over the symbol alphabet that
+  actually occurs in the file rather than a fixed `0..QMAX` range, shrinking the
+  quality stream on data with sparse quality alphabets. Byte-identical
+  round-trips are preserved.
+
+### Performance
+
+- **Reorder merge** — the overlap-merge k-mer index now uses a rolling hash with
+  sharding (~10% faster `--max`, byte-identical output), and the
+  `merge_reference` vote-scatter is parallelized.
+
+### Documentation
+
+- VHS-rendered terminal demos on the docs site, refreshed benchmarks (including
+  an `fqxv-shuffle` row), and clearer positioning.
+
 ## [0.1.0] - 2026-07-14
 
 Initial release of `fqxv`, a Rust toolkit for lossless (opt-in lossy) archiving
@@ -84,4 +120,5 @@ of FASTQ. Codecs are clean-room implementations from specs and papers
   SPRING and fqz_comp do). Name, sequence, and quality are otherwise preserved
   exactly; this is the one documented deviation from byte-losslessness.
 
+[0.2.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.2.0
 [0.1.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.1.0
