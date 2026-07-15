@@ -196,6 +196,14 @@ enum Command {
         /// `est_fqxv_bytes`, `ratio`) instead of the human report.
         #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "human", value_name = "FORMAT")]
         estimate: Option<EstimateFormat>,
+        /// After writing the archive, re-read and fully decode it to confirm it
+        /// round-trips before reporting success — recommended before deleting the
+        /// source FASTQ. Catches a codec or memory error that produced a
+        /// CRC-valid-but-wrong archive. Roughly doubles wall time (adds a decode
+        /// pass; the reorder/`--max` path is the heaviest). On failure the archive
+        /// is left in place and the command exits non-zero.
+        #[arg(long, conflicts_with = "estimate")]
+        verify: bool,
     },
     /// Decompress a `.fqxv` file to FASTQ.
     Decompress {
@@ -446,6 +454,7 @@ fn main() -> anyhow::Result<()> {
             quality_bin,
             platform,
             estimate,
+            verify,
         } => {
             if inputs.is_empty() {
                 anyhow::bail!("at least one input FASTQ is required");
@@ -524,6 +533,30 @@ fn main() -> anyhow::Result<()> {
             let secs = t0.elapsed().as_secs_f64();
             sp.abandon();
 
+            // Optional read-after-write verification: fully decode the archive we
+            // just wrote and confirm it round-trips before reporting success. The
+            // output handle was flushed and dropped by the compress call above, so
+            // reopen the path. On any failure the archive is left in place (for
+            // inspection) and we bail non-zero via `?` — a bad archive is never
+            // reported as done. The spinner's Drop clears its line on that bail.
+            if verify {
+                let sp = progress::Spinner::start("verifying…", cli.quiet);
+                let decoded = File::open(&output)
+                    .with_context(|| format!("reopening {} to verify", output.display()))
+                    .and_then(|f| {
+                        fqxv::verify_roundtrip(f)
+                            .with_context(|| format!("verifying {}", output.display()))
+                    })?;
+                if decoded != stats.reads {
+                    anyhow::bail!(
+                        "verification of {} decoded {decoded} reads but {} were written",
+                        output.display(),
+                        stats.reads
+                    );
+                }
+                sp.abandon();
+            }
+
             // User-facing summary: printed to stderr, gated only on `--quiet` and
             // deliberately independent of the tracing log level. The structured
             // line below is diagnostics only (visible at `-v`).
@@ -533,6 +566,9 @@ fn main() -> anyhow::Result<()> {
                     "{}",
                     report::compress_summary(&names, &output, in_size, &stats, secs)
                 );
+                if verify {
+                    eprintln!("verified: archive fully decodes ({} reads)", stats.reads);
+                }
             }
             tracing::debug!(
                 reads = stats.reads,
