@@ -1393,6 +1393,482 @@ pub fn assemble_global_windowed(
     (GlobalReference { seq, offs }, places)
 }
 
+// --- PROTOTYPE: SPRING-style bidirectional assembly (measurement only) --------
+//
+// fqxv's [`assemble_global`] grows each contig RIGHTWARD only: `place` requires a
+// non-negative offset, so a read that overlaps a contig's *left* end (it would
+// start before the contig) can't attach and seeds a near-duplicate new contig.
+// SPRING (`reorder.h`) instead extends a contig rightward until dry, then
+// LEFTWARD (its `left_search`), and only then starts a new contig — which is why
+// its reference has fewer/longer contigs (~55M bases vs fqxv's 88.9M). This
+// prototype adds that leftward extension to measure the contig/base-count
+// reduction. It tracks NO per-read placements (not container-wired) — it only
+// freezes the assembled contigs so the reference base count can be compared.
+
+/// A contig that can grow at BOTH ends. Columns live in a `VecDeque` (cheap front
+/// growth); `left` counts columns prepended so the k-mer index, keyed by
+/// ORIGIN-relative position (`deque_index - left`), survives prepends.
+type Contig = std::collections::VecDeque<Column>;
+
+#[derive(Default)]
+struct BidirAssembler {
+    contigs: Vec<Contig>,
+    left: Vec<usize>,
+    ref_anchors: Vec<u32>,
+    index: IntMap<u64, (u32, i32)>,
+}
+
+/// k-mer at deque position `start` of a contig, or `None` (off-end / non-ACGT).
+#[inline]
+fn contig_kmer(dq: &Contig, start: usize) -> Option<u64> {
+    if start + RESCUE_K > dq.len() {
+        return None;
+    }
+    let mut v = 0u64;
+    for j in 0..RESCUE_K {
+        let c = code(dq[start + j].base);
+        if c >= 4 {
+            return None;
+        }
+        v = (v << 2) | u64::from(c);
+    }
+    Some(v)
+}
+
+/// Acceptance test for placing `cur` on `dq` at deque shift `s` (the deque index
+/// of `cur[0]`; may be negative — leftward). Returns `(overlap, mismatches)` when
+/// cheaper than a literal, mirroring [`try_place`]'s thresholds.
+fn try_place_shift(dq: &Contig, cur: &[u8], s: i64) -> Option<(usize, usize)> {
+    let len = dq.len() as i64;
+    let ov_start = s.max(0);
+    let ov_end = (s + cur.len() as i64).min(len);
+    if ov_end <= ov_start {
+        return None;
+    }
+    let overlap = (ov_end - ov_start) as usize;
+    if overlap < MIN_CONTIG_OVERLAP.min(cur.len()) {
+        return None;
+    }
+    let mut mism = 0usize;
+    for c in ov_start..ov_end {
+        let r = (c - s) as usize;
+        if cur[r] != dq[c as usize].base {
+            mism += 1;
+        }
+    }
+    let novel = cur.len() - overlap;
+    (mism <= overlap / 4 && novel + mism * 2 < cur.len()).then_some((overlap, mism))
+}
+
+impl BidirAssembler {
+    /// Index k-mers for deque positions `[from, to)` of contig `ci`, keyed by
+    /// origin-relative position (survives future prepends).
+    fn index_range(&mut self, ci: usize, from: usize, to: usize) {
+        let Self {
+            contigs,
+            left,
+            index,
+            ..
+        } = self;
+        let dq = &contigs[ci];
+        let l = left[ci] as i32;
+        let hi = to.min(dq.len().saturating_sub(RESCUE_K - 1));
+        for start in from..hi {
+            if let Some(v) = contig_kmer(dq, start) {
+                index.insert(v, (ci as u32, start as i32 - l));
+            }
+        }
+    }
+
+    /// Best placement of `cur` across contigs as `(ci, shift)` (shift may be
+    /// negative), or `None` to seed. Same candidate sources as [`Assembler::place`]
+    /// (anchor fast-path on the last contig + sampled read k-mers) plus negative
+    /// shifts. Deterministic: candidates deduped and scored by (mism, recency).
+    fn place(&self, cur: &[u8], anchor: u32) -> Option<(usize, i64)> {
+        if cur.is_empty() || self.contigs.is_empty() {
+            return None;
+        }
+        let mut cands: Vec<(usize, i64)> = Vec::new();
+        let last = self.contigs.len() - 1;
+        // Anchor fast-path on the last contig (in deque frame: + left).
+        let center = self.ref_anchors[last] as i64 - anchor as i64 + self.left[last] as i64;
+        cands.push((last, center));
+        let mut start = 0usize;
+        while start + RESCUE_K <= cur.len() {
+            if let Some(k) = kmer_at(cur, start, RESCUE_K) {
+                if let Some(&(ci, orp)) = self.index.get(&k) {
+                    let vpos = orp as i64 + self.left[ci as usize] as i64;
+                    cands.push((ci as usize, vpos - start as i64));
+                }
+            }
+            start += RESCUE_K;
+        }
+        cands.sort_unstable();
+        cands.dedup();
+
+        let mut best: Option<(usize, i64)> = None;
+        let mut best_key = (usize::MAX, usize::MAX);
+        for (ci, s) in cands {
+            if let Some((_ov, mism)) = try_place_shift(&self.contigs[ci], cur, s) {
+                let key = (mism, self.contigs.len() - 1 - ci);
+                if key < best_key {
+                    best_key = key;
+                    best = Some((ci, s));
+                }
+            }
+        }
+        // SPRING-style EXHAUSTIVE shift search on the current (last) contig, as a
+        // fallback when the k-mer index found no placement: try every shift within
+        // ±readlen/2 of the anchor-implied centre and accept the best within the
+        // mismatch budget. This catches reads that DO align to the current contig
+        // but whose sampled k-mers all carried an error (so the index missed
+        // them) — SPRING searches all shifts (`0..maxshift`) rather than only
+        // k-mer-implied offsets, which is a chunk of why it places more reads.
+        if best.is_none() {
+            let last = self.contigs.len() - 1;
+            let center = self.ref_anchors[last] as i64 - anchor as i64 + self.left[last] as i64;
+            let maxshift = (cur.len() / 2) as i64;
+            for s in (center - maxshift)..=(center + maxshift) {
+                if let Some((_ov, mism)) = try_place_shift(&self.contigs[last], cur, s) {
+                    if (mism, 0usize) < best_key {
+                        best_key = (mism, 0);
+                        best = Some((last, s));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Fold `cur` into contig `ci` at shift `s`, extending right (append) and/or
+    /// left (prepend) as needed, then re-index the changed ends.
+    fn commit(&mut self, ci: usize, cur: &[u8], s: i64) {
+        if s >= 0 {
+            let off = s as usize;
+            let old_len = self.contigs[ci].len();
+            let ov = cur.len().min(old_len - off);
+            for k in 0..ov {
+                cast_vote(&mut self.contigs[ci][off + k], cur[k]);
+            }
+            for &b in &cur[ov..] {
+                self.contigs[ci].push_back(seed_column(b));
+            }
+            if self.contigs[ci].len() > old_len {
+                self.index_range(
+                    ci,
+                    old_len.saturating_sub(RESCUE_K - 1),
+                    self.contigs[ci].len(),
+                );
+            }
+        } else {
+            let p = (-s) as usize;
+            // Prepend cur[0..p] (front-most is cur[0]).
+            for &b in cur[..p].iter().rev() {
+                self.contigs[ci].push_front(seed_column(b));
+            }
+            self.left[ci] += p;
+            // cur[p..] now aligns to deque[p..].
+            let ov = (cur.len() - p).min(self.contigs[ci].len() - p);
+            for k in 0..ov {
+                cast_vote(&mut self.contigs[ci][p + k], cur[p + k]);
+            }
+            for &b in &cur[p + ov..] {
+                self.contigs[ci].push_back(seed_column(b));
+            }
+            // Re-index the whole (usually short) contig — positions in deque frame
+            // shifted, though origin-relative keys for old columns are unchanged;
+            // re-indexing the front join + tail is enough, done generously here.
+            let len = self.contigs[ci].len();
+            self.index_range(ci, 0, (p + RESCUE_K).min(len));
+            if ov < cur.len() - p {
+                self.index_range(ci, len.saturating_sub(RESCUE_K - 1), len);
+            }
+        }
+    }
+
+    fn seed(&mut self, cur: &[u8], anchor: u32) {
+        let ci = self.contigs.len();
+        self.contigs
+            .push(cur.iter().map(|&b| seed_column(b)).collect());
+        self.left.push(0);
+        self.ref_anchors.push(anchor);
+        self.index_range(ci, 0, cur.len());
+    }
+}
+
+/// PROTOTYPE (measurement only): SPRING-style BIDIRECTIONAL global assembly.
+/// Same as [`assemble_global`] but reads that overlap a contig's LEFT end prepend
+/// to it instead of seeding a near-duplicate contig. Returns only the frozen
+/// reference (no placements) — for measuring the contig/base-count reduction.
+#[must_use]
+pub fn assemble_global_bidir(reads: &[&[u8]], anchors: &[u32]) -> GlobalReference {
+    let mut asm = BidirAssembler::default();
+    for (i, &cur) in reads.iter().enumerate() {
+        if cur.is_empty() {
+            continue;
+        }
+        if i > 0 && cur == reads[i - 1] {
+            continue; // exact duplicate of previous — inherits its placement
+        }
+        match asm.place(cur, anchors[i]) {
+            Some((ci, s)) => asm.commit(ci, cur, s),
+            None => asm.seed(cur, anchors[i]),
+        }
+    }
+    let mut seq = Vec::new();
+    let mut offs = vec![0usize];
+    for dq in &asm.contigs {
+        for col in dq {
+            seq.push(col.base);
+        }
+        offs.push(seq.len());
+    }
+    GlobalReference { seq, offs }
+}
+
+// --- PROTOTYPE: fully-integrated SPRING-style reference-driven assembly ---------
+//
+// fqxv's assembler is READ-DRIVEN: it walks reads in clustered order and pushes
+// each onto its best existing contig, so deep-coverage reads that don't attach
+// seed near-duplicate contigs (88.9M reference bases vs SPRING's ~55M). SPRING is
+// REFERENCE-DRIVEN (`reorder.h`): it seeds one contig, then greedily PULLS IN
+// every remaining read that overlaps the current reference — extending RIGHTWARD
+// until dry, then LEFTWARD (its `left_search`) until dry — before starting the
+// next contig, so a whole region collapses into ONE contig. This is the full
+// integrated version of that: bidirectional, max-overlap ("all-shift") read
+// selection so the end sweeps slowly and skips nothing, pulling every matching
+// read. Reads are already minimizer-oriented, so reverse-complement search is
+// omitted (a read that is RC relative to a cross-cluster contig is not pulled — a
+// known undercount vs SPRING). Returns only the frozen reference (no placements);
+// this measures the base-count reduction from the assembly STRATEGY.
+
+/// Read-index fanout, sampling, and per-end scan window for [`assemble_global_refdriven`].
+const RD_FANOUT: usize = 24;
+const RD_SAMPLE: usize = 4;
+const RD_WINDOW: usize = 200;
+
+/// PROTOTYPE (measurement): the reference-driven bidirectional assembler above.
+///
+/// **Does NOT converge yet** (measured on 4M NovaSeq — see the design issue): all
+/// tried extension-selection rules produce MORE reference bases than fqxv's
+/// baseline, not fewer, because the pieces are not tuned together:
+/// - max-overlap (min advance): contigs *creep* one base per read and stall at
+///   ~200 bp (~+84% bases, 887k contigs);
+/// - max-reach (max advance, current): chains through spurious short overlaps into
+///   *chimeric* contigs that duplicate regions (~+328% bases, 1.2M contigs).
+/// Reaching SPRING's ~55 MB needs coupled tuning (consensus quality, overlap +
+/// identity thresholds, the sliding-window/shift bookkeeping, chimera guards) with
+/// instrumentation — a real assembler-engineering project, not this prototype. The
+/// separately-measured leftward lever ([`assemble_global_bidir`], −8.8% bases) is
+/// the tractable win.
+#[must_use]
+pub fn assemble_global_refdriven(reads: &[&[u8]], _anchors: &[u32]) -> GlobalReference {
+    const ORIENT_BIT: u32 = 1 << 31;
+    let n = reads.len();
+    // Reverse complements, so a read that is RC relative to a cross-cluster contig
+    // can still be pulled in (SPRING searches both orientations at each step).
+    let rc_reads: Vec<Vec<u8>> = reads.iter().map(|r| revcomp(r)).collect();
+    // The oriented sequence for a candidate `(rid, orient)`.
+    let oriented = |rid: usize, orient: u32| -> &[u8] {
+        if orient == 0 {
+            reads[rid]
+        } else {
+            &rc_reads[rid]
+        }
+    };
+    // Read index (built once): k-mer -> [(read id, read pos | orient-bit)]. Both
+    // the forward read and its reverse complement are indexed.
+    let mut index: IntMap<u64, Vec<(u32, u32)>> = IntMap::default();
+    for rid in 0..n {
+        for (orient, seq) in [(0u32, reads[rid]), (ORIENT_BIT, rc_reads[rid].as_slice())] {
+            let mut p = 0usize;
+            while p + RESCUE_K <= seq.len() {
+                if let Some(k) = kmer_at(seq, p, RESCUE_K) {
+                    let e = index.entry(k).or_default();
+                    if e.len() < RD_FANOUT {
+                        e.push((rid as u32, p as u32 | orient));
+                    }
+                }
+                p += RD_SAMPLE;
+            }
+        }
+    }
+
+    let mut used = vec![false; n];
+    let mut contigs: Vec<Contig> = Vec::new();
+    // Per-step candidate map (rid -> (best read_start, orient)), reused.
+    let mut cand: IntMap<u32, (i64, u32)> = IntMap::default();
+
+    for seed in 0..n {
+        if used[seed] || reads[seed].is_empty() {
+            continue;
+        }
+        used[seed] = true;
+        let mut c: Contig = reads[seed].iter().map(|&b| seed_column(b)).collect();
+
+        // RIGHTWARD sweep: pull the max-overlap read that extends the right end.
+        loop {
+            let l = c.len();
+            cand.clear();
+            let lo = l.saturating_sub(RD_WINDOW);
+            let hi = l.saturating_sub(RESCUE_K);
+            for p in lo..=hi {
+                let Some(k) = contig_kmer(&c, p) else {
+                    continue;
+                };
+                let Some(cs) = index.get(&k) else { continue };
+                for &(rid, packed) in cs {
+                    if used[rid as usize] {
+                        continue;
+                    }
+                    let orient = packed & ORIENT_BIT;
+                    let rstart = p as i64 - (packed & !ORIENT_BIT) as i64;
+                    // Keep the smallest read_start (largest overlap) per read.
+                    cand.entry(rid)
+                        .and_modify(|e| {
+                            if rstart < e.0 {
+                                *e = (rstart, orient);
+                            }
+                        })
+                        .or_insert((rstart, orient));
+                }
+            }
+            // Among valid extenders, take the one reaching FURTHEST right (max
+            // `rs + read_len`) so the contig grows by the largest reliable step and
+            // a whole region collapses into one contig, rather than creeping one
+            // base at a time. `reach` is the new contig length if this read is
+            // taken; the hamming gate keeps the overlap reliable.
+            let mut best: Option<(u32, usize, usize, u32)> = None; // (rid, rs, reach, orient)
+            for (&rid, &(rstart, orient)) in &cand {
+                if rstart < 0 {
+                    continue;
+                }
+                let rs = rstart as usize;
+                let r = oriented(rid as usize, orient);
+                let reach = rs + r.len();
+                if reach <= l {
+                    continue; // no rightward extension
+                }
+                let overlap = l - rs;
+                // read[j] vs contig column rs+j.
+                if overlap < MIN_CONTIG_OVERLAP || !hamming_ok(r, &c, 0, rs, overlap) {
+                    continue;
+                }
+                if best.is_none_or(|(brid, _, br, _)| reach > br || (reach == br && rid < brid)) {
+                    best = Some((rid, rs, reach, orient));
+                }
+            }
+            let Some((rid, rs, _, orient)) = best else {
+                break;
+            };
+            used[rid as usize] = true;
+            let r = oriented(rid as usize, orient);
+            for cc in rs..l {
+                cast_vote(&mut c[cc], r[cc - rs]);
+            }
+            for &b in &r[l - rs..] {
+                c.push_back(seed_column(b));
+            }
+        }
+
+        // LEFTWARD sweep: pull the max-overlap read that extends the left end.
+        loop {
+            let l = c.len();
+            cand.clear();
+            let hi = RD_WINDOW.min(l.saturating_sub(RESCUE_K));
+            for p in 0..=hi {
+                let Some(k) = contig_kmer(&c, p) else {
+                    continue;
+                };
+                let Some(cs) = index.get(&k) else { continue };
+                for &(rid, packed) in cs {
+                    if used[rid as usize] {
+                        continue;
+                    }
+                    let orient = packed & ORIENT_BIT;
+                    let rstart = p as i64 - (packed & !ORIENT_BIT) as i64;
+                    // Keep the smallest (most-negative) read_start = reaches furthest left.
+                    cand.entry(rid)
+                        .and_modify(|e| {
+                            if rstart < e.0 {
+                                *e = (rstart, orient);
+                            }
+                        })
+                        .or_insert((rstart, orient));
+                }
+            }
+            // Take the read reaching FURTHEST left (largest prepend), the mirror of
+            // the rightward furthest-reach rule.
+            let mut best: Option<(u32, usize, usize, u32)> = None; // (rid, prepend, pfx, orient)
+            for (&rid, &(rstart, orient)) in &cand {
+                if rstart >= 0 {
+                    continue; // must extend left
+                }
+                let r = oriented(rid as usize, orient);
+                let oend = (rstart + r.len() as i64).min(l as i64);
+                if oend <= 0 {
+                    continue;
+                }
+                let overlap = oend as usize; // overlap region is columns [0, overlap)
+                let pfx = (-rstart) as usize;
+                // read[pfx+j] vs contig column j.
+                if overlap < MIN_CONTIG_OVERLAP || !hamming_ok(r, &c, pfx, 0, overlap) {
+                    continue;
+                }
+                if best.is_none_or(|(brid, _, bp, _)| pfx > bp || (pfx == bp && rid < brid)) {
+                    best = Some((rid, pfx, pfx, orient));
+                }
+            }
+            let Some((rid, pfx, _, orient)) = best else {
+                break;
+            };
+            used[rid as usize] = true;
+            let r = oriented(rid as usize, orient);
+            for &b in r[..pfx].iter().rev() {
+                c.push_front(seed_column(b));
+            }
+            // The read now aligns at deque index 0; vote read[pfx..] into c[pfx..].
+            let l2 = c.len();
+            let ov = (r.len() - pfx).min(l2 - pfx);
+            for k in 0..ov {
+                cast_vote(&mut c[pfx + k], r[pfx + k]);
+            }
+            for &b in &r[pfx + ov..] {
+                c.push_back(seed_column(b));
+            }
+        }
+
+        contigs.push(c);
+    }
+
+    let mut seq = Vec::new();
+    let mut offs = vec![0usize];
+    for c in &contigs {
+        for col in c {
+            seq.push(col.base);
+        }
+        offs.push(seq.len());
+    }
+    GlobalReference { seq, offs }
+}
+
+/// Hamming check over `overlap` columns: `read[read_off + j]` vs contig column
+/// `col_off + j`, accepting up to `overlap / 4` mismatches (mirrors [`try_place`]).
+#[inline]
+fn hamming_ok(read: &[u8], c: &Contig, read_off: usize, col_off: usize, overlap: usize) -> bool {
+    let budget = overlap / 4;
+    let mut mism = 0usize;
+    for j in 0..overlap {
+        if read[read_off + j] != c[col_off + j].base {
+            mism += 1;
+            if mism > budget {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Pass 2 of the v4 codec: code one block of clustered reads as positions on the
 /// frozen `reference`, using the placements from [`assemble_global`]. Each read
 /// is `MATCH` (byte-identical to the block-previous read) or `CONTIG` — a
