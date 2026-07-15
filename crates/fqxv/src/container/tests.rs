@@ -635,11 +635,13 @@ fn discard_order_renumbers_and_preserves_content() {
 }
 
 #[test]
-fn discard_order_falls_back_for_non_counter_names() {
+fn discard_order_renumbers_non_counter_names() {
     // Illumina tile/x/y names aren't a per-read counter (x/y vary
-    // non-monotonically), so regenerate_names can't engage — it must fall back
-    // to a byte-lossless clustered layout (records preserved as a set, names
-    // intact and still paired with their reads).
+    // non-monotonically), so they can't be reproduced from position. Renumber
+    // mode still engages: the reads are relabeled with a fresh 1..n counter (no
+    // name stream, no permutation) rather than falling back to a lossless
+    // order-preserving layout. Sequences are preserved as a set; original names
+    // are intentionally discarded.
     let input = windowed_input(
         |i| {
             format!(
@@ -658,9 +660,25 @@ fn discard_order_falls_back_for_non_counter_names() {
     };
     let mut archive = Vec::new();
     compress(&input[..], &mut archive, params).unwrap();
+    // No permutation stored, names reported as regenerated.
+    assert!(!peek(&archive[..]).unwrap().keep_order);
+    assert!(
+        inspect(io::Cursor::new(&archive[..]))
+            .unwrap()
+            .regenerated_names
+    );
+
     let mut out = Vec::new();
     decompress(&archive[..], &mut out, 1).unwrap();
-    assert_eq!(record_set(&out), record_set(&input));
+    // Sequences preserved exactly as a set (identity discarded).
+    assert_eq!(seq_set(&out), seq_set(&input));
+    // Names are a fresh 1..n counter in output order.
+    let lines: Vec<&[u8]> = out.split(|&b| b == b'\n').collect();
+    let recs: Vec<&[&[u8]]> = lines.chunks(4).filter(|c| c.len() == 4).collect();
+    assert_eq!(recs.len(), 2000);
+    for (k, c) in recs.iter().enumerate() {
+        assert_eq!(c[0], format!("@{}", k + 1).as_bytes(), "name at output {k}");
+    }
 }
 
 #[test]

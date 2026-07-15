@@ -276,12 +276,13 @@ enum ReadOrder {
     Preserve,
     /// Allow reordering for a better ratio; single-end order may change.
     Any,
-    /// Like `any`, but if the read names are purely positional (a counter, e.g.
-    /// SRA `@RUN.N N`), discard the original order entirely: renumber the reads
-    /// and regenerate the names, dropping the permutation and the name stream for
-    /// the smallest archive. **Reorder-lossy — reads are renumbered** (sequence
-    /// and quality preserved exactly). Falls back to `any` when names aren't a
-    /// counter. Single-end only.
+    /// Discard the original read order AND names entirely for the smallest
+    /// archive: renumber the reads and regenerate the names, dropping both the
+    /// order permutation and the name stream. Names that are a positional counter
+    /// (e.g. SRA `@RUN.N N`) are reproduced exactly; otherwise the reads are
+    /// renumbered with a fresh 1..n counter. **Reorder-lossy — original names and
+    /// order are not recoverable** (sequence and quality preserved exactly).
+    /// Single-end only.
     Shuffle,
 }
 
