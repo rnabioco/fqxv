@@ -38,6 +38,39 @@ pub fn verify<R: Read + Seek>(reader: R) -> Result<()> {
     Ok(())
 }
 
+/// Full post-write verification: re-read a just-written archive and prove it is
+/// both intact on disk *and* decodes cleanly, returning the decoded read count.
+///
+/// This is the check to run after `compress` before trusting (or deleting) the
+/// source: it fully decodes the archive into a sink so every per-block content
+/// digest and cross-stream length check is exercised — catching a codec bug that
+/// produced a CRC-valid-but-wrong archive, which the structural [`verify`] alone
+/// cannot. For the plain layout it *also* runs [`verify`] first, because the
+/// whole-file CRC covers the header, inter-block framing, and footer index —
+/// bytes a streaming decode never reads. The globally-clustered reorder layout has
+/// no whole-file CRC, but a single decode already drives every frame CRC and the
+/// trailing output digest, so it is not decoded twice.
+///
+/// It does not compare against the original FASTQ bytes, so it cannot catch a
+/// *parse*-level bug (the content digest is computed from the parsed block); it
+/// proves the archive round-trips to the content that was encoded. Being
+/// page-cache-coherent, it validates the bytes the encoder emitted rather than the
+/// storage medium — latent bit-rot is what a later [`verify`] catches.
+pub fn verify_roundtrip<R: Read + Seek>(mut reader: R) -> Result<u64> {
+    let header = read_header(&mut BufReader::new(&mut reader))?;
+    reader.seek(SeekFrom::Start(0))?;
+
+    if header.flags & FLAG_GLOBAL_REORDER != 0 {
+        // One decode is both the structural and the content check here.
+        return Ok(decompress(reader, io::sink(), 0)?.reads);
+    }
+
+    // Plain layout: whole-file CRC (structure/framing) then decode (content).
+    verify(&mut reader)?;
+    reader.seek(SeekFrom::Start(0))?;
+    Ok(decompress(reader, io::sink(), 0)?.reads)
+}
+
 /// The authoritative number of reads the archive should contain, for detecting a
 /// truncated file on decompress.
 ///
