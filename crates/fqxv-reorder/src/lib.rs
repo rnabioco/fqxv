@@ -731,21 +731,32 @@ impl Assembler {
     /// the index only proposes candidates, [`try_place`] validates against the
     /// live consensus, so staleness costs recall, never correctness.
     fn index_range(&mut self, ci: usize, from: usize, to: usize) {
-        let n = self.contigs[ci].len();
-        let hi = to.min(n.saturating_sub(RESCUE_K - 1));
-        for start in from..hi {
-            let mut v = 0u64;
-            let mut ok = true;
-            for j in 0..RESCUE_K {
-                let c = code(self.contigs[ci][start + j].base);
-                if c >= 4 {
-                    ok = false;
-                    break;
-                }
-                v = (v << 2) | u64::from(c);
+        // Low 2*RESCUE_K bits: the rolling window of the last RESCUE_K bases.
+        const MASK: u64 = (1u64 << (2 * RESCUE_K)) - 1;
+        let Self { contigs, index, .. } = self;
+        let contig = &contigs[ci];
+        let n = contig.len();
+        let hi = to.min(n.saturating_sub(RESCUE_K - 1)); // k-mer starts are `< hi`
+        if from >= hi {
+            return;
+        }
+        // Roll a 2-bit-packed k-mer across the columns instead of recomputing all
+        // RESCUE_K bases at every start (O(bases) not O(bases * k)). A non-ACGT
+        // base resets the run, so only all-ACGT windows are indexed — identical
+        // keys and insert order to the per-start recompute, so output is unchanged.
+        let last = hi + RESCUE_K - 1; // exclusive column bound, `<= n`
+        let mut v = 0u64;
+        let mut run = 0usize;
+        for p in from..last {
+            let c = code(contig[p].base);
+            if c >= 4 {
+                run = 0;
+                continue;
             }
-            if ok {
-                self.index.insert(v, (ci as u32, start as u32));
+            v = ((v << 2) | u64::from(c)) & MASK;
+            run += 1;
+            if run >= RESCUE_K {
+                index.insert(v, (ci as u32, (p + 1 - RESCUE_K) as u32));
             }
         }
     }
@@ -1697,19 +1708,29 @@ fn build_merge_index(
         .par_iter()
         .map(|&start| {
             let end = (start + chunk).min(nc);
+            const MASK: u64 = (1u64 << (2 * MERGE_K)) - 1;
             let mut m: IntMap<u64, Vec<(u32, u32)>> = IntMap::default();
             for ci in start..end {
                 let c = contigs[ci];
                 let hi = c.len().min(prefix);
-                let mut s = 0usize;
-                while s + MERGE_K <= hi {
-                    if let Some(code) = kmer_at(c, s, MERGE_K) {
-                        let e = m.entry(code).or_default();
+                // Roll the k-mer instead of recomputing all MERGE_K bases per
+                // start (O(bases) not O(bases * k)); a non-ACGT base resets the
+                // run, so keys and insert order match the per-start recompute.
+                let (mut v, mut run) = (0u64, 0usize);
+                for s in 0..hi {
+                    let cb = code(c[s]);
+                    if cb >= 4 {
+                        run = 0;
+                        continue;
+                    }
+                    v = ((v << 2) | u64::from(cb)) & MASK;
+                    run += 1;
+                    if run >= MERGE_K {
+                        let e = m.entry(v).or_default();
                         if e.len() < fanout {
-                            e.push((ci as u32, s as u32));
+                            e.push((ci as u32, (s + 1 - MERGE_K) as u32));
                         }
                     }
-                    s += 1;
                 }
             }
             m
