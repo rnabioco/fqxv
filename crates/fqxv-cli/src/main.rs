@@ -1,7 +1,10 @@
 //! `fqxv` command-line interface — a thin front-end over the [`fqxv`] library.
 
+mod progress;
+mod report;
+
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,7 +18,7 @@ use serde::Serialize;
 use tabled::builder::Builder as TableBuilder;
 use tabled::settings::object::Columns;
 use tabled::settings::{Alignment, Modify, Style};
-use tracing::{info, warn};
+use tracing::warn;
 use tracing_subscriber::{fmt, EnvFilter};
 
 /// Terminal color scheme for `--help` (shared with the rnabioco tooling look):
@@ -411,6 +414,12 @@ fn configure_global_pool(threads: usize) -> Result<(), rayon::ThreadPoolBuildErr
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose, cli.quiet);
+    // Color the user-facing summaries only on an interactive stderr with color
+    // permitted; honor the `NO_COLOR` convention. Quiet mode prints no summary,
+    // so color is moot there.
+    report::set_color(
+        !cli.quiet && io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
+    );
     configure_global_pool(cli.threads).context("configuring the global thread pool")?;
     match cli.command {
         Command::Compress {
@@ -475,6 +484,16 @@ fn main() -> anyhow::Result<()> {
             let out = File::create(&output)
                 .with_context(|| format!("creating output {}", output.display()))?;
 
+            // The reorder path opens with a long single-threaded prelude, so name
+            // the spinner after the slow work to set expectations. On a `?` bail
+            // the spinner's Drop clears the line before the error prints.
+            let spin_msg = if params.reorder {
+                "compressing (reorder — this can take a while)…"
+            } else {
+                "compressing…"
+            };
+            let sp = progress::Spinner::start(spin_msg, cli.quiet);
+
             let t0 = Instant::now();
             let stats = if inputs.len() == 1 {
                 match interleaved {
@@ -492,24 +511,25 @@ fn main() -> anyhow::Result<()> {
                 fqxv::compress_multi(readers, out, params)?
             };
             let secs = t0.elapsed().as_secs_f64();
-            // Ratio needs the input size; a stdin stream (`-`) has none, so omit it.
-            let ratio = if in_size > 0 && stats.out_bytes > 0 {
-                format!(" ({:.2}x)", in_size as f64 / stats.out_bytes as f64)
-            } else {
-                String::new()
-            };
-            let layout = match stats.group_size {
-                0 | 1 => "single-end".to_string(),
-                2 => "paired".to_string(),
-                g => format!("grouped x{g}"),
-            };
-            info!(
+            sp.abandon();
+
+            // User-facing summary: printed to stderr, gated only on `--quiet` and
+            // deliberately independent of the tracing log level. The structured
+            // line below is diagnostics only (visible at `-v`).
+            if !cli.quiet {
+                let names: Vec<String> = inputs.iter().map(|p| p.display().to_string()).collect();
+                eprintln!(
+                    "{}",
+                    report::compress_summary(&names, &output, in_size, &stats, secs)
+                );
+            }
+            tracing::debug!(
                 reads = stats.reads,
                 inputs = inputs.len(),
                 blocks = stats.blocks,
                 out_bytes = stats.out_bytes,
                 secs = format_args!("{secs:.1}"),
-                "compressed {layout}{ratio}"
+                "compressed"
             );
         }
         Command::Decompress {
@@ -523,30 +543,50 @@ fn main() -> anyhow::Result<()> {
         } => {
             let open_in =
                 || File::open(&input).with_context(|| format!("opening input {}", input.display()));
+            // Where the decoded FASTQ is headed, for the summary line. Computed
+            // from borrows before `split`/`output` are consumed below.
+            let dest = if let Some(prefix) = split.as_ref() {
+                format!("{}_*", prefix.display())
+            } else if stdout || output.as_deref().is_some_and(|p| p.as_os_str() == "-") {
+                "stdout".to_string()
+            } else if let Some(o) = output.as_ref() {
+                o.display().to_string()
+            } else {
+                "stdout".to_string()
+            };
             let t0 = Instant::now();
             if recover {
                 // Recovery deliberately tolerates missing/corrupt blocks, so the
                 // completeness check below does not apply here.
+                let sp = progress::Spinner::start("recovering…", cli.quiet);
                 let mut sink = open_sink(output.as_deref(), stdout)?;
                 let rec = fqxv::decompress_recover(open_in()?, &mut sink, cli.threads)?;
                 sink.finish()?;
+                let secs = t0.elapsed().as_secs_f64();
+                sp.abandon();
                 if rec.blocks_skipped > 0 {
-                    // User-facing summary on stderr so it shows even when the
-                    // decoded FASTQ is piped from stdout.
+                    // On stderr so it shows even when decoded FASTQ is piped out.
                     eprintln!(
                         "warning: recovered {} block(s), skipped {} corrupt block(s) — {} read(s) lost",
                         rec.blocks_recovered, rec.blocks_skipped, rec.reads_lost
                     );
                 }
-                info!(
+                if !cli.quiet {
+                    eprintln!(
+                        "{}",
+                        report::decompress_summary(&input, &dest, &rec.stats, secs)
+                    );
+                }
+                tracing::debug!(
                     reads = rec.stats.reads,
                     blocks = rec.blocks_recovered,
                     skipped = rec.blocks_skipped,
                     reads_lost = rec.reads_lost,
-                    secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+                    secs = format_args!("{secs:.1}"),
                     "recovered"
                 );
             } else {
+                let sp = progress::Spinner::start("decompressing…", cli.quiet);
                 // Read the footer's authoritative read count first. For a truncated
                 // archive (which also lost its footer) this errors before any output
                 // is written; otherwise we compare it against what we actually
@@ -577,10 +617,18 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
-                info!(
+                let secs = t0.elapsed().as_secs_f64();
+                sp.abandon();
+                if !cli.quiet {
+                    eprintln!(
+                        "{}",
+                        report::decompress_summary(&input, &dest, &stats, secs)
+                    );
+                }
+                tracing::debug!(
                     reads = stats.reads,
                     blocks = stats.blocks,
-                    secs = format_args!("{:.1}", t0.elapsed().as_secs_f64()),
+                    secs = format_args!("{secs:.1}"),
                     "decompressed"
                 );
             }
