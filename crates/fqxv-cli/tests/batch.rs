@@ -195,3 +195,47 @@ fn estimate_tsv_reports_file_and_sizes() {
     assert!(row[2].parse::<u64>().unwrap() > 0);
     assert!(row[3].parse::<f64>().unwrap() > 0.0);
 }
+
+#[test]
+fn compress_verify_confirms_roundtrip() {
+    let dir = tmp("compress_verify");
+    fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("reads.fastq");
+    fs::write(&src, fastq(3)).unwrap();
+    let arc = dir.join("reads.fqxv");
+
+    let out = run(&[
+        "compress",
+        src.to_str().unwrap(),
+        "-o",
+        arc.to_str().unwrap(),
+        "--force",
+        "--verify",
+        "--threads",
+        "1",
+    ]);
+    assert!(arc.exists(), "verified compress still writes the archive");
+    // The verification note is printed to stderr alongside the summary.
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains("verified"),
+        "expected a verification note, got: {stderr}"
+    );
+}
+
+#[test]
+fn compress_verify_conflicts_with_estimate() {
+    let dir = tmp("verify_estimate_conflict");
+    fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("reads.fastq");
+    fs::write(&src, fastq(4)).unwrap();
+
+    let out = Command::new(FQXV)
+        .args(["compress", src.to_str().unwrap(), "--verify", "--estimate"])
+        .output()
+        .expect("spawn fqxv");
+    assert!(
+        !out.status.success(),
+        "--verify with --estimate must be rejected"
+    );
+}
