@@ -827,6 +827,52 @@ mod tests {
         }
     }
 
+    /// Apply byte substitutions, an optional 0xFF window (to drive a length/count
+    /// field high), and an optional truncation to `data`.
+    fn corrupt(
+        mut data: Vec<u8>,
+        subs: &[(usize, u8)],
+        wipe: Option<(usize, usize)>,
+        trunc: Option<usize>,
+    ) -> Vec<u8> {
+        for &(pos, val) in subs {
+            if !data.is_empty() {
+                let i = pos % data.len();
+                data[i] = val;
+            }
+        }
+        if let (Some((pos, w)), false) = (wipe, data.is_empty()) {
+            let i = pos % data.len();
+            for b in data.iter_mut().skip(i).take(w) {
+                *b = 0xFF;
+            }
+        }
+        if let Some(t) = trunc {
+            if !data.is_empty() {
+                data.truncate(t % data.len());
+            }
+        }
+        data
+    }
+
+    proptest::proptest! {
+        /// Encode valid names, corrupt the stream, then decode: a mutated name
+        /// stream must never panic or abort — only return Ok/Err.
+        #[test]
+        fn decode_survives_mutation(
+            names in proptest::collection::vec(
+                proptest::collection::vec(proptest::sample::select(b"AB:._-0129 ".to_vec()), 0..40),
+                0..60),
+            subs in proptest::collection::vec((proptest::num::usize::ANY, proptest::num::u8::ANY), 0..12),
+            wipe in proptest::option::of((proptest::num::usize::ANY, 1usize..9)),
+            trunc in proptest::option::of(proptest::num::usize::ANY),
+        ) {
+            let refs: Vec<&[u8]> = names.iter().map(|n| n.as_slice()).collect();
+            let enc = encode(&refs).expect("encode");
+            let _ = decode(&corrupt(enc, &subs, wipe, trunc));
+        }
+    }
+
     // --- hardening: corrupt-input allocation guards ---
 
     #[test]

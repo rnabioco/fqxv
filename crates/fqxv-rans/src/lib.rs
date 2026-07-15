@@ -468,4 +468,50 @@ mod tests {
         }
         assert!(matches!(decode(&src), Err(Error::Malformed(_))));
     }
+
+    /// Apply byte substitutions, an optional 0xFF window (to drive a length/count
+    /// field high), and an optional truncation to `data`.
+    fn corrupt(
+        mut data: Vec<u8>,
+        subs: &[(usize, u8)],
+        wipe: Option<(usize, usize)>,
+        trunc: Option<usize>,
+    ) -> Vec<u8> {
+        for &(pos, val) in subs {
+            if !data.is_empty() {
+                let i = pos % data.len();
+                data[i] = val;
+            }
+        }
+        if let (Some((pos, w)), false) = (wipe, data.is_empty()) {
+            let i = pos % data.len();
+            for b in data.iter_mut().skip(i).take(w) {
+                *b = 0xFF;
+            }
+        }
+        if let Some(t) = trunc {
+            if !data.is_empty() {
+                data.truncate(t % data.len());
+            }
+        }
+        data
+    }
+
+    proptest::proptest! {
+        /// Encode valid data, corrupt the stream, then decode: a mutated rANS
+        /// stream must never panic or abort — only return Ok/Err. Covers both
+        /// orders and whichever backend `decode` dispatches to on this CPU.
+        #[test]
+        fn decode_survives_mutation(
+            data in proptest::collection::vec(0u8..40, 0..2000),
+            zero_order in proptest::bool::ANY,
+            subs in proptest::collection::vec((proptest::num::usize::ANY, proptest::num::u8::ANY), 0..12),
+            wipe in proptest::option::of((proptest::num::usize::ANY, 1usize..9)),
+            trunc in proptest::option::of(proptest::num::usize::ANY),
+        ) {
+            let order = if zero_order { Order::Zero } else { Order::One };
+            let enc = encode(&data, order).expect("encode");
+            let _ = decode(&corrupt(enc, &subs, wipe, trunc));
+        }
+    }
 }
