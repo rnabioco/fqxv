@@ -74,6 +74,7 @@ NNGGCC\n\
         in_path.to_str().unwrap(),
         "-o",
         arc_path.to_str().unwrap(),
+        "--force",
         "--quality-bin",
         "bin4",
         "--threads",
@@ -95,6 +96,7 @@ NNGGCC\n\
         arc_path.to_str().unwrap(),
         "-o",
         rt_path.to_str().unwrap(),
+        "--force",
         "--threads",
         "1",
     ]);

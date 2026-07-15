@@ -302,13 +302,13 @@ run_rt() {  # id files_csv
     local comp="$WORK/$id.$mode.fqxv" rt="$WORK/$id.$mode.rt" log="$LOGS/$id.$mode.log" args
     args=$(compress_args "$mode")
     # shellcheck disable=SC2086
-    "$FQXV_BIN" compress "${ins[@]}" -o "$comp" --threads "$THREADS" $args > "$log" 2>&1
+    "$FQXV_BIN" compress "${ins[@]}" -o "$comp" --force --threads "$THREADS" $args > "$log" 2>&1
     local rc=$?
     if [[ $rc -ne 0 ]]; then
       crashed "$log" && { echo -e "$id\t$mode\tFAIL_CRASH\tcompress rc=$rc"; continue; }
       echo -e "$id\t$mode\tFAIL_COMPRESS\trc=$rc"; continue
     fi
-    if ! "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" >> "$log" 2>&1; then
+    if ! "$FQXV_BIN" decompress "$comp" -o "$rt" --force --threads "$THREADS" >> "$log" 2>&1; then
       rc=$?; crashed "$log" && { echo -e "$id\t$mode\tFAIL_CRASH\tdecompress rc=$rc"; continue; }
       echo -e "$id\t$mode\tFAIL_DECOMPRESS\trc=$rc"; rm -f "$comp"; continue
     fi
@@ -319,7 +319,7 @@ run_rt() {  # id files_csv
     # determinism
     local comp1="$WORK/$id.$mode.t1.fqxv"
     # shellcheck disable=SC2086
-    "$FQXV_BIN" compress "${ins[@]}" -o "$comp1" --threads 1 $args >> "$log" 2>&1
+    "$FQXV_BIN" compress "${ins[@]}" -o "$comp1" --force --threads 1 $args >> "$log" 2>&1
     if ! cmp -s "$comp" "$comp1"; then echo -e "$id\t$mode\tFAIL_DET\tt1 != t$THREADS"; rm -f "$rt"; continue; fi
     rm -f "$comp" "$comp1" "$rt"
     echo -e "$id\t$mode\tPASS\t-"
@@ -331,12 +331,12 @@ run_reject() {  # id files_csv
   local ins=(); local r; for r in "${rel[@]}"; do ins+=("$IN/$r"); done
   local comp="$WORK/$id.fqxv" rt="$WORK/$id.rt" log="$LOGS/$id.log"
   # shellcheck disable=SC2086
-  "$FQXV_BIN" compress "${ins[@]}" -o "$comp" --threads "$THREADS" > "$log" 2>&1
+  "$FQXV_BIN" compress "${ins[@]}" -o "$comp" --force --threads "$THREADS" > "$log" 2>&1
   local rc=$?
   if [[ $rc -ge 128 ]] || crashed "$log"; then echo -e "$id\treject\tFAIL_CRASH\trc=$rc"; return; fi
   if [[ $rc -ne 0 ]]; then echo -e "$id\treject\tPASS_REJECT\tclean error rc=$rc"; rm -f "$comp"; return; fi
   # Accepted the malformed input: that's allowed only if it round-trips losslessly.
-  if ! "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" >> "$log" 2>&1; then
+  if ! "$FQXV_BIN" decompress "$comp" -o "$rt" --force --threads "$THREADS" >> "$log" 2>&1; then
     crashed "$log" && { echo -e "$id\treject\tFAIL_CRASH\tdecompress"; return; }
     echo -e "$id\treject\tFAIL_DECOMPRESS\taccepted then failed to decode"; return
   fi
@@ -353,11 +353,11 @@ run_xfail() {  # id files_csv note
   local id="$1" csv="$2" note="$3"; IFS=',' read -ra rel <<< "$csv"
   local ins=(); local r; for r in "${rel[@]}"; do ins+=("$IN/$r"); done
   local comp="$WORK/$id.fqxv" rt="$WORK/$id.rt" log="$LOGS/$id.log"
-  if ! "$FQXV_BIN" compress "${ins[@]}" -o "$comp" --threads "$THREADS" > "$log" 2>&1; then
+  if ! "$FQXV_BIN" compress "${ins[@]}" -o "$comp" --force --threads "$THREADS" > "$log" 2>&1; then
     crashed "$log" && { echo -e "$id\tdefault\tFAIL_CRASH\t$note"; return; }
     echo -e "$id\tdefault\tXFAIL\t$note"; return
   fi
-  "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" >> "$log" 2>&1 || { echo -e "$id\tdefault\tXFAIL\t$note"; return; }
+  "$FQXV_BIN" decompress "$comp" -o "$rt" --force --threads "$THREADS" >> "$log" 2>&1 || { echo -e "$id\tdefault\tXFAIL\t$note"; return; }
   if [[ "$(digest "$rt")" == "$(digest "${ins[@]}")" ]]; then echo -e "$id\tdefault\tXPASS\t$note (now passes — promote to rt)"
   else echo -e "$id\tdefault\tXFAIL\t$note"; fi
   rm -f "$comp" "$rt"

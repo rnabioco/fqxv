@@ -65,7 +65,15 @@ awk 'BEGIN {
 fqxv --quiet compress demo.fastq.gz -o demo.fqxv
 
 # --- render -----------------------------------------------------------------
+# compress.tape / readme.tape run `fqxv compress … -o demo.fqxv` live, so the
+# recorded gif shows a real run. The archive pre-built above (and left by an
+# earlier tape) would trip the no-clobber guard and make the demo error, so
+# clear it just before those producer tapes. Glob order is alphabetical, so the
+# consumers (decompress/info) still see the archive compress.tape leaves behind.
 for tape in docs/tapes/*.tape; do
+    case "$tape" in
+        */compress.tape | */readme.tape) rm -f demo.fqxv ;;
+    esac
     echo "Generating: $tape"
     vhs "$tape"
 done

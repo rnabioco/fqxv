@@ -202,8 +202,8 @@ aligner_order_effect() {  # returns a NOTE string
 roundtrip() {  # mode compress-args...
   local mode="$1"; shift
   echo "==> $mode"
-  "$FQXV_BIN" compress "$orig" -o "$w/$mode.fqxv" "$@" --threads "$THREADS" >/dev/null 2>&1
-  "$FQXV_BIN" decompress "$w/$mode.fqxv" -o "$w/$mode.fastq" --threads "$THREADS" >/dev/null 2>&1
+  "$FQXV_BIN" compress "$orig" -o "$w/$mode.fqxv" --force "$@" --threads "$THREADS" >/dev/null 2>&1
+  "$FQXV_BIN" decompress "$w/$mode.fqxv" -o "$w/$mode.fastq" --force --threads "$THREADS" >/dev/null 2>&1
   align "$w/$mode.fastq" "$ref" "$w/$mode.bam"
   evaluate "$mode" "$w/$mode.fastq"
 }

@@ -145,7 +145,7 @@ process_accession() {
     echo "=== compress ($mode) fqxv $args ===" >> "$log"
     t0=$SECONDS
     # shellcheck disable=SC2086
-    if ! "$FQXV_BIN" compress "${INPUTS[@]}" -o "$comp" --threads "$THREADS" $args >> "$log" 2>&1; then
+    if ! "$FQXV_BIN" compress "${INPUTS[@]}" -o "$comp" --force --threads "$THREADS" $args >> "$log" 2>&1; then
       rc=$?; secs=$((SECONDS-t0))
       echo "  $acc/$mode: FAIL_COMPRESS (rc=$rc)"
       record "$acc" "$mode" "FAIL_COMPRESS" "rc=$rc" "" "$secs"
@@ -156,7 +156,7 @@ process_accession() {
 
     # Decompress (interleaved to stdout captured to file).
     echo "=== decompress ($mode) ===" >> "$log"
-    if ! "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" >> "$log" 2>&1; then
+    if ! "$FQXV_BIN" decompress "$comp" -o "$rt" --force --threads "$THREADS" >> "$log" 2>&1; then
       rc=$?
       echo "  $acc/$mode: FAIL_DECOMPRESS (rc=$rc)"
       record "$acc" "$mode" "FAIL_DECOMPRESS" "rc=$rc" "$bytes" "$secs"
@@ -183,7 +183,7 @@ process_accession() {
     echo "=== determinism ($mode, --threads 1) ===" >> "$log"
     local comp1="$wd/$mode.t1.fqxv"
     # shellcheck disable=SC2086
-    if ! "$FQXV_BIN" compress "${INPUTS[@]}" -o "$comp1" --threads 1 $args >> "$log" 2>&1; then
+    if ! "$FQXV_BIN" compress "${INPUTS[@]}" -o "$comp1" --force --threads 1 $args >> "$log" 2>&1; then
       rc=$?
       echo "  $acc/$mode: FAIL_COMPRESS (threads=1, rc=$rc)"
       record "$acc" "$mode" "FAIL_COMPRESS" "threads=1 rc=$rc" "$bytes" "$secs"

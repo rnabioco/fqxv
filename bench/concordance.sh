@@ -103,8 +103,8 @@ run_one() {  # acc label ref_src
   for b in $BINS; do
     echo "==> $label: $b"
     # The exact binned FASTQ the codec would store (compress then decompress).
-    "$FQXV_BIN" compress "$r1" -o "$w/$b.fqxv" --quality-bin "$b" --threads "$THREADS" >/dev/null 2>&1
-    "$FQXV_BIN" decompress "$w/$b.fqxv" -o "$w/$b.fastq" --threads "$THREADS" >/dev/null 2>&1
+    "$FQXV_BIN" compress "$r1" -o "$w/$b.fqxv" --force --quality-bin "$b" --threads "$THREADS" >/dev/null 2>&1
+    "$FQXV_BIN" decompress "$w/$b.fqxv" -o "$w/$b.fastq" --force --threads "$THREADS" >/dev/null 2>&1
     call_variants "$w/$b.fastq" "$ref" "$w/$b"
 
     read -r bs bn sh < <(isec_counts "$w/base.vcf.gz" "$w/$b.vcf.gz" snps "$w/isec_snp_$b")
