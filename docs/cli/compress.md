@@ -2,6 +2,8 @@
 
 Compress one or more FASTQ files into a single `.fqxv` archive.
 
+![fqxv compress demo](../images/compress.gif)
+
 ## Usage
 
 ```bash

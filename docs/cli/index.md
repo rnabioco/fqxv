@@ -9,6 +9,8 @@ The `fqxv` binary has four subcommands:
 | [`verify`](verify.md) | Validate a container's CRC-32C checksums without decompressing |
 | [`info`](info.md) | Print container metadata and per-stream sizes |
 
+![fqxv --help](../images/help.gif)
+
 ## Global options
 
 | Option | Description |

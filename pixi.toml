@@ -1,0 +1,27 @@
+# Root pixi environment for the docs toolchain (VHS tape rendering + the
+# zensical site). NOT the build path for the crates — that stays pure cargo
+# (see CLAUDE.md). The separate `bench/pixi.toml` is the benchmarking harness.
+
+[workspace]
+name = "fqxv"
+version = "0.1.0"
+description = "A reference-free FASTQ archiver, in Rust"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[dependencies]
+rust = ">=1.95"
+vhs = ">=0.11.0,<0.12"
+imagemagick = ">=7.1"
+python = ">=3.12,<3.13"
+
+[pypi-dependencies]
+# Pinned to match the docs CI (.github/workflows/docs.yml).
+zensical = "==0.0.50"
+
+[tasks]
+release = "cargo build --profile release"
+# Render every docs/tapes/*.tape to a GIF in docs/images/ (builds fqxv first).
+tapes = { cmd = "docs/tapes/generate.sh", depends-on = ["release"] }
+docs-serve = "zensical serve"
+docs-build = "zensical build"
