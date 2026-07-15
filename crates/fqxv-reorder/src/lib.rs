@@ -29,7 +29,7 @@
 //! ```
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 
 use fqxv_bytes::{unzigzag, write_varint, zigzag};
@@ -1334,10 +1334,281 @@ pub fn assemble_global(reads: &[&[u8]], anchors: &[u32]) -> (GlobalReference, Ve
     assemble_window(reads, anchors)
 }
 
+/// A contig that can grow at BOTH ends. Columns live in a `VecDeque` so a read
+/// overlapping the LEFT end can prepend cheaply. This is fqxv's analogue of
+/// SPRING's bidirectional contig growth (`reorder.h`: extend rightward until dry,
+/// then `left_search` — RC of the seed — leftward until dry): a read that
+/// overlaps a contig's start folds onto it instead of seeding a near-duplicate
+/// contig, so a whole region collapses toward one contig.
+type BiContig = std::collections::VecDeque<Column>;
+
+/// k-mer at deque position `start` of a contig, or `None` (off-end / non-ACGT).
+#[inline]
+fn contig_kmer(dq: &BiContig, start: usize) -> Option<u64> {
+    if start + RESCUE_K > dq.len() {
+        return None;
+    }
+    let mut v = 0u64;
+    for j in 0..RESCUE_K {
+        let c = code(dq[start + j].base);
+        if c >= 4 {
+            return None;
+        }
+        v = (v << 2) | u64::from(c);
+    }
+    Some(v)
+}
+
+/// Acceptance test for placing `cur` on `dq` at deque shift `s` (the deque index
+/// of `cur[0]`; negative means the read hangs off the LEFT end and would prepend).
+/// Returns `(overlap, mismatches)` when cheaper than a literal, with the same
+/// thresholds as the rightward-only [`try_place`].
+fn try_place_shift(dq: &BiContig, cur: &[u8], s: i64) -> Option<(usize, usize)> {
+    let len = dq.len() as i64;
+    let ov_start = s.max(0);
+    let ov_end = (s + cur.len() as i64).min(len);
+    if ov_end <= ov_start {
+        return None;
+    }
+    let overlap = (ov_end - ov_start) as usize;
+    if overlap < MIN_CONTIG_OVERLAP.min(cur.len()) {
+        return None;
+    }
+    let mut mism = 0usize;
+    for c in ov_start..ov_end {
+        let r = (c - s) as usize;
+        if cur[r] != dq[c as usize].base {
+            mism += 1;
+        }
+    }
+    let novel = cur.len() - overlap;
+    (mism <= overlap / 4 && novel + mism * 2 < cur.len()).then_some((overlap, mism))
+}
+
+/// Bidirectional multi-contig assembler: like [`Assembler`] but contigs grow at
+/// both ends, so a read overlapping a contig's LEFT end prepends to it instead of
+/// seeding a near-duplicate. The encoder-side k-mer index is keyed by
+/// ORIGIN-relative position (`deque_index - left`) so it survives prepends.
+///
+/// Placements are tracked in the same origin-relative frame (the deque index of a
+/// read's first base minus the prepends seen so far), which is STABLE under later
+/// prepends; [`assemble_window`] resolves each to a final non-negative `off` on
+/// the frozen contig once assembly stops growing.
+#[derive(Default)]
+struct BidirAssembler {
+    contigs: Vec<BiContig>,
+    /// Columns prepended to each contig so far (front growth).
+    left: Vec<usize>,
+    ref_anchors: Vec<u32>,
+    /// k-mer -> (contig index, origin-relative column position).
+    index: IntMap<u64, (u32, i32)>,
+}
+
+impl BidirAssembler {
+    /// Index k-mers for deque positions `[from, to)` of contig `ci`, keyed by
+    /// origin-relative position (survives future prepends).
+    fn index_range(&mut self, ci: usize, from: usize, to: usize) {
+        let l = self.left[ci] as i32;
+        let dq = &self.contigs[ci];
+        let hi = to.min(dq.len().saturating_sub(RESCUE_K - 1));
+        let mut keys: Vec<(u64, i32)> = Vec::new();
+        for start in from..hi {
+            if let Some(v) = contig_kmer(dq, start) {
+                keys.push((v, start as i32 - l));
+            }
+        }
+        for (v, orp) in keys {
+            self.index.insert(v, (ci as u32, orp));
+        }
+    }
+
+    /// Best placement of `cur` (minimizer at `anchor`) as `(ci, shift)` where
+    /// `shift` is the deque index of `cur[0]` (may be negative — leftward), or
+    /// `None` to seed. Same candidate sources as [`Assembler::place`] — the anchor
+    /// fast-path on the last contig plus sampled read k-mers — extended to negative
+    /// shifts, with a final SPRING-style exhaustive-shift sweep of the current
+    /// contig (all shifts within `±readlen/2` of the anchor centre) when the k-mer
+    /// index found nothing, catching reads whose sampled k-mers all carried an
+    /// error. Deterministic: candidates are deduped and scored by (mismatches,
+    /// recency).
+    fn place(&self, cur: &[u8], anchor: u32) -> Option<(usize, i64)> {
+        if cur.is_empty() || self.contigs.is_empty() {
+            return None;
+        }
+        let mut cands: Vec<(usize, i64)> = Vec::new();
+        let last = self.contigs.len() - 1;
+        // Anchor fast-path on the last contig (deque frame: + left).
+        let center = self.ref_anchors[last] as i64 - anchor as i64 + self.left[last] as i64;
+        cands.push((last, center));
+        // Non-overlapping k-mers cover every base, so a read with a few errors
+        // still has clean k-mers to match on.
+        let mut start = 0usize;
+        while start + RESCUE_K <= cur.len() {
+            if let Some(k) = kmer_at(cur, start, RESCUE_K) {
+                if let Some(&(ci, orp)) = self.index.get(&k) {
+                    let vpos = orp as i64 + self.left[ci as usize] as i64;
+                    cands.push((ci as usize, vpos - start as i64));
+                }
+            }
+            start += RESCUE_K;
+        }
+        cands.sort_unstable();
+        cands.dedup();
+
+        let mut best: Option<(usize, i64)> = None;
+        let mut best_key = (usize::MAX, usize::MAX);
+        for (ci, s) in cands {
+            if let Some((_ov, mism)) = try_place_shift(&self.contigs[ci], cur, s) {
+                let key = (mism, self.contigs.len() - 1 - ci);
+                if key < best_key {
+                    best_key = key;
+                    best = Some((ci, s));
+                }
+            }
+        }
+        // SPRING-style exhaustive shift search on the current contig as a fallback
+        // (see `reorder.h`, which tries every `shift` in `0..maxshift` rather than
+        // only k-mer-implied offsets).
+        if best.is_none() {
+            let maxshift = (cur.len() / 2) as i64;
+            for s in (center - maxshift)..=(center + maxshift) {
+                if let Some((_ov, mism)) = try_place_shift(&self.contigs[last], cur, s) {
+                    if (mism, 0usize) < best_key {
+                        best_key = (mism, 0);
+                        best = Some((last, s));
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Fold `cur` into contig `ci` at deque shift `s`, extending right (append)
+    /// and/or left (prepend) as needed, then re-index the changed ends. Returns
+    /// the ORIGIN-relative start of `cur[0]` (`s - left_before`), which is stable
+    /// under any later prepend.
+    fn commit(&mut self, ci: usize, cur: &[u8], s: i64) -> i64 {
+        let orp0 = s - self.left[ci] as i64;
+        if s >= 0 {
+            let off = s as usize;
+            let old_len = self.contigs[ci].len();
+            let ov = cur.len().min(old_len - off);
+            for k in 0..ov {
+                cast_vote(&mut self.contigs[ci][off + k], cur[k]);
+            }
+            for &b in &cur[ov..] {
+                self.contigs[ci].push_back(seed_column(b));
+            }
+            if self.contigs[ci].len() > old_len {
+                self.index_range(
+                    ci,
+                    old_len.saturating_sub(RESCUE_K - 1),
+                    self.contigs[ci].len(),
+                );
+            }
+        } else {
+            let p = (-s) as usize;
+            // Prepend cur[0..p] (front-most is cur[0]).
+            for &b in cur[..p].iter().rev() {
+                self.contigs[ci].push_front(seed_column(b));
+            }
+            self.left[ci] += p;
+            // cur[p..] now aligns to deque[p..].
+            let ov = (cur.len() - p).min(self.contigs[ci].len() - p);
+            for k in 0..ov {
+                cast_vote(&mut self.contigs[ci][p + k], cur[p + k]);
+            }
+            for &b in &cur[p + ov..] {
+                self.contigs[ci].push_back(seed_column(b));
+            }
+            // Origin-relative keys for old columns are unchanged; re-index the new
+            // front join and (if it grew) the tail.
+            let len = self.contigs[ci].len();
+            self.index_range(ci, 0, (p + RESCUE_K).min(len));
+            if ov < cur.len() - p {
+                self.index_range(ci, len.saturating_sub(RESCUE_K - 1), len);
+            }
+        }
+        orp0
+    }
+
+    /// Seed a fresh contig from a literal read; returns its origin-relative start
+    /// (always 0 — a seed defines its contig's origin).
+    fn seed(&mut self, cur: &[u8], anchor: u32) -> i64 {
+        let ci = self.contigs.len();
+        self.contigs
+            .push(cur.iter().map(|&b| seed_column(b)).collect());
+        self.left.push(0);
+        self.ref_anchors.push(anchor);
+        self.index_range(ci, 0, cur.len());
+        0
+    }
+}
+
 /// The serial greedy fold over one window of reads: place each read on the
 /// growing multi-contig assembly (or seed a new contig), then freeze the
 /// consensus. Contig ids in the returned placements are local to this window.
+///
+/// Uses the bidirectional [`BidirAssembler`], so a read overlapping a contig's
+/// left end prepends to it rather than seeding a near-duplicate — SPRING's
+/// leftward extension, which shrinks the reference (fewer, longer contigs).
+/// Placements are tracked origin-relative during the fold and resolved to
+/// non-negative offsets on the frozen contigs afterward.
 fn assemble_window(reads: &[&[u8]], anchors: &[u32]) -> (GlobalReference, Vec<Place4>) {
+    let mut asm = BidirAssembler::default();
+    // Per read: (contig id, origin-relative start of the read's first base).
+    let mut starts: Vec<(u32, i64)> = Vec::with_capacity(reads.len());
+    for (i, &cur) in reads.iter().enumerate() {
+        if i > 0 && cur == reads[i - 1] {
+            starts.push(starts[i - 1]);
+            continue;
+        }
+        match asm.place(cur, anchors[i]) {
+            Some((ci, s)) => {
+                let orp0 = asm.commit(ci, cur, s);
+                starts.push((ci as u32, orp0));
+            }
+            None => {
+                let ci = asm.contigs.len() as u32;
+                let orp0 = asm.seed(cur, anchors[i]);
+                starts.push((ci, orp0));
+            }
+        }
+    }
+    // Freeze: concatenate every contig's final consensus byte, in contig order.
+    let total: usize = asm.contigs.iter().map(VecDeque::len).sum();
+    let mut seq = Vec::with_capacity(total);
+    let mut offs = Vec::with_capacity(asm.contigs.len() + 1);
+    offs.push(0);
+    for c in &asm.contigs {
+        for col in c {
+            seq.push(col.base);
+        }
+        offs.push(seq.len());
+    }
+    // Resolve each read's placement: the frozen deque index of its first base is
+    // `orp0 + left_final`, which is always in `[0, contig_len - read_len]`
+    // because columns only ever shift right (prepends) and every placed base is a
+    // real column of the frozen contig.
+    let places: Vec<Place4> = starts
+        .iter()
+        .map(|&(ci, orp0)| Place4 {
+            ci,
+            off: (orp0 + asm.left[ci as usize] as i64) as u32,
+        })
+        .collect();
+    (GlobalReference { seq, offs }, places)
+}
+
+/// TEMPORARY A/B BASELINE (remove before merge): the old RIGHTWARD-only fold, so
+/// an example can measure leftward extension's effect on raw reference bases both
+/// before and after [`merge_reference`].
+#[doc(hidden)]
+#[must_use]
+pub fn assemble_global_rightward(
+    reads: &[&[u8]],
+    anchors: &[u32],
+) -> (GlobalReference, Vec<Place4>) {
     let mut asm = Assembler::default();
     let mut places: Vec<Place4> = Vec::with_capacity(reads.len());
     for (i, &cur) in reads.iter().enumerate() {
@@ -1363,7 +1634,6 @@ fn assemble_window(reads: &[&[u8]], anchors: &[u32]) -> (GlobalReference, Vec<Pl
             }
         }
     }
-    // Freeze: concatenate every contig's final consensus byte.
     let total: usize = asm.contigs.iter().map(Vec::len).sum();
     let mut seq = Vec::with_capacity(total);
     let mut offs = Vec::with_capacity(asm.contigs.len() + 1);
@@ -2408,6 +2678,48 @@ mod tests {
                 s = e;
             }
             proptest::prop_assert_eq!(got, reads);
+        }
+
+        // Every bidirectional placement must land WITHIN its frozen contig
+        // (`off + read_len <= contig_len`, `off` non-negative). The codec still
+        // round-trips a bad `off` via its tail escape hatch, so a wrong
+        // origin-relative-to-final offset resolution (e.g. the `i64 -> u32` cast
+        // wrapping negative) would pass the round-trip tests yet silently wreck the
+        // ratio — this pins the offset math directly. Also checks contig ids are in
+        // range and duplicates inherit the previous read's placement.
+        #[test]
+        fn global_bidir_placements_in_bounds(
+            reads in proptest::collection::vec(
+                proptest::collection::vec(proptest::sample::select(b"ACGTN".to_vec()), 0..80),
+                0..80)
+        ) {
+            let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+            let anchors: Vec<u32> = reads
+                .iter()
+                .enumerate()
+                .map(|(i, r)| ((r.len() * 3 + i * 5) % 29) as u32)
+                .collect();
+            let (reference, places) = assemble_global(&refs, &anchors);
+            let lens = reference.contig_lens();
+            proptest::prop_assert_eq!(places.len(), refs.len());
+            for (i, p) in places.iter().enumerate() {
+                proptest::prop_assert!(
+                    (p.ci as usize) < reference.n_contigs(),
+                    "read {} contig {} out of {} contigs", i, p.ci, reference.n_contigs()
+                );
+                let clen = lens[p.ci as usize] as usize;
+                proptest::prop_assert!(
+                    p.off as usize + refs[i].len() <= clen,
+                    "read {} (len {}) at off {} overruns contig {} (len {})",
+                    i, refs[i].len(), p.off, p.ci, clen
+                );
+                if i > 0 && refs[i] == refs[i - 1] {
+                    proptest::prop_assert_eq!(
+                        (p.ci, p.off), (places[i - 1].ci, places[i - 1].off),
+                        "duplicate read {} did not inherit its predecessor's placement", i
+                    );
+                }
+            }
         }
 
         // The overlap-merge refinement must preserve the v4 round-trip: assemble,
