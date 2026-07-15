@@ -29,6 +29,7 @@ fqxv decompress <INPUT> (-o <OUTPUT> | --split <PREFIX> | -Z)
 | `--mate-style <r\|num>` | `--split` labels: `r` → `_R1`,`_R2`,… (default); `num` → `_1`,`_2`,…. |
 | `--no-gzip` | Write plain `.fastq` for `--split` instead of the default `.fastq.gz`. |
 | `--recover` | Best-effort decode of a corrupted archive: skip blocks that fail their CRC and emit the rest. See [below](#recovering-a-corrupted-archive). |
+| `-f, --force` | Overwrite output FASTQ file(s) if they already exist. By default an existing `-o` file or `--split` mate file is left untouched and the command errors before decoding. Ignored when writing to stdout (`-Z` / `-o -`). |
 | `--threads <N>` | Worker threads (0 = all cores). |
 
 `--output`, `--split`, and `--stdout` are mutually exclusive, as are `--split` and
