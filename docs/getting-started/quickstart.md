@@ -20,6 +20,17 @@ threads with `--threads` (default 16, capped at available cores; 0 = all cores):
 fqxv compress reads.fastq.gz -o reads.fqxv --level 7 --threads 16
 ```
 
+Not sure how well your data will compress? Add `--estimate` to predict the
+archive size and ratio from a sample of the input, writing nothing:
+
+```bash
+fqxv compress reads.fastq.gz --estimate
+# reads.fastq.gz (436.93 MB)  →  estimated fqxv ~216.87 MB  (50% smaller, ~2.01x)
+```
+
+See [`compress --estimate`](../cli/compress.md#estimating-compression) for
+details and accuracy.
+
 ## Inspect
 
 ```bash
