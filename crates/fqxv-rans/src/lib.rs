@@ -434,4 +434,38 @@ mod tests {
         let o1 = encode(&data, Order::One).expect("o1").len();
         assert!(o1 < o0, "order-1 ({o1}) should beat order-0 ({o0}) here");
     }
+
+    #[test]
+    fn decode_rejects_malformed_freq_table_without_aborting() {
+        // order-0 stream, n=1, with a frequency table that doesn't sum to TOTFREQ.
+        // Pre-hardening `Model::from_freqs` sliced `slot2sym` out of bounds and
+        // panicked (a process abort under panic=abort); now `decode` returns Err.
+        let mut src = vec![0u8]; // order 0
+        src.extend_from_slice(&1u64.to_le_bytes()); // n = 1
+        let mut freq = [0u16; 256];
+        freq[0] = crate::model::TOTFREQ as u16 + 100; // exceeds TOTFREQ
+        for f in freq {
+            src.extend_from_slice(&f.to_le_bytes());
+        }
+        assert!(matches!(decode(&src), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn decode_rejects_huge_output_length_without_aborting() {
+        // Valid single-symbol freq table but a corrupt, enormous output length.
+        // The output reservation must fail cleanly instead of aborting on a
+        // multi-exabyte infallible allocation.
+        let mut src = vec![0u8]; // order 0
+        src.extend_from_slice(&u64::MAX.to_le_bytes()); // n = huge
+        let mut freq = [0u16; 256];
+        freq[0] = crate::model::TOTFREQ as u16; // sums to exactly TOTFREQ
+        for f in freq {
+            src.extend_from_slice(&f.to_le_bytes());
+        }
+        // Encoder states (values irrelevant — the allocation is attempted first).
+        for _ in 0..crate::model::N_STATES {
+            src.extend_from_slice(&0u32.to_le_bytes());
+        }
+        assert!(matches!(decode(&src), Err(Error::Malformed(_))));
+    }
 }

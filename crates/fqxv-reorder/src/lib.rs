@@ -558,6 +558,17 @@ pub fn op_stats(reads: &[&[u8]], anchors: &[u32]) -> OpStats {
     st
 }
 
+/// Allocate a `len`-byte read buffer fallibly. `len` is a per-read length decoded
+/// from an untrusted stream, so a corrupt value must error rather than abort the
+/// process on a huge infallible allocation.
+fn alloc_read(len: usize) -> Result<Vec<u8>> {
+    let mut read = Vec::new();
+    read.try_reserve_exact(len)
+        .map_err(|_| Error::Malformed("read length too large to allocate"))?;
+    read.resize(len, 0);
+    Ok(read)
+}
+
 /// Decode a stream produced by [`encode_clustered`], returning the reads in the
 /// same (clustered) order.
 pub fn decode_clustered(src: &[u8]) -> Result<Vec<Vec<u8>>> {
@@ -618,7 +629,7 @@ pub fn decode_clustered(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                 }
                 let cur_len = c_slen.varint()? as usize;
                 let overlap = cur_len.min(contig.len() - off);
-                let mut read = vec![0u8; cur_len];
+                let mut read = alloc_read(cur_len)?;
                 for (j, slot) in read.iter_mut().enumerate().take(overlap) {
                     *slot = contig[off + j].base; // consensus of prior reads
                 }
@@ -988,7 +999,7 @@ pub fn decode_clustered_rescue(src: &[u8]) -> Result<Vec<Vec<u8>>> {
                 }
                 let cur_len = c_slen.varint()? as usize;
                 let overlap = cur_len.min(contigs[ci].len() - off);
-                let mut read = vec![0u8; cur_len];
+                let mut read = alloc_read(cur_len)?;
                 for (j, slot) in read.iter_mut().enumerate().take(overlap) {
                     *slot = contigs[ci][off + j].base;
                 }
@@ -1257,7 +1268,12 @@ impl GlobalReference {
     pub fn decode_blocked(src: &[u8]) -> Result<GlobalReference> {
         let mut r = Cursor::new(src);
         let nb = r.varint()? as usize;
-        let mut blocks: Vec<(usize, &[u8])> = Vec::with_capacity(nb);
+        // `nb` is an untrusted block count; reserve fallibly so a corrupt value
+        // errors instead of aborting on a huge infallible allocation.
+        let mut blocks: Vec<(usize, &[u8])> = Vec::new();
+        blocks
+            .try_reserve_exact(nb)
+            .map_err(|_| Error::Malformed("reference block count too large to allocate"))?;
         for _ in 0..nb {
             let ncb = r.varint()? as usize;
             blocks.push((ncb, r.take_stream()?));
@@ -1582,7 +1598,7 @@ pub fn decode_global_block(src: &[u8], reference: &GlobalReference) -> Result<Ve
                     return Err(Error::Malformed("contig offset past reference"));
                 }
                 let overlap = cur_len.min(contig.len() - off);
-                let mut read = vec![0u8; cur_len];
+                let mut read = alloc_read(cur_len)?;
                 read[..overlap].copy_from_slice(&contig[off..off + overlap]);
                 let m = c_nmis.varint()? as usize;
                 let mut p = 0usize;
@@ -2032,6 +2048,22 @@ mod tests {
         assert_eq!(revcomp(b"ACGT"), b"ACGT");
         assert_eq!(revcomp(b"AACG"), b"CGTT");
         assert_eq!(revcomp(b"ACGTN"), b"NACGT");
+    }
+
+    #[test]
+    fn alloc_read_rejects_huge_len() {
+        // The per-read length guard used by the clustered decoders: a corrupt
+        // length must error rather than abort on a huge infallible allocation.
+        assert!(alloc_read(usize::MAX).is_err());
+        assert_eq!(alloc_read(8).unwrap().len(), 8);
+    }
+
+    #[test]
+    fn decode_blocked_rejects_huge_block_count() {
+        // A corrupt reference block count must fail the reservation, not abort.
+        let mut src = Vec::new();
+        write_varint(&mut src, 1u64 << 62); // absurd block count
+        assert!(GlobalReference::decode_blocked(&src).is_err());
     }
 
     #[test]

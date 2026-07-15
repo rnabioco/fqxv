@@ -670,7 +670,11 @@ pub(crate) fn lzma_decode(buf: &[u8], n: usize) -> Result<Vec<u8>> {
     let mut dec = Decoder::new(buf);
     let mut state = 0usize;
     let mut reps = [0u32; 4];
-    let mut out: Vec<u8> = Vec::with_capacity(n);
+    // `n` is an untrusted decoded-length header; reserve fallibly so a corrupt
+    // value errors rather than aborting on a huge infallible allocation.
+    let mut out: Vec<u8> = Vec::new();
+    out.try_reserve(n)
+        .map_err(|_| Error::Malformed("reflzma: output too large to allocate"))?;
 
     while out.len() < n {
         let pos = out.len();
@@ -892,5 +896,12 @@ mod tests {
         fn decode_never_panics(bytes in proptest::collection::vec(0u8..=255, 0..500)) {
             let _ = decode(&bytes);
         }
+    }
+
+    #[test]
+    fn lzma_decode_rejects_huge_len_without_aborting() {
+        // A corrupt decoded-length header must fail the reservation, not abort
+        // the process on a huge infallible allocation.
+        assert!(lzma_decode(&[], usize::MAX).is_err());
     }
 }

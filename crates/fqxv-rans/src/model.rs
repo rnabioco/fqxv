@@ -4,6 +4,8 @@
 //! (a 12-bit total), which is the invariant the rANS coder relies on. We also
 //! build the cumulative table and the `slot -> symbol` lookup the decoder uses.
 
+use crate::{Error, Result};
+
 /// Number of bits in the frequency total (the rANS "scale").
 pub(crate) const SCALE_BITS: u32 = 12;
 /// The frequency total; every model sums to this.
@@ -132,9 +134,11 @@ impl EncSym {
 }
 
 impl Model {
-    /// Build a model from raw byte counts.
+    /// Build a model from raw byte counts (encode path).
     pub(crate) fn from_counts(counts: &[u32; 256]) -> Self {
-        Self::from_freqs(normalize(counts))
+        // `normalize` is trusted: it sums to `TOTFREQ`, or to 0 for empty input
+        // (a degenerate model the encoder never uses to code symbols).
+        Self::from_freqs_unchecked(normalize(counts))
     }
 
     /// Per-symbol division-free encode constants for this model.
@@ -146,8 +150,34 @@ impl Model {
         table
     }
 
-    /// Build a model from an already-normalized frequency table (decoder path).
-    pub(crate) fn from_freqs(freq: [u16; 256]) -> Self {
+    /// Build a model from a frequency table, validating it (decoder path).
+    ///
+    /// The table is untrusted on decode, so this checks that the frequencies sum
+    /// to exactly [`TOTFREQ`] with a monotonic cumulative table (accumulated in
+    /// `u32` to catch a `u16` wrap) before building `slot2sym`. A table that does
+    /// not — a corrupt or crafted stream — would otherwise index `slot2sym` past
+    /// its `TOTFREQ` length and panic (aborting the process under `panic=abort`).
+    pub(crate) fn from_freqs(freq: [u16; 256]) -> Result<Self> {
+        let mut acc: u32 = 0;
+        for s in 0..256 {
+            acc += u32::from(freq[s]);
+            if acc > TOTFREQ {
+                return Err(Error::Malformed("rANS freq table exceeds TOTFREQ"));
+            }
+        }
+        if acc != TOTFREQ {
+            return Err(Error::Malformed("rANS freq table does not sum to TOTFREQ"));
+        }
+        // Validated: the cumulative sums are monotonic and stay within `TOTFREQ`,
+        // so the `slot2sym` slices below are in bounds.
+        Ok(Self::from_freqs_unchecked(freq))
+    }
+
+    /// Build the model from a table trusted to be well-formed — the encode path
+    /// (where `normalize` guarantees the invariant) and the validated
+    /// [`from_freqs`]. The all-zero table for empty input yields empty slices and
+    /// a zero-filled `slot2sym`.
+    fn from_freqs_unchecked(freq: [u16; 256]) -> Self {
         let mut cum = [0u16; 257];
         for s in 0..256 {
             cum[s + 1] = cum[s] + freq[s];
@@ -161,6 +191,17 @@ impl Model {
             cum,
             slot2sym,
         }
+    }
+
+    /// Allocate the `n`-byte decode output fallibly. `n` is the output-length
+    /// header read straight from the stream, so a corrupt value must fail cleanly
+    /// instead of aborting the process on a huge infallible allocation.
+    pub(crate) fn alloc_output(n: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        out.try_reserve_exact(n)
+            .map_err(|_| Error::Malformed("rANS output length too large to allocate"))?;
+        out.resize(n, 0);
+        Ok(out)
     }
 }
 
@@ -321,5 +362,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn from_freqs_rejects_malformed_tables() {
+        // Sums to 0, not TOTFREQ — must error, not build a degenerate model.
+        assert!(Model::from_freqs([0u16; 256]).is_err());
+        // A single entry exceeding TOTFREQ — pre-hardening this sliced `slot2sym`
+        // out of bounds and panicked; now it must return Err.
+        let mut over = [0u16; 256];
+        over[0] = TOTFREQ as u16 + 1;
+        assert!(Model::from_freqs(over).is_err());
+        // A table summing above TOTFREQ across several symbols is also rejected.
+        let mut spread = [0u16; 256];
+        spread[0] = 3000;
+        spread[1] = 3000;
+        assert!(Model::from_freqs(spread).is_err());
+        // A table summing to exactly TOTFREQ is accepted.
+        let mut ok = [0u16; 256];
+        ok[0] = TOTFREQ as u16;
+        assert!(Model::from_freqs(ok).is_ok());
+    }
+
+    #[test]
+    fn alloc_output_rejects_huge_len() {
+        // A corrupt output-length header must fail the reservation, not abort.
+        assert!(Model::alloc_output(usize::MAX).is_err());
+        assert_eq!(Model::alloc_output(16).unwrap().len(), 16);
     }
 }

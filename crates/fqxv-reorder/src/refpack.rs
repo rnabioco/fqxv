@@ -77,7 +77,11 @@ fn unpack(packed: &[u8], total: usize, exceptions: &[(usize, u8)]) -> Result<Vec
     if packed.len() < total.div_ceil(4) {
         return Err(Error::Malformed("refpack: packed stream too short"));
     }
-    let mut seq = Vec::with_capacity(total);
+    // `total` is bounded by `packed.len() * 4` (checked above), but reserve
+    // fallibly anyway so an over-large value can never abort on the allocation.
+    let mut seq = Vec::new();
+    seq.try_reserve_exact(total)
+        .map_err(|_| Error::Malformed("refpack: output too large to allocate"))?;
     for i in 0..total {
         let byte = packed[i / 4];
         let c = ((byte >> (2 * (i % 4))) & 3) as usize;
