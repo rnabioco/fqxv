@@ -183,9 +183,11 @@ enum Command {
         /// with the real codecs at the chosen `--level`/`--quality-bin` and
         /// projects the whole-file archive. Reordering (`--order any`/`--max`) is
         /// not modeled, so with it the estimate is a conservative lower bound —
-        /// the real archive comes out this size or smaller.
-        #[arg(long)]
-        estimate: bool,
+        /// the real archive comes out this size or smaller. Pass `tsv` for a
+        /// two-line machine-readable table (`file`, `input_bytes`,
+        /// `est_fqxv_bytes`, `ratio`) instead of the human report.
+        #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "human", value_name = "FORMAT")]
+        estimate: Option<EstimateFormat>,
     },
     /// Decompress a `.fqxv` file to FASTQ.
     Decompress {
@@ -220,12 +222,16 @@ enum Command {
         #[arg(long, conflicts_with = "split")]
         recover: bool,
     },
-    /// Print `.fqxv` container metadata and per-stream sizes.
+    /// Print `.fqxv` container metadata and per-stream sizes. Give several files
+    /// or a directory (scanned recursively for `*.fqxv`) to report a batch — one
+    /// TSV/JSON entry per archive, keyed by filename.
     Info {
-        /// Input `.fqxv` file.
-        input: PathBuf,
-        /// Emit a single machine-readable TSV line instead of the human
-        /// report (stable columns for the benchmark harness / scripts).
+        /// Input `.fqxv` file(s), or a directory scanned recursively for `*.fqxv`.
+        #[arg(num_args = 1..)]
+        inputs: Vec<PathBuf>,
+        /// Emit machine-readable TSV instead of the human report. A single file
+        /// keeps the stable one-row columns (benchmark harness / scripts); a batch
+        /// prepends a `file` column and prints one row per archive.
         #[arg(long, conflicts_with = "json")]
         tsv: bool,
         /// Emit a JSON object instead of the human report.
@@ -239,17 +245,20 @@ enum Command {
         stats: bool,
     },
     /// Verify archive integrity (CRC checks) without writing any output.
-    /// Prints a table of per-check results; exits non-zero if the archive is
-    /// corrupt.
+    /// Prints a table of per-check results; exits non-zero if any archive is
+    /// corrupt. Give several files or a directory (scanned recursively for
+    /// `*.fqxv`) to verify a batch.
     Verify {
-        /// Input `.fqxv` file.
-        input: PathBuf,
+        /// Input `.fqxv` file(s), or a directory scanned recursively for `*.fqxv`.
+        #[arg(num_args = 1..)]
+        inputs: Vec<PathBuf>,
         /// Faster, weaker check: verify each block's stored CRC via the footer
         /// index (parallel positioned reads) instead of the whole-file digest.
         /// Skips the header, footer, and inter-block framing bytes.
         #[arg(long)]
         quick: bool,
-        /// Emit tab-separated per-check rows instead of the human table.
+        /// Emit tab-separated per-check rows instead of the human table. A batch
+        /// prepends a `file` column so rows from different archives stay distinct.
         #[arg(long, conflicts_with = "json")]
         tsv: bool,
         /// Emit a JSON object instead of the human table.
@@ -274,6 +283,18 @@ enum ReadOrder {
     /// and quality preserved exactly). Falls back to `any` when names aren't a
     /// counter. Single-end only.
     Shuffle,
+}
+
+/// Output format for `compress --estimate`. Bare `--estimate` selects `Human`
+/// (via `default_missing_value`); `--estimate tsv` selects the scriptable table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+enum EstimateFormat {
+    /// Human-readable projection report (default).
+    #[default]
+    Human,
+    /// Two lines — a header then one data row: `file`, `input_bytes`,
+    /// `est_fqxv_bytes`, `ratio` (current on-disk size / estimated archive size).
+    Tsv,
 }
 
 /// Labeling for the per-mate files produced by `decompress --split`.
@@ -438,8 +459,8 @@ fn main() -> anyhow::Result<()> {
             // `--estimate` samples the input and reports a projected ratio/size
             // without writing an archive, so it short-circuits the whole compress
             // path (no output file is resolved or created).
-            if estimate {
-                return run_estimate(&inputs, params, reorders);
+            if let Some(fmt) = estimate {
+                return run_estimate(&inputs, params, reorders, fmt);
             }
             let output = match output {
                 Some(p) => p,
@@ -564,17 +585,17 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Info {
-            input,
+            inputs,
             tsv,
             json,
             stats,
-        } => print_info(&input, tsv, json, stats, cli.threads)?,
+        } => print_info(&inputs, tsv, json, stats, cli.threads)?,
         Command::Verify {
-            input,
+            inputs,
             quick,
             tsv,
             json,
-        } => print_verify(&input, quick, tsv, json)?,
+        } => print_verify(&inputs, quick, tsv, json)?,
     }
     Ok(())
 }
@@ -681,18 +702,75 @@ struct InfoStreams {
     total: StreamJson,
 }
 
-fn print_info(
-    path: &Path,
-    tsv: bool,
-    json: bool,
-    stats: bool,
-    threads: usize,
-) -> anyhow::Result<()> {
+/// Resolve `info`/`verify` inputs to a concrete `.fqxv` file list. A file path is
+/// taken as-is; a directory is walked recursively for `*.fqxv` (sorted for a
+/// deterministic order). Returns the file list and whether this is a *batch* — more
+/// than one input path, or any directory — which selects the per-file
+/// (filename-keyed) output. A single explicit file keeps the original
+/// single-archive output, so scripts and the benchmark harness are unaffected.
+fn resolve_fqxv_inputs(inputs: &[PathBuf]) -> anyhow::Result<(Vec<PathBuf>, bool)> {
+    let mut files = Vec::new();
+    let mut batch = inputs.len() > 1;
+    for input in inputs {
+        let meta =
+            std::fs::metadata(input).with_context(|| format!("reading {}", input.display()))?;
+        if meta.is_dir() {
+            batch = true;
+            let mut dir_files = Vec::new();
+            collect_fqxv(input, &mut dir_files)?;
+            // Sort within each directory subtree for a stable, reproducible order;
+            // explicit file arguments keep the order the user gave them.
+            dir_files.sort();
+            files.extend(dir_files);
+        } else {
+            files.push(input.clone());
+        }
+    }
+    if files.is_empty() {
+        anyhow::bail!("no .fqxv files found in the given input(s)");
+    }
+    Ok((files, batch))
+}
+
+/// Recursively collect files with a `.fqxv` extension (case-insensitive) under
+/// `dir` into `out`.
+fn collect_fqxv(dir: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
+    let entries =
+        std::fs::read_dir(dir).with_context(|| format!("reading directory {}", dir.display()))?;
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("reading directory {}", dir.display()))?
+            .path();
+        if path.is_dir() {
+            collect_fqxv(&path, out)?;
+        } else if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("fqxv"))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// One archive's inspected metadata plus the optional `--stats` content decode,
+/// gathered once by [`gather_info`] and shared across the TSV/JSON/human renderers.
+struct FileInfo {
+    path: PathBuf,
+    file_size: u64,
+    info: fqxv::Info,
+    content: Option<fqxv::ContentStats>,
+    /// Whole-file CRC-32C as lowercase hex, or `None` for the footer-less layouts.
+    crc_hex: Option<String>,
+}
+
+/// Inspect one archive's header/footer, and — with `stats` — decode it fully for
+/// content statistics. Shared by every `info` output format.
+fn gather_info(path: &Path, stats: bool, threads: usize) -> anyhow::Result<FileInfo> {
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let info = fqxv::inspect(
         File::open(path).with_context(|| format!("opening input {}", path.display()))?,
     )?;
-    let total = info.names_bytes + info.seq_bytes + info.qual_bytes;
     // `--stats` requires a full decode (unlike the metadata above, which comes
     // from the header + footer index); do it once and share across formats.
     let content = if stats {
@@ -707,50 +785,125 @@ fn print_info(
         None
     };
     let crc_hex = info.whole_file_crc.map(|c| format!("{c:08x}"));
+    Ok(FileInfo {
+        path: path.to_path_buf(),
+        file_size,
+        info,
+        content,
+        crc_hex,
+    })
+}
+
+fn print_info(
+    inputs: &[PathBuf],
+    tsv: bool,
+    json: bool,
+    stats: bool,
+    threads: usize,
+) -> anyhow::Result<()> {
+    let (files, batch) = resolve_fqxv_inputs(inputs)?;
 
     if tsv {
-        // Stable, tab-separated columns for scripts. Keep field order fixed;
-        // append new fields at the end so existing parsers don't break. The
-        // `--stats` columns are appended only when that flag is set.
-        let mut header = String::from(
-            "file_size\treads\tblocks\tgroup_size\tseq_order\tquality_binning\treordered\tnames_bytes\tseq_bytes\tqual_bytes\tplatform\tformat_version\twhole_file_crc",
-        );
-        let mut row = format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            file_size,
-            info.reads,
-            info.blocks,
-            info.group_size,
-            info.seq_order,
-            info.quality_binning,
-            info.reordered as u8,
-            info.names_bytes,
-            info.seq_bytes,
-            info.qual_bytes,
-            info.platform.token(),
-            info.format_version,
-            crc_hex.as_deref().unwrap_or(""),
-        );
-        if let Some(cs) = &content {
-            header.push_str("\tbases\tmin_len\tmax_len\tgc_fraction\tmean_quality");
-            row.push_str(&format!(
-                "\t{}\t{}\t{}\t{}\t{}",
-                cs.bases,
-                cs.min_len,
-                cs.max_len,
-                cs.gc_fraction()
-                    .map(|x| format!("{x:.6}"))
-                    .unwrap_or_default(),
-                cs.mean_quality()
-                    .map(|x| format!("{x:.4}"))
-                    .unwrap_or_default(),
-            ));
+        // Header printed once. A batch prepends a `file` column and one row per
+        // archive; a single file keeps the stable columns the benchmark harness
+        // parses by position (see the `Info` doc comment).
+        let mut header = String::new();
+        if batch {
+            header.push_str("file\t");
         }
+        header.push_str(&info_tsv_header(stats));
         println!("{header}");
-        println!("{row}");
+        for path in &files {
+            let fi = gather_info(path, stats, threads)?;
+            if batch {
+                println!("{}\t{}", path.display(), info_tsv_row(&fi));
+            } else {
+                println!("{}", info_tsv_row(&fi));
+            }
+        }
         return Ok(());
     }
 
+    if json {
+        // A batch emits a JSON array; a single file stays a bare object so
+        // existing single-archive consumers keep parsing one object.
+        if batch {
+            let reports = files
+                .iter()
+                .map(|p| gather_info(p, stats, threads).map(|fi| info_json_report(&fi)))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            println!("{}", serde_json::to_string_pretty(&reports)?);
+        } else {
+            let fi = gather_info(&files[0], stats, threads)?;
+            println!("{}", serde_json::to_string_pretty(&info_json_report(&fi))?);
+        }
+        return Ok(());
+    }
+
+    for (i, path) in files.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        let fi = gather_info(path, stats, threads)?;
+        print_info_human(&fi);
+    }
+    Ok(())
+}
+
+/// The stable `info --tsv` header columns (no leading `file` column — a batch
+/// prepends that). `--stats` appends its columns only when set.
+fn info_tsv_header(stats: bool) -> String {
+    let mut header = String::from(
+        "file_size\treads\tblocks\tgroup_size\tseq_order\tquality_binning\treordered\tnames_bytes\tseq_bytes\tqual_bytes\tplatform\tformat_version\twhole_file_crc",
+    );
+    if stats {
+        header.push_str("\tbases\tmin_len\tmax_len\tgc_fraction\tmean_quality");
+    }
+    header
+}
+
+/// One archive's `info --tsv` data row (no leading `file` column). Keep field
+/// order fixed and append new fields at the end so existing parsers don't break.
+fn info_tsv_row(fi: &FileInfo) -> String {
+    let info = &fi.info;
+    let mut row = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        fi.file_size,
+        info.reads,
+        info.blocks,
+        info.group_size,
+        info.seq_order,
+        info.quality_binning,
+        info.reordered as u8,
+        info.names_bytes,
+        info.seq_bytes,
+        info.qual_bytes,
+        info.platform.token(),
+        info.format_version,
+        fi.crc_hex.as_deref().unwrap_or(""),
+    );
+    if let Some(cs) = &fi.content {
+        row.push_str(&format!(
+            "\t{}\t{}\t{}\t{}\t{}",
+            cs.bases,
+            cs.min_len,
+            cs.max_len,
+            cs.gc_fraction()
+                .map(|x| format!("{x:.6}"))
+                .unwrap_or_default(),
+            cs.mean_quality()
+                .map(|x| format!("{x:.4}"))
+                .unwrap_or_default(),
+        ));
+    }
+    row
+}
+
+/// Build the [`InfoReport`] JSON shape for one archive.
+fn info_json_report(fi: &FileInfo) -> InfoReport {
+    let info = &fi.info;
+    let content = &fi.content;
+    let total = info.names_bytes + info.seq_bytes + info.qual_bytes;
     let pct = |x: u64| {
         if total > 0 {
             100.0 * x as f64 / total as f64
@@ -774,69 +927,95 @@ fn print_info(
     let spots = (info.group_size > 1).then(|| info.reads / info.group_size.max(1) as u64);
     let bytes_per_read = (info.reads > 0).then(|| total as f64 / info.reads as f64);
 
-    if json {
-        let stream = |bytes: u64| StreamJson {
-            bytes,
-            pct: pct(bytes),
-            per_read: per_read(bytes),
-        };
-        let report = InfoReport {
-            file: path.display().to_string(),
-            file_size,
-            file_size_human: human_bytes(file_size),
-            platform: info.platform.token().to_string(),
-            reads: info.reads,
-            spots,
-            blocks: info.blocks,
-            layout,
-            group_size: info.group_size,
-            sequence_order: info.seq_order,
-            quality: quality.to_string(),
-            quality_binning: info.quality_binning,
-            reordered: info.reordered,
-            read_order_preserved: info.keep_order,
-            plus_normalized: info.plus_normalized,
-            streams: InfoStreams {
-                names: stream(info.names_bytes),
-                sequence: stream(info.seq_bytes),
-                quality: stream(info.qual_bytes),
-                total: stream(total),
+    let stream = |bytes: u64| StreamJson {
+        bytes,
+        pct: pct(bytes),
+        per_read: per_read(bytes),
+    };
+    InfoReport {
+        file: fi.path.display().to_string(),
+        file_size: fi.file_size,
+        file_size_human: human_bytes(fi.file_size),
+        platform: info.platform.token().to_string(),
+        reads: info.reads,
+        spots,
+        blocks: info.blocks,
+        layout,
+        group_size: info.group_size,
+        sequence_order: info.seq_order,
+        quality: quality.to_string(),
+        quality_binning: info.quality_binning,
+        reordered: info.reordered,
+        read_order_preserved: info.keep_order,
+        plus_normalized: info.plus_normalized,
+        streams: InfoStreams {
+            names: stream(info.names_bytes),
+            sequence: stream(info.seq_bytes),
+            quality: stream(info.qual_bytes),
+            total: stream(total),
+        },
+        bytes_per_read,
+        format_version: info.format_version,
+        whole_file_crc: fi.crc_hex.clone(),
+        stats: content.as_ref().map(|cs| StatsJson {
+            reads: cs.reads,
+            bases: cs.bases,
+            min_length: cs.min_len,
+            max_length: cs.max_len,
+            mean_length: cs.mean_len(),
+            fixed_length: cs.fixed_length(),
+            gc_fraction: cs.gc_fraction(),
+            mean_quality: cs.mean_quality(),
+            base_composition: BaseCompositionJson {
+                a: cs.a,
+                c: cs.c,
+                g: cs.g,
+                t: cs.t,
+                n: cs.n,
+                other: cs.other,
             },
-            bytes_per_read,
-            format_version: info.format_version,
-            whole_file_crc: crc_hex.clone(),
-            stats: content.as_ref().map(|cs| StatsJson {
-                reads: cs.reads,
-                bases: cs.bases,
-                min_length: cs.min_len,
-                max_length: cs.max_len,
-                mean_length: cs.mean_len(),
-                fixed_length: cs.fixed_length(),
-                gc_fraction: cs.gc_fraction(),
-                mean_quality: cs.mean_quality(),
-                base_composition: BaseCompositionJson {
-                    a: cs.a,
-                    c: cs.c,
-                    g: cs.g,
-                    t: cs.t,
-                    n: cs.n,
-                    other: cs.other,
-                },
-                quality_histogram: cs
-                    .qual_hist
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, &count)| count > 0)
-                    .map(|(phred, &count)| QualBucketJson {
-                        phred: phred as u8,
-                        count,
-                    })
-                    .collect(),
-            }),
-        };
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
+            quality_histogram: cs
+                .qual_hist
+                .iter()
+                .enumerate()
+                .filter(|(_, &count)| count > 0)
+                .map(|(phred, &count)| QualBucketJson {
+                    phred: phred as u8,
+                    count,
+                })
+                .collect(),
+        }),
     }
+}
+
+/// Print the human `info` report for one archive: a metadata table, a per-stream
+/// size table, and — with `--stats` — content statistics and a quality histogram.
+fn print_info_human(fi: &FileInfo) {
+    let info = &fi.info;
+    let content = &fi.content;
+    let total = info.names_bytes + info.seq_bytes + info.qual_bytes;
+    let pct = |x: u64| {
+        if total > 0 {
+            100.0 * x as f64 / total as f64
+        } else {
+            0.0
+        }
+    };
+    let per_read = |x: u64| (info.reads > 0).then(|| x as f64 / info.reads as f64);
+    let layout = match info.group_size {
+        1 => "single-end".to_string(),
+        2 => "paired".to_string(),
+        g => format!("grouped x{g} (single-cell)"),
+    };
+    let quality = match info.quality_binning {
+        0 => "lossless",
+        1 => "lossy (Illumina 8-bin)",
+        2 => "lossy (Illumina 4-bin, RTA4)",
+        3 => "lossy (2-bin, custom)",
+        _ => "unknown",
+    };
+    let spots = (info.group_size > 1).then(|| info.reads / info.group_size.max(1) as u64);
+    let bytes_per_read = (info.reads > 0).then(|| total as f64 / info.reads as f64);
 
     // Human report: a metadata table, a per-stream size table, and — with
     // `--stats` — a content-statistics table plus a quality histogram.
@@ -883,14 +1062,14 @@ fn print_info(
     meta_row("format", format!("v{}", info.format_version));
     meta_row(
         "whole-file crc",
-        crc_hex.clone().unwrap_or_else(|| "—".to_string()),
+        fi.crc_hex.clone().unwrap_or_else(|| "—".to_string()),
     );
     meta_row(
         "file size",
         format!(
             "{} ({} bytes)",
-            human_bytes(file_size),
-            group_digits(file_size)
+            human_bytes(fi.file_size),
+            group_digits(fi.file_size)
         ),
     );
     let mut meta = meta.build();
@@ -921,16 +1100,15 @@ fn print_info(
         .with(Style::rounded())
         .with(Modify::new(Columns::new(1..)).with(Alignment::right()));
 
-    println!("{}", path.display());
+    println!("{}", fi.path.display());
     println!("{meta}");
     println!("{streams}");
     if let Some(bpr) = bytes_per_read {
         println!("{bpr:.2} bytes/read");
     }
-    if let Some(cs) = &content {
+    if let Some(cs) = content {
         print!("{}", render_content_stats(cs));
     }
-    Ok(())
 }
 
 /// Render the `--stats` content-statistics table and quality histogram as a
@@ -1053,20 +1231,98 @@ struct VerifyJson {
     failed_blocks: Vec<u64>,
 }
 
-/// Run `fqxv::verify_report` and render it as a table (default), TSV, or JSON.
-/// Exits the process non-zero when the archive is corrupt so scripts can branch
-/// on `$?` regardless of the chosen format.
-fn print_verify(path: &Path, quick: bool, tsv: bool, json: bool) -> anyhow::Result<()> {
-    let file = File::open(path).with_context(|| format!("opening input {}", path.display()))?;
-    let report = fqxv::verify_report(&file, quick)
-        .with_context(|| format!("{} is not a readable fqxv archive", path.display()))?;
-    let passed = report.passed();
+/// Verify one or more archives and render each as a table (default), TSV, or
+/// JSON. A single file keeps the original single-archive output; a batch (several
+/// files or a directory) prepends a `file` column (TSV) or emits a JSON array,
+/// and stays resilient — an unreadable archive becomes a failing entry instead of
+/// aborting the run. Exits the process non-zero when *any* archive is corrupt so
+/// scripts can branch on `$?` regardless of the chosen format.
+fn print_verify(inputs: &[PathBuf], quick: bool, tsv: bool, json: bool) -> anyhow::Result<()> {
+    let (files, batch) = resolve_fqxv_inputs(inputs)?;
+
+    // Verify each archive. In single-file mode a bad archive is a hard error (as
+    // before); in a batch it becomes a failing entry so one corrupt file doesn't
+    // abort the rest.
+    let mut results: Vec<(PathBuf, Result<fqxv::VerifyReport, String>)> =
+        Vec::with_capacity(files.len());
+    for path in &files {
+        let r = File::open(path)
+            .map_err(|e| format!("opening input {}: {e}", path.display()))
+            .and_then(|f| {
+                fqxv::verify_report(&f, quick)
+                    .map_err(|e| format!("{} is not a readable fqxv archive: {e}", path.display()))
+            });
+        if !batch {
+            // Single file: surface the error with context, exactly as before.
+            results.push((path.clone(), Ok(r.map_err(anyhow::Error::msg)?)));
+        } else {
+            results.push((path.clone(), r));
+        }
+    }
 
     if json {
-        let out = VerifyJson {
+        let entries: Vec<VerifyJson> = results.iter().map(|(p, r)| verify_json_of(p, r)).collect();
+        if batch {
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&entries[0])?);
+        }
+    } else if tsv {
+        let mut header = String::new();
+        if batch {
+            header.push_str("file\t");
+        }
+        header.push_str("check\tresult\tdetail");
+        println!("{header}");
+        for (p, r) in &results {
+            let prefix = if batch {
+                format!("{}\t", p.display())
+            } else {
+                String::new()
+            };
+            match r {
+                Ok(rep) => {
+                    for c in &rep.checks {
+                        println!(
+                            "{prefix}{}\t{}\t{}",
+                            c.name,
+                            if c.ok { "ok" } else { "fail" },
+                            c.detail
+                        );
+                    }
+                }
+                Err(e) => println!("{prefix}readable\tfail\t{e}"),
+            }
+        }
+    } else {
+        for (i, (p, r)) in results.iter().enumerate() {
+            if i > 0 {
+                println!();
+            }
+            match r {
+                Ok(rep) => print_verify_human_one(p, rep),
+                Err(e) => println!("{}: CORRUPT ({e})", p.display()),
+            }
+        }
+    }
+
+    let all_passed = results
+        .iter()
+        .all(|(_, r)| r.as_ref().map(|rep| rep.passed()).unwrap_or(false));
+    if !all_passed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Build the [`VerifyJson`] for one archive, mapping an unreadable archive to a
+/// single failing `readable` check.
+fn verify_json_of(path: &Path, r: &Result<fqxv::VerifyReport, String>) -> VerifyJson {
+    match r {
+        Ok(rep) => VerifyJson {
             file: path.display().to_string(),
-            passed,
-            checks: report
+            passed: rep.passed(),
+            checks: rep
                 .checks
                 .iter()
                 .map(|c| VerifyCheckJson {
@@ -1075,48 +1331,46 @@ fn print_verify(path: &Path, quick: bool, tsv: bool, json: bool) -> anyhow::Resu
                     detail: c.detail.clone(),
                 })
                 .collect(),
-            failed_blocks: report.failed_blocks.clone(),
-        };
-        println!("{}", serde_json::to_string_pretty(&out)?);
-    } else if tsv {
-        println!("check\tresult\tdetail");
-        for c in &report.checks {
-            println!(
-                "{}\t{}\t{}",
-                c.name,
-                if c.ok { "ok" } else { "fail" },
-                c.detail
-            );
-        }
-    } else {
-        let mut table = TableBuilder::default();
-        table.push_record([
-            "check".to_string(),
-            "result".to_string(),
-            "detail".to_string(),
-        ]);
-        for c in &report.checks {
-            table.push_record([
-                c.name.clone(),
-                if c.ok { "ok" } else { "FAIL" }.to_string(),
-                c.detail.clone(),
-            ]);
-        }
-        let mut table = table.build();
-        table.with(Style::rounded());
-        println!("{}", path.display());
-        println!("{table}");
-        println!(
-            "{}: {}",
-            path.display(),
-            if passed { "OK" } else { "CORRUPT" }
-        );
+            failed_blocks: rep.failed_blocks.clone(),
+        },
+        Err(e) => VerifyJson {
+            file: path.display().to_string(),
+            passed: false,
+            checks: vec![VerifyCheckJson {
+                name: "readable".to_string(),
+                ok: false,
+                detail: e.clone(),
+            }],
+            failed_blocks: Vec::new(),
+        },
     }
+}
 
-    if !passed {
-        std::process::exit(1);
+/// Print the human `verify` report for one archive: the per-check table and a
+/// final `path: OK/CORRUPT` line.
+fn print_verify_human_one(path: &Path, report: &fqxv::VerifyReport) {
+    let mut table = TableBuilder::default();
+    table.push_record([
+        "check".to_string(),
+        "result".to_string(),
+        "detail".to_string(),
+    ]);
+    for c in &report.checks {
+        table.push_record([
+            c.name.clone(),
+            if c.ok { "ok" } else { "FAIL" }.to_string(),
+            c.detail.clone(),
+        ]);
     }
-    Ok(())
+    let mut table = table.build();
+    table.with(Style::rounded());
+    println!("{}", path.display());
+    println!("{table}");
+    println!(
+        "{}: {}",
+        path.display(),
+        if report.passed() { "OK" } else { "CORRUPT" }
+    );
 }
 
 /// Pick one of two words by a flag and own it (small helper so the metadata
@@ -1324,7 +1578,12 @@ struct InputEstimate {
 /// projected ratio and archive size without writing an archive. `reorders` is the
 /// resolved `--order any`/`--max` flag; when set the estimate is a lower bound
 /// (reordering is not modeled — see the note in the report and `fqxv::estimate`).
-fn run_estimate(inputs: &[PathBuf], params: fqxv::Params, reorders: bool) -> anyhow::Result<()> {
+fn run_estimate(
+    inputs: &[PathBuf],
+    params: fqxv::Params,
+    reorders: bool,
+    fmt: EstimateFormat,
+) -> anyhow::Result<()> {
     let g = inputs.len().max(1);
     // Keep the aggregate sample ~one block: split the cap across grouped inputs.
     let per_input = (ESTIMATE_SAMPLE_READS / g).max(1);
@@ -1383,6 +1642,42 @@ fn run_estimate(inputs: &[PathBuf], params: fqxv::Params, reorders: bool) -> any
             projectable = false;
         }
     }
+    // Machine-readable table: the input file(s), current on-disk size, projected
+    // archive size, and their ratio — a header line then one data row (a compress
+    // estimate is one archive, even when several inputs interleave into it). When
+    // the whole-file total is known (files, or a fully-consumed stream) it reports
+    // the projection; a streaming input of unknown length falls back to the
+    // sample's own figures.
+    if fmt == EstimateFormat::Tsv {
+        let (cur, est, ratio) = if projectable && proj_archive > 0.0 && disk_in > 0 {
+            (disk_in, proj_archive as u64, disk_in as f64 / proj_archive)
+        } else if sample_archive > 0 {
+            (
+                sample_raw,
+                sample_archive,
+                sample_raw as f64 / sample_archive as f64,
+            )
+        } else {
+            (sample_raw, sample_archive, 0.0)
+        };
+        // Interleaved inputs all feed one archive, so join their names into the
+        // single `file` field (`stdin` for a `-` stream).
+        let file = inputs
+            .iter()
+            .map(|p| {
+                if p.as_os_str() == "-" {
+                    "stdin".to_string()
+                } else {
+                    p.display().to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("file\tinput_bytes\test_fqxv_bytes\tratio");
+        println!("{file}\t{cur}\t{est}\t{ratio:.4}");
+        return Ok(());
+    }
+
     let streams = names + seq + qual;
     let name_of = |p: &Path| {
         if p.as_os_str() == "-" {
