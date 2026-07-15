@@ -1904,30 +1904,43 @@ pub fn merge_reference_with(
     // reference less — recovering most of the block-byte cost the layout-only merge
     // would otherwise add. Columns with no ACGT vote keep their laid-down byte
     // (preserving non-ACGT reference content).
-    let mut votes = vec![[0u32; 4]; new_seq.len()];
-    for (r, pl) in reads.iter().zip(&new_places) {
-        let start = new_offs[pl.ci as usize] + pl.off as usize;
-        for (j, &byte) in r.iter().enumerate() {
-            let c = code(byte);
-            if c < 4 {
-                votes[start + j][c as usize] += 1;
-            }
-        }
-    }
-    // Per-column plurality is independent per position, so resolve in parallel.
-    // Deterministic: each output byte is a pure function of that column's votes
-    // (ties to the lowest base via `Reverse(k)`).
-    new_seq
-        .par_iter_mut()
-        .zip(votes.par_iter())
-        .for_each(|(byte, v)| {
-            if v.iter().any(|&x| x > 0) {
-                let best = (0..4)
-                    .max_by_key(|&k| (v[k], std::cmp::Reverse(k)))
-                    .unwrap();
-                *byte = b"ACGT"[best];
+    // Scatter votes in PARALLEL. The fold is O(all bases) — previously the largest
+    // serial loop in the merge. Increments into a flat atomic vote array
+    // (`[pos*4 + base]`) commute, so the final per-column counts — hence the
+    // plurality byte — are identical regardless of thread interleaving: the output
+    // stays byte-for-byte independent of thread count. Low contention: increments
+    // spread over millions of columns.
+    use std::sync::atomic::{AtomicU32, Ordering};
+    let votes: Vec<AtomicU32> = (0..new_seq.len() * 4).map(|_| AtomicU32::new(0)).collect();
+    reads
+        .par_iter()
+        .zip(new_places.par_iter())
+        .for_each(|(r, pl)| {
+            let start = new_offs[pl.ci as usize] + pl.off as usize;
+            for (j, &byte) in r.iter().enumerate() {
+                let c = code(byte);
+                if c < 4 {
+                    votes[(start + j) * 4 + c as usize].fetch_add(1, Ordering::Relaxed);
+                }
             }
         });
+    // Per-column plurality is independent per position, so resolve in parallel.
+    // Deterministic: each output byte is a pure function of that column's counts
+    // (ties to the lowest base via `Reverse(k)`).
+    new_seq.par_iter_mut().enumerate().for_each(|(i, byte)| {
+        let v = [
+            votes[i * 4].load(Ordering::Relaxed),
+            votes[i * 4 + 1].load(Ordering::Relaxed),
+            votes[i * 4 + 2].load(Ordering::Relaxed),
+            votes[i * 4 + 3].load(Ordering::Relaxed),
+        ];
+        if v.iter().any(|&x| x > 0) {
+            let best = (0..4)
+                .max_by_key(|&k| (v[k], std::cmp::Reverse(k)))
+                .unwrap();
+            *byte = b"ACGT"[best];
+        }
+    });
 
     let merged = GlobalReference {
         seq: new_seq,
