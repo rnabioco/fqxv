@@ -44,6 +44,18 @@ TOOLS_DIR="${FQXV_TOOLS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/tools}"
 export PATH="$TOOLS_DIR/bin:$PATH"
 export LD_LIBRARY_PATH="$TOOLS_DIR/lib:${LD_LIBRARY_PATH:-}"
 
+# Rust content-digest tool (single O(n) streaming pass, bounded memory, no sort) —
+# the record-multiset round-trip check. Built on demand from bench/fqdigest.rs.
+FQDIGEST="${FQDIGEST:-$TOOLS_DIR/bin/fqdigest}"
+FQDIGEST_SRC="$HERE/fqdigest.rs"
+ensure_fqdigest() {
+  if [[ ! -x "$FQDIGEST" || "$FQDIGEST_SRC" -nt "$FQDIGEST" ]]; then
+    mkdir -p "$(dirname "$FQDIGEST")"
+    rustc -O --edition 2021 "$FQDIGEST_SRC" -o "$FQDIGEST"
+  fi
+}
+ensure_fqdigest
+
 mkdir -p "$RESULTS_DIR" "$WORK"
 # Execution mode (for the parallel Slurm-array harness — see submit_parallel.sh):
 #   default        one node, all datasets x tools, sequential (clean throughput)
@@ -93,34 +105,25 @@ measure() {
 
 fastq_records() { echo $(( $(wc -l < "$1") / 4 )); }
 
-# Order-independent record-multiset digest: emit name<TAB>seq[<TAB>qual] per
-# record, sort, and hash. This verifies *content* losslessness (names, bases,
-# and — unless mode=noqual — qualities), and because it sorts, it is invariant
-# to read reordering (SPRING, `fqxv --order any`). The `+` line (record line 3) is
-# deliberately excluded: fqxv normalizes it, which is the one documented, lossy-
-# by-design deviation. mode=noqual drops quality for lossy-quality tools.
+# Order-independent record-multiset digest via fqdigest: hashes each
+# (name, sequence[, quality]) record and sums the hashes, so the result is
+# invariant to read reordering (SPRING, `fqxv --order any`) in one streaming pass.
+# Verifies *content* losslessness. The `+` line (record line 3) is excluded:
+# fqxv normalizes it, the one documented lossy-by-design deviation. mode=noqual
+# drops quality (for lossy-quality tools), via `--no-qual`.
 record_digest() {  # file mode(full|noqual)
-  awk -v mode="$2" '
-    NR%4==1{n=$0} NR%4==2{s=$0}
-    NR%4==0{ if(mode=="noqual") print n"\t"s; else print n"\t"s"\t"$0 }
-  ' "$1" | LC_ALL=C sort | md5sum | cut -d' ' -f1
+  if [[ "$2" == noqual ]]; then
+    "$FQDIGEST" --no-qual "$1"
+  else
+    "$FQDIGEST" "$1"
+  fi
 }
 
 # Like record_digest with quality, but first pass every quality byte through
 # fqxv's bin table `scheme` (bin8|bin4|bin2) — i.e. the *expected* content of a
-# correct lossy round-trip. Must mirror QualityBinning::apply in fqxv-fqzcomp.
+# correct lossy round-trip. fqdigest's `--bin` mirrors QualityBinning::apply.
 record_digest_binned() {  # file scheme(bin8|bin4|bin2)
-  awk -v scheme="$2" '
-    BEGIN{ for(i=0;i<256;i++) ord[sprintf("%c",i)]=i }
-    function binq(c,   q,b){ q=ord[c]-33
-      if(scheme=="bin8"){ if(q<=1)b=q; else if(q<=9)b=6; else if(q<=19)b=15; else if(q<=24)b=22; else if(q<=29)b=27; else if(q<=34)b=33; else if(q<=39)b=37; else b=40 }
-      else if(scheme=="bin4"){ if(q<=2)b=2; else if(q<=17)b=12; else if(q<=29)b=24; else b=40 }
-      else if(scheme=="bin2"){ if(q<=24)b=15; else b=37 }
-      else b=q
-      return b+33 }
-    NR%4==1{n=$0} NR%4==2{s=$0}
-    NR%4==0{ out=""; L=length($0); for(i=1;i<=L;i++) out=out sprintf("%c", binq(substr($0,i,1))); print n"\t"s"\t"out }
-  ' "$1" | LC_ALL=C sort | md5sum | cut -d' ' -f1
+  "$FQDIGEST" --bin "$2" "$1"
 }
 
 # Per-base quality distortion of a lossy round-trip vs the original: mean absolute

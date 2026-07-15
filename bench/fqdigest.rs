@@ -14,7 +14,8 @@
 //! through fqxv's bin table first — the expected content of a correct lossy
 //! round-trip (mirrors QualityBinning::apply in fqxv-fqzcomp).
 //!
-//! Usage: fqdigest [--bin bin8|bin4|bin2] FILE...   (or `-`/no args = stdin)
+//! Usage: fqdigest [--bin bin8|bin4|bin2] [--no-qual] FILE...  (or `-`/none = stdin)
+//! `--no-qual` hashes (name, sequence) only, for tools that drop quality.
 //! Output: a 32-hex-digit digest. Same digest ⇔ same record multiset.
 //!
 //! Not fqxv's own hash — a standalone harness tool. Build:
@@ -102,7 +103,13 @@ fn lane(domain: u64, name: &[u8], seq: &[u8], qual: &[u8]) -> u64 {
     mum(h ^ P0, P1)
 }
 
-fn digest_reader<R: Read>(r: R, scheme: Bin, lo: &mut u64, hi: &mut u64) -> io::Result<()> {
+fn digest_reader<R: Read>(
+    r: R,
+    scheme: Bin,
+    no_qual: bool,
+    lo: &mut u64,
+    hi: &mut u64,
+) -> io::Result<()> {
     // Stream line-by-line with reused buffers: memory is bounded to four records'
     // worth regardless of file size (a multi-GB run must not be slurped whole).
     let mut br = BufReader::with_capacity(1 << 20, r);
@@ -127,13 +134,15 @@ fn digest_reader<R: Read>(r: R, scheme: Bin, lo: &mut u64, hi: &mut u64) -> io::
 
         let n = trim(&name);
         let s = trim(&seq);
-        if scheme != Bin::None {
+        if scheme != Bin::None && !no_qual {
             let end = trim_len(&qual);
             for b in &mut qual[..end] {
                 *b = bin_q(scheme, b.wrapping_sub(33)) + 33;
             }
         }
-        let q = trim(&qual);
+        // `--no-qual`: hash (name, sequence) only — for tools that intentionally
+        // drop quality, so the round-trip is compared on the retained content.
+        let q: &[u8] = if no_qual { &[] } else { trim(&qual) };
         *lo = lo.wrapping_add(lane(1, n, s, q));
         *hi = hi.wrapping_add(lane(2, n, s, q));
     }
@@ -160,6 +169,7 @@ fn trim(l: &[u8]) -> &[u8] {
 
 fn main() -> io::Result<()> {
     let mut scheme = Bin::None;
+    let mut no_qual = false;
     let mut files: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -176,8 +186,11 @@ fn main() -> io::Result<()> {
                     }
                 };
             }
+            "--no-qual" => no_qual = true,
             "-h" | "--help" => {
-                eprintln!("usage: fqdigest [--bin bin8|bin4|bin2] FILE...  (- or none = stdin)");
+                eprintln!(
+                    "usage: fqdigest [--bin bin8|bin4|bin2] [--no-qual] FILE...  (- or none = stdin)"
+                );
                 return Ok(());
             }
             _ => files.push(a),
@@ -186,11 +199,11 @@ fn main() -> io::Result<()> {
 
     let (mut lo, mut hi) = (0u64, 0u64);
     if files.is_empty() || files == ["-"] {
-        digest_reader(io::stdin().lock(), scheme, &mut lo, &mut hi)?;
+        digest_reader(io::stdin().lock(), scheme, no_qual, &mut lo, &mut hi)?;
     } else {
         for f in &files {
             let file = File::open(f)?;
-            digest_reader(file, scheme, &mut lo, &mut hi)?;
+            digest_reader(file, scheme, no_qual, &mut lo, &mut hi)?;
         }
     }
 
