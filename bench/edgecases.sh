@@ -28,25 +28,23 @@ RESULTS="$EDGE_DIR/results.tsv"
 
 FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$HERE/.." && pwd)/target}/release/fqxv}"
 FQDIGEST="${FQDIGEST:-${SCRATCH:-$HOME/scratch}/fqxv/tools/bin/fqdigest}"
+FQDIGEST_SRC="$HERE/fqdigest.rs"
 THREADS="${FQXV_THREADS:-8}"
 MODES="${FQXV_MODES:-default max maxkeep bin8 bin4 bin2}"
 
 mkdir -p "$IN" "$WORK" "$LOGS"
 
-# Order-independent content digest (fqdigest if built, awk otherwise).
+# Order-independent content digest via the fqdigest Rust tool, built on demand.
+if [[ ! -x "$FQDIGEST" || "$FQDIGEST_SRC" -nt "$FQDIGEST" ]]; then
+  mkdir -p "$(dirname "$FQDIGEST")"
+  rustc -O --edition 2021 "$FQDIGEST_SRC" -o "$FQDIGEST"
+fi
 digest() {  # file...
-  if [[ -x "$FQDIGEST" ]]; then "$FQDIGEST" "$@"
-  else awk 'NR%4==1{n=$0}NR%4==2{s=$0}NR%4==0{print n"\t"s"\t"$0}' "$@" | LC_ALL=C sort | md5sum | cut -d' ' -f1; fi
+  "$FQDIGEST" "$@"
 }
 digest_bin() {  # scheme file...
   local s="$1"; shift
-  if [[ -x "$FQDIGEST" ]]; then "$FQDIGEST" --bin "$s" "$@"; return; fi
-  awk -v scheme="$s" 'BEGIN{for(i=0;i<256;i++)ord[sprintf("%c",i)]=i}
-    function binq(c, q,b){q=ord[c]-33
-      if(scheme=="bin8"){if(q<=1)b=q;else if(q<=9)b=6;else if(q<=19)b=15;else if(q<=24)b=22;else if(q<=29)b=27;else if(q<=34)b=33;else if(q<=39)b=37;else b=40}
-      else b=q; return b+33}
-    NR%4==1{n=$0}NR%4==2{s=$0}NR%4==0{out="";L=length($0);for(i=1;i<=L;i++)out=out sprintf("%c",binq(substr($0,i,1)));print n"\t"s"\t"out}
-  ' "$@" | LC_ALL=C sort | md5sum | cut -d' ' -f1
+  "$FQDIGEST" --bin "$s" "$@"
 }
 
 compress_args() { case "$1" in
