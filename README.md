@@ -72,6 +72,7 @@ Every crate is independently publishable to crates.io and dual-licensed
 ```bash
 # single-end (gzip input auto-detected; -o defaults to reads.fqxv)
 fqxv compress reads.fastq.gz
+fqxv compress reads.fastq.gz --estimate                        # predict ratio/size from a sample, write nothing
 fqxv decompress reads.fqxv -o reads.fastq
 
 # paired-end / single-cell: interleave per-spot files into one archive
