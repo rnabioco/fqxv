@@ -130,6 +130,11 @@ enum Command {
         /// stdin (`-`).
         #[arg(short, long)]
         output: Option<PathBuf>,
+        /// Overwrite the output archive if it already exists. Without this, an
+        /// existing output path is left untouched and the command errors, so a
+        /// stray `compress` can't silently clobber an archive.
+        #[arg(short = 'f', long)]
+        force: bool,
         /// Maximum-compression preset: the deepest sequence context plus read
         /// reordering *where it helps*. Overrides `--level`/`--order`. Reordering
         /// is applied to short-read data and automatically skipped for long reads
@@ -224,6 +229,12 @@ enum Command {
         /// output only (plain, non-reordered archives).
         #[arg(long, conflicts_with = "split")]
         recover: bool,
+        /// Overwrite output FASTQ file(s) if they already exist. Without this, an
+        /// existing output (`-o FILE` or any `--split` mate file) is left
+        /// untouched and the command errors before decoding. Ignored when writing
+        /// to stdout (`-Z`/`-o -`).
+        #[arg(short = 'f', long)]
+        force: bool,
     },
     /// Print `.fqxv` container metadata and per-stream sizes. Give several files
     /// or a directory (scanned recursively for `*.fqxv`) to report a batch — one
@@ -425,6 +436,7 @@ fn main() -> anyhow::Result<()> {
         Command::Compress {
             inputs,
             output,
+            force,
             level,
             max,
             interleaved,
@@ -481,8 +493,7 @@ fn main() -> anyhow::Result<()> {
                 .filter_map(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len())
                 .sum();
-            let out = File::create(&output)
-                .with_context(|| format!("creating output {}", output.display()))?;
+            let out = create_output(&output, force)?;
 
             // The reorder path opens with a long single-threaded prelude, so name
             // the spinner after the slow work to set expectations. On a `?` bail
@@ -540,6 +551,7 @@ fn main() -> anyhow::Result<()> {
             mate_style,
             no_gzip,
             recover,
+            force,
         } => {
             let open_in =
                 || File::open(&input).with_context(|| format!("opening input {}", input.display()));
@@ -559,7 +571,7 @@ fn main() -> anyhow::Result<()> {
                 // Recovery deliberately tolerates missing/corrupt blocks, so the
                 // completeness check below does not apply here.
                 let sp = progress::Spinner::start("recovering…", cli.quiet);
-                let mut sink = open_sink(output.as_deref(), stdout)?;
+                let mut sink = open_sink(output.as_deref(), stdout, force)?;
                 let rec = fqxv::decompress_recover(open_in()?, &mut sink, cli.threads)?;
                 sink.finish()?;
                 let secs = t0.elapsed().as_secs_f64();
@@ -595,7 +607,9 @@ fn main() -> anyhow::Result<()> {
                 let stats = if let Some(prefix) = split {
                     let g = fqxv::peek(open_in()?)?.group_size as usize;
                     let mut sinks: Vec<FastqSink> = (1..=g)
-                        .map(|i| open_fastq_file(&split_path(&prefix, i, mate_style, !no_gzip)))
+                        .map(|i| {
+                            open_fastq_file(&split_path(&prefix, i, mate_style, !no_gzip), force)
+                        })
                         .collect::<anyhow::Result<_>>()?;
                     let stats = fqxv::decompress_split(open_in()?, &mut sinks, cli.threads)?;
                     for sink in sinks {
@@ -603,7 +617,7 @@ fn main() -> anyhow::Result<()> {
                     }
                     stats
                 } else {
-                    let mut sink = open_sink(output.as_deref(), stdout)?;
+                    let mut sink = open_sink(output.as_deref(), stdout, force)?;
                     let stats = fqxv::decompress(open_in()?, &mut sink, cli.threads)?;
                     sink.finish()?;
                     stats
@@ -1933,10 +1947,10 @@ fn is_gzip_path(path: &Path) -> bool {
 /// wins; `-Z/--stdout` streams raw to stdout; with neither we refuse rather than
 /// dump a whole FASTQ to the terminal. Stdout is always raw so a piped decode isn't
 /// gzip-wrapped; a file's `.gz` extension selects BGZF.
-fn open_sink(output: Option<&Path>, to_stdout: bool) -> anyhow::Result<FastqSink> {
+fn open_sink(output: Option<&Path>, to_stdout: bool, force: bool) -> anyhow::Result<FastqSink> {
     match output {
         Some(p) if p.as_os_str() == "-" => Ok(FastqSink::Raw(Box::new(io::stdout()))),
-        Some(p) => open_fastq_file(p),
+        Some(p) => open_fastq_file(p, force),
         None if to_stdout => Ok(FastqSink::Raw(Box::new(io::stdout()))),
         None => anyhow::bail!(
             "no output specified: pass -o FILE (\".gz\" for BGZF), --split PREFIX for separate \
@@ -1946,9 +1960,27 @@ fn open_sink(output: Option<&Path>, to_stdout: bool) -> anyhow::Result<FastqSink
 }
 
 /// Create a FASTQ output file, choosing BGZF compression from its `.gz` extension.
-fn open_fastq_file(path: &Path) -> anyhow::Result<FastqSink> {
-    let file = File::create(path).with_context(|| format!("creating output {}", path.display()))?;
+fn open_fastq_file(path: &Path, force: bool) -> anyhow::Result<FastqSink> {
+    let file = create_output(path, force)?;
     Ok(FastqSink::new(Box::new(file), is_gzip_path(path)))
+}
+
+/// Create `path` for writing, refusing to clobber an existing file unless `force`.
+/// Without `force` the create is atomic (`create_new`), so it fails cleanly if the
+/// path appears between a check and the open rather than truncating a file another
+/// process just wrote. With `force` this truncates any existing file, as before.
+fn create_output(path: &Path, force: bool) -> anyhow::Result<File> {
+    if force {
+        return File::create(path).with_context(|| format!("creating output {}", path.display()));
+    }
+    match File::options().write(true).create_new(true).open(path) {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => anyhow::bail!(
+            "output {} already exists; pass -f/--force to overwrite",
+            path.display()
+        ),
+        Err(e) => Err(e).with_context(|| format!("creating output {}", path.display())),
+    }
 }
 
 /// Build the path for member `i` (1-based) of a `--split` decode: `<prefix>` plus a
@@ -2029,6 +2061,29 @@ mod tests {
         let mut hdr = BGZF_HEADER;
         hdr[12] = b'X';
         assert!(!is_bgzf(&hdr));
+    }
+
+    #[test]
+    fn create_output_refuses_existing_unless_forced() {
+        let dir = std::env::temp_dir().join(format!("fqxv-create-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("archive.fqxv");
+
+        // A fresh path is created regardless of `force`.
+        create_output(&path, false).unwrap();
+        assert!(path.exists());
+        std::fs::write(&path, b"existing contents").unwrap();
+
+        // Without force, an existing path errors and is left untouched.
+        let err = create_output(&path, false).unwrap_err().to_string();
+        assert!(err.contains("already exists"), "unexpected error: {err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing contents");
+
+        // With force, the file is truncated for rewriting.
+        create_output(&path, true).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

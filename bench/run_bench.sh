@@ -165,27 +165,27 @@ is_name_lossy() { [[ "$1" == *shuffle* ]]; }
 compress() {  # tool input out_prefix
   local tool="$1" in="$2" pfx="$3"
   case "$tool" in
-    fqxv)          COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --threads "$THREADS" ;;
-    fqxv9)         COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" -l 9 --threads "$THREADS" ;;
-    fqxv-reorder)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --order any --threads "$THREADS" ;;
+    fqxv)          COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --threads "$THREADS" ;;
+    fqxv9)         COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force -l 9 --threads "$THREADS" ;;
+    fqxv-reorder)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --order any --threads "$THREADS" ;;
     # fqxv-max: the advertised best-ratio preset (`--max` == `-l 9 --order any`):
     # deepest sequence context AND read reordering together.
-    fqxv-max)      COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --max --threads "$THREADS" ;;
+    fqxv-max)      COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --max --threads "$THREADS" ;;
     # fqxv-shuffle: best-ratio RENUMBER preset (`-l 9 --order shuffle`) — the
     # apples-to-apples point vs SPRING, which also renumbers/reorders. Reads come
     # back as a seq+qual multiset with fresh names (name-lossy); verified below
     # with a `--no-names` digest, as SPRING's own reordering is verified by a
     # (order-independent) multiset digest.
-    fqxv-shuffle)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" -l 9 --order shuffle --threads "$THREADS" ;;
-    fqxv-bin8)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin8 --threads "$THREADS" ;;
-    fqxv-bin4)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin4 --threads "$THREADS" ;;
-    fqxv-bin2)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --quality-bin bin2 --threads "$THREADS" ;;
+    fqxv-shuffle)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force -l 9 --order shuffle --threads "$THREADS" ;;
+    fqxv-bin8)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin bin8 --threads "$THREADS" ;;
+    fqxv-bin4)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin bin4 --threads "$THREADS" ;;
+    fqxv-bin2)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin bin2 --threads "$THREADS" ;;
     # reorder + binning combined — the like-for-like rivals to SPRING's lossy
     # modes (spring-illbin vs fqxv-reorder-bin8, spring-binary vs -bin2), since
     # SPRING always reorders. The plain fqxv-bin* rows keep original order.
-    fqxv-reorder-bin8) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --order any --quality-bin bin8 --threads "$THREADS" ;;
-    fqxv-reorder-bin4) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --order any --quality-bin bin4 --threads "$THREADS" ;;
-    fqxv-reorder-bin2) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --order any --quality-bin bin2 --threads "$THREADS" ;;
+    fqxv-reorder-bin8) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --order any --quality-bin bin8 --threads "$THREADS" ;;
+    fqxv-reorder-bin4) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --order any --quality-bin bin4 --threads "$THREADS" ;;
+    fqxv-reorder-bin2) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --order any --quality-bin bin2 --threads "$THREADS" ;;
     gzip)     COMP="$pfx.gz";  measure bash -c "pigz -p $THREADS -6 -c '$in' > '$COMP'" ;;
     zstd19)   COMP="$pfx.zst"; measure bash -c "zstd -19 --long=27 -T$THREADS -q -f -o '$COMP' '$in'" ;;
     xz9)      COMP="$pfx.xz";  measure bash -c "xz -9 -T$THREADS -c '$in' > '$COMP'" ;;
@@ -205,7 +205,7 @@ compress() {  # tool input out_prefix
 decompress() {  # tool comp out_rt
   local tool="$1" comp="$2" rt="$3"
   case "$tool" in
-    fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-shuffle|fqxv-bin8|fqxv-bin4|fqxv-bin2|fqxv-reorder-bin8|fqxv-reorder-bin4|fqxv-reorder-bin2) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --threads "$THREADS" ;;
+    fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-shuffle|fqxv-bin8|fqxv-bin4|fqxv-bin2|fqxv-reorder-bin8|fqxv-reorder-bin4|fqxv-reorder-bin2) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --force --threads "$THREADS" ;;
     gzip)     measure bash -c "pigz -d -p $THREADS -c '$comp' > '$rt'" ;;
     zstd19)   measure bash -c "zstd -d -q -f -o '$rt' '$comp'" ;;
     xz9)      measure bash -c "xz -d -T$THREADS -c '$comp' > '$rt'" ;;
@@ -356,17 +356,17 @@ for row in "${rows[@]}"; do
     if is_fqxv "$tool"; then
       det1="$WORK/${label}.${tool}.det1.fqxv"
       case "$tool" in
-        fqxv)         "$FQXV_BIN" compress "$in" -o "$det1" --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv9)        "$FQXV_BIN" compress "$in" -o "$det1" -l 9 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-reorder) "$FQXV_BIN" compress "$in" -o "$det1" --order any --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-max)     "$FQXV_BIN" compress "$in" -o "$det1" --max --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-shuffle) "$FQXV_BIN" compress "$in" -o "$det1" -l 9 --order shuffle --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-bin8)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-bin4)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-bin2)    "$FQXV_BIN" compress "$in" -o "$det1" --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-reorder-bin8) "$FQXV_BIN" compress "$in" -o "$det1" --order any --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-reorder-bin4) "$FQXV_BIN" compress "$in" -o "$det1" --order any --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-reorder-bin2) "$FQXV_BIN" compress "$in" -o "$det1" --order any --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv)         "$FQXV_BIN" compress "$in" -o "$det1" --force --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv9)        "$FQXV_BIN" compress "$in" -o "$det1" --force -l 9 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-reorder) "$FQXV_BIN" compress "$in" -o "$det1" --force --order any --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-max)     "$FQXV_BIN" compress "$in" -o "$det1" --force --max --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-shuffle) "$FQXV_BIN" compress "$in" -o "$det1" --force -l 9 --order shuffle --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-bin8)    "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-bin4)    "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-bin2)    "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-reorder-bin8) "$FQXV_BIN" compress "$in" -o "$det1" --force --order any --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-reorder-bin4) "$FQXV_BIN" compress "$in" -o "$det1" --force --order any --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-reorder-bin2) "$FQXV_BIN" compress "$in" -o "$det1" --force --order any --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;
       esac
       if [[ -f "$det1" ]] && cmp -s "$det1" "$COMP"; then deterministic="yes"; else deterministic="no"; fi
       rm -f "$det1"
@@ -393,10 +393,10 @@ for row in "${rows[@]}"; do
     p_full="$(record_digest "$pcat" full)"
     pfx="$WORK/${label}.fqxv-paired"; COMP="$pfx.fqxv"; rt="$WORK/${label}.fqxv-paired.rt"
     rm -f "$pfx".* "$rt"_*
-    measure "$FQXV_BIN" compress "$r1" "$r2" -o "$COMP" --threads "$THREADS"; c_secs="$MEAS_SECS"; c_rss="$MEAS_RSS_KB"
+    measure "$FQXV_BIN" compress "$r1" "$r2" -o "$COMP" --force --threads "$THREADS"; c_secs="$MEAS_SECS"; c_rss="$MEAS_RSS_KB"
     comp_bytes="$(stat -c %s "$COMP" 2>/dev/null || echo 0)"
     # Restore both mates and concatenate to compare the multiset against R1+R2.
-    measure "$FQXV_BIN" decompress "$COMP" --split "$rt" --threads "$THREADS"; d_secs="$MEAS_SECS"; d_rss="$MEAS_RSS_KB"
+    measure "$FQXV_BIN" decompress "$COMP" --split "$rt" --force --threads "$THREADS"; d_secs="$MEAS_SECS"; d_rss="$MEAS_RSS_KB"
     rt_ok="no"
     # `--split` (PR #44) writes BGZF mates named <prefix>_R1.fastq.gz /
     # _R2.fastq.gz — decompress before digesting. record_digest sorts, so the

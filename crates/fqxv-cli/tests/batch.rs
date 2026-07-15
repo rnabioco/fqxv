@@ -47,6 +47,7 @@ fn compress_to(arc: &Path, seed: u8) {
         src.to_str().unwrap(),
         "-o",
         arc.to_str().unwrap(),
+        "--force",
         "--threads",
         "1",
     ]);
