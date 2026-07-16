@@ -154,6 +154,12 @@ const N_CTX: usize = 1 << 18;
 /// Saturating cap on the running delta counter (2 bits).
 const DELTA_MAX: u8 = 3;
 const FORMAT_VERSION: u8 = 1;
+/// Absolute ceiling on a single decode's total quality bytes, guarding the
+/// [`decode`] allocation/loop against a corrupt length header on memory-overcommit
+/// systems (where `try_reserve` can't). Sized far above any real decode — quality
+/// is one byte per base and a container row group caps at 256 MiB of sequence — so
+/// it never rejects legitimate data; 16 GiB leaves a wide margin.
+const MAX_DECODED_QUALS: usize = 1 << 34;
 
 /// Position bucket: fine near the read start, then 32-wide buckets so the
 /// low-quality tail of long reads keeps positional resolution. The old `pos>>3`
@@ -278,10 +284,19 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     // repeated quality symbol codes to almost nothing (a 1-symbol alphabet costs
     // ~0 bits/symbol), so there is no finite "symbols per compressed byte" bound —
     // any ratio cap would reject legitimately compressible constant/low-entropy
-    // quality (including the lossy `--quality-bin` modes). Reserving `total`
-    // fallibly rejects a hostile length before allocating; the container caps a
+    // quality (including the lossy `--quality-bin` modes). The container caps a
     // block's read count and cross-checks it against the decoded content digest,
     // so a lying `total` can't turn into wrong output.
+    //
+    // Reserving `total` fallibly rejects a hostile length on systems that refuse
+    // the allocation — but memory overcommit (macOS always, Linux by default)
+    // accepts a multi-terabyte reservation and then stalls in the decode loop
+    // below. So first reject any `total` past an absolute ceiling. This is not a
+    // ratio (which would lose data): no real single decode approaches it — quality
+    // is one byte per base and a container block caps at `MAX_BLOCK_SEQ_BYTES`.
+    if total > MAX_DECODED_QUALS {
+        return Err(Error::Malformed("declared total length exceeds maximum"));
+    }
     let mut quals = Vec::new();
     quals
         .try_reserve(total)
@@ -361,6 +376,9 @@ impl ReaderError for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the corruption tests hand-build streams; `write_lens` moved to
+    // fqxv-bytes, so this varint helper is no longer used outside tests.
+    use fqxv_bytes::write_varint;
 
     fn roundtrip(lens: &[u32], quals: &[u8], binning: QualityBinning) {
         let enc = encode(lens, quals, binning).expect("encode");
