@@ -18,13 +18,14 @@ seek to any of them without scanning the file.
 [1]  group size G               (1 single-end, 2 paired, 3-4 single-cell)
 [4]  header CRC-32C (LE)        (over the 10 header-field bytes above)
 repeated until the terminator:
+  [4]  block sync marker "FQXB"          (recovery scans for it to resync)
   [8]  block payload length (LE, nonzero)
   [4]  CRC-32C of the payload (LE)       (verified before the block is decoded)
   [ ]  block payload
-[8]  0                          (zero-length terminator block)
+[4]  "FQXB" [8] 0               (zero-length terminator frame)
 footer:
   [4]  n_row_groups (LE)
-  per row group: [8] byte_offset (LE)   (points at the group's length field)
+  per row group: [8] byte_offset (LE)   (points at the group's frame marker)
                  [4] read_count  (LE)
   [8]  total_reads (LE)
   [4]  whole_file_crc (LE)              (CRC-32C of byte 0 .. total_reads)

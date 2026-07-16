@@ -51,10 +51,14 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 /// - tags the `FLAG_GLOBAL_REFERENCE` frame with a leading method byte so the
 ///   shared reference can be coded by either the clean-room order-k model or an
 ///   xz pass (whichever is smaller), exploiting long-range repeat structure the
-///   order-k model can't see.
+///   order-k model can't see;
+/// - prefixes every block frame with a `BLOCK_MAGIC` sync marker (v2) so
+///   [`decompress_recover`] can resynchronize to a block boundary by scanning —
+///   recovering intact blocks even when the footer index is lost (a truncated
+///   tail) or a block's length prefix is corrupt.
 ///
 /// See `container.rs` for the full layout.
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 
 /// Errors returned by the archiver.
 #[derive(Debug, Error)]

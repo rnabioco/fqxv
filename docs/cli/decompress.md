@@ -103,10 +103,13 @@ Notes and limits:
 
 - Output is interleaved FASTQ, exactly like a normal `decompress`; `--recover`
   cannot be combined with `--split`.
-- Recovery reads the footer index, so it only applies to the **plain** layout.
-  A globally-clustered [reordered](../design/container.md#reordered-archives)
-  archive is all-or-nothing (its streams are mutually dependent) and returns an
-  error directing you to a plain `decompress`.
-- If the footer itself is unreadable (e.g. a truncated download), fall back to a
-  plain streaming `decompress`, which decodes every whole block before the
-  truncation point.
+- Recovery applies to the **plain** layout only. A globally-clustered
+  [reordered](../design/container.md#reordered-archives) archive is all-or-nothing
+  (its streams are mutually dependent) and returns an error directing you to a
+  plain `decompress`.
+- **A lost footer is handled.** When the footer index is unreadable — the common
+  truncated-download case, which also takes the trailing blocks with it — recovery
+  falls back to scanning for each block's sync marker, so it resynchronizes past a
+  corrupt length prefix or a bad block and still recovers every intact block. (In
+  that mode the per-block read counts are gone, so the "reads lost" tally is
+  unavailable, but the recovered reads are all emitted.)

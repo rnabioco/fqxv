@@ -38,6 +38,13 @@ pub(crate) const MAX_BLOCK_PAYLOAD: u64 = (MAX_BLOCK_SEQ_BYTES as u64) * 8;
 pub(crate) const FOOTER_MAGIC: [u8; 4] = *b"FQXF";
 /// Bytes in the fixed EOF trailer: `[8] footer_offset` + `[4] FOOTER_MAGIC`.
 pub(crate) const TRAILER_LEN: usize = 12;
+/// Per-block sync marker at the head of every block frame (`[4] BLOCK_MAGIC
+/// [8] len [4] crc [payload]`). Recovery scans for it to resynchronize to a block
+/// boundary, so a corrupt length prefix or a lost footer no longer strands the
+/// blocks that follow it (see [`decompress_recover`](super::decompress_recover)).
+pub(crate) const BLOCK_MAGIC: [u8; 4] = *b"FQXB";
+/// Frame overhead before a block payload: `BLOCK_MAGIC + [8] len + [4] crc`.
+pub(crate) const FRAME_HEAD_LEN: usize = BLOCK_MAGIC.len() + 8 + CRC_LEN;
 pub(crate) const FLAG_PLUS_NORMALIZED: u8 = 0x01;
 pub(crate) const FLAG_REORDERED: u8 = 0x02;
 pub(crate) const FLAG_KEEP_ORDER: u8 = 0x04;
@@ -130,9 +137,11 @@ pub(crate) fn write_footer<W: Write>(
     index: &FooterIndex,
     total_reads: u64,
 ) -> Result<u64> {
-    // Zero-length terminator block (fed through the tee like everything else).
+    // Zero-length terminator block — a full frame (marker + `len == 0`) so the
+    // scan-based recovery treats it like any other boundary. Fed through the tee.
+    w.write_all(&BLOCK_MAGIC)?;
     w.write_all(&0u64.to_le_bytes())?;
-    let footer_offset = index.offset + 8;
+    let footer_offset = index.offset + BLOCK_MAGIC.len() as u64 + 8;
 
     let mut body = Vec::with_capacity(4 + index.entries.len() * 12 + 8 + FOOTER_CRC_TAIL);
     body.extend_from_slice(&(index.entries.len() as u32).to_le_bytes());
@@ -153,8 +162,8 @@ pub(crate) fn write_footer<W: Write>(
 
     w.write_all(&footer_offset.to_le_bytes())?;
     w.write_all(&FOOTER_MAGIC)?;
-    // body = n_groups..whole_file_crc; +CRC_LEN for footer_crc, +8 terminator.
-    Ok(8 + body.len() as u64 + CRC_LEN as u64 + TRAILER_LEN as u64)
+    // body = n_groups..whole_file_crc; +CRC_LEN footer_crc, + marker+len terminator.
+    Ok((BLOCK_MAGIC.len() + 8) as u64 + body.len() as u64 + CRC_LEN as u64 + TRAILER_LEN as u64)
 }
 
 /// Write `[u32 len][u32 crc32c][bytes]`.
