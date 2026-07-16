@@ -442,6 +442,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fqxv-lroverlap"
+version = "0.2.0"
+dependencies = [
+ "fqxv-bytes",
+ "fqxv-range",
+ "fqxv-rans",
+ "fqxv-seq",
+ "proptest",
+ "rayon",
+ "thiserror",
+]
+
+[[package]]
 name = "fqxv-range"
 version = "0.2.0"
 dependencies = [

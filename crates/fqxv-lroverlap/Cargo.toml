@@ -1,0 +1,30 @@
+[package]
+name = "fqxv-lroverlap"
+description = "Cross-read overlap detection for long-read (ONT/PacBio) sequence compression"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+# Same dependency set as `fqxv-reorder` (a sibling in the DAG, never a parent):
+# depending on it would drag the short-read clustering path — `plan`,
+# `min_canonical`, the v2/v3 codecs — into the long-read dependency and force its
+# internals into a public API they were not designed for.
+[dependencies]
+fqxv-bytes.workspace = true
+fqxv-rans.workspace = true
+fqxv-range.workspace = true
+fqxv-seq.workspace = true
+thiserror.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
