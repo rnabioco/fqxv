@@ -20,8 +20,8 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use fqxv_lroverlap::{
-    align_banded, consensus, find_overlaps, layout, place_against, ChainOpts, ConsensusOpts, Index,
-    LayoutOpts, Op, Repeat, Sketch,
+    align_banded, consensus, find_overlaps, layout, place_against, Anchored, ChainOpts,
+    ConsensusOpts, Index, LayoutOpts, Op, Repeat, Sketch,
 };
 
 fn read_fastq(path: &str) -> (Vec<u32>, Vec<u8>) {
@@ -82,6 +82,12 @@ struct Streams {
     ins_bases: Vec<u8>,
     indel_lens: Vec<u8>,
     placements: Vec<u8>,
+    /// One byte per placed read: does it align reverse-complemented to the
+    /// reference. Its own stream because it is one bit of real information that
+    /// the decoder cannot derive, and rANS takes it back down to ~that. The
+    /// layout-framed encode could skip it (reads were pre-oriented by the
+    /// layout); placing raw reads against a reference cannot.
+    flips: Vec<u8>,
     /// Bases of reads that could not be placed — coded standalone.
     literals: Vec<u8>,
 }
@@ -94,6 +100,7 @@ impl Streams {
         self.ins_bases.extend(o.ins_bases);
         self.indel_lens.extend(o.indel_lens);
         self.placements.extend(o.placements);
+        self.flips.extend(o.flips);
         self.literals.extend(o.literals);
     }
 }
@@ -150,8 +157,57 @@ fn main() {
     offs.push(acc);
     let read_at = |r: usize| &seq[offs[r]..offs[r + 1]];
 
+    // ---- SUBSAMPLE FOR LAYOUT ------------------------------------------
+    // The layout is fed a SUBSAMPLE, not every read. Two problems have the same
+    // answer. (1) `overlaps` is quadratic in coverage: 636.8s of a 770s run at
+    // 300x, already saturating 64 cores. (2) The layout starves at depth — at
+    // 300x a read's ~800 partners are mostly COINCIDENT reads, which carry no
+    // layout information yet crowd out the few that extend it, shattering the
+    // layout into 43287 contigs where 40x gives ONE (see `layout.rs`).
+    //
+    // So do not fix the layout for 300x — feed it 40x, where it already works,
+    // and place the other 260x against the consensus it produces.
+    // `place_against` is one hop from a fixed frame and never reads a layout
+    // offset, so the deep vote and the encode are untouched. The reference is
+    // then amortised over every read rather than over the subsample, which is
+    // where most of the predicted win comes from.
+    //
+    // A stride, not a coverage target: the genome size is not ours to assume.
+    // FQXV_LAYOUT_STRIDE=8 takes ecoli_hifi's 300x down to ~40x. Default 1 is
+    // the old behaviour exactly.
+    let stride: usize = env::var("FQXV_LAYOUT_STRIDE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s| s >= 1)
+        .unwrap_or(1);
+    let sub: Vec<u32> = (0..lens.len() as u32).step_by(stride).collect();
+    let sub_lens: Vec<u32> = sub.iter().map(|&r| lens[r as usize]).collect();
+    let mut sub_seq: Vec<u8> = Vec::new();
+    for &r in &sub {
+        sub_seq.extend_from_slice(read_at(r as usize));
+    }
+    let mut sub_offs = Vec::with_capacity(sub.len() + 1);
+    let mut acc = 0usize;
+    for &l in &sub_lens {
+        sub_offs.push(acc);
+        acc += l as usize;
+    }
+    sub_offs.push(acc);
+    let sub_read_at = |i: usize| &sub_seq[sub_offs[i]..sub_offs[i + 1]];
+    if stride > 1 {
+        let sub_bases: u64 = sub_lens.iter().map(|&l| u64::from(l)).sum();
+        println!(
+            "layout subsample: {} of {} reads (stride {}) · {:.0} of {:.0} Mbase",
+            sub.len(),
+            lens.len(),
+            stride,
+            sub_bases as f64 / 1e6,
+            total_bases as f64 / 1e6
+        );
+    }
+
     let t = Instant::now();
-    let idx = Index::build(&lens, &seq, sketch, Repeat::default()).expect("index");
+    let idx = Index::build(&sub_lens, &sub_seq, sketch, Repeat::default()).expect("index");
     println!(
         "index: {} occs · {:.1}s",
         idx.len(),
@@ -159,14 +215,14 @@ fn main() {
     );
 
     let t = Instant::now();
-    let ovs: Vec<Vec<_>> = (0..lens.len())
+    let ovs: Vec<Vec<_>> = (0..sub.len())
         .into_par_iter()
-        .map(|r| find_overlaps(&idx, r as u32, read_at(r), ChainOpts::default()))
+        .map(|r| find_overlaps(&idx, r as u32, sub_read_at(r), ChainOpts::default()))
         .collect();
     println!("overlaps: {:.1}s", t.elapsed().as_secs_f64());
 
     let t = Instant::now();
-    let contigs = layout(&lens, &ovs, LayoutOpts::default());
+    let contigs = layout(&sub_lens, &ovs, LayoutOpts::default());
     let placed: usize = contigs
         .iter()
         .filter(|c| c.reads.len() > 1)
@@ -209,18 +265,20 @@ fn main() {
         n50 as f64 / 1e6,
     );
 
-    // Per contig: consensus, then code every read against it.
+    // ---- CONSENSUS over the subsample ----------------------------------
+    // Only multi-read contigs get a reference; a singleton is one read and has
+    // nothing to vote with.
     let t = Instant::now();
-    let per_contig: Vec<(Streams, usize)> = contigs
+    let consensi: Vec<Vec<u8>> = contigs
         .par_iter()
-        .map(|c| {
-            let mut s = Streams::default();
+        .filter(|c| c.reads.len() > 1)
+        .filter_map(|c| {
             // Orient reads as the layout placed them.
             let oriented: Vec<Vec<u8>> = c
                 .reads
                 .iter()
                 .map(|p| {
-                    let r = read_at(p.read as usize);
+                    let r = sub_read_at(p.read as usize);
                     if p.flip {
                         revcomp(r)
                     } else {
@@ -228,13 +286,9 @@ fn main() {
                     }
                 })
                 .collect();
-            // A singleton has no reference: its bases are literals.
-            if c.reads.len() == 1 {
-                s.literals.extend(oriented[0].iter().map(|&b| base_code(b)));
-                return (s, 0);
-            }
-            // `consensus` indexes by read id, so build a full-length table.
-            let mut by_id: Vec<Vec<u8>> = vec![Vec::new(); lens.len()];
+            // `consensus` indexes by read id, so build a full-length table over
+            // the SUBSAMPLE's local ids — which is what the layout speaks.
+            let mut by_id: Vec<Vec<u8>> = vec![Vec::new(); sub.len()];
             for (i, p) in c.reads.iter().enumerate() {
                 by_id[p.read as usize] = oriented[i].clone();
             }
@@ -263,55 +317,104 @@ fn main() {
                 }
             }
             if cons.is_empty() {
-                for o in &oriented {
-                    s.literals.extend(o.iter().map(|&b| base_code(b)));
-                }
-                return (s, 0);
+                None
+            } else {
+                Some(cons.seq)
             }
+        })
+        .collect();
+    let ref_bases: usize = consensi.iter().map(Vec::len).sum();
+    println!(
+        "consensus: {} references · {:.2} Mb · {:.1}s",
+        consensi.len(),
+        ref_bases as f64 / 1e6,
+        t.elapsed().as_secs_f64()
+    );
 
-            // M3 REFINEMENT. Do NOT reuse the layout's offsets here. They are
-            // composed hop-by-hop from chain point estimates, so their indel
-            // error accumulates across the contig with nothing re-anchoring it —
-            // measured at 0.036 subs/base emitted where 0.0025 exist. Re-place
-            // every read against the finished consensus instead: one hop from a
-            // fixed frame, so error cannot compound.
-            let refs: Vec<&[u8]> = oriented.iter().map(|v| v.as_slice()).collect();
-            let anchored = place_against(&cons.seq, &refs, sketch, ChainOpts::default());
+    // ---- PLACE EVERY READ ----------------------------------------------
+    // Including the ones the layout never saw. This is the whole point of the
+    // subsample: the reference is built from 1/stride of the data and paid for
+    // by all of it.
+    let t = Instant::now();
+    let all_refs: Vec<&[u8]> = (0..lens.len()).map(read_at).collect();
+    let placed: Vec<Vec<Option<Anchored>>> = consensi
+        .iter()
+        .map(|cs| place_against(cs, &all_refs, sketch, ChainOpts::default()))
+        .collect();
+    // Each read goes to its best-scoring reference. Score DESC, then reference
+    // index, so the assignment cannot depend on iteration order.
+    let mut best: Vec<Option<(usize, Anchored)>> = vec![None; lens.len()];
+    for (ci, per_read) in placed.iter().enumerate() {
+        for (r, a) in per_read.iter().enumerate() {
+            let Some(a) = a else { continue };
+            let take = match best[r] {
+                None => true,
+                Some((_, b)) => a.score > b.score,
+            };
+            if take {
+                best[r] = Some((ci, *a));
+            }
+        }
+    }
+    let n_placed = best.iter().filter(|b| b.is_some()).count();
+    println!(
+        "placement: {} of {} reads on a reference · {:.1}s",
+        n_placed,
+        lens.len(),
+        t.elapsed().as_secs_f64()
+    );
 
+    // ---- CODE EACH READ AGAINST ITS REFERENCE --------------------------
+    let t = Instant::now();
+    // Group by reference, ordered by offset then read: `placements` is delta-
+    // coded on the start, so offset order is what makes it small, and the
+    // tie-break keeps the order total.
+    let mut by_ref: Vec<Vec<(u32, u32)>> = vec![Vec::new(); consensi.len()];
+    for (r, b) in best.iter().enumerate() {
+        if let Some((ci, a)) = b {
+            by_ref[*ci].push((a.offset, r as u32));
+        }
+    }
+    for v in &mut by_ref {
+        v.sort_unstable();
+    }
+
+    let mut per_contig: Vec<Streams> = consensi
+        .par_iter()
+        .enumerate()
+        .map(|(ci, cs)| {
+            let mut s = Streams::default();
             // Align in PARALLEL, then emit serially. The alignment is ~10 ms per
             // read (a 12.9 kb read at band 96 is ~2.5M cells) and there are
-            // thousands per contig; the emission is microseconds. Doing both in
-            // one loop made the whole thing serial, because delta-coded
+            // thousands per reference; the emission is microseconds. Doing both
+            // in one loop made the whole thing serial, because delta-coded
             // placements depend on the previous read's start — so the cheap
             // order-dependent step was forcing the expensive order-independent
             // one to run on a single core.
-            let aligned: Vec<Option<(usize, Vec<Op>)>> = (0..c.reads.len())
-                .into_par_iter()
-                .map(|i| {
-                    let read = &oriented[i];
-                    let a = anchored[i]?;
-                    // `oriented` is already in the layout's frame, so a further
-                    // flip here means the layout and the consensus disagree about
-                    // orientation. Treat as unplaceable rather than guess.
-                    if a.flip {
-                        return None;
-                    }
+            let aligned: Vec<Option<(usize, Vec<Op>)>> = by_ref[ci]
+                .par_iter()
+                .map(|&(_, r)| {
+                    let a = best[r as usize].expect("assigned").1;
+                    let raw = read_at(r as usize);
+                    let read = if a.flip { revcomp(raw) } else { raw.to_vec() };
                     let start = a.offset as usize;
-                    let end = (start + read.len() + 64).min(cons.seq.len());
+                    let end = (start + read.len() + 64).min(cs.len());
                     if start >= end {
                         return None;
                     }
-                    Some((start, align_banded(&cons.seq[start..end], read, 96).ops))
+                    Some((start, align_banded(&cs[start..end], &read, 96).ops))
                 })
                 .collect();
 
             let mut prev_start: i64 = 0;
-            for (i, slot) in aligned.into_iter().enumerate() {
+            for (idx, slot) in aligned.into_iter().enumerate() {
+                let r = by_ref[ci][idx].1 as usize;
                 let Some((start, ops)) = slot else {
                     // Unplaceable -> code standalone.
-                    s.literals.extend(oriented[i].iter().map(|&b| base_code(b)));
+                    s.literals.extend(read_at(r).iter().map(|&b| base_code(b)));
                     continue;
                 };
+                s.flips.push(u8::from(best[r].expect("assigned").1.flip));
                 // Placement: delta-coded start. Order-dependent, hence serial.
                 let d = start as i64 - prev_start;
                 prev_start = start as i64;
@@ -339,16 +442,27 @@ fn main() {
                     }
                 }
             }
-            (s, cons.seq.len())
+            s
         })
         .collect();
-    println!("consensus + scripts: {:.1}s", t.elapsed().as_secs_f64());
+
+    // Reads that landed on no reference code standalone — the graceful
+    // degradation path, and the number to watch: at 300x the unsubsampled layout
+    // stranded 40146 of them as 496 Mbase of literals.
+    let mut orphans = Streams::default();
+    for (r, b) in best.iter().enumerate() {
+        if b.is_none() {
+            orphans
+                .literals
+                .extend(read_at(r).iter().map(|&x| base_code(x)));
+        }
+    }
+    per_contig.push(orphans);
+    println!("scripts: {:.1}s", t.elapsed().as_secs_f64());
 
     let mut all = Streams::default();
-    let mut ref_bases = 0usize;
-    for (s, rb) in per_contig {
+    for s in per_contig {
         all.merge(s);
-        ref_bases += rb;
     }
 
     println!("--- streams (order-1 rANS) ---");
@@ -361,6 +475,7 @@ fn main() {
         ("ins-bases", &all.ins_bases),
         ("indel-lens", &all.indel_lens),
         ("placements", &all.placements),
+        ("flips", &all.flips),
         ("literals", &all.literals),
     ];
     let sizes: Vec<usize> = named.par_iter().map(|(_, b)| encoded_len(b)).collect();
