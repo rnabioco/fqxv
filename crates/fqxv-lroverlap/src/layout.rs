@@ -114,13 +114,29 @@ pub fn layout(lens: &[u32], overlaps: &[Vec<Overlap>], opts: LayoutOpts) -> Vec<
             let cur_off = offset_of[cur as usize];
             let cur_flip = flip_of[cur as usize];
             let lc = i64::from(lens[cur as usize]);
-            for o in overlaps[cur as usize]
+            // Take the best `max_candidates` *usable* overlaps — not the best
+            // `max_candidates` overlaps, most of which are then dropped as
+            // already-placed. The distinction is the whole ballgame at high
+            // coverage: overlaps arrive sorted by descending score, and the
+            // top scorers are the reads that most nearly *coincide* with `cur`,
+            // which are exactly the ones placed earliest. At 40x a read has
+            // ~100 partners and its top 16 still hold unplaced ones, so a cap
+            // applied first looks fine. At 300x it has ~800 partners whose top
+            // 16 are a placed local clique, every candidate is skipped, the read
+            // extends nothing and the walk starves — 43287 stunted contigs
+            // instead of 1. Filter, then cap.
+            //
+            // Collected rather than lazily filtered because the loop body places
+            // reads, and a `.filter` closure reading `contig_of` would hold a
+            // borrow across those writes.
+            let cands: Vec<&Overlap> = overlaps[cur as usize]
                 .iter()
-                .filter(|o| o.score >= opts.min_score)
+                .filter(|o| o.score >= opts.min_score && contig_of[o.target as usize].is_none())
                 .take(opts.max_candidates)
-            {
+                .collect();
+            for o in cands {
                 if contig_of[o.target as usize].is_some() {
-                    continue; // already placed; do not re-litigate
+                    continue; // placed by an earlier pass of this same loop
                 }
                 let lt = i64::from(lens[o.target as usize]);
                 let qs = i64::from(o.q_start);
@@ -316,6 +332,57 @@ mod tests {
         let ovs = vec![vec![ov(1, 10, 400, 0)], vec![ov(0, 10, 0, 400)]];
         let c = layout(&lens, &ovs, LayoutOpts::default());
         assert_eq!(c.len(), 2, "weak overlaps must not merge contigs");
+    }
+
+    /// The candidate cap must bound *usable* overlaps, not all overlaps.
+    ///
+    /// Reads 0..=16 are a mutually-overlapping clique — coincident reads, which
+    /// score highest and so sort first. Read 17 overlaps only at read 1's tip,
+    /// so it scores lowest and lands seventeenth in read 1's list. Seed read 0
+    /// places the whole clique, so by the time the walk pops read 1 its sixteen
+    /// best overlaps are all placed: capping before the already-placed filter
+    /// spends the entire budget on reads that are then skipped, read 17 is never
+    /// reached, and it drops out as a singleton.
+    ///
+    /// This is the shape that shattered the 300x layout into 43287 contigs and
+    /// 40146 singletons while every low-coverage test here still passed — at 40x
+    /// a read's top sixteen still hold something unplaced, so the cap order does
+    /// not matter. It only bites once coverage makes the top scorers a placed
+    /// clique, which is why this test constructs that state directly instead of
+    /// hoping a coverage level triggers it.
+    #[test]
+    fn the_candidate_cap_does_not_starve_on_already_placed_overlaps() {
+        let n = 18usize;
+        let lens = vec![2000u32; n];
+        let clique: Vec<u32> = (0..17).collect();
+
+        let mut overlaps: Vec<Vec<Overlap>> = vec![Vec::new(); n];
+        for &i in &clique {
+            for &j in &clique {
+                if i != j {
+                    overlaps[i as usize].push(ov(j, 1000, 100, 100));
+                }
+            }
+        }
+        // Only reads 0 and 1 see the extension, and they see it last. Read 0 is
+        // the seed and takes its sixteen best while every one is still unplaced,
+        // so read 1's visit is the only chance to reach read 17.
+        overlaps[0].push(ov(17, 300, 1500, 0));
+        overlaps[1].push(ov(17, 300, 1500, 0));
+        overlaps[17].push(ov(0, 300, 0, 1500));
+        overlaps[17].push(ov(1, 300, 0, 1500));
+
+        let contigs = layout(&lens, &overlaps, LayoutOpts::default());
+
+        let placed: usize = contigs.iter().map(|c| c.reads.len()).sum();
+        assert_eq!(placed, n, "every read placed exactly once");
+        assert_eq!(
+            contigs.len(),
+            1,
+            "read 17 was reachable from read 1, but the cap was spent on \
+             already-placed reads and stranded it: {} contigs",
+            contigs.len()
+        );
     }
 
     #[test]
