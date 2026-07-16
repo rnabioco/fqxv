@@ -69,33 +69,56 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
     // corner and the result is garbage rather than merely suboptimal.
     let band = band.max(n.abs_diff(m)) + 1;
 
-    // Full (n+1) x (m+1) table, but only cells within the band are computed.
-    // Short segments by construction, so the memory is small; the band is what
-    // bounds the *work*.
-    let w = m + 1;
-    let mut dp = vec![INF; (n + 1) * w];
-    let mut from = vec![0u8; (n + 1) * w]; // 0=diag 1=up(del) 2=left(ins)
+    // BAND-LIMITED STORAGE. Only row `i`'s window `[i-band, i+band]` is ever
+    // computed, so only that slice is stored: memory is O(n * band), not
+    // O(n * m). This is not a micro-optimization — callers align whole reads
+    // (the consensus aligns each 14 kb read to its draft), and a full table
+    // there is ~196M cells ≈ 1 GB per call, which times a rayon pool is an OOM.
+    // The stride is capped at `m + 1` so a band wider than the row cannot make
+    // the allocation *larger* than the full table.
+    let stride = (2 * band + 1).min(m + 1);
+    let lo_of = |i: usize| i.saturating_sub(band);
+    // Row `i` stores column `j` at `i * stride + (j - lo_of(i))`; `j` outside the
+    // row's window has no cell and reads as INF.
+    let at = |i: usize, j: usize| -> Option<usize> {
+        let lo = lo_of(i);
+        let hi = (i + band).min(m);
+        if j < lo || j > hi {
+            return None;
+        }
+        Some(i * stride + (j - lo))
+    };
 
-    dp[0] = 0;
+    let mut dp = vec![INF; (n + 1) * stride];
+    let mut from = vec![0u8; (n + 1) * stride]; // 0=diag 1=up(del) 2=left(ins)
+
+    let get = |dp: &[u32], i: usize, j: usize| at(i, j).map_or(INF, |k| dp[k]);
+
+    if let Some(k) = at(0, 0) {
+        dp[k] = 0;
+    }
     for j in 1..=m.min(band) {
-        dp[j] = j as u32;
-        from[j] = 2;
+        if let Some(k) = at(0, j) {
+            dp[k] = j as u32;
+            from[k] = 2;
+        }
     }
     for i in 1..=n {
-        let lo = i.saturating_sub(band);
+        let lo = lo_of(i);
         let hi = (i + band).min(m);
         for j in lo..=hi {
+            let Some(cur) = at(i, j) else { continue };
             if j == 0 {
-                dp[i * w] = i as u32;
-                from[i * w] = 1;
+                dp[cur] = i as u32;
+                from[cur] = 1;
                 continue;
             }
             let cost = u32::from(refr[i - 1] != query[j - 1]);
-            let diag = dp[(i - 1) * w + (j - 1)].saturating_add(cost);
-            let up = dp[(i - 1) * w + j].saturating_add(1); // consume refr = del
-            let left = dp[i * w + (j - 1)].saturating_add(1); // consume query = ins
-                                                              // Prefer diagonal, then deletion, then insertion — a fixed total
-                                                              // order, so the traceback is deterministic for equal-cost paths.
+            let diag = get(&dp, i - 1, j - 1).saturating_add(cost);
+            let up = get(&dp, i - 1, j).saturating_add(1); // consume refr = del
+            let left = get(&dp, i, j - 1).saturating_add(1); // consume query = ins
+                                                             // Prefer diagonal, then deletion, then insertion — a fixed total
+                                                             // order, so the traceback is deterministic for equal-cost paths.
             let (best, f) = if diag <= up && diag <= left {
                 (diag, 0u8)
             } else if up <= left {
@@ -103,13 +126,13 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
             } else {
                 (left, 2u8)
             };
-            dp[i * w + j] = best;
-            from[i * w + j] = f;
+            dp[cur] = best;
+            from[cur] = f;
         }
     }
 
     // Traceback from (n, m), emitting per-base steps, then compact.
-    let dist = dp[n * w + m];
+    let dist = get(&dp, n, m);
     let (mut i, mut j) = (n, m);
     let mut rev: Vec<Op> = Vec::new();
     while i > 0 || j > 0 {
@@ -118,7 +141,7 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
         } else if j == 0 {
             1
         } else {
-            from[i * w + j]
+            at(i, j).map_or(1, |k| from[k])
         };
         match f {
             0 => {
@@ -240,6 +263,28 @@ mod tests {
             "a homopolymer deletion must be ONE run-length op: {:?}",
             al.ops
         );
+    }
+
+    #[test]
+    fn long_sequences_stay_within_band_memory() {
+        // Storage is O(n * band), not O(n * m). At this size a full table would
+        // be ~10^8 cells (~400 MB) per call; banded it is ~10^6. The consensus
+        // aligns whole reads, so this is the real operating point, and the test
+        // exists to keep the allocation honest as much as the answer.
+        let mut a = Vec::new();
+        let mut x: u32 = 5;
+        for _ in 0..10_000 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            a.push(b"ACGT"[(x >> 16) as usize % 4]);
+        }
+        // A copy with a handful of edits, well inside a narrow band.
+        let mut b = a.clone();
+        b[100] = b'A';
+        b[5000] = b'C';
+        b.remove(7000);
+        let al = align_banded(&a, &b, 32);
+        assert_eq!(apply(&a, &al.ops), b, "must still round-trip at length");
+        assert!(al.dist <= 4, "a few edits, got {}", al.dist);
     }
 
     #[test]

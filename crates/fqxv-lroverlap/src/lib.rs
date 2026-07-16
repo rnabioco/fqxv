@@ -58,6 +58,7 @@
 
 mod align;
 mod chain;
+mod consensus;
 mod index;
 mod layout;
 mod minimizer;
@@ -66,6 +67,7 @@ mod script;
 
 pub use align::{align_banded, apply, Alignment, Op};
 pub use chain::{chain, Anchor, Chain, ChainOpts};
+pub use consensus::{consensus, ConsensusOpts};
 pub use index::{Index, Occ, Repeat};
 pub use layout::{layout, Contig, LayoutOpts, Placement};
 pub use minimizer::{minimizers, Minimizer};
