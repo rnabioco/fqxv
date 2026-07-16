@@ -44,6 +44,49 @@ impl Default for ConsensusOpts {
     }
 }
 
+/// A voted consensus, plus the coordinate map back to the layout.
+///
+/// The map is not a convenience — it is required. A column the vote deletes is
+/// dropped from the sequence, so the consensus is shorter than the draft the
+/// layout's offsets are expressed in. At a few percent deletions that drift
+/// reaches thousands of bases over a megabase contig, far beyond any alignment
+/// band, so a [`Placement`](crate::Placement) offset applied straight to the
+/// consensus would land in the wrong place entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Consensus {
+    /// The voted sequence.
+    pub seq: Vec<u8>,
+    /// `draft position -> position in `seq``. Deleted columns map to the next
+    /// surviving position, so every draft coordinate maps somewhere valid.
+    to_cons: Vec<u32>,
+}
+
+impl Consensus {
+    /// Map a layout (draft) coordinate to its position in [`Consensus::seq`].
+    ///
+    /// Saturates at the sequence end, so an offset past the contig cannot
+    /// produce an out-of-range index.
+    #[must_use]
+    pub fn map(&self, draft_pos: u32) -> u32 {
+        match self.to_cons.get(draft_pos as usize) {
+            Some(&p) => p,
+            None => self.seq.len() as u32,
+        }
+    }
+
+    /// Length of the consensus sequence.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.seq.len()
+    }
+
+    /// True when the consensus is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.seq.is_empty()
+    }
+}
+
 /// Per-column base votes: `A, C, G, T`, plus a deletion tally.
 #[derive(Debug, Clone, Copy, Default)]
 struct Column {
@@ -96,20 +139,26 @@ fn base_idx(b: u8) -> Option<usize> {
 ///
 /// The draft is seeded from the reads laid down at their offsets, then every
 /// read is aligned to that draft and votes through the alignment. Returns the
-/// consensus sequence.
+/// consensus and the map from layout coordinates onto it (see [`Consensus`]).
 ///
 /// Insertions are deliberately not voted into the consensus: a read carrying an
 /// insertion simply codes it as an `Ins` op. Admitting them would grow the
 /// reference for the benefit of a minority of reads, and the reference is shared
 /// by all of them.
 #[must_use]
-pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Vec<u8> {
+pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Consensus {
     if contig.reads.is_empty() {
-        return Vec::new();
+        return Consensus {
+            seq: Vec::new(),
+            to_cons: Vec::new(),
+        };
     }
-    // A single read is its own consensus — nothing to vote against.
+    // A single read is its own consensus — nothing to vote against, and the map
+    // is the identity.
     if contig.reads.len() == 1 {
-        return reads[contig.reads[0].read as usize].clone();
+        let seq = reads[contig.reads[0].read as usize].clone();
+        let to_cons = (0..=seq.len() as u32).collect();
+        return Consensus { seq, to_cons };
     }
 
     // 1. Draft: first read to cover each position wins. Good enough to align
@@ -128,7 +177,10 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Vec
     // is a real sequence.
     draft.retain(|&b| b != 0);
     if draft.is_empty() {
-        return Vec::new();
+        return Consensus {
+            seq: Vec::new(),
+            to_cons: Vec::new(),
+        };
     }
 
     // 2. Vote: align each read to the draft and tally through the alignment, so
@@ -183,16 +235,22 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Vec
         }
     }
 
-    // 3. Call each column. An uncovered or under-covered column keeps the draft.
+    // 3. Call each column, recording where each draft position landed. A dropped
+    //    column maps to the next surviving position, so a layout offset that
+    //    happens to point at a deleted column still resolves somewhere valid.
     let mut out = Vec::with_capacity(draft.len());
+    let mut to_cons = Vec::with_capacity(draft.len() + 1);
     for (i, c) in cols.iter().enumerate() {
+        to_cons.push(out.len() as u32);
         match c.call(opts.min_votes) {
             Some(b) => out.push(b),
             None if c.acgt.iter().sum::<u32>() + c.del < opts.min_votes => out.push(draft[i]),
             None => {} // deletion won: the column is dropped
         }
     }
-    out
+    // One past the end, so a read ending at the contig's end maps cleanly.
+    to_cons.push(out.len() as u32);
+    Consensus { seq: out, to_cons }
 }
 
 #[cfg(test)]
@@ -272,7 +330,7 @@ mod tests {
         let r = rand_seq(200, 1);
         let c = contig_of(&[0], &[200]);
         assert_eq!(
-            consensus(&c, std::slice::from_ref(&r), ConsensusOpts::default()),
+            consensus(&c, std::slice::from_ref(&r), ConsensusOpts::default()).seq,
             r
         );
     }
@@ -292,7 +350,7 @@ mod tests {
         let r = rand_seq(300, 3);
         let reads = vec![r.clone(), r.clone(), r.clone()];
         let c = contig_of(&[0, 0, 0], &[300, 300, 300]);
-        assert_eq!(consensus(&c, &reads, ConsensusOpts::default()), r);
+        assert_eq!(consensus(&c, &reads, ConsensusOpts::default()).seq, r);
     }
 
     #[test]
@@ -306,7 +364,7 @@ mod tests {
         let c = contig_of(&vec![0u32; reads.len()], &lens);
 
         let cons = consensus(&c, &reads, ConsensusOpts::default());
-        let cons_err = edit_dist(&cons, &truth);
+        let cons_err = edit_dist(&cons.seq, &truth);
         let mean_read_err: u32 =
             reads.iter().map(|r| edit_dist(r, &truth)).sum::<u32>() / reads.len() as u32;
 
@@ -326,7 +384,7 @@ mod tests {
             let reads: Vec<Vec<u8>> = (0..n).map(|i| mutate(&truth, 0.06, 200 + i)).collect();
             let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
             let c = contig_of(&vec![0u32; reads.len()], &lens);
-            edit_dist(&consensus(&c, &reads, ConsensusOpts::default()), &truth)
+            edit_dist(&consensus(&c, &reads, ConsensusOpts::default()).seq, &truth)
         };
         let shallow = mk(3);
         let deep = mk(21);
@@ -334,6 +392,52 @@ mod tests {
             deep < shallow,
             "21x consensus ({deep}) must beat 3x ({shallow})"
         );
+    }
+
+    #[test]
+    fn the_map_is_identity_when_nothing_is_deleted() {
+        let r = rand_seq(300, 3);
+        let reads = vec![r.clone(), r.clone(), r.clone()];
+        let c = contig_of(&[0, 0, 0], &[300, 300, 300]);
+        let cons = consensus(&c, &reads, ConsensusOpts::default());
+        assert_eq!(cons.seq, r);
+        for p in [0u32, 1, 150, 299, 300] {
+            assert_eq!(cons.map(p), p, "no deletions -> map is the identity");
+        }
+    }
+
+    #[test]
+    fn the_map_tracks_deleted_columns() {
+        // The reason `Consensus` carries a map at all. When the vote deletes
+        // columns the consensus is SHORTER than the draft the layout's offsets
+        // are in, so a raw offset drifts — here every read agrees on deleting a
+        // chunk, so the drift is large and unambiguous.
+        let truth = rand_seq(600, 31);
+        // Reads that all lack truth[200..250]: the vote must delete those.
+        let mut short = truth[..200].to_vec();
+        short.extend_from_slice(&truth[250..]);
+        let reads: Vec<Vec<u8>> = (0..7).map(|_| short.clone()).collect();
+        // The draft is seeded from the reads, so the draft IS `short` here; the
+        // point is that map() stays consistent with whatever survives.
+        let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
+        let c = contig_of(&vec![0u32; reads.len()], &lens);
+        let cons = consensus(&c, &reads, ConsensusOpts::default());
+
+        // Monotonic and in range: a coordinate map that goes backwards or off
+        // the end would place reads at nonsense offsets.
+        let mut prev = 0u32;
+        for p in 0..=cons.seq.len() as u32 {
+            let m = cons.map(p);
+            assert!(m >= prev, "map must be monotonic at {p}: {m} < {prev}");
+            assert!(
+                m <= cons.seq.len() as u32,
+                "map must stay in range at {p}: {m} > {}",
+                cons.seq.len()
+            );
+            prev = m;
+        }
+        // Past the end saturates rather than panicking.
+        assert_eq!(cons.map(u32::MAX), cons.seq.len() as u32);
     }
 
     #[test]
