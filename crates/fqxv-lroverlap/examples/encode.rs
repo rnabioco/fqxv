@@ -273,24 +273,16 @@ fn main() {
         .par_iter()
         .filter(|c| c.reads.len() > 1)
         .filter_map(|c| {
-            // Orient reads as the layout placed them.
-            let oriented: Vec<Vec<u8>> = c
-                .reads
-                .iter()
-                .map(|p| {
-                    let r = sub_read_at(p.read as usize);
-                    if p.flip {
-                        revcomp(r)
-                    } else {
-                        r.to_vec()
-                    }
-                })
-                .collect();
-            // `consensus` indexes by read id, so build a full-length table over
-            // the SUBSAMPLE's local ids — which is what the layout speaks.
+            // Orient reads as the layout placed them, straight into the table
+            // `consensus` wants — which it indexes by read id, so it is
+            // full-length over the SUBSAMPLE's local ids, the ids the layout
+            // speaks. Built in one pass rather than oriented into a Vec and then
+            // cloned into this one: that held two full copies of every read on
+            // the contig, times however many contigs rayon ran at once.
             let mut by_id: Vec<Vec<u8>> = vec![Vec::new(); sub.len()];
-            for (i, p) in c.reads.iter().enumerate() {
-                by_id[p.read as usize] = oriented[i].clone();
+            for p in &c.reads {
+                let r = sub_read_at(p.read as usize);
+                by_id[p.read as usize] = if p.flip { revcomp(r) } else { r.to_vec() };
             }
             // The sketch must match the platform: the draft is built and voted
             // by chaining, so a sketch too sparse for the error rate loses reads

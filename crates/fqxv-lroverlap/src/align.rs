@@ -209,6 +209,15 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
             (_, op) => ops.push(op),
         }
     }
+    // The capacity above is the PER-BASE path length, because that is the worst
+    // case and reserving it keeps the compaction realloc-free. Compaction is the
+    // whole point though, so the result is ~two orders smaller — a 13 kb HiFi
+    // read at 0.0025 edits/base walks ~13000 steps and compacts to ~150 ops.
+    // Returning the fat buffer means every retained `Alignment` holds ~416 KB to
+    // carry ~5 KB, and a caller with one per read holds 120k of them: measured at
+    // 42 GB peak on ecoli_hifi at 300x, growing ~0.4 GB/s through the encode.
+    // Hand back what the alignment actually is.
+    ops.shrink_to_fit();
     Alignment { ops, dist }
 }
 
