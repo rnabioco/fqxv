@@ -361,35 +361,20 @@ pub(crate) fn binning_tag(b: QualityBinning) -> u8 {
     }
 }
 
-pub(crate) struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
+/// Shared byte cursor specialized to this crate's [`Error`].
+///
+/// The container reads fixed-width little-endian fields and length-prefixed
+/// slices; every out-of-bounds read maps to [`Error::Truncated`].
+pub(crate) type Cursor<'a> = fqxv_bytes::Reader<'a, Error>;
 
-impl<'a> Cursor<'a> {
-    pub(crate) fn new(buf: &'a [u8]) -> Self {
-        Cursor { buf, pos: 0 }
+impl fqxv_bytes::ReaderError for Error {
+    fn truncated() -> Self {
+        Error::Truncated
     }
-    pub(crate) fn u32(&mut self) -> Result<u32> {
-        let end = self.pos + 4;
-        let s = self.buf.get(self.pos..end).ok_or(Error::Truncated)?;
-        self.pos = end;
-        Ok(u32::from_le_bytes(s.try_into().unwrap()))
+    fn bad_varint() -> Self {
+        Error::Truncated
     }
-    pub(crate) fn u64(&mut self) -> Result<u64> {
-        let end = self.pos + 8;
-        let s = self.buf.get(self.pos..end).ok_or(Error::Truncated)?;
-        self.pos = end;
-        Ok(u64::from_le_bytes(s.try_into().unwrap()))
-    }
-    pub(crate) fn slice_u32(&mut self) -> Result<&'a [u8]> {
-        let n = self.u32()? as usize;
-        self.take(n)
-    }
-    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos + n;
-        let s = self.buf.get(self.pos..end).ok_or(Error::Truncated)?;
-        self.pos = end;
-        Ok(s)
+    fn oversized() -> Self {
+        Error::Truncated
     }
 }

@@ -39,6 +39,11 @@ PgRC2, zstd, gzip) — it is not part of the Cargo build. See `bench/README.md`.
 The crates form a strict dependency DAG; lower layers never depend on higher
 ones. Build understanding bottom-up:
 
+- **`fqxv-bytes`** — leaf crate of on-disk byte primitives shared by every codec:
+  LEB128 varints, zig-zag, the `Reader<'a, E>` bounds-checked cursor (generic
+  over each crate's `Error` via the `ReaderError` trait), and the read-length
+  array codec (`write_lens`/`read_lens`). No dependencies; the single source of
+  truth for these encodings.
 - **`fqxv-rans`** — rANS Nx16 entropy coder (CRAM 3.1). 32 interleaved states;
   order-0/order-1 models. Backends live behind one API and are chosen at runtime
   via `is_x86_feature_detected!`: **scalar** (all orders, the correctness

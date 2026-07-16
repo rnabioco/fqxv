@@ -38,7 +38,7 @@
 
 use std::borrow::Cow;
 
-use fqxv_bytes::write_varint;
+use fqxv_bytes::{read_lens, write_lens, ReaderError};
 use fqxv_range::{Decoder, Encoder, SimpleModel};
 use thiserror::Error;
 
@@ -354,79 +354,18 @@ fn dense_alphabet(quals: &[u8]) -> Result<(Vec<u8>, [u8; 256])> {
 
 // --- length stream (LEB128 varints, with a fixed-length fast path) -----------
 
-fn write_lens(out: &mut Vec<u8>, lens: &[u32]) {
-    write_varint(out, lens.len() as u64);
-    let fixed = lens.first().is_some_and(|&f| lens.iter().all(|&l| l == f));
-    out.push(u8::from(fixed));
-    if fixed {
-        if let Some(&f) = lens.first() {
-            write_varint(out, u64::from(f));
-        }
-    } else {
-        for &l in lens {
-            write_varint(out, u64::from(l));
-        }
-    }
-}
+/// Shared byte cursor specialized to this crate's [`Error`].
+type ByteReader<'a> = fqxv_bytes::Reader<'a, Error>;
 
-fn read_lens(r: &mut ByteReader<'_>) -> Result<Vec<u32>> {
-    let n = r.varint()? as usize;
-    let fixed = r.u8()? != 0;
-    let mut lens = Vec::new();
-    if fixed {
-        // The fixed path allocates all `n` entries up front regardless of how
-        // many input bytes remain, so an untrusted `n` must not abort the
-        // process on a hostile allocation — turn it into a clean error.
-        if n > 0 {
-            let f = r.varint()? as u32;
-            lens.try_reserve_exact(n)
-                .map_err(|_| Error::Malformed("length count too large to allocate"))?;
-            lens.resize(n, f);
-        }
-    } else {
-        // Self-limiting: each length is a varint consuming >= 1 input byte, so
-        // `n` is bounded by the remaining input. Cap the speculative reserve.
-        lens.try_reserve(n.min(1 << 20))
-            .map_err(|_| Error::Malformed("length count too large to allocate"))?;
-        for _ in 0..n {
-            lens.push(r.varint()? as u32);
-        }
+impl ReaderError for Error {
+    fn truncated() -> Self {
+        Error::Malformed("truncated header")
     }
-    Ok(lens)
-}
-
-struct ByteReader<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> ByteReader<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        ByteReader { buf, pos: 0 }
+    fn bad_varint() -> Self {
+        Error::Malformed("varint too long")
     }
-    fn u8(&mut self) -> Result<u8> {
-        let b = *self
-            .buf
-            .get(self.pos)
-            .ok_or(Error::Malformed("truncated header"))?;
-        self.pos += 1;
-        Ok(b)
-    }
-    fn varint(&mut self) -> Result<u64> {
-        fqxv_bytes::read_varint(self.buf, &mut self.pos).ok_or(Error::Malformed("varint too long"))
-    }
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self
-            .pos
-            .checked_add(n)
-            .filter(|&e| e <= self.buf.len())
-            .ok_or(Error::Malformed("truncated header"))?;
-        let s = &self.buf[self.pos..end];
-        self.pos = end;
-        Ok(s)
-    }
-    fn rest(&self) -> &'a [u8] {
-        &self.buf[self.pos..]
+    fn oversized() -> Self {
+        Error::Malformed("length count too large to allocate")
     }
 }
 
