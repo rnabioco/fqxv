@@ -173,12 +173,40 @@ fn main() {
         .map(|c| c.reads.len())
         .sum();
     let singletons = contigs.iter().filter(|c| c.reads.len() == 1).count();
+    // SPAN, not just count. A contig count alone is not a correctness check: a
+    // layout that collapses distinct loci onto each other reports FEWER contigs
+    // while getting worse. The number that catches both failure modes is total
+    // span against the genome -- fragmentation inflates it (43.9 Mb on a 5.16 Mb
+    // genome), collapse deflates it (1.5 Mb). Only ~1x is right.
+    let mut spans: Vec<u64> = contigs
+        .iter()
+        .filter(|c| c.reads.len() > 1)
+        .map(|c| u64::from(c.len))
+        .collect();
+    spans.sort_unstable_by(|a, b| b.cmp(a));
+    let total_span: u64 = spans.iter().sum();
+    let half = total_span / 2;
+    let mut acc = 0u64;
+    let n50 = spans
+        .iter()
+        .find(|&&s| {
+            acc += s;
+            acc >= half
+        })
+        .copied()
+        .unwrap_or(0);
     println!(
         "layout: {} contigs · {} reads on multi-read contigs · {} singletons · {:.1}s",
         contigs.len(),
         placed,
         singletons,
         t.elapsed().as_secs_f64()
+    );
+    println!(
+        "layout span: {:.2} Mb total · largest {:.2} Mb · N50 {:.2} Mb  (1x genome is the target)",
+        total_span as f64 / 1e6,
+        spans.first().copied().unwrap_or(0) as f64 / 1e6,
+        n50 as f64 / 1e6,
     );
 
     // Per contig: consensus, then code every read against it.
