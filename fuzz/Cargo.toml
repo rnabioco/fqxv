@@ -1,0 +1,70 @@
+[package]
+name = "fqxv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Standalone from the parent workspace: fuzzing needs a nightly toolchain and
+# sanitizer instrumentation, so it must not be pulled into the stable
+# `cargo build --workspace` / MSRV checks.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fqxv = { path = "../crates/fqxv" }
+fqxv-rans = { path = "../crates/fqxv-rans" }
+fqxv-tokenizer = { path = "../crates/fqxv-tokenizer" }
+fqxv-seq = { path = "../crates/fqxv-seq" }
+fqxv-fqzcomp = { path = "../crates/fqxv-fqzcomp" }
+fqxv-reorder = { path = "../crates/fqxv-reorder" }
+
+[profile.release]
+debug = 1
+
+# One binary per public decode entry point. `decode` must never panic or abort on
+# any input — libFuzzer flags a panic/abort/OOM as a crash.
+
+[[bin]]
+name = "container"
+path = "fuzz_targets/container.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rans"
+path = "fuzz_targets/rans.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tokenizer"
+path = "fuzz_targets/tokenizer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seq"
+path = "fuzz_targets/seq.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fqzcomp"
+path = "fuzz_targets/fqzcomp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "reorder"
+path = "fuzz_targets/reorder.rs"
+test = false
+doc = false
+bench = false

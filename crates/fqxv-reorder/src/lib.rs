@@ -562,6 +562,14 @@ pub fn op_stats(reads: &[&[u8]], anchors: &[u32]) -> OpStats {
 /// from an untrusted stream, so a corrupt value must error rather than abort the
 /// process on a huge infallible allocation.
 fn alloc_read(len: usize) -> Result<Vec<u8>> {
+    // Reorder is a short-read layout (mean length <= `REORDER_MAX_MEAN_LEN`), so a
+    // single read this large is a corrupt length, not real data. Reject it before
+    // allocating — a bomb declaring a multi-GB read would otherwise reserve (and
+    // fill) that much before any downstream check.
+    const MAX_READ_LEN: usize = 1 << 24; // 16 MiB — far above any real read
+    if len > MAX_READ_LEN {
+        return Err(Error::Malformed("read length implausibly large"));
+    }
     let mut read = Vec::new();
     read.try_reserve_exact(len)
         .map_err(|_| Error::Malformed("read length too large to allocate"))?;

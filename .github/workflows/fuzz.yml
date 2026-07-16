@@ -1,0 +1,73 @@
+name: Fuzz
+
+# Non-blocking: a separate workflow from CI, so it never gates a PR. Runs each
+# decode fuzz target for a short bounded time. See fuzz/README.md.
+#
+# Manual dispatch only for now. A weekly `schedule:` (the regression-net role from
+# issue #90) is deliberately not enabled yet: the standalone codec targets still
+# surface decompression-bomb OOMs (a header can declare a large count/length that
+# the codec allocates for), so a scheduled run would go red on known findings.
+# Enable the schedule once those allocations are input-bounded — see #90.
+on:
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Seconds to fuzz each target"
+        required: false
+        default: "120"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Let the sanitizer return null on an oversized/failed allocation instead of
+  # aborting, so the decoders' `try_reserve` guards can reject a corrupt length
+  # gracefully (as they do in production). A genuine *infallible* over-allocation
+  # still aborts via `handle_alloc_error`, which libFuzzer catches.
+  ASAN_OPTIONS: allocator_may_return_null=1
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [container, rans, tokenizer, seq, fqzcomp, reorder]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Seed corpus with sample archives (container only)
+        if: matrix.target == 'container'
+        run: |
+          mkdir -p fuzz/corpus/container
+          cp *.fqxv fuzz/corpus/container/ 2>/dev/null || true
+      # `-malloc_limit_mb=0` (with ASAN_OPTIONS=allocator_may_return_null=1) stops
+      # the sanitizer aborting when a decoder's `try_reserve` asks the allocator
+      # for a corrupt-length-sized block — that returns an error, not a crash. A
+      # genuine *infallible* over-allocation still aborts via `handle_alloc_error`;
+      # `-rss_limit_mb` bounds real growth (kept finite so a bomb triggers a clean
+      # libFuzzer OOM + reproducer rather than an OS OOM-kill).
+      - name: Fuzz
+        run: >
+          cargo +nightly fuzz run ${{ matrix.target }} --
+          -max_total_time=${{ github.event.inputs.max_total_time || '120' }}
+          -rss_limit_mb=4096
+          -malloc_limit_mb=0
+      - name: Upload crash reproducer
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
