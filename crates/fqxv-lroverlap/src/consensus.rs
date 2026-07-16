@@ -65,6 +65,16 @@ const TAIL_WINDOW: usize = 60_000;
 /// extension and is skipped.
 const MIN_TILE_OVERLAP: u32 = 2_000;
 
+/// How far a chained splice may disagree with the layout's expectation before it
+/// is distrusted, in bases.
+///
+/// The layout and the chain are INDEPENDENT estimates of where a read belongs.
+/// The layout's is one hop from the previously appended read, so its error is
+/// the indels within a single overlap — tens of bases, not hundreds. A chain
+/// that lands far from it is not a better estimate; it is a chain that matched
+/// somewhere else.
+const SPLICE_TOLERANCE: i64 = 500;
+
 /// Consensus options.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ConsensusOpts {
@@ -272,7 +282,8 @@ fn build_draft(contig: &Contig, reads: &[Vec<u8>], lens: &[u32], sketch: Sketch)
     let mut draft = reads[seed.read as usize].clone();
     // Chained splices are exact; fallback splices are approximate and are the
     // suspected source of the poorly-voted regions. Count them rather than guess.
-    let (mut n_chained, mut n_fallback, mut n_flip) = (0usize, 0usize, 0usize);
+    let (mut n_chained, mut n_fallback, mut n_flip, mut n_disagree) =
+        (0usize, 0usize, 0usize, 0usize);
     // The draft's end in LAYOUT coordinates. Needed for the fallback below: it
     // lets a failed chain still extend the draft rather than stall it.
     let mut end_layout = seed.offset + lens[seed.read as usize];
@@ -292,14 +303,41 @@ fn build_draft(contig: &Contig, reads: &[Vec<u8>], lens: &[u32], sketch: Sketch)
             sketch,
             ChainOpts::default(),
         );
-        // Where this read starts on the draft. A chain is exact; the layout is
-        // approximate but always available.
+        // Two INDEPENDENT estimates of where this read belongs.
+        //
+        // The layout's is one hop from the previously appended read: approximate,
+        // but derived from thousands of overlaps and never wildly wrong.
+        // A chain's is exact WHEN IT IS THE RIGHT CHAIN — but "a chain was found"
+        // is not evidence it is. 442 of 444 splices chained while building a
+        // chimera across the genome's circular wrap, where the next tiling read
+        // is adjacent on the circle but distant in the layout's linear offsets:
+        // chaining duly matched it somewhere, and the draft went 10x wrong
+        // (0.0311/base) for 700 kb, plus 268 kb aligning to the genome nowhere
+        // at all.
+        //
+        // So require them to AGREE. Where they do, take the chain (it is exact).
+        // Where they do not, the chain matched elsewhere — take the layout.
+        let expected = draft
+            .len()
+            .saturating_sub(end_layout.saturating_sub(p.offset) as usize);
         let start = match placed[0] {
             // Reads are pre-oriented by the layout, so a flip means the layout
             // and the draft disagree — do not trust that placement.
             Some(a) if !a.flip => {
-                n_chained += 1;
-                tail_start + a.offset as usize
+                let chained = tail_start + a.offset as usize;
+                if (chained as i64 - expected as i64).abs() <= SPLICE_TOLERANCE {
+                    n_chained += 1;
+                    chained
+                } else {
+                    // Chain and layout disagree: a spurious match, not a better
+                    // answer. Never stall here — an earlier version skipped the
+                    // read, which truncated the draft (the next tiling read is
+                    // further along and could not overlap the stalled end either,
+                    // so one failure killed every read after it: 4.92 Mb -> 1.15
+                    // Mb, three quarters of the reads dumped into literals).
+                    n_disagree += 1;
+                    expected
+                }
             }
             _ => {
                 if matches!(placed[0], Some(a) if a.flip) {
@@ -307,18 +345,7 @@ fn build_draft(contig: &Contig, reads: &[Vec<u8>], lens: &[u32], sketch: Sketch)
                 } else {
                     n_fallback += 1;
                 }
-                // FALLBACK — never stall. An earlier version skipped the read
-                // here, which truncated the draft: the next tiling read is even
-                // further along, so it could not overlap the stalled end either,
-                // and one failure killed every read after it. That collapsed the
-                // draft from 4.92 Mb to 1.15 Mb and dumped three quarters of the
-                // reads into literals at ~2 bits/base.
-                //
-                // The layout's coordinates are approximate, so this splice may be
-                // off by an indel or two — which the vote repairs. A truncated
-                // draft cannot be repaired by anything.
-                let overlap = end_layout.saturating_sub(p.offset) as usize;
-                draft.len().saturating_sub(overlap)
+                expected
             }
         };
         let start = start.min(draft.len());
@@ -332,7 +359,8 @@ fn build_draft(contig: &Contig, reads: &[Vec<u8>], lens: &[u32], sketch: Sketch)
     if std::env::var("FQXV_DIAG_COLS").is_ok() {
         eprintln!(
             "DIAG draft: {} bp from {} tiling reads · splices: {n_chained} chained, \
-             {n_fallback} no-chain, {n_flip} flip-disagree",
+             {n_disagree} chain-vs-layout-disagree, {n_fallback} no-chain, \
+             {n_flip} flip-disagree",
             draft.len(),
             picked.len()
         );
@@ -908,6 +936,61 @@ mod tests {
         assert!(
             draft.len() > truth.len() * 3 / 4,
             "an unplaceable read must not truncate the draft: got {} of {}",
+            draft.len(),
+            truth.len()
+        );
+    }
+
+    #[test]
+    fn a_repeat_cannot_hijack_a_splice() {
+        // Regression for the chimera. A tiling read that also matches a REPEAT
+        // elsewhere on the draft can chain to the wrong copy — and "a chain was
+        // found" is not evidence it is the right one. On real data 442 of 444
+        // splices chained while building a draft that was 10x wrong for 700 kb.
+        //
+        // The layout is an independent estimate; where the two disagree, the
+        // chain matched elsewhere. Here the genome carries a long exact repeat,
+        // so chaining has a decoy to find.
+        let unique = rand_seq(24_000, 55);
+        let motif = rand_seq(3_000, 56);
+        // truth = A + motif + B + motif + C, so any read over a motif has two
+        // equally good chain targets.
+        let mut truth = unique[0..8_000].to_vec();
+        truth.extend_from_slice(&motif);
+        truth.extend_from_slice(&unique[8_000..16_000]);
+        truth.extend_from_slice(&motif);
+        truth.extend_from_slice(&unique[16_000..24_000]);
+
+        let read_len = 4_000usize;
+        let step = 400usize;
+        let n = (truth.len() - read_len) / step;
+        let mut by_id: Vec<Vec<u8>> = Vec::with_capacity(n);
+        let mut places = Vec::with_capacity(n);
+        for i in 0..n {
+            let o = i * step;
+            by_id.push(mutate(&truth[o..o + read_len], 0.03, 900 + i as u32));
+            places.push(Placement {
+                read: i as u32,
+                contig: 0,
+                offset: o as u32,
+                flip: false,
+            });
+        }
+        let c = Contig {
+            id: 0,
+            len: truth.len() as u32,
+            reads: places,
+        };
+        let lens: Vec<u32> = by_id.iter().map(|r| r.len() as u32).collect();
+        let draft = build_draft(&c, &by_id, &lens, Sketch::ont());
+
+        // A hijacked splice collapses or duplicates the region between the two
+        // motif copies, so the draft's LENGTH is the tell: it must still track
+        // the genome, not jump ~11 kb short.
+        let err = draft.len().abs_diff(truth.len());
+        assert!(
+            err < truth.len() / 8,
+            "a repeat must not hijack a splice: draft {} vs truth {} (off by {err})",
             draft.len(),
             truth.len()
         );
