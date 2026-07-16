@@ -63,15 +63,17 @@ mod index;
 mod layout;
 mod minimizer;
 mod overlap;
+mod refine;
 mod script;
 
 pub use align::{align_banded, apply, Alignment, Op};
 pub use chain::{chain, Anchor, Chain, ChainOpts};
-pub use consensus::{consensus, ConsensusOpts};
+pub use consensus::{consensus, Consensus, ConsensusOpts};
 pub use index::{Index, Occ, Repeat};
 pub use layout::{layout, Contig, LayoutOpts, Placement};
 pub use minimizer::{minimizers, Minimizer};
 pub use overlap::{find_overlaps, Overlap};
+pub use refine::{place_against, Anchored};
 pub use script::{chain_span, script_from_chain, ScriptOpts};
 
 /// Errors returned by this crate.

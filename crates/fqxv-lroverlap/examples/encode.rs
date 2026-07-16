@@ -20,8 +20,8 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use fqxv_lroverlap::{
-    align_banded, consensus, find_overlaps, layout, ChainOpts, ConsensusOpts, Index, LayoutOpts,
-    Op, Repeat, Sketch,
+    align_banded, consensus, find_overlaps, layout, place_against, ChainOpts, ConsensusOpts, Index,
+    LayoutOpts, Op, Repeat, Sketch,
 };
 
 fn read_fastq(path: &str) -> (Vec<u32>, Vec<u8>) {
@@ -98,20 +98,26 @@ impl Streams {
     }
 }
 
-fn cost(label: &str, buf: &[u8], total_bases: u64) -> usize {
+/// Entropy-code one stream, returning its compressed size.
+fn encoded_len(buf: &[u8]) -> usize {
     if buf.is_empty() {
-        println!("    {label:<12}      empty");
         return 0;
     }
-    let enc = fqxv_rans::encode(buf, fqxv_rans::Order::One).expect("rans");
+    fqxv_rans::encode(buf, fqxv_rans::Order::One)
+        .expect("rans")
+        .len()
+}
+
+fn report(label: &str, raw: usize, enc: usize, total_bases: u64) {
+    if raw == 0 {
+        println!("    {label:<12}      empty");
+        return;
+    }
     println!(
-        "    {label:<12} {:>12} B raw -> {:>11} B  ({:.3} b/sym, {:.4} bits/base)",
-        buf.len(),
-        enc.len(),
-        (enc.len() as f64 * 8.0) / buf.len() as f64,
-        (enc.len() as f64 * 8.0) / total_bases as f64
+        "    {label:<12} {raw:>12} B raw -> {enc:>11} B  ({:.3} b/sym, {:.4} bits/base)",
+        (enc as f64 * 8.0) / raw as f64,
+        (enc as f64 * 8.0) / total_bases as f64
     );
-    enc.len()
 }
 
 fn main() {
@@ -205,6 +211,19 @@ fn main() {
                 by_id[p.read as usize] = oriented[i].clone();
             }
             let cons = consensus(c, &by_id, ConsensusOpts::default());
+            // Dump the consensus so its quality can be measured directly against
+            // the true genome, rather than inferred from the bits/base it
+            // produces. FQXV_DUMP_CONS=<dir> writes one FASTA per contig.
+            if let Ok(dir) = std::env::var("FQXV_DUMP_CONS") {
+                use std::io::Write;
+                if let Ok(mut f) = File::create(format!("{dir}/contig{}.fa", c.id)) {
+                    let _ = writeln!(f, ">contig{} reads={}", c.id, c.reads.len());
+                    for chunk in cons.seq.chunks(80) {
+                        let _ = f.write_all(chunk);
+                        let _ = f.write_all(b"\n");
+                    }
+                }
+            }
             if cons.is_empty() {
                 for o in &oriented {
                     s.literals.extend(o.iter().map(|&b| base_code(b)));
@@ -212,24 +231,55 @@ fn main() {
                 return (s, 0);
             }
 
+            // M3 REFINEMENT. Do NOT reuse the layout's offsets here. They are
+            // composed hop-by-hop from chain point estimates, so their indel
+            // error accumulates across the contig with nothing re-anchoring it —
+            // measured at 0.036 subs/base emitted where 0.0025 exist. Re-place
+            // every read against the finished consensus instead: one hop from a
+            // fixed frame, so error cannot compound.
+            let refs: Vec<&[u8]> = oriented.iter().map(|v| v.as_slice()).collect();
+            let anchored = place_against(&cons.seq, &refs, sketch, ChainOpts::default());
+
+            // Align in PARALLEL, then emit serially. The alignment is ~10 ms per
+            // read (a 12.9 kb read at band 96 is ~2.5M cells) and there are
+            // thousands per contig; the emission is microseconds. Doing both in
+            // one loop made the whole thing serial, because delta-coded
+            // placements depend on the previous read's start — so the cheap
+            // order-dependent step was forcing the expensive order-independent
+            // one to run on a single core.
+            let aligned: Vec<Option<(usize, Vec<Op>)>> = (0..c.reads.len())
+                .into_par_iter()
+                .map(|i| {
+                    let read = &oriented[i];
+                    let a = anchored[i]?;
+                    // `oriented` is already in the layout's frame, so a further
+                    // flip here means the layout and the consensus disagree about
+                    // orientation. Treat as unplaceable rather than guess.
+                    if a.flip {
+                        return None;
+                    }
+                    let start = a.offset as usize;
+                    let end = (start + read.len() + 64).min(cons.seq.len());
+                    if start >= end {
+                        return None;
+                    }
+                    Some((start, align_banded(&cons.seq[start..end], read, 96).ops))
+                })
+                .collect();
+
             let mut prev_start: i64 = 0;
-            for (i, p) in c.reads.iter().enumerate() {
-                let read = &oriented[i];
-                // Map the layout offset through the consensus's coordinate map —
-                // deleted columns mean the raw offset is stale.
-                let start = cons.map(p.offset) as usize;
-                let end = (start + read.len() + 64).min(cons.seq.len());
-                if start >= end {
-                    s.literals.extend(read.iter().map(|&b| base_code(b)));
+            for (i, slot) in aligned.into_iter().enumerate() {
+                let Some((start, ops)) = slot else {
+                    // Unplaceable -> code standalone.
+                    s.literals.extend(oriented[i].iter().map(|&b| base_code(b)));
                     continue;
-                }
-                // Placement: delta-coded start.
+                };
+                // Placement: delta-coded start. Order-dependent, hence serial.
                 let d = start as i64 - prev_start;
                 prev_start = start as i64;
                 push_varint(&mut s.placements, ((d << 1) ^ (d >> 63)) as u64);
 
-                let al = align_banded(&cons.seq[start..end], read, 96);
-                for op in &al.ops {
+                for op in &ops {
                     match op {
                         Op::Match(n) => {
                             s.ops.push(0);
@@ -264,14 +314,23 @@ fn main() {
     }
 
     println!("--- streams (order-1 rANS) ---");
+    // Encode the seven streams CONCURRENTLY — they are independent, and doing
+    // them one after another left ~10s of a 67s run on a single core.
+    let named: Vec<(&str, &[u8])> = vec![
+        ("ops", &all.ops),
+        ("match-runs", &all.runs),
+        ("sub-bases", &all.subs),
+        ("ins-bases", &all.ins_bases),
+        ("indel-lens", &all.indel_lens),
+        ("placements", &all.placements),
+        ("literals", &all.literals),
+    ];
+    let sizes: Vec<usize> = named.par_iter().map(|(_, b)| encoded_len(b)).collect();
     let mut total = 0usize;
-    total += cost("ops", &all.ops, total_bases);
-    total += cost("match-runs", &all.runs, total_bases);
-    total += cost("sub-bases", &all.subs, total_bases);
-    total += cost("ins-bases", &all.ins_bases, total_bases);
-    total += cost("indel-lens", &all.indel_lens, total_bases);
-    total += cost("placements", &all.placements, total_bases);
-    total += cost("literals", &all.literals, total_bases);
+    for ((label, buf), enc) in named.iter().zip(&sizes) {
+        report(label, buf.len(), *enc, total_bases);
+        total += *enc;
+    }
 
     // Reference: 2-bit packed (refpack's 2bit+LZMA would do better).
     let ref_bytes = ref_bases.div_ceil(4);
