@@ -154,7 +154,7 @@ pub fn chain_span(anchors: &[Anchor], k: u32) -> (u32, u32, u32, u32) {
 mod tests {
     use super::*;
     use crate::align::apply;
-    use crate::{chain, ChainOpts, Index, Repeat, Sketch};
+    use crate::{ChainOpts, Chainer, Index, Repeat, Sketch};
     use proptest::prelude::*;
 
     fn rand_seq(n: usize, seed: u32) -> Vec<u8> {
@@ -225,7 +225,7 @@ mod tests {
                 }
             }
         }
-        let chains = chain(&mut anchors, ChainOpts::default());
+        let chains = Chainer::new(ChainOpts::default()).chain(&mut anchors);
         let Some(c) = chains.first().copied() else {
             return (Vec::new(), Vec::new(), 0);
         };

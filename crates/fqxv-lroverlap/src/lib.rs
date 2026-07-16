@@ -67,7 +67,7 @@ mod refine;
 mod script;
 
 pub use align::{align_banded, apply, Alignment, Op};
-pub use chain::{chain, Anchor, Chain, ChainOpts};
+pub use chain::{Anchor, Chain, ChainOpts, Chainer};
 pub use consensus::{consensus, Consensus, ConsensusOpts};
 pub use index::{Index, Occ, Repeat};
 pub use layout::{layout, Contig, LayoutOpts, Placement};

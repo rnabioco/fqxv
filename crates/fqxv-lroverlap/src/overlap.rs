@@ -5,7 +5,7 @@
 //! needs to pick a reference read and code against it.
 
 use crate::{
-    chain::{chain, Anchor, ChainOpts},
+    chain::{Anchor, ChainOpts, Chainer},
     Index,
 };
 
@@ -62,7 +62,10 @@ pub fn find_overlaps(
     // under-scored every HiFi chain by ~21% (k=19) and pushed marginal ones below
     // `min_score`. Overriding here rather than trusting callers: the index knows
     // the truth, and a caller cannot get it wrong if it is not theirs to pass.
-    let opts = ChainOpts { k, ..opts };
+    // Built once per query, not once per candidate target: it precomputes the
+    // gap penalty, which pays for itself across a read's hundreds of targets and
+    // would be pure overhead per target.
+    let chainer = Chainer::new(ChainOpts { k, ..opts });
 
     // Group anchors by (target, same-orientation). Collected into a Vec and
     // sorted rather than a hash map, so iteration order is never a factor.
@@ -100,7 +103,7 @@ pub fn find_overlaps(
             anchors.push(buckets[j].2);
             j += 1;
         }
-        for c in chain(&mut anchors, opts) {
+        for c in chainer.chain(&mut anchors) {
             out.push(Overlap {
                 target,
                 strand: !same,

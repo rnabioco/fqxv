@@ -87,110 +87,168 @@ fn gap_cost(gap: u32, k: u32) -> i32 {
     (lin + log) as i32
 }
 
-/// Chain colinear anchors into candidate overlaps.
+/// A configured chainer: [`ChainOpts`] plus the gap penalty they imply,
+/// precomputed.
 ///
-/// `anchors` need not be sorted; it is sorted internally by `(tpos, qpos)`.
-/// Returns chains sorted by descending score, ties broken on `(q_start,
-/// t_start)` so the order is total and thread-independent.
-#[must_use]
-pub fn chain(anchors: &mut Vec<Anchor>, opts: ChainOpts) -> Vec<Chain> {
-    anchors.sort_unstable();
-    anchors.dedup();
-    let n = anchors.len();
-    let mut out = Vec::new();
-    if n == 0 {
-        return out;
+/// Build one per [`find_overlaps`](crate::find_overlaps) and reuse it for every
+/// candidate target — building it per target would cost far more than it saves.
+///
+/// ## Why the table exists
+///
+/// The DP evaluates [`gap_cost`] once per (anchor, predecessor) pair — about
+/// 2.2e12 times on a 300x HiFi dataset, where `overlaps` is 83% of runtime — and
+/// its log term was an `f64::log2`, a libm call in the innermost loop. Both of
+/// that function's inputs are bounded before it is ever called: the DP skips any
+/// `gap > max_gap`, and `k` is fixed for a whole `find_overlaps` (the index owns
+/// it). So the penalty is not a function to evaluate, it is a table to read —
+/// `max_gap + 1` entries, 20 KB at the default, small enough to stay in cache.
+///
+/// Every entry is exactly what the arithmetic produced, so chains — and the
+/// archive — stay **byte-identical**; this is a speedup, not a heuristic change.
+/// See `the_table_matches_the_arithmetic_it_replaced`.
+///
+/// Bundling the table WITH the opts it was built from is deliberate: a table
+/// built for one `k` and used with another would silently mis-score every chain,
+/// and this way that pairing is not the caller's to get wrong — the same reason
+/// `find_overlaps` takes `k` from the index rather than the caller.
+#[derive(Debug, Clone)]
+pub struct Chainer {
+    opts: ChainOpts,
+    gap_cost: Vec<i32>,
+}
+
+impl Chainer {
+    /// Precompute the gap penalty for `opts`.
+    #[must_use]
+    pub fn new(opts: ChainOpts) -> Self {
+        let gap_cost = (0..=opts.max_gap).map(|g| gap_cost(g, opts.k)).collect();
+        Self { opts, gap_cost }
     }
 
-    // f[i]: best score of a chain ending at anchor i. p[i]: its predecessor.
-    let mut f = vec![opts.k as i32; n];
-    let mut p = vec![usize::MAX; n];
-
-    for i in 0..n {
-        let a = anchors[i];
-        let lo = i.saturating_sub(opts.lookback);
-        for j in (lo..i).rev() {
-            let b = anchors[j];
-            // Strictly colinear: both coordinates must advance.
-            if b.tpos >= a.tpos || b.qpos >= a.qpos {
-                continue;
-            }
-            let dt = a.tpos - b.tpos;
-            let dq = a.qpos - b.qpos;
-            if dt > opts.max_dist || dq > opts.max_dist {
-                continue;
-            }
-            let gap = dt.abs_diff(dq);
-            if gap > opts.max_gap {
-                continue;
-            }
-            // Overlapping anchors contribute only the new bases they cover.
-            let weight = dt.min(dq).min(opts.k) as i32;
-            let score = f[j] + weight - gap_cost(gap, opts.k);
-            // Strictly-greater keeps the SMALLEST predecessor index on a tie,
-            // since j descends — a total order, so the DP cannot depend on
-            // iteration or thread scheduling.
-            if score > f[i] {
-                f[i] = score;
-                p[i] = j;
-            }
-        }
+    /// The options this chainer was built from.
+    #[must_use]
+    pub fn opts(&self) -> ChainOpts {
+        self.opts
     }
 
-    // Backtrack from best-scoring anchors, each anchor used by one chain only.
-    let mut order: Vec<usize> = (0..n).collect();
-    // Total order: score DESC, then index ASC.
-    order.sort_unstable_by(|&x, &y| f[y].cmp(&f[x]).then(x.cmp(&y)));
-    let mut used = vec![false; n];
+    /// The precomputed penalty for `gap`.
+    #[inline]
+    fn gap_penalty(&self, gap: u32) -> i32 {
+        // The DP rejects `gap > max_gap` before asking, so this is always a hit.
+        // Recompute rather than panic if some future caller does not.
+        self.gap_cost
+            .get(gap as usize)
+            .copied()
+            .unwrap_or_else(|| gap_cost(gap, self.opts.k))
+    }
 
-    for &end in &order {
-        if used[end] || f[end] < opts.min_score {
-            continue;
+    /// Chain colinear anchors into candidate overlaps.
+    ///
+    /// `anchors` need not be sorted; it is sorted internally by `(tpos, qpos)`.
+    /// Returns chains sorted by descending score, ties broken on `(q_start,
+    /// t_start)` so the order is total and thread-independent.
+    #[must_use]
+    pub fn chain(&self, anchors: &mut Vec<Anchor>) -> Vec<Chain> {
+        let opts = self.opts;
+        anchors.sort_unstable();
+        anchors.dedup();
+        let n = anchors.len();
+        let mut out = Vec::new();
+        if n == 0 {
+            return out;
         }
-        let mut path = Vec::new();
-        let mut cur = end;
-        loop {
-            if used[cur] {
-                // Ran into an existing chain; stop rather than steal its anchors.
-                break;
+
+        // f[i]: best score of a chain ending at anchor i. p[i]: its predecessor.
+        let mut f = vec![opts.k as i32; n];
+        let mut p = vec![usize::MAX; n];
+
+        for i in 0..n {
+            let a = anchors[i];
+            let lo = i.saturating_sub(opts.lookback);
+            for j in (lo..i).rev() {
+                let b = anchors[j];
+                // Strictly colinear: both coordinates must advance.
+                if b.tpos >= a.tpos || b.qpos >= a.qpos {
+                    continue;
+                }
+                let dt = a.tpos - b.tpos;
+                let dq = a.qpos - b.qpos;
+                if dt > opts.max_dist || dq > opts.max_dist {
+                    continue;
+                }
+                let gap = dt.abs_diff(dq);
+                if gap > opts.max_gap {
+                    continue;
+                }
+                // Overlapping anchors contribute only the new bases they cover.
+                let weight = dt.min(dq).min(opts.k) as i32;
+                let score = f[j] + weight - self.gap_penalty(gap);
+                // Strictly-greater keeps the SMALLEST predecessor index on a tie,
+                // since j descends — a total order, so the DP cannot depend on
+                // iteration or thread scheduling.
+                if score > f[i] {
+                    f[i] = score;
+                    p[i] = j;
+                }
             }
-            path.push(cur);
-            match p[cur] {
-                usize::MAX => break,
-                prev => cur = prev,
+        }
+
+        // Backtrack from best-scoring anchors, each anchor used by one chain only.
+        let mut order: Vec<usize> = (0..n).collect();
+        // Total order: score DESC, then index ASC.
+        order.sort_unstable_by(|&x, &y| f[y].cmp(&f[x]).then(x.cmp(&y)));
+        let mut used = vec![false; n];
+
+        for &end in &order {
+            if used[end] || f[end] < opts.min_score {
+                continue;
             }
+            let mut path = Vec::new();
+            let mut cur = end;
+            loop {
+                if used[cur] {
+                    // Ran into an existing chain; stop rather than steal its anchors.
+                    break;
+                }
+                path.push(cur);
+                match p[cur] {
+                    usize::MAX => break,
+                    prev => cur = prev,
+                }
+            }
+            if (path.len() as u32) < opts.min_anchors {
+                continue;
+            }
+            for &i in &path {
+                used[i] = true;
+            }
+            // `path` runs end -> start.
+            let first = anchors[*path.last().expect("non-empty")];
+            let last = anchors[path[0]];
+            out.push(Chain {
+                score: f[end],
+                n_anchors: path.len() as u32,
+                q_start: first.qpos,
+                q_end: last.qpos + opts.k,
+                t_start: first.tpos,
+                t_end: last.tpos + opts.k,
+            });
         }
-        if (path.len() as u32) < opts.min_anchors {
-            continue;
-        }
-        for &i in &path {
-            used[i] = true;
-        }
-        // `path` runs end -> start.
-        let first = anchors[*path.last().expect("non-empty")];
-        let last = anchors[path[0]];
-        out.push(Chain {
-            score: f[end],
-            n_anchors: path.len() as u32,
-            q_start: first.qpos,
-            q_end: last.qpos + opts.k,
-            t_start: first.tpos,
-            t_end: last.tpos + opts.k,
+
+        out.sort_unstable_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then(a.q_start.cmp(&b.q_start))
+                .then(a.t_start.cmp(&b.t_start))
         });
+        out
     }
-
-    out.sort_unstable_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then(a.q_start.cmp(&b.q_start))
-            .then(a.t_start.cmp(&b.t_start))
-    });
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Sketch;
     use proptest::prelude::*;
 
     fn opts() -> ChainOpts {
@@ -198,6 +256,38 @@ mod tests {
             min_score: 0,
             min_anchors: 2,
             ..ChainOpts::default()
+        }
+    }
+
+    /// Chain with the test options, the way every test here used to.
+    fn chain(anchors: &mut Vec<Anchor>, opts: ChainOpts) -> Vec<Chain> {
+        Chainer::new(opts).chain(anchors)
+    }
+
+    /// The table replaced an `f64::log2` in the innermost loop, and it is only a
+    /// legitimate swap if it returns the SAME penalty for every gap the DP can
+    /// reach. If it ever does not, chains re-score, overlaps move, and the
+    /// archive changes — a silent ratio regression with no failing test to point
+    /// at it. So check every entry against the arithmetic it replaced, for both
+    /// sketch presets.
+    #[test]
+    fn the_table_matches_the_arithmetic_it_replaced() {
+        for k in [Sketch::ont().k as u32, Sketch::hifi().k as u32] {
+            let o = ChainOpts {
+                k,
+                ..ChainOpts::default()
+            };
+            let c = Chainer::new(o);
+            for gap in 0..=o.max_gap {
+                assert_eq!(
+                    c.gap_penalty(gap),
+                    gap_cost(gap, k),
+                    "table disagrees with gap_cost at k={k} gap={gap}"
+                );
+            }
+            // Past the table the DP never asks, but the fallback must still be
+            // right rather than panic.
+            assert_eq!(c.gap_penalty(o.max_gap + 1), gap_cost(o.max_gap + 1, k));
         }
     }
 
