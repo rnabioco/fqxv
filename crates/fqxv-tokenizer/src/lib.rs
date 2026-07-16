@@ -32,7 +32,7 @@
 
 use std::borrow::Cow;
 
-use fqxv_bytes::{unzigzag, write_varint, zigzag};
+use fqxv_bytes::{unzigzag, write_varint, zigzag, ReaderError};
 use fqxv_rans::Order;
 use thiserror::Error;
 
@@ -64,6 +64,16 @@ const MAX_NUM_DIGITS: usize = 18;
 // this cap, so each column (tile / x / y …) is modeled on its own distribution.
 const MAX_COL: usize = 63;
 
+// Cap on any single rANS sub-stream's decoded length, as a multiple of the whole
+// compressed names stream (with a floor for tiny inputs). Names decode one block
+// at a time, and no individual stream legitimately expands past this — the large
+// expansion in repetitive data comes from token reconstruction (MATCH/DELTA
+// replays), not from one stream. On the untrusted direct-decode path this stops
+// a corrupt output-length header from allocating gigabytes; see
+// [`fqxv_rans::decode_bounded`].
+const MAX_STREAM_EXPANSION: usize = 1 << 16;
+const MIN_STREAM_BOUND: usize = 1 << 20;
+
 /// One name token. On the encode path `bytes` borrows a slice of the input name
 /// (no per-token allocation for millions of names); on decode it owns rebuilt
 /// bytes. `Cow` lets one type serve both without copying on encode.
@@ -92,10 +102,11 @@ fn push_stream(out: &mut Vec<u8>, stream: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Read one flat `[varint comp_len, comp_bytes]` stream and rANS-decode it.
-fn read_stream(r: &mut Cursor<'_>) -> Result<Vec<u8>> {
+/// Read one flat `[varint comp_len, comp_bytes]` stream and rANS-decode it,
+/// rejecting a decoded length above `max_out` before it is allocated.
+fn read_stream(r: &mut Cursor<'_>, max_out: usize) -> Result<Vec<u8>> {
     let len = r.varint()? as usize;
-    Ok(fqxv_rans::decode(r.take(len)?)?)
+    Ok(fqxv_rans::decode_bounded(r.take(len)?, max_out)?)
 }
 
 /// Append the per-column numeric deltas as fixed-width little-endian byte
@@ -142,7 +153,9 @@ fn read_delta_planes(r: &mut Cursor<'_>, n_delta: &[usize]) -> Result<Vec<Vec<u6
         vals.resize(n, 0);
         for plane in 0..width {
             let len = r.varint()? as usize;
-            let bytes = fqxv_rans::decode(r.take(len)?)?;
+            // Each plane must decode to exactly `n` bytes, so bound the decode by
+            // `n` up front — a corrupt length header can't over-allocate.
+            let bytes = fqxv_rans::decode_bounded(r.take(len)?, n)?;
             if bytes.len() != n {
                 return Err(Error::Malformed("delta plane length mismatch"));
             }
@@ -189,10 +202,10 @@ fn push_op_rle(out: &mut Vec<u8>, cols: &[Vec<u8>]) -> Result<()> {
 /// Inverse of [`push_op_rle`]. `n_records` bounds each column's length (a column
 /// holds at most one op per record), guarding a corrupt run length from
 /// allocating unboundedly.
-fn read_op_rle(r: &mut Cursor<'_>, n_records: usize) -> Result<Vec<Vec<u8>>> {
-    let counts = read_stream(r)?;
-    let syms = read_stream(r)?;
-    let lens = read_stream(r)?;
+fn read_op_rle(r: &mut Cursor<'_>, n_records: usize, max_out: usize) -> Result<Vec<Vec<u8>>> {
+    let counts = read_stream(r, max_out)?;
+    let syms = read_stream(r, max_out)?;
+    let lens = read_stream(r, max_out)?;
     let mut c_counts = Cursor::new(&counts);
     let mut c_lens = Cursor::new(&lens);
     let mut sym_pos = 0usize;
@@ -206,11 +219,17 @@ fn read_op_rle(r: &mut Cursor<'_>, n_records: usize) -> Result<Vec<Vec<u8>>> {
                 .ok_or(Error::Malformed("op sym underrun"))?;
             sym_pos += 1;
             let run = c_lens.varint()? as usize;
-            if col.len() + run > n_records {
+            // `n_records` is bounded by the token stream (see `decode`), so this
+            // is a tight cap on the column length. `checked_add` also stops a
+            // near-`usize::MAX` run from overflowing the sum past the check.
+            if col
+                .len()
+                .checked_add(run)
+                .is_none_or(|total| total > n_records)
+            {
                 return Err(Error::Malformed("op run too long"));
             }
-            // `n_records` is an untrusted header, so the guard above is not a real
-            // bound; grow fallibly so a crafted run can't abort on a huge alloc.
+            // Grow fallibly so even a within-bound run can't abort on OOM.
             col.try_reserve(run)
                 .map_err(|_| Error::Malformed("op run too large to allocate"))?;
             col.resize(col.len() + run, s);
@@ -517,12 +536,29 @@ pub fn decode(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     }
     let n_records = r.varint()? as usize;
 
-    let counts = read_stream(&mut r)?;
-    let str_lens = read_stream(&mut r)?;
-    let str_data = read_stream(&mut r)?;
-    let num_vals = read_stream(&mut r)?;
-    let pads = read_stream(&mut r)?;
-    let op_data = read_op_rle(&mut r, n_records)?;
+    // Per-stream decode cap for the untrusted direct-decode path (see
+    // [`MAX_STREAM_EXPANSION`]). Well above any legitimate single stream, but
+    // finite, so a corrupt length header cannot allocate gigabytes.
+    let max_out = src
+        .len()
+        .saturating_mul(MAX_STREAM_EXPANSION)
+        .max(MIN_STREAM_BOUND);
+
+    let counts = read_stream(&mut r, max_out)?;
+    // `counts` holds exactly one token-count varint per record (>= 1 byte each),
+    // so a valid `n_records` can never exceed `counts.len()`. Enforcing that here
+    // turns the `col.len() + run > n_records` check in `read_op_rle` and the
+    // delta-plane sizing into tight bounds: without it a corrupt `n_records` lets
+    // a crafted run drive a multi-gigabyte zero-fill that still fits in memory
+    // (so `try_reserve` never trips) and stalls decode for minutes.
+    if n_records > counts.len() {
+        return Err(Error::Malformed("record count exceeds token stream"));
+    }
+    let str_lens = read_stream(&mut r, max_out)?;
+    let str_data = read_stream(&mut r, max_out)?;
+    let num_vals = read_stream(&mut r, max_out)?;
+    let pads = read_stream(&mut r, max_out)?;
+    let op_data = read_op_rle(&mut r, n_records, max_out)?;
     // Each column holds one delta per DELTA op in it; that count sizes the byte
     // planes, so it need not be stored.
     let n_delta: Vec<usize> = op_data
@@ -650,39 +686,18 @@ fn num_tok(value: i64, width: usize) -> Tok<'static> {
     }
 }
 
-struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
+/// Shared byte cursor specialized to this crate's [`Error`].
+type Cursor<'a> = fqxv_bytes::Reader<'a, Error>;
 
-impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Cursor { buf, pos: 0 }
+impl ReaderError for Error {
+    fn truncated() -> Self {
+        Error::Malformed("truncated")
     }
-    fn u8(&mut self) -> Result<u8> {
-        let b = *self
-            .buf
-            .get(self.pos)
-            .ok_or(Error::Malformed("truncated"))?;
-        self.pos += 1;
-        Ok(b)
+    fn bad_varint() -> Self {
+        Error::Malformed("varint too long")
     }
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        // `n` is an untrusted length (a varint), so guard the add: a huge value
-        // overflows `usize` (a debug-build panic; a silent wrap in release).
-        let end = self
-            .pos
-            .checked_add(n)
-            .ok_or(Error::Malformed("truncated slice"))?;
-        let s = self
-            .buf
-            .get(self.pos..end)
-            .ok_or(Error::Malformed("truncated slice"))?;
-        self.pos = end;
-        Ok(s)
-    }
-    fn varint(&mut self) -> Result<u64> {
-        fqxv_bytes::read_varint(self.buf, &mut self.pos).ok_or(Error::Malformed("varint too long"))
+    fn oversized() -> Self {
+        Error::Malformed("length count too large to allocate")
     }
 }
 
@@ -700,6 +715,50 @@ mod tests {
     #[test]
     fn roundtrip_empty() {
         roundtrip(&[]);
+    }
+
+    /// A corrupt stream must not be able to drive decode into a huge zero-fill.
+    ///
+    /// Hand-build a well-formed stream whose op-RLE claims a ~1 GiB run while the
+    /// header inflates `n_records` so the `col.len() + run > n_records` check
+    /// would pass. The record-count bound in `decode` must reject it up front
+    /// rather than `resize`-ing gigabytes (which fits in memory, so `try_reserve`
+    /// would not catch it).
+    #[test]
+    fn corrupt_run_length_cannot_drive_huge_allocation() {
+        let mut out = Vec::new();
+        out.push(FORMAT_VERSION);
+        write_varint(&mut out, u64::MAX / 2); // inflated n_records
+
+        // Flat streams the decoder reads before the op RLE. `counts` is short —
+        // that is what now bounds `n_records`; the rest are empty.
+        let mut counts = Vec::new();
+        write_varint(&mut counts, 1); // record 0 has one token
+        push_stream(&mut out, &counts).unwrap();
+        push_stream(&mut out, &[]).unwrap(); // str_lens
+        push_stream(&mut out, &[]).unwrap(); // str_data
+        push_stream(&mut out, &[]).unwrap(); // num_vals
+        push_stream(&mut out, &[]).unwrap(); // pads
+
+        // Op RLE: column 0 has one run of ~1 GiB; the other columns are empty.
+        let mut op_counts = Vec::new();
+        for c in 0..=MAX_COL {
+            write_varint(&mut op_counts, u64::from(c == 0));
+        }
+        let syms = vec![MATCH];
+        let mut op_lens = Vec::new();
+        write_varint(&mut op_lens, 1 << 30);
+        push_stream(&mut out, &op_counts).unwrap();
+        push_stream(&mut out, &syms).unwrap();
+        push_stream(&mut out, &op_lens).unwrap();
+
+        // Must fail at the record-count bound, before the op RLE resizes: any
+        // other `Malformed` means decode walked into the huge run first.
+        let err = decode(&out).expect_err("inflated n_records must be rejected");
+        assert!(
+            matches!(err, Error::Malformed("record count exceeds token stream")),
+            "expected the record-count guard to fire, got {err:?}"
+        );
     }
 
     /// A detected template must regenerate the names in ORIGINAL order exactly.
@@ -911,7 +970,7 @@ mod tests {
         push_stream(&mut data, &[0u8]).unwrap(); // syms: one op byte
         push_stream(&mut data, &lens).unwrap();
         let mut r = Cursor::new(&data);
-        let err = read_op_rle(&mut r, usize::MAX).unwrap_err();
+        let err = read_op_rle(&mut r, usize::MAX, usize::MAX).unwrap_err();
         assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
     }
 

@@ -32,7 +32,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
-use fqxv_bytes::{unzigzag, write_varint, zigzag};
+use fqxv_bytes::{unzigzag, write_varint, zigzag, ReaderError};
 use rayon::prelude::*;
 use thiserror::Error;
 
@@ -2015,35 +2015,18 @@ pub fn merge_reference_with(
     (merged, new_places)
 }
 
-struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
-}
+/// Shared byte cursor specialized to this crate's [`Error`].
+type Cursor<'a> = fqxv_bytes::Reader<'a, Error>;
 
-impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Cursor { buf, pos: 0 }
+impl ReaderError for Error {
+    fn truncated() -> Self {
+        Error::Malformed("truncated")
     }
-    fn u8(&mut self) -> Result<u8> {
-        let b = *self
-            .buf
-            .get(self.pos)
-            .ok_or(Error::Malformed("truncated"))?;
-        self.pos += 1;
-        Ok(b)
+    fn bad_varint() -> Self {
+        Error::Malformed("varint too long")
     }
-    fn varint(&mut self) -> Result<u64> {
-        fqxv_bytes::read_varint(self.buf, &mut self.pos).ok_or(Error::Malformed("varint too long"))
-    }
-    fn take_stream(&mut self) -> Result<&'a [u8]> {
-        let n = self.varint()? as usize;
-        let end = self.pos + n;
-        let s = self
-            .buf
-            .get(self.pos..end)
-            .ok_or(Error::Malformed("stream truncated"))?;
-        self.pos = end;
-        Ok(s)
+    fn oversized() -> Self {
+        Error::Malformed("length count too large to allocate")
     }
 }
 

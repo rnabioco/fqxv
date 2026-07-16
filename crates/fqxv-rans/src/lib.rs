@@ -199,6 +199,37 @@ pub fn decode(src: &[u8]) -> Result<Vec<u8>> {
     scalar::decode(src)
 }
 
+/// The declared output length in a stream header, without decoding.
+///
+/// The header is `[u8 order][u64 n]` little-endian (see [`scalar`]); `n` is the
+/// byte count the stream reconstructs to. Returns `None` if `src` is too short
+/// to hold the header.
+fn peek_output_len(src: &[u8]) -> Option<u64> {
+    let bytes = src.get(1..9)?;
+    Some(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+/// Decode `src`, rejecting a declared output length above `max_len`.
+///
+/// The output length is a `u64` in the stream header. A corrupt or hostile value
+/// can be far larger than the stream could ever legitimately reconstruct: a
+/// single-symbol model emits its entire output from the header alone, consuming
+/// no renorm input, so there is no input-relative bound that separates a valid
+/// high-compression stream from a decompression bomb. `try_reserve` does not stop
+/// the allocation under memory overcommit — a multi-gigabyte `n` reserves fine
+/// and then stalls or is OOM-killed while the buffer is zeroed.
+///
+/// Callers decoding untrusted bytes therefore pass the largest length they could
+/// legitimately expect and this rejects anything beyond it *before* allocating.
+/// [`decode`] imposes no bound and is only safe on data whose integrity is
+/// already established (e.g. a CRC-checked container block).
+pub fn decode_bounded(src: &[u8], max_len: usize) -> Result<Vec<u8>> {
+    if peek_output_len(src).is_some_and(|n| n > max_len as u64) {
+        return Err(Error::Malformed("rANS output length exceeds caller bound"));
+    }
+    decode(src)
+}
+
 /// Decode using an explicitly chosen [`Backend`].
 ///
 /// [`Backend::Avx512`] / [`Backend::Avx2`] use the corresponding order-0 vector
@@ -258,6 +289,26 @@ mod tests {
     #[test]
     fn roundtrip_single_byte() {
         roundtrip(b"Q");
+    }
+
+    #[test]
+    fn decode_bounded_rejects_inflated_length() {
+        // A single-symbol stream emits its whole output from the `n` header with
+        // no input to consume, so an inflated `n` is a decompression bomb. The
+        // dangerous band is a length that `try_reserve` accepts under overcommit
+        // (so `decode` would stall/OOM) but that exceeds the caller's bound.
+        let enc = encode(&[b'A'; 64], Order::Zero).unwrap();
+        let mut bomb = enc.clone();
+        bomb[1..9].copy_from_slice(&(1u64 << 31).to_le_bytes()); // 2 GiB
+        assert!(matches!(
+            decode_bounded(&bomb, 1 << 20),
+            Err(Error::Malformed(_))
+        ));
+        // The unmodified stream decodes fine when its true length is within bound.
+        assert_eq!(decode_bounded(&enc, 1 << 20).unwrap(), vec![b'A'; 64]);
+        // A header too short to hold the length field still errors (in decode),
+        // rather than being mistaken for an unbounded stream.
+        assert!(decode_bounded(&enc[..1], 1 << 20).is_err());
     }
 
     #[test]
