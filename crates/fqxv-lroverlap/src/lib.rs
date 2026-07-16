@@ -56,12 +56,14 @@
 
 #![forbid(unsafe_code)]
 
+mod align;
 mod chain;
 mod index;
 mod layout;
 mod minimizer;
 mod overlap;
 
+pub use align::{align_banded, apply, Alignment, Op};
 pub use chain::{chain, Anchor, Chain, ChainOpts};
 pub use index::{Index, Occ, Repeat};
 pub use layout::{layout, Contig, LayoutOpts, Placement};
