@@ -83,7 +83,7 @@ pub(crate) use crate::{Error, Result, FORMAT_VERSION, MAGIC};
 pub(crate) use fqxv_fqzcomp::QualityBinning;
 pub(crate) use std::borrow::Cow;
 pub(crate) use std::fs::File;
-pub(crate) use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+pub(crate) use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 pub(crate) use xxhash_rust::xxh3::Xxh3;
 
 mod block;

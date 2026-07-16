@@ -34,6 +34,57 @@ NNGGCCTA\n\
     assert_eq!(fastq, expected);
 }
 
+/// #49: the raw definition line must round-trip byte-exactly — a trailing
+/// separator or a tab must not be dropped or rewritten to a space.
+const SEP_EDGE: &[u8] = b"\
+@a:b:c:d \nACGTACGTACGT\n+\nIIIIIIIIIIII\n\
+@id\tdesc\nTTGGCCAATTGG\n+\nFFFFFFFFFFFF\n\
+@plain desc\nAACCGGTTAACC\n+\nJJJJJJJJJJJJ\n\
+@bare\nACGTACGTACGT\n+\nKKKKKKKKKKKK\n";
+
+#[test]
+fn preserves_trailing_and_tab_separators_plain() {
+    let archive = compress_bytes(SEP_EDGE, Params::default());
+    let mut out = Vec::new();
+    decompress(&archive[..], &mut out, 1).unwrap();
+    assert_eq!(
+        out, SEP_EDGE,
+        "plain path must preserve headers byte-exactly"
+    );
+}
+
+#[test]
+fn preserves_trailing_and_tab_separators_reorder() {
+    let archive = compress_bytes(
+        SEP_EDGE,
+        Params {
+            reorder: true,
+            ..Params::default()
+        },
+    );
+    let mut out = Vec::new();
+    decompress(&archive[..], &mut out, 1).unwrap();
+    // Single-end reorder may change read order, so compare the record set.
+    assert_eq!(
+        record_set(&out),
+        record_set(SEP_EDGE),
+        "reorder path must preserve headers byte-exactly"
+    );
+}
+
+#[test]
+fn preserves_separators_multi_file() {
+    let r1: &[u8] = b"@a:b \nACGT\n+\nIIII\n@c\td\nTTTT\n+\nFFFF\n";
+    let r2: &[u8] = b"@a:b \nGGGG\n+\nJJJJ\n@c\td\nCCCC\n+\nKKKK\n";
+    let readers: Vec<Box<dyn io::Read + Send>> = vec![Box::new(r1), Box::new(r2)];
+    let mut archive = Vec::new();
+    compress_multi(readers, &mut archive, Params::default()).unwrap();
+    let (mut m1, mut m2) = (Vec::new(), Vec::new());
+    decompress_split(&archive[..], &mut [&mut m1, &mut m2], 1).unwrap();
+    assert_eq!(m1, r1, "mate 1 header not byte-exact");
+    assert_eq!(m2, r2, "mate 2 header not byte-exact");
+}
+
 #[test]
 fn classify_header_reads_platform_from_name_grammar() {
     // Illumina Casava 1.8 name + description.

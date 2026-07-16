@@ -8,10 +8,10 @@ use tracing::{debug, info, instrument};
 /// better (higher ratio) but reduce parallelism and raise memory.
 pub(crate) const DEFAULT_BLOCK_READS: usize = 1 << 20;
 
-/// One interleaved spot's records — `(name, description, sequence, quality)` per
-/// member — owned so the platform can be detected before the streaming header is
-/// written (see `compress_multi`).
-pub(crate) type PrimedSpot = Vec<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)>;
+/// One interleaved spot's records — `(raw_header, sequence, quality)` per member —
+/// owned so the platform can be detected before the streaming header is written
+/// (see `compress_multi`). The header is the byte-exact definition line.
+pub(crate) type PrimedSpot = Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>;
 
 /// Compression parameters.
 #[derive(Debug, Clone, Copy)]
@@ -254,11 +254,13 @@ pub fn compress_multi<'a, W: Write>(
     if g > u8::MAX as usize {
         return Err(Error::Malformed("too many interleaved inputs"));
     }
-    let mut fqs: Vec<_> = readers
-        .into_iter()
-        .map(|r| noodles_fastq::io::Reader::new(BufReader::new(r)))
-        .collect();
-    let mut recs: Vec<_> = (0..g).map(|_| noodles_fastq::Record::default()).collect();
+    let mut fqs: Vec<BufReader<Box<dyn Read + Send + 'a>>> =
+        readers.into_iter().map(BufReader::new).collect();
+    // Per-member scratch buffers, reused across records (raw definition line,
+    // sequence, quality). `read_raw_record` keeps the header byte-exact.
+    let mut defs: Vec<Vec<u8>> = vec![Vec::new(); g];
+    let mut seqs: Vec<Vec<u8>> = vec![Vec::new(); g];
+    let mut quals: Vec<Vec<u8>> = vec![Vec::new(); g];
 
     if params.reorder {
         // Buffer every spot in interleaved order (m0₀, m1₀, …), then globally
@@ -267,15 +269,15 @@ pub fn compress_multi<'a, W: Write>(
         let mut all = RawBlock::default();
         loop {
             for j in 0..g {
-                if fqs[j].read_record(&mut recs[j])? == 0 {
+                if !read_raw_record(&mut fqs[j], &mut defs[j], &mut seqs[j], &mut quals[j])? {
                     if j == 0 {
                         return encode_reordered(all, writer, params, g as u8);
                     }
                     return Err(Error::Malformed("inputs have unequal read counts"));
                 }
             }
-            for r in &recs {
-                all.push(r.name(), r.description(), r.sequence(), r.quality_scores());
+            for j in 0..g {
+                all.push_raw(&defs[j], &seqs[j], &quals[j]);
             }
         }
     }
@@ -288,32 +290,22 @@ pub fn compress_multi<'a, W: Write>(
     // boundaries are byte-identical to reading it inline.
     let mut primed: PrimedSpot = Vec::with_capacity(g);
     for j in 0..g {
-        if fqs[j].read_record(&mut recs[j])? == 0 {
+        if !read_raw_record(&mut fqs[j], &mut defs[j], &mut seqs[j], &mut quals[j])? {
             if j == 0 {
                 break; // empty input
             }
             return Err(Error::Malformed("inputs have unequal read counts"));
         }
-        let r = &recs[j];
-        primed.push((
-            r.name().to_vec(),
-            r.description().to_vec(),
-            r.sequence().to_vec(),
-            r.quality_scores().to_vec(),
-        ));
+        primed.push((defs[j].clone(), seqs[j].clone(), quals[j].clone()));
     }
-    let headers: Vec<Vec<u8>> = primed
-        .iter()
-        .map(|(n, d, _, _)| join_header(n, d))
-        .collect();
-    let refs: Vec<&[u8]> = headers.iter().map(Vec::as_slice).collect();
+    let refs: Vec<&[u8]> = primed.iter().map(|(d, _, _)| d.as_slice()).collect();
     let platform = params.platform.unwrap_or_else(|| detect_platform(&refs));
     let mut primed = Some(primed).filter(|p| !p.is_empty());
     drive(writer, params, g as u8, platform, |b| {
         // Emit the primed first spot into the first block before reading on.
         if let Some(spot) = primed.take() {
-            for (name, desc, seq, qual) in &spot {
-                b.push(name, desc, seq, qual);
+            for (header, seq, qual) in &spot {
+                b.push_raw(header, seq, qual);
             }
         }
         // Cut on reads OR the raw-sequence byte budget, whichever comes first;
@@ -321,19 +313,16 @@ pub fn compress_multi<'a, W: Write>(
         // boundary. Matches the byte budgeting in `block_ranges`.
         while b.n_reads() < block_reads && b.seq.len() < MAX_BLOCK_SEQ_BYTES {
             // Read one record from each input; member 0 EOF ends cleanly.
-            let mut got = 0;
             for j in 0..g {
-                if fqs[j].read_record(&mut recs[j])? == 0 {
+                if !read_raw_record(&mut fqs[j], &mut defs[j], &mut seqs[j], &mut quals[j])? {
                     if j == 0 {
                         return Ok(b.n_reads());
                     }
                     return Err(Error::Malformed("inputs have unequal read counts"));
                 }
-                got += 1;
             }
-            debug_assert_eq!(got, g);
-            for r in &recs {
-                b.push(r.name(), r.description(), r.sequence(), r.quality_scores());
+            for j in 0..g {
+                b.push_raw(&defs[j], &seqs[j], &quals[j]);
             }
         }
         Ok(b.n_reads())
