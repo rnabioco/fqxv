@@ -337,6 +337,20 @@ fn build_draft(contig: &Contig, reads: &[Vec<u8>], lens: &[u32], sketch: Sketch)
             picked.len()
         );
     }
+    // Dump the PRE-VOTE draft so it can be aligned to a real genome. The
+    // consensus is measurable (FQXV_DUMP_CONS) but that conflates two stages: a
+    // bad draft and a bad vote produce the same number. Only comparing them
+    // separates the two, and guessing which it is has been refuted five times.
+    if let Ok(dir) = std::env::var("FQXV_DUMP_DRAFT") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::File::create(format!("{dir}/draft{}.fa", contig.id)) {
+            let _ = writeln!(f, ">draft{} reads={}", contig.id, contig.reads.len());
+            for chunk in draft.chunks(80) {
+                let _ = f.write_all(chunk);
+                let _ = f.write_all(b"\n");
+            }
+        }
+    }
     draft
 }
 
