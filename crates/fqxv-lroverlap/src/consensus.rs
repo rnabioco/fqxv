@@ -18,6 +18,30 @@
 //! offset-indexed vote misaligns almost immediately and votes unrelated columns
 //! against each other. Each read is therefore aligned to the growing reference
 //! and votes through that alignment.
+//!
+//! # KNOWN BROKEN: the draft is a mosaic
+//!
+//! Measured on ecoli_hifi: this consensus is **0.0078 edits/base from the true
+//! genome, where a raw read is 0.0025** — three times *worse* than an arbitrary
+//! single read. A 40x plurality vote should be ~0. Coding against it is worse
+//! than read-vs-read (0.005), so the margin above is currently negative. This is
+//! the binding defect in the codec; nothing downstream can recover it.
+//!
+//! The cause is the DRAFT below, not the vote. "First read covering a position
+//! wins" with reads starting every ~322 bases (15.5k reads over 5 Mb at 40x)
+//! makes the draft ~322-base fragments from **15,183 different reads**, spliced
+//! at offsets that each carry error. A 12.9 kb read crosses ~40 such splices and
+//! cannot align across them within the band, so its votes land in the wrong
+//! columns and the consensus never rises above the mosaic it started from. Note
+//! the draft does exactly what the section above says not to do: it lays reads
+//! down BY OFFSET.
+//!
+//! The fix is a coherent draft — OLC-style extension (seed read; align each next
+//! read; append its tail) or POA — not a mosaic. Do not chase this through
+//! placement: re-placing against a fixed frame ([`place_against`](crate::
+//! place_against)) was tried and gained 2.6%. Verify any change by dumping the
+//! consensus (`FQXV_DUMP_CONS`) and aligning it to a reference; that number is
+//! the only one that matters here.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 

@@ -2,21 +2,32 @@
 //!
 //! The greedy layout composes offsets hop by hop (`off = cur_off + q_start -
 //! t_start`), so every hop's indel error is added to the last and nothing
-//! re-anchors them. Across a contig of tens of thousands of reads the offsets
-//! drift by hundreds of bases — far past any alignment band — and every read
-//! downstream of the drift then codes against the wrong stretch of consensus.
-//! Measured cost: 0.036 substitutions per base emitted where only 0.0025 exist,
-//! i.e. ~14x phantom edits, which is the whole of the 0.427-vs-0.040 gap.
+//! re-anchors them. This module removes that by construction: the reference is a
+//! **fixed frame**, so each read is anchored to it directly, in one hop, and
+//! error cannot compound. The layout's job is only to decide *which* reads
+//! belong together and roughly where — which it does well (99%+ recall);
+//! precision is this module's job.
 //!
-//! Placing against the consensus instead fixes this by construction. The
-//! consensus is a **fixed frame**: each read is anchored to it directly, in one
-//! hop, so error cannot compound. The layout's job is only to decide *which*
-//! reads belong together and roughly where — which it does well (99%+ recall).
-//! Precision is this module's job.
-//!
-//! This is deliberately not a wider band. A band wide enough to swallow
+//! It is deliberately not a wider band. A band wide enough to swallow
 //! accumulated drift pays for it quadratically and still only *masks* the
-//! problem; re-anchoring removes its source.
+//! problem.
+//!
+//! ## What this did NOT fix
+//!
+//! This was built to close the 0.427-vs-0.040 bits/base gap, on the theory that
+//! accumulated placement drift caused the ~14x phantom edits (0.036 subs/base
+//! emitted where 0.0025 exist). **That theory was wrong.** Re-placing gained
+//! 2.6% (0.4267 -> 0.4154).
+//!
+//! Measuring the intermediate artifact rather than theorising about the pipeline
+//! found the real cause: the CONSENSUS is 0.0078 edits/base from the truth
+//! versus 0.0025 for a raw read — three times worse than an arbitrary single
+//! read (dump it with `FQXV_DUMP_CONS` and align to the reference). Re-placing
+//! precisely against a bad reference cannot help, and no downstream change can.
+//! See [`consensus`](crate::consensus) for the mosaic draft that causes it.
+//!
+//! This module is still correct and still needed — a fixed frame is the right
+//! way to place — it simply was not the bottleneck.
 
 use rayon::prelude::*;
 
