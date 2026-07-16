@@ -2,12 +2,6 @@
 
 use super::*;
 
-/// The platform tag lives in flag bits 5-7 (values 0-7), so it is archive-level
-/// metadata carried in the existing header byte — no extra bytes, no per-read
-/// cost — and is read straight off `flags` by [`peek`]/[`inspect`]. Bit 4 is
-/// [`FLAG_REGEN_NAMES`].
-pub(crate) const PLATFORM_SHIFT: u8 = 5;
-pub(crate) const PLATFORM_MASK: u8 = 0b1110_0000;
 /// Leading reads sampled to guess the platform (see [`detect_platform`]).
 pub(crate) const PLATFORM_PEEK: usize = 16;
 
@@ -31,7 +25,7 @@ pub enum Platform {
 }
 
 impl Platform {
-    /// Numeric tag stored in the header flag bits.
+    /// Numeric tag stored in the header's dedicated platform byte.
     pub(crate) fn to_code(self) -> u8 {
         match self {
             Platform::Unknown => 0,
@@ -50,16 +44,6 @@ impl Platform {
             4 => Platform::MgiBgi,
             _ => Platform::Unknown,
         }
-    }
-
-    /// Decode the platform from a header `flags` byte.
-    pub(crate) fn from_flags(flags: u8) -> Self {
-        Self::from_code((flags & PLATFORM_MASK) >> PLATFORM_SHIFT)
-    }
-
-    /// The platform's contribution to the header `flags` byte.
-    pub(crate) fn flag_bits(self) -> u8 {
-        self.to_code() << PLATFORM_SHIFT
     }
 
     /// Human-facing label for the `info` report.
@@ -408,7 +392,7 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
         reordered: header.flags & FLAG_REORDERED != 0,
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
         regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
-        platform: Platform::from_flags(header.flags),
+        platform: Platform::from_code(header.platform),
         format_version: FORMAT_VERSION,
         ..Info::default()
     })
@@ -447,7 +431,7 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         reordered: header.flags & FLAG_REORDERED != 0,
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
         regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
-        platform: Platform::from_flags(header.flags),
+        platform: Platform::from_code(header.platform),
         format_version: FORMAT_VERSION,
         ..Info::default()
     };

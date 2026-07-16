@@ -174,6 +174,47 @@ ACGTACGTACGT\n+\nIIIIFFF#IIII\n";
     assert_eq!(peek(&archive[..]).unwrap().platform, Platform::Nanopore);
 }
 
+#[test]
+fn illumina_reorder_without_reference_roundtrips() {
+    // Regression: the platform tag used to live in flags bits 5-7, where
+    // `Platform::Illumina` (code 1) produced exactly 0x20 == FLAG_GLOBAL_REFERENCE.
+    // An Illumina archive in the global-reorder layout that did not adopt a
+    // reference (`use_reference` is false whenever the reference does not
+    // strictly win — e.g. on non-redundant data like this) still advertised one,
+    // and decode died on `Corrupt { what: "reorder global reference" }`. The tag
+    // now has its own header byte; the platform must never imply a flag.
+    let mut input = Vec::new();
+    let mut state: u32 = 12345;
+    for i in 0..64 {
+        let mut seq = Vec::new();
+        for _ in 0..60 {
+            // Deterministic LCG: non-redundant bases so no reference wins.
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            seq.push(b"ACGT"[(state >> 16) as usize % 4]);
+        }
+        input.extend_from_slice(
+            format!("@M01234:12:000-ABC:1:1101:{i}:2000 1:N:0:ATCACG\n").as_bytes(),
+        );
+        input.extend_from_slice(&seq);
+        input.extend_from_slice(b"\n+\n");
+        input.extend_from_slice(&[b'I'; 60]);
+        input.push(b'\n');
+    }
+    // keep_order so the exact input is reconstructible; the global-reorder
+    // layout (and thus the flags/platform header path) is exercised either way.
+    let params = Params {
+        reorder: true,
+        keep_order: true,
+        ..Params::default()
+    };
+    let archive = compress_bytes(&input, params);
+    // The platform must survive, and the archive must decode.
+    assert_eq!(peek(&archive[..]).unwrap().platform, Platform::Illumina);
+    let mut out = Vec::new();
+    decompress(&archive[..], &mut out, 1).expect("decompress Illumina+reorder archive");
+    assert_eq!(out, input, "Illumina + reorder must round-trip");
+}
+
 fn make_reads(tag: &str, n: usize) -> Vec<u8> {
     let mut v = Vec::new();
     for i in 0..n {
