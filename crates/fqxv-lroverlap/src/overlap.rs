@@ -55,6 +55,15 @@ pub fn find_overlaps(
     let k = sketch.k as u32;
     let mins = sketch.minimizers(query_seq);
 
+    // The chainer's `k` MUST be the sketch's. An anchor is an exact match of
+    // exactly `sketch.k` bases, and `chain` uses `k` to weight anchors, scale the
+    // gap penalty, and size chain spans — so any other value mis-scores every
+    // chain. `ChainOpts::default()` carries 15 (the ONT sketch), which silently
+    // under-scored every HiFi chain by ~21% (k=19) and pushed marginal ones below
+    // `min_score`. Overriding here rather than trusting callers: the index knows
+    // the truth, and a caller cannot get it wrong if it is not theirs to pass.
+    let opts = ChainOpts { k, ..opts };
+
     // Group anchors by (target, same-orientation). Collected into a Vec and
     // sorted rather than a hash map, so iteration order is never a factor.
     let mut buckets: Vec<(u32, bool, Anchor)> = Vec::new();
@@ -217,6 +226,40 @@ mod tests {
             best.n_anchors > 10,
             "expected a solid chain, got {}",
             best.n_anchors
+        );
+    }
+
+    #[test]
+    fn the_hifi_sketch_is_chained_with_its_own_k() {
+        // Regression: `ChainOpts::default()` carries k=15 (the ONT sketch), but
+        // the HiFi sketch is k=19. Chaining HiFi anchors with k=15 under-scores
+        // every chain by ~21%, pushing marginal ones below `min_score` — they
+        // then look like "no overlap" rather than a scoring bug, which is
+        // exactly how it hid.
+        let genome = rand_seq(12_000, 41);
+        let a = mutate(&genome[0..5000], 0.002, 1);
+        let b = mutate(&genome[2500..7500], 0.002, 2);
+        let lens = [a.len() as u32, b.len() as u32];
+        let mut seq = a.clone();
+        seq.extend_from_slice(&b);
+        let idx = Index::build(&lens, &seq, Sketch::hifi(), Repeat { drop_top_frac: 0.0 }).unwrap();
+
+        // Pass a deliberately WRONG k; find_overlaps must ignore it and use the
+        // index's sketch, so the score is identical either way.
+        let right = find_overlaps(&idx, 0, &a, ChainOpts::default());
+        let wrong_k = find_overlaps(
+            &idx,
+            0,
+            &a,
+            ChainOpts {
+                k: 3,
+                ..ChainOpts::default()
+            },
+        );
+        assert!(!right.is_empty(), "a HiFi overlap must be found");
+        assert_eq!(
+            right[0].score, wrong_k[0].score,
+            "the caller's k must be ignored — the index's sketch is the truth"
         );
     }
 

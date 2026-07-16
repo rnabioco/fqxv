@@ -270,6 +270,9 @@ fn build_draft(contig: &Contig, reads: &[Vec<u8>], lens: &[u32], sketch: Sketch)
     let picked = tiling(contig, lens);
     let seed = &contig.reads[picked[0]];
     let mut draft = reads[seed.read as usize].clone();
+    // Chained splices are exact; fallback splices are approximate and are the
+    // suspected source of the poorly-voted regions. Count them rather than guess.
+    let (mut n_chained, mut n_fallback, mut n_flip) = (0usize, 0usize, 0usize);
     // The draft's end in LAYOUT coordinates. Needed for the fallback below: it
     // lets a failed chain still extend the draft rather than stall it.
     let mut end_layout = seed.offset + lens[seed.read as usize];
@@ -294,8 +297,16 @@ fn build_draft(contig: &Contig, reads: &[Vec<u8>], lens: &[u32], sketch: Sketch)
         let start = match placed[0] {
             // Reads are pre-oriented by the layout, so a flip means the layout
             // and the draft disagree — do not trust that placement.
-            Some(a) if !a.flip => tail_start + a.offset as usize,
+            Some(a) if !a.flip => {
+                n_chained += 1;
+                tail_start + a.offset as usize
+            }
             _ => {
+                if matches!(placed[0], Some(a) if a.flip) {
+                    n_flip += 1;
+                } else {
+                    n_fallback += 1;
+                }
                 // FALLBACK — never stall. An earlier version skipped the read
                 // here, which truncated the draft: the next tiling read is even
                 // further along, so it could not overlap the stalled end either,
@@ -317,6 +328,14 @@ fn build_draft(contig: &Contig, reads: &[Vec<u8>], lens: &[u32], sketch: Sketch)
             draft.extend_from_slice(&r[already..]);
             end_layout = p.offset + lens[p.read as usize];
         }
+    }
+    if std::env::var("FQXV_DIAG_COLS").is_ok() {
+        eprintln!(
+            "DIAG draft: {} bp from {} tiling reads · splices: {n_chained} chained, \
+             {n_fallback} no-chain, {n_flip} flip-disagree",
+            draft.len(),
+            picked.len()
+        );
     }
     draft
 }
