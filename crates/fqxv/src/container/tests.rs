@@ -1001,7 +1001,7 @@ fn verify_accepts_intact_archive() {
 fn verify_rejects_payload_bit_flip() {
     let mut archive = multiblock_archive(40, 8);
     // Header(10) + [8 len][4 crc]; the first payload byte is at offset 22.
-    archive[HEADER_LEN + 8 + CRC_LEN] ^= 0x01;
+    archive[HEADER_LEN + FRAME_HEAD_LEN] ^= 0x01;
     let err = verify(io::Cursor::new(&archive)).unwrap_err();
     assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
 }
@@ -1051,7 +1051,7 @@ fn verify_roundtrip_counts_empty_archive() {
 #[test]
 fn verify_roundtrip_rejects_payload_bit_flip() {
     let mut archive = multiblock_archive(40, 8);
-    archive[HEADER_LEN + 8 + CRC_LEN] ^= 0x01;
+    archive[HEADER_LEN + FRAME_HEAD_LEN] ^= 0x01;
     let err = verify_roundtrip(io::Cursor::new(&archive)).unwrap_err();
     assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
 }
@@ -1153,7 +1153,7 @@ fn verify_quick_accepts_intact_archive() {
 #[test]
 fn verify_quick_rejects_payload_bit_flip() {
     let mut archive = multiblock_archive(40, 8);
-    archive[HEADER_LEN + 8 + CRC_LEN] ^= 0x01;
+    archive[HEADER_LEN + FRAME_HEAD_LEN] ^= 0x01;
     let (file, path) = temp_archive(&archive);
     let err = verify_quick(&file).unwrap_err();
     std::fs::remove_file(&path).ok();
@@ -1206,9 +1206,9 @@ fn verify_report_localizes_corrupt_block() {
     let footer = read_footer(&mut io::Cursor::new(&archive)).unwrap();
     assert!(footer.groups.len() >= 3, "need multiple blocks to localize");
     // Corrupt the payload of the second block (index 1): its footer offset
-    // points at the [8 len][4 crc] frame header, so the payload follows.
+    // points at the frame head ([4 marker][8 len][4 crc]), so the payload follows.
     let mut archive = archive;
-    archive[footer.groups[1].0 as usize + 8 + CRC_LEN] ^= 0xFF;
+    archive[footer.groups[1].0 as usize + FRAME_HEAD_LEN] ^= 0xFF;
     let (file, path) = temp_archive(&archive);
     let report = verify_report(&file, false).expect("still structurally readable");
     std::fs::remove_file(&path).ok();
@@ -1243,7 +1243,7 @@ fn verify_report_quick_skips_whole_file_crc() {
 #[test]
 fn decompress_detects_block_corruption() {
     let mut archive = multiblock_archive(40, 8);
-    archive[HEADER_LEN + 8 + CRC_LEN] ^= 0xFF;
+    archive[HEADER_LEN + FRAME_HEAD_LEN] ^= 0xFF;
     let mut out = Vec::new();
     let err = decompress(&archive[..], &mut out, 1).unwrap_err();
     assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
@@ -1288,11 +1288,12 @@ fn decompress_detects_content_digest_mismatch() {
     // Simulate by flipping a byte in the payload's leading digest and repairing
     // the frame CRC, so only the content-digest check can reject it.
     let mut archive = multiblock_archive(20, 64); // block_reads > n => one block
-    let payload_start = HEADER_LEN + 8 + CRC_LEN;
+    let payload_start = HEADER_LEN + FRAME_HEAD_LEN;
     archive[payload_start] ^= 0xFF; // first byte of the content digest
-    let len = u64::from_le_bytes(archive[HEADER_LEN..HEADER_LEN + 8].try_into().unwrap()) as usize;
+    let len_at = HEADER_LEN + BLOCK_MAGIC.len();
+    let len = u64::from_le_bytes(archive[len_at..len_at + 8].try_into().unwrap()) as usize;
     let repaired = crc32c(&archive[payload_start..payload_start + len]);
-    archive[HEADER_LEN + 8..payload_start].copy_from_slice(&repaired.to_le_bytes());
+    archive[len_at + 8..payload_start].copy_from_slice(&repaired.to_le_bytes());
 
     let mut out = Vec::new();
     let err = decompress(&archive[..], &mut out, 1).unwrap_err();
@@ -1394,9 +1395,10 @@ fn decompress_detects_reorder_output_digest_mismatch() {
 #[test]
 fn oversized_block_length_is_rejected_not_allocated() {
     let mut archive = multiblock_archive(40, 8);
-    // Overwrite the first block's [8] length with a hostile value; the reader
-    // must reject it up front instead of trying to allocate exabytes.
-    archive[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+    // Overwrite the first block's [8] length (past the marker) with a hostile
+    // value; the reader must reject it up front instead of allocating exabytes.
+    let len_at = HEADER_LEN + BLOCK_MAGIC.len();
+    archive[len_at..len_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     let mut out = Vec::new();
     let err = decompress(&archive[..], &mut out, 1).unwrap_err();
     assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
@@ -1411,8 +1413,8 @@ fn recover_skips_corrupt_block_and_keeps_the_rest() {
         "need several blocks for this test"
     );
     let (off1, rc1) = footer.groups[1];
-    // Corrupt one byte in block 1's payload (past its [8 len][4 crc]).
-    archive[off1 as usize + 8 + CRC_LEN] ^= 0xFF;
+    // Corrupt one byte in block 1's payload (past its frame head).
+    archive[off1 as usize + FRAME_HEAD_LEN] ^= 0xFF;
 
     let mut out = Vec::new();
     let rec = decompress_recover(io::Cursor::new(&archive), &mut out, 1).unwrap();
@@ -1431,15 +1433,68 @@ fn recover_skips_corrupt_block_and_keeps_the_rest() {
     );
 }
 
+/// Footer-independent recovery: a lost tail (no footer) still recovers every
+/// whole block via the sync-marker scan.
 #[test]
-fn truncated_at_block_boundary_streams_prefix() {
+fn recover_scans_when_footer_is_lost() {
     let full = multiblock_archive(40, 8);
-    // The trailer's back-pointer gives footer_offset; the 8-byte terminator
-    // sits just before it, so footer_offset - 8 is a clean block boundary.
+    let footer = read_footer(&mut io::Cursor::new(&full)).unwrap();
+    assert!(footer.groups.len() >= 3, "need several blocks");
+    // Drop the footer + trailer at the terminator boundary — a truncated tail.
     let n = full.len();
     let footer_offset =
         u64::from_le_bytes(full[n - TRAILER_LEN..n - 4].try_into().unwrap()) as usize;
-    let truncated = &full[..footer_offset - 8];
+    let truncated = full[..footer_offset - (BLOCK_MAGIC.len() + 8)].to_vec();
+
+    let mut out = Vec::new();
+    let rec = decompress_recover(io::Cursor::new(&truncated), &mut out, 1).unwrap();
+    assert_eq!(rec.blocks_recovered, footer.groups.len() as u64);
+    assert_eq!(rec.stats.reads, footer.total_reads);
+    let mut full_out = Vec::new();
+    decompress(&full[..], &mut full_out, 1).unwrap();
+    assert_eq!(out, full_out, "scan recovery yields the same reads");
+}
+
+/// Footer lost AND a middle block corrupt: the scan resynchronizes to the next
+/// marker, skipping the bad block and recovering the rest — where streaming
+/// `decompress` would stop at the bad block and lose everything after it.
+#[test]
+fn recover_scans_past_a_corrupt_block_without_footer() {
+    let full = multiblock_archive(40, 8);
+    let footer = read_footer(&mut io::Cursor::new(&full)).unwrap();
+    assert!(footer.groups.len() >= 3, "need several blocks");
+    let n = full.len();
+    let footer_offset =
+        u64::from_le_bytes(full[n - TRAILER_LEN..n - 4].try_into().unwrap()) as usize;
+    let mut archive = full[..footer_offset - (BLOCK_MAGIC.len() + 8)].to_vec();
+    // Corrupt a payload byte of the middle block (its marker stays intact).
+    let (off1, rc1) = footer.groups[1];
+    archive[off1 as usize + FRAME_HEAD_LEN] ^= 0xFF;
+
+    let mut out = Vec::new();
+    let rec = decompress_recover(io::Cursor::new(&archive), &mut out, 1).unwrap();
+    assert_eq!(
+        rec.blocks_recovered,
+        footer.groups.len() as u64 - 1,
+        "every block but the corrupt one recovered"
+    );
+    assert_eq!(rec.stats.reads, footer.total_reads - u64::from(rc1));
+    assert_eq!(
+        out.iter().filter(|&&b| b == b'\n').count() as u64,
+        rec.stats.reads * 4
+    );
+}
+
+#[test]
+fn truncated_at_block_boundary_streams_prefix() {
+    let full = multiblock_archive(40, 8);
+    // The trailer's back-pointer gives footer_offset; the terminator frame
+    // (marker + [8] 0) sits just before it, so subtracting its size lands on a
+    // clean block boundary.
+    let n = full.len();
+    let footer_offset =
+        u64::from_le_bytes(full[n - TRAILER_LEN..n - 4].try_into().unwrap()) as usize;
+    let truncated = &full[..footer_offset - (BLOCK_MAGIC.len() + 8)];
 
     // Streaming decode reads every whole block, then stops at the clean EOF.
     let mut out_trunc = Vec::new();

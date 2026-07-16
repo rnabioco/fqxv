@@ -490,9 +490,9 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
             info.blocks = footer.groups.len() as u64;
             info.whole_file_crc = Some(footer.whole_file_crc);
             for &(off, _) in &footer.groups {
-                // Position past the [8] payload length and [4] block CRC, at the
-                // block header, then walk its stream frames.
-                r.seek(SeekFrom::Start(off + 8 + CRC_LEN as u64))?;
+                // Position past the frame head ([4] marker, [8] length, [4] CRC),
+                // at the block payload, then walk its stream frames.
+                r.seek(SeekFrom::Start(off + FRAME_HEAD_LEN as u64))?;
                 scan_block_header(&mut r, info.reordered, &mut info)?;
             }
         }
@@ -539,22 +539,26 @@ pub(crate) fn scan_blocks_sequentially<R: Read + Seek>(r: &mut R, info: &mut Inf
     let mut off = HEADER_LEN as u64;
     loop {
         r.seek(SeekFrom::Start(off))?;
-        let mut lenb = [0u8; 8];
-        if r.read_exact(&mut lenb).is_err() {
-            break; // clean EOF at a frame boundary
+        // Frame head: [4] marker, [8] length, [4] CRC.
+        let mut head = [0u8; FRAME_HEAD_LEN];
+        if r.read_exact(&mut head).is_err() {
+            break; // clean EOF (or a partial marker) at a frame boundary
         }
-        let plen = u64::from_le_bytes(lenb);
+        if head[..BLOCK_MAGIC.len()] != BLOCK_MAGIC {
+            break; // not a block boundary — corrupt, or past the block region
+        }
+        let plen = u64::from_le_bytes(head[4..12].try_into().unwrap());
         if plen == 0 || plen > MAX_BLOCK_PAYLOAD {
             break; // terminator, or a length too large to be a real frame
         }
-        r.seek(SeekFrom::Start(off + 8 + CRC_LEN as u64))?;
+        r.seek(SeekFrom::Start(off + FRAME_HEAD_LEN as u64))?;
         let n = match scan_block_header(r, info.reordered, info) {
             Ok(n) => n,
             Err(_) => break, // ran off the end of a truncated block
         };
         info.reads += n;
         info.blocks += 1;
-        off += 8 + CRC_LEN as u64 + plen;
+        off += FRAME_HEAD_LEN as u64 + plen;
     }
     Ok(())
 }

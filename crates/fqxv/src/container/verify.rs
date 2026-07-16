@@ -177,11 +177,16 @@ pub(crate) fn quick_check_blocks(file: &File, footer: &Footer) -> Result<()> {
             .par_iter()
             .enumerate()
             .try_for_each(|(i, &(off, _read_count))| {
-                // Block frame on disk: [8 payload_len][4 crc32c][payload].
-                let mut frame = [0u8; 8 + CRC_LEN];
+                // Block frame on disk: [4 BLOCK_MAGIC][8 payload_len][4 crc32c][payload].
+                let mut frame = [0u8; FRAME_HEAD_LEN];
                 file.read_exact_at(&mut frame, off)
                     .map_err(|_| Error::Truncated)?;
-                let len = u64::from_le_bytes(frame[..8].try_into().unwrap());
+                if frame[..BLOCK_MAGIC.len()] != BLOCK_MAGIC {
+                    return Err(Error::Corrupt {
+                        what: format!("block {i} (bad sync marker)"),
+                    });
+                }
+                let len = u64::from_le_bytes(frame[4..12].try_into().unwrap());
                 if len == 0 {
                     return Err(Error::Malformed(
                         "row-group offset points at the terminator",
@@ -190,14 +195,14 @@ pub(crate) fn quick_check_blocks(file: &File, footer: &Footer) -> Result<()> {
                 if len > MAX_BLOCK_PAYLOAD {
                     return Err(Error::Malformed("block payload length exceeds the maximum"));
                 }
-                let expected = u32::from_le_bytes(frame[8..].try_into().unwrap());
+                let expected = u32::from_le_bytes(frame[12..].try_into().unwrap());
                 // Fallible allocation: a corrupt-but-in-range length must not abort
                 // the process (mirrors `read_block`).
                 let mut buf = Vec::new();
                 buf.try_reserve_exact(len as usize)
                     .map_err(|_| Error::Malformed("block payload too large to allocate"))?;
                 buf.resize(len as usize, 0);
-                file.read_exact_at(&mut buf, off + (8 + CRC_LEN) as u64)
+                file.read_exact_at(&mut buf, off + FRAME_HEAD_LEN as u64)
                     .map_err(|_| Error::Truncated)?;
                 if crc32c(&buf) != expected {
                     return Err(Error::Corrupt {
@@ -396,20 +401,23 @@ pub(crate) fn scan_failed_blocks(file: &File, footer: &Footer) -> Vec<u64> {
 pub(crate) fn block_crc_ok(file: &File, off: u64) -> Result<bool> {
     use std::os::unix::fs::FileExt;
 
-    let mut frame = [0u8; 8 + CRC_LEN];
+    let mut frame = [0u8; FRAME_HEAD_LEN];
     file.read_exact_at(&mut frame, off)
         .map_err(|_| Error::Truncated)?;
-    let len = u64::from_le_bytes(frame[..8].try_into().unwrap());
+    if frame[..BLOCK_MAGIC.len()] != BLOCK_MAGIC {
+        return Ok(false);
+    }
+    let len = u64::from_le_bytes(frame[4..12].try_into().unwrap());
     if len == 0 || len > MAX_BLOCK_PAYLOAD {
         return Ok(false);
     }
-    let expected = u32::from_le_bytes(frame[8..].try_into().unwrap());
+    let expected = u32::from_le_bytes(frame[12..].try_into().unwrap());
     let mut buf = Vec::new();
     if buf.try_reserve_exact(len as usize).is_err() {
         return Ok(false);
     }
     buf.resize(len as usize, 0);
-    file.read_exact_at(&mut buf, off + (8 + CRC_LEN) as u64)
+    file.read_exact_at(&mut buf, off + FRAME_HEAD_LEN as u64)
         .map_err(|_| Error::Truncated)?;
     Ok(crc32c(&buf) == expected)
 }

@@ -240,12 +240,14 @@ pub struct Recovery {
 /// skipped block is logged (with its lost read count) and reported in
 /// [`Recovery`]. Output is interleaved FASTQ (as [`decompress`]).
 ///
-/// Only the plain layout is recoverable this way; the globally-clustered reorder
-/// layout is all-or-nothing (its streams are mutually dependent) and returns an
-/// error directing the caller to plain [`decompress`]. If the footer itself is
-/// unreadable (e.g. a truncated download), this returns the footer error; callers
-/// wanting the intact prefix of such a file can fall back to streaming
-/// [`decompress`], which decodes every whole block before the truncation.
+/// If the footer itself is unreadable — the common truncated-tail case, which also
+/// loses the trailing blocks — recovery falls back to **scanning for the
+/// per-block `BLOCK_MAGIC` sync marker**: it needs no index and resynchronizes past
+/// a corrupt length prefix or a bad block, so every intact block is still
+/// recovered (loss counts aren't available without the footer, so `reads_lost` is
+/// 0 in that mode). Only the plain layout is recoverable; the globally-clustered
+/// reorder layout is all-or-nothing (its streams are mutually dependent) and
+/// returns an error directing the caller to plain [`decompress`].
 pub fn decompress_recover<R: Read + Seek, W: Write>(
     reader: R,
     writer: W,
@@ -259,14 +261,43 @@ pub fn decompress_recover<R: Read + Seek, W: Write>(
             "recover supports only the plain layout; reordered archives decode all-or-nothing",
         ));
     }
-    let footer = read_footer(&mut r)?;
+    // Prefer the footer's row-group index — it carries per-group read counts, so
+    // losses can be tallied exactly. If the footer is unreadable (the common
+    // truncated-tail case, which also loses the trailing blocks), fall back to
+    // scanning for block sync markers: that needs no index and resynchronizes past
+    // a corrupt length prefix or a bad block.
+    let rec = match read_footer(&mut r) {
+        Ok(footer) => recover_via_footer(&mut r, &pool, &footer, writer)?,
+        Err(footer_err) => {
+            debug!(error = %footer_err, "footer unreadable; scanning for block markers");
+            recover_via_scan(&mut r, &pool, writer)?
+        }
+    };
+    info!(
+        recovered = rec.blocks_recovered,
+        skipped = rec.blocks_skipped,
+        reads_lost = rec.reads_lost,
+        "recovery complete"
+    );
+    Ok(rec)
+}
+
+/// Footer-driven recovery: seek to each row group's block via the index and skip
+/// any that won't decode. Per-group read counts make loss accounting exact.
+fn recover_via_footer<R: Read + Seek, W: Write>(
+    r: &mut BufReader<R>,
+    pool: &rayon::ThreadPool,
+    footer: &Footer,
+    writer: W,
+) -> Result<Recovery> {
     let mut rec = Recovery::default();
     let mut w = BufWriter::new(writer);
     for (i, &(off, read_count)) in footer.groups.iter().enumerate() {
         r.seek(SeekFrom::Start(off))?;
-        // read_block bounds the length and verifies the block CRC; any failure —
-        // bad CRC, truncation, or a decode error below — drops just this group.
-        let outcome = match read_block(&mut r, i as u64) {
+        // read_block checks the marker, bounds the length, and verifies the CRC;
+        // any failure — bad marker/CRC, truncation, or a decode error — drops just
+        // this group.
+        let outcome = match read_block(r, i as u64) {
             Ok(Some(payload)) => pool.install(|| decode_block(&payload)),
             Ok(None) => Err(Error::Malformed(
                 "row-group offset points at the terminator",
@@ -289,11 +320,85 @@ pub fn decompress_recover<R: Read + Seek, W: Write>(
         }
     }
     w.flush()?;
-    info!(
-        recovered = rec.blocks_recovered,
-        skipped = rec.blocks_skipped,
-        reads_lost = rec.reads_lost,
-        "recovery complete"
-    );
     Ok(rec)
+}
+
+/// Footer-independent recovery: scan the block region for `BLOCK_MAGIC` and decode
+/// every frame that validates, resynchronizing past corruption or a lost index — so
+/// a truncated tail (which takes the footer with it) or a corrupt length prefix no
+/// longer strands the blocks after it.
+///
+/// Reads the block region (header..EOF) into memory to scan it; recovery is an
+/// exceptional break-glass operation, so the transient copy is worth the
+/// simplicity. Without the footer there are no per-group read counts, so
+/// `reads_lost` stays 0 — the recovered counts are still reported, and
+/// `blocks_skipped` counts frames whose CRC passed but which would not decode.
+fn recover_via_scan<R: Read + Seek, W: Write>(
+    r: &mut BufReader<R>,
+    pool: &rayon::ThreadPool,
+    writer: W,
+) -> Result<Recovery> {
+    r.seek(SeekFrom::Start(HEADER_LEN as u64))?;
+    let mut region = Vec::new();
+    r.read_to_end(&mut region)?;
+
+    let mut rec = Recovery::default();
+    let mut w = BufWriter::new(writer);
+    let mut pos = 0usize;
+    let mut idx = 0u64;
+    while pos < region.len() {
+        let Some(rel) = find_block_marker(&region[pos..]) else {
+            break;
+        };
+        let m = pos + rel;
+        match read_frame_at(&region, m) {
+            Some((len, payload)) => {
+                match pool.install(|| decode_block(payload)) {
+                    Ok((reads, fastq)) => {
+                        w.write_all(&fastq)?;
+                        rec.stats.reads += reads;
+                        rec.stats.blocks += 1;
+                        rec.stats.out_bytes += fastq.len() as u64;
+                        rec.blocks_recovered += 1;
+                    }
+                    Err(e) => {
+                        warn!(block = idx, off = m, error = %e, "scan: frame CRC ok but won't decode");
+                        rec.blocks_skipped += 1;
+                    }
+                }
+                idx += 1;
+                pos = m + FRAME_HEAD_LEN + len; // past this frame (validated to fit)
+            }
+            // Terminator, bad length, short frame, or a false-positive marker:
+            // resync one byte on and keep scanning.
+            None => pos = m + 1,
+        }
+    }
+    w.flush()?;
+    Ok(rec)
+}
+
+/// First `BLOCK_MAGIC` occurrence in `buf`, if any.
+fn find_block_marker(buf: &[u8]) -> Option<usize> {
+    buf.windows(BLOCK_MAGIC.len())
+        .position(|w| w == BLOCK_MAGIC)
+}
+
+/// If a valid data-block frame starts at `region[m]`, return its payload length
+/// and the CRC-verified payload slice. `None` for the terminator (`len == 0`), a
+/// bad/oversized length, a frame that runs past the buffer, or a CRC mismatch —
+/// i.e. a false-positive marker or a corrupt frame.
+fn read_frame_at(region: &[u8], m: usize) -> Option<(usize, &[u8])> {
+    let head = region.get(m..m + FRAME_HEAD_LEN)?;
+    if head[..BLOCK_MAGIC.len()] != BLOCK_MAGIC {
+        return None;
+    }
+    let len = u64::from_le_bytes(head[4..12].try_into().unwrap());
+    if len == 0 || len > MAX_BLOCK_PAYLOAD {
+        return None;
+    }
+    let len = len as usize;
+    let expected = u32::from_le_bytes(head[12..16].try_into().unwrap());
+    let payload = region.get(m + FRAME_HEAD_LEN..m + FRAME_HEAD_LEN + len)?;
+    (crc32c(payload) == expected).then_some((len, payload))
 }

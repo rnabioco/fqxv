@@ -15,15 +15,18 @@
 //!     on read so a flipped version/flags/binning-tag/group-size byte is caught
 //!     rather than silently changing decode. Present in both layouts.
 //! repeated until the terminator:
+//!   [4] BLOCK_MAGIC "FQXB" -- per-block sync marker; recovery scans for it to
+//!       resynchronize to a block boundary when the footer is lost or a length
+//!       prefix is corrupt (see `decompress_recover`)
 //!   [8] block payload length (LE, nonzero)
 //!   [4] CRC-32C of the payload (LE) -- verified before decode, so corruption is
 //!       caught and localized to one block instead of decoded into garbage
 //!   [ ] block payload
-//! [8] 0  (zero-length terminator block: a streaming, non-seekable decoder
-//!         stops here; seekable readers jump to the footer via the trailer)
+//! [4] BLOCK_MAGIC  [8] 0  (zero-length terminator frame: a streaming, non-seekable
+//!         decoder stops here; seekable readers jump to the footer via the trailer)
 //! footer (row-group index — lets `inspect`/random access seek, not scan):
 //!   [4] n_row_groups (LE)
-//!   per row group: [8] byte_offset (LE, points at the group's length field)
+//!   per row group: [8] byte_offset (LE, points at the group's frame marker)
 //!                  [4] read_count  (LE)
 //!   [8] total_reads (LE)
 //!   [4] whole_file_crc (LE)  -- CRC-32C of the archive from byte 0 through the
