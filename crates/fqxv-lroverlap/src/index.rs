@@ -65,6 +65,9 @@ pub struct Index {
     sketch: Sketch,
     /// All kept occurrences, sorted by `(hash, read, pos)`.
     occs: Vec<Occ>,
+    /// Per-read lengths — needed to map a reverse-complement hit into the
+    /// query's coordinate frame.
+    lens: Vec<u32>,
     /// Occurrence count of the most frequent minimizer kept.
     max_kept: usize,
     /// Distinct minimizers discarded as repetitive.
@@ -149,9 +152,22 @@ impl Index {
         Ok(Self {
             sketch,
             occs,
+            lens: lens.to_vec(),
             max_kept,
             dropped: n_drop,
         })
+    }
+
+    /// Length of read `r`, or 0 if out of range.
+    #[must_use]
+    pub fn read_len(&self, r: u32) -> u32 {
+        self.lens.get(r as usize).copied().unwrap_or(0)
+    }
+
+    /// Number of reads indexed.
+    #[must_use]
+    pub fn n_reads(&self) -> usize {
+        self.lens.len()
     }
 
     /// The occurrences of `hash`, ascending by `(read, pos)`; empty if absent or

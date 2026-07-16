@@ -37,10 +37,12 @@
 mod chain;
 mod index;
 mod minimizer;
+mod overlap;
 
 pub use chain::{chain, Anchor, Chain, ChainOpts};
 pub use index::{Index, Occ, Repeat};
 pub use minimizer::{minimizers, Minimizer};
+pub use overlap::{find_overlaps, Overlap};
 
 /// Errors returned by this crate.
 #[derive(Debug, thiserror::Error)]
