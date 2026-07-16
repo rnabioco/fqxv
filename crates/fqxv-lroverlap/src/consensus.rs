@@ -19,6 +19,10 @@
 //! against each other. Each read is therefore aligned to the growing reference
 //! and votes through that alignment.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use rayon::prelude::*;
+
 use crate::{
     align::{align_banded, Op},
     Contig,
@@ -84,6 +88,40 @@ impl Consensus {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.seq.is_empty()
+    }
+}
+
+/// Per-column base votes being accumulated in parallel: `A, C, G, T`, plus a
+/// deletion tally.
+///
+/// Atomic because reads vote concurrently, and safe to do so because
+/// **increments commute**: the final per-column tallies are identical whatever
+/// order the threads interleave in, so the called consensus is a pure function
+/// of the input and the workspace's thread-count-invariance rule holds.
+/// `Relaxed` suffices — no ordering between columns is implied or needed.
+///
+/// The vote must parallelise across READS, not contigs. Real long-read data
+/// assembles to a handful of contigs (measured: ~3 for 15.5k HiFi reads), so
+/// parallelising across contigs leaves a 32-core node running 3 threads while
+/// one contig does ~15k alignments in series.
+#[derive(Debug, Default)]
+struct AtomicColumn {
+    acgt: [AtomicU32; 4],
+    del: AtomicU32,
+}
+
+impl AtomicColumn {
+    /// Collapse to a plain tally once voting is done.
+    fn load(&self) -> Column {
+        Column {
+            acgt: [
+                self.acgt[0].load(Ordering::Relaxed),
+                self.acgt[1].load(Ordering::Relaxed),
+                self.acgt[2].load(Ordering::Relaxed),
+                self.acgt[3].load(Ordering::Relaxed),
+            ],
+            del: self.del.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -185,13 +223,16 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Con
 
     // 2. Vote: align each read to the draft and tally through the alignment, so
     //    indels shift the register rather than corrupting every column after.
-    let mut cols: Vec<Column> = vec![Column::default(); draft.len()];
-    for p in &contig.reads {
+    //    Reads vote CONCURRENTLY — the alignment is the expensive part and there
+    //    are tens of thousands of them per contig. Tallies are atomic and
+    //    increments commute, so the result does not depend on thread count.
+    let cols: Vec<AtomicColumn> = (0..draft.len()).map(|_| AtomicColumn::default()).collect();
+    contig.reads.par_iter().for_each(|p| {
         let s = &reads[p.read as usize];
         let from = (p.offset as usize).min(draft.len());
         let to = (from + s.len()).min(draft.len());
         if from >= to {
-            continue;
+            return;
         }
         let al = align_banded(&draft[from..to], s, opts.band);
         let mut d = from; // position in the draft
@@ -202,7 +243,7 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Con
                     for _ in 0..*n {
                         if d < cols.len() && q < s.len() {
                             if let Some(i) = base_idx(s[q]) {
-                                cols[d].acgt[i] += 1;
+                                cols[d].acgt[i].fetch_add(1, Ordering::Relaxed);
                             }
                         }
                         d += 1;
@@ -212,7 +253,7 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Con
                 Op::Sub(b) => {
                     if d < cols.len() {
                         if let Some(i) = base_idx(*b) {
-                            cols[d].acgt[i] += 1;
+                            cols[d].acgt[i].fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     d += 1;
@@ -222,7 +263,7 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Con
                     // The read lacks these draft bases: vote to remove them.
                     for _ in 0..*n {
                         if d < cols.len() {
-                            cols[d].del += 1;
+                            cols[d].del.fetch_add(1, Ordering::Relaxed);
                         }
                         d += 1;
                     }
@@ -233,7 +274,8 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Con
                 }
             }
         }
-    }
+    });
+    let cols: Vec<Column> = cols.iter().map(AtomicColumn::load).collect();
 
     // 3. Call each column, recording where each draft position landed. A dropped
     //    column maps to the next surviving position, so a layout offset that
@@ -438,6 +480,32 @@ mod tests {
         }
         // Past the end saturates rather than panicking.
         assert_eq!(cons.map(u32::MAX), cons.seq.len() as u32);
+    }
+
+    #[test]
+    fn is_thread_count_invariant() {
+        // The vote is concurrent, so the workspace's byte-identical-regardless-
+        // of-threads rule has to be asserted, not assumed. It holds because
+        // increments commute — but "it should be fine" is exactly how a codec
+        // acquires a heisenbug that only appears on a different core count.
+        let truth = rand_seq(4000, 61);
+        let reads: Vec<Vec<u8>> = (0..24).map(|i| mutate(&truth, 0.06, 700 + i)).collect();
+        let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
+        let c = contig_of(&vec![0u32; reads.len()], &lens);
+
+        let run = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("pool")
+                .install(|| consensus(&c, &reads, ConsensusOpts::default()))
+        };
+        let one = run(1);
+        let many = run(8);
+        assert_eq!(
+            one, many,
+            "consensus must be identical on 1 thread and 8 — atomic votes commute"
+        );
     }
 
     #[test]
