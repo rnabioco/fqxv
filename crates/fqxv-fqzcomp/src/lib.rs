@@ -145,12 +145,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// is accepted rather than rejected. `context` masks its fields (below) so a
 /// symbol beyond the old 64-cap can never index past `N_CTX`.
 const QMAX: usize = 94;
-/// Loose upper bound on quality symbols the range coder can emit per compressed
-/// byte, used as a decompression-bomb guard in [`decode`]. The adaptive model
-/// caps its total frequency at `1<<13`, so with 64 symbols the most-skewed
-/// symbol still costs ~0.011 bits (~700 symbols/byte is the true ceiling); this
-/// leaves a wide margin so legitimate streams never trip it.
-const MAX_SYMBOLS_PER_BYTE: usize = 1 << 16;
 /// Number of contexts: q1(6) | q2>>2(4) | delta(2) | q3>>4(2) | pos-bucket(4) =
 /// 18 bits. `q3` (the third-previous quality, coarse) captures more of the local
 /// quality trajectory. Keeping `q2` at 4 bits and growing to 18 bits beat the
@@ -273,26 +267,21 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     let lens = read_lens(&mut r)?;
 
     let mut models = vec![SimpleModel::<QMAX>::with_active(k); N_CTX];
-    let payload_len = r.rest().len();
     // Checked sum: a malformed stream can declare lengths whose total wraps
     // `usize`, which would under-allocate `quals` and then over-push.
     let total = lens
         .iter()
         .try_fold(0usize, |acc, &l| acc.checked_add(l as usize))
         .ok_or(Error::Malformed("total length overflows usize"))?;
-    // Decompression-bomb guard. The range model caps its total frequency at
-    // `1<<13`, so the most-skewed symbol still costs a fraction of a bit and the
-    // coder can emit at most a few hundred quality symbols per compressed byte.
-    // A header that declares far more output than the payload could possibly
-    // encode is malformed — reject it before allocating or looping, so a tiny
-    // stream can't request a terabyte-scale decode.
-    let max_plausible = payload_len
-        .saturating_mul(MAX_SYMBOLS_PER_BYTE)
-        .saturating_add(MAX_SYMBOLS_PER_BYTE);
-    if total > max_plausible {
-        return Err(Error::Malformed("declared length exceeds payload capacity"));
-    }
     let mut dec = Decoder::new(r.rest());
+    // Decompression-bomb guard: bound the *allocation*, not the ratio. A single
+    // repeated quality symbol codes to almost nothing (a 1-symbol alphabet costs
+    // ~0 bits/symbol), so there is no finite "symbols per compressed byte" bound —
+    // any ratio cap would reject legitimately compressible constant/low-entropy
+    // quality (including the lossy `--quality-bin` modes). Reserving `total`
+    // fallibly rejects a hostile length before allocating; the container caps a
+    // block's read count and cross-checks it against the decoded content digest,
+    // so a lying `total` can't turn into wrong output.
     let mut quals = Vec::new();
     quals
         .try_reserve(total)
@@ -398,6 +387,39 @@ mod tests {
             b"ABCDEFGHIJKLMN",
             QualityBinning::Lossless,
         );
+    }
+
+    #[test]
+    fn roundtrip_large_constant_quality() {
+        // Constant quality compresses to almost nothing, so total / payload_len
+        // far exceeds any fixed ratio — the old "declared length exceeds payload
+        // capacity" guard wrongly rejected this on decode, so `compress` produced
+        // an archive `decompress` refused. Regression: it must round-trip.
+        let n = 100_000usize;
+        let read_len = 100u32;
+        let lens = vec![read_len; n];
+        let quals = vec![b'I'; n * read_len as usize]; // 10M identical symbols
+        let enc = encode(&lens, &quals, QualityBinning::Lossless).expect("encode");
+        assert!(
+            enc.len() < 100_000,
+            "constant quality must compress tiny (got {} bytes for 10M symbols)",
+            enc.len()
+        );
+        let (out_lens, out_quals) = decode(&enc).expect("high compression must not be rejected");
+        assert_eq!(out_lens, lens);
+        assert_eq!(out_quals, quals);
+    }
+
+    #[test]
+    fn decode_rejects_length_bomb_without_aborting() {
+        // A tiny stream declaring an enormous fixed-length total must fail the
+        // fallible reserve, not abort (the removed ratio guard used to catch this;
+        // `try_reserve` on `total` still does).
+        let mut src = vec![FORMAT_VERSION, 0, 1, b'I']; // version, lossless, k=1, symbol
+        write_varint(&mut src, 1000); // n = 1000 reads
+        src.push(1); // fixed-length flag
+        write_varint(&mut src, u64::from(u32::MAX)); // f -> total ~4.3e12 bytes
+        assert!(matches!(decode(&src), Err(Error::Malformed(_))));
     }
 
     #[test]

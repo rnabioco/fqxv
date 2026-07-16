@@ -117,11 +117,12 @@ pub(crate) fn write_blocks<W: Write>(
     for (b, payload) in blocks.iter().zip(compressed) {
         let payload = payload?;
         index.entries.push((index.offset, b.n_reads() as u32));
-        // Frame: [8 payload_len][4 crc32c(payload)][payload].
+        // Frame: [4 BLOCK_MAGIC][8 payload_len][4 crc32c(payload)][payload].
+        w.write_all(&BLOCK_MAGIC)?;
         w.write_all(&(payload.len() as u64).to_le_bytes())?;
         w.write_all(&crc32c(&payload).to_le_bytes())?;
         w.write_all(&payload)?;
-        let framed = (8 + CRC_LEN + payload.len()) as u64;
+        let framed = (FRAME_HEAD_LEN + payload.len()) as u64;
         index.offset += framed;
         trace!(
             reads = b.n_reads(),
@@ -355,23 +356,32 @@ pub(crate) fn decode_block_group(buf: &[u8], g: usize) -> Result<(u64, Vec<Vec<u
     Ok((n_reads as u64, outs))
 }
 
-/// Read one length-prefixed, CRC-checked block, or `None` at the terminator /
-/// a clean EOF. `index` names the block in any corruption error.
+/// Read one framed, CRC-checked block, or `None` at the terminator / a clean EOF.
+/// `index` names the block in any corruption error.
 ///
-/// A zero-length block is the terminator that separates the block region from
-/// the footer, so a streaming (non-seekable) decoder stops here without reading
-/// into the footer. A clean EOF (no length at all) is also treated as the end,
-/// which keeps truncated pre-footer streams decoding what they can. The frame is
-/// `[8 payload_len][4 crc32c(payload)][payload]`; the CRC is verified before the
-/// payload is handed to the entropy decoders so corruption surfaces as a clean
-/// [`Error::Corrupt`] rather than garbage output.
+/// The frame is `[4 BLOCK_MAGIC][8 payload_len][4 crc32c(payload)][payload]`. A
+/// zero-length block (magic + `len == 0`) is the terminator that separates the
+/// block region from the footer, so a streaming (non-seekable) decoder stops here
+/// without reading into the footer. A clean EOF (no bytes, or a partial marker) is
+/// also treated as the end, which keeps truncated pre-footer streams decoding what
+/// they can. The CRC is verified before the payload is handed to the entropy
+/// decoders so corruption surfaces as a clean [`Error::Corrupt`] rather than
+/// garbage output.
 pub(crate) fn read_block<R: Read>(r: &mut R, index: u64) -> Result<Option<Vec<u8>>> {
-    let mut len = [0u8; 8];
-    match r.read_exact(&mut len) {
+    let mut magic = [0u8; BLOCK_MAGIC.len()];
+    match r.read_exact(&mut magic) {
         Ok(()) => {}
+        // No marker (or only a partial one) left: a clean end of the block region.
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     }
+    if magic != BLOCK_MAGIC {
+        return Err(Error::Corrupt {
+            what: format!("block {index} (bad sync marker)"),
+        });
+    }
+    let mut len = [0u8; 8];
+    r.read_exact(&mut len).map_err(|_| Error::Truncated)?;
     let len = u64::from_le_bytes(len);
     if len == 0 {
         return Ok(None);
