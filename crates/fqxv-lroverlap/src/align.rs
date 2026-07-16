@@ -103,22 +103,54 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
             from[k] = 2;
         }
     }
+    // HOT LOOP. This is O(n * band) and, at 40x on ecoli_hifi, 63% of the entire
+    // encode — so it is written against the band's structure rather than through
+    // the `at`/`get` helpers, which recompute a row's bounds and build an
+    // `Option` for every one of the three neighbours of every cell. Everything
+    // those helpers derive is a per-ROW constant, hoisted here. The arithmetic is
+    // otherwise untouched: same predecessors, same tie-break, same values.
     for i in 1..=n {
         let lo = lo_of(i);
         let hi = (i + band).min(m);
+        // The previous row's window and flat base, so a neighbour is an index,
+        // not a lookup.
+        let lo_p = lo_of(i - 1);
+        let hi_p = (i - 1 + band).min(m);
+        let base = i * stride;
+        let base_p = (i - 1) * stride;
+        let rb = refr[i - 1];
+
         for j in lo..=hi {
-            let Some(cur) = at(i, j) else { continue };
+            // `j` is inside row `i`'s window by construction, so the old
+            // `at(i, j)` could never fail here.
+            let cur = base + (j - lo);
             if j == 0 {
                 dp[cur] = i as u32;
                 from[cur] = 1;
                 continue;
             }
-            let cost = u32::from(refr[i - 1] != query[j - 1]);
-            let diag = get(&dp, i - 1, j - 1).saturating_add(cost);
-            let up = get(&dp, i - 1, j).saturating_add(1); // consume refr = del
-            let left = get(&dp, i, j - 1).saturating_add(1); // consume query = ins
-                                                             // Prefer diagonal, then deletion, then insertion — a fixed total
-                                                             // order, so the traceback is deterministic for equal-cost paths.
+            // A neighbour outside the previous row's window has no cell and
+            // reads as INF, exactly as `get` returned.
+            let diag = if j > lo_p && j - 1 <= hi_p {
+                dp[base_p + (j - 1 - lo_p)]
+            } else {
+                INF
+            };
+            let up = if j >= lo_p && j <= hi_p {
+                dp[base_p + (j - lo_p)]
+            } else {
+                INF
+            };
+            // (i, j-1) is this row, one cell back — in-window iff j > lo.
+            let left = if j > lo { dp[cur - 1] } else { INF };
+
+            let cost = u32::from(rb != query[j - 1]);
+            let diag = diag.saturating_add(cost);
+            let up = up.saturating_add(1); // consume refr = del
+            let left = left.saturating_add(1); // consume query = ins
+
+            // Prefer diagonal, then deletion, then insertion — a fixed total
+            // order, so the traceback is deterministic for equal-cost paths.
             let (best, f) = if diag <= up && diag <= left {
                 (diag, 0u8)
             } else if up <= left {
