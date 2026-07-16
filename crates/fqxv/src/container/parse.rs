@@ -42,21 +42,68 @@ pub(crate) fn take_line(buf: &[u8], pos: usize, end: usize) -> (usize, usize, us
     }
 }
 
-/// Build a record's header exactly as [`RawBlock::push`] would from the
-/// `noodles` name/description split: name is the bytes before the first space or
-/// tab; the separator becomes a single space; an empty description is dropped.
+/// Append a record's raw definition line (the bytes after `@`) to `out`
+/// **byte-for-byte** — the header is preserved exactly, including a trailing
+/// separator or a tab, per fqxv's losslessness contract.
+///
+/// (Previously this split on the first space/tab and rejoined with a single space
+/// to mirror the `noodles` name/description reader, which silently dropped a
+/// trailing separator and rewrote a tab to a space — see #49. All read paths now
+/// capture the raw definition instead; see [`read_raw_record`].)
 pub(crate) fn normalize_header(out: &mut Vec<u8>, def: &[u8]) {
-    match def.iter().position(|&b| b == b' ' || b == b'\t') {
-        None => out.extend_from_slice(def),
-        Some(i) => {
-            out.extend_from_slice(&def[..i]);
-            let desc = &def[i + 1..];
-            if !desc.is_empty() {
-                out.push(b' ');
-                out.extend_from_slice(desc);
-            }
+    out.extend_from_slice(def);
+}
+
+/// Strip a trailing `\n` (and a `\r` immediately before it) from a read line.
+fn strip_eol(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    if end > 0 && line[end - 1] == b'\n' {
+        end -= 1;
+        if end > 0 && line[end - 1] == b'\r' {
+            end -= 1;
         }
     }
+    &line[..end]
+}
+
+/// Read one 4-line FASTQ record from `r`, capturing the header **byte-exactly**:
+/// `def` gets the definition line's bytes after `@` with no separator
+/// normalization, `seq`/`qual` get the sequence and quality lines (all three are
+/// cleared first). The `+` separator line is read and dropped (fqxv's one
+/// sanctioned deviation). Returns `Ok(false)` at a clean EOF before a record.
+///
+/// This is the shared reader for the streaming / buffered paths that previously
+/// used `noodles`, whose name/description split is lossy for the header separator.
+pub(crate) fn read_raw_record<R: BufRead>(
+    r: &mut R,
+    def: &mut Vec<u8>,
+    seq: &mut Vec<u8>,
+    qual: &mut Vec<u8>,
+) -> Result<bool> {
+    def.clear();
+    seq.clear();
+    qual.clear();
+    let mut line = Vec::new();
+    if r.read_until(b'\n', &mut line)? == 0 {
+        return Ok(false); // clean EOF at a record boundary
+    }
+    let d = strip_eol(&line);
+    if d.first() != Some(&b'@') {
+        return Err(Error::Malformed("expected '@' at FASTQ record start"));
+    }
+    def.extend_from_slice(&d[1..]);
+
+    line.clear();
+    r.read_until(b'\n', &mut line)?;
+    seq.extend_from_slice(strip_eol(&line));
+
+    line.clear();
+    r.read_until(b'\n', &mut line)?; // '+' separator line — dropped
+
+    line.clear();
+    r.read_until(b'\n', &mut line)?;
+    qual.extend_from_slice(strip_eol(&line));
+    Ok(true)
 }
 
 /// True when `o` begins a well-formed 4-line FASTQ record: `@`-line, sequence,

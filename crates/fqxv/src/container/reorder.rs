@@ -28,15 +28,10 @@ pub(crate) const ASSEMBLY_WINDOWS: usize = 8;
 /// whole file resident before it can cluster globally.
 pub(crate) fn buffer_records(buf: &[u8]) -> Result<RawBlock> {
     let mut all = RawBlock::default();
-    let mut fq = noodles_fastq::io::Reader::new(buf);
-    let mut rec = noodles_fastq::Record::default();
-    while fq.read_record(&mut rec)? != 0 {
-        all.push(
-            rec.name(),
-            rec.description(),
-            rec.sequence(),
-            rec.quality_scores(),
-        );
+    let mut r: &[u8] = buf;
+    let (mut def, mut seq, mut qual) = (Vec::new(), Vec::new(), Vec::new());
+    while read_raw_record(&mut r, &mut def, &mut seq, &mut qual)? {
+        all.push_raw(&def, &seq, &qual);
     }
     Ok(all)
 }
@@ -91,15 +86,10 @@ pub(crate) fn compress_reordered_whole<R: Read + Send, W: Write>(
     // Buffer every read; input order is preserved, so an interleaved stream stays
     // interleaved and the permutation can restore that spot order on decode.
     let mut all = RawBlock::default();
-    let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
-    let mut rec = noodles_fastq::Record::default();
-    while fq.read_record(&mut rec)? != 0 {
-        all.push(
-            rec.name(),
-            rec.description(),
-            rec.sequence(),
-            rec.quality_scores(),
-        );
+    let mut br = BufReader::new(reader);
+    let (mut def, mut seq, mut qual) = (Vec::new(), Vec::new(), Vec::new());
+    while read_raw_record(&mut br, &mut def, &mut seq, &mut qual)? {
+        all.push_raw(&def, &seq, &qual);
     }
     encode_reordered(all, writer, params, group_size)
 }
