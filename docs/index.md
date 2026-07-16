@@ -5,6 +5,23 @@ tuned to it — a context model for quality, an order-k model for sequence, a
 positional tokenizer for names — and composes them into one parallel,
 block-based container.
 
+!!! warning "Not production-ready — the format is still stabilizing"
+
+    `fqxv` is in **early development** and the on-disk `.fqxv` format is **not
+    frozen**. Do not use it as the only copy of data you care about.
+
+    - **The format changes without notice.** Each build reads only its own
+      `FORMAT_VERSION`, so an archive written today may be unreadable by
+      tomorrow's build. Pin an exact version if you need archives to survive an
+      upgrade — and prefer re-compressing from the original FASTQ.
+    - **Bugs are still being found.** Correctness work is ongoing, including
+      defects that produced archives which could not be decompressed. Every
+      archive is checksummed and `compress --verify` will read one back to
+      confirm, but **keep your original FASTQ** until the format is frozen.
+
+    We will announce a frozen format and a stability guarantee before
+    recommending `fqxv` for archival use.
+
 ![fqxv compress and decompress demo](images/readme.gif)
 
 ## Why fqxv

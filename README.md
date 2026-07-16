@@ -5,10 +5,24 @@ one-crate-per-algorithm codecs plus a container format and CLI.
 
 ![fqxv compress and decompress demo](docs/images/readme.gif)
 
-> Status: **v0.2.0.** The library and CLI work end-to-end and are
-> [benchmarked against the field](docs/benchmarks.md), but the on-disk `.fqxv`
-> format (`FORMAT_VERSION` 2) is **not yet frozen** — each build reads only its
-> own version, so pin a version if you need archives to survive upgrades.
+> [!WARNING]
+> **Not production-ready — the format is still stabilizing.** `fqxv` is in
+> **early development** (v0.2.0). The library and CLI work end-to-end and are
+> [benchmarked against the field](docs/benchmarks.md), but **do not use `fqxv` as
+> the only copy of data you care about.**
+>
+> - **The on-disk `.fqxv` format (`FORMAT_VERSION` 2) is not frozen and changes
+>   without notice.** Each build reads only its own version, so an archive
+>   written today may be unreadable by tomorrow's build. Pin an exact version if
+>   you need archives to survive an upgrade — and prefer re-compressing from the
+>   original FASTQ.
+> - **Bugs are still being found.** Correctness work is ongoing, including
+>   defects that produced archives which could not be decompressed. Archives are
+>   checksummed and `compress --verify` reads one back to confirm, but **keep
+>   your original FASTQ** until the format is frozen.
+>
+> A frozen format and a stability guarantee will be announced before `fqxv` is
+> recommended for archival use.
 
 ## Why
 
