@@ -34,8 +34,12 @@
 
 #![forbid(unsafe_code)]
 
+mod chain;
+mod index;
 mod minimizer;
 
+pub use chain::{chain, Anchor, Chain, ChainOpts};
+pub use index::{Index, Occ, Repeat};
 pub use minimizer::{minimizers, Minimizer};
 
 /// Errors returned by this crate.
