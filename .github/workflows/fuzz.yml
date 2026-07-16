@@ -1,14 +1,18 @@
 name: Fuzz
 
-# Non-blocking: a separate workflow from CI, so it never gates a PR. Runs each
-# decode fuzz target for a short bounded time. See fuzz/README.md.
+# Non-blocking: a separate workflow from CI, so it never gates a PR. See
+# fuzz/README.md.
 #
-# Manual dispatch only for now. A weekly `schedule:` (the regression-net role from
-# issue #90) is deliberately not enabled yet: the standalone codec targets still
-# surface decompression-bomb OOMs (a header can declare a large count/length that
-# the codec allocates for), so a scheduled run would go red on known findings.
-# Enable the schedule once those allocations are input-bounded — see #90.
+# The weekly `schedule:` runs only the targets verified OOM-clean (container,
+# rans, tokenizer). The other decoders (seq, fqzcomp, reorder) still surface
+# decompression-bomb OOMs — a header can declare a large output the codec
+# allocates for, up to the RSS limit, before erroring — so they would make a
+# scheduled run go red. They stay available on manual dispatch, which runs all
+# six; bounding those decode allocations by input size (issue #90) is what lets
+# them join the schedule.
 on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC — verified-clean targets only
   workflow_dispatch:
     inputs:
       max_total_time:
@@ -39,7 +43,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [container, rans, tokenizer, seq, fqzcomp, reorder]
+        # Schedule: only the verified OOM-clean targets. Manual dispatch: all six.
+        target: ${{ (github.event_name == 'schedule') && fromJSON('["container","rans","tokenizer"]') || fromJSON('["container","rans","tokenizer","seq","fqzcomp","reorder"]') }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -56,14 +61,16 @@ jobs:
       # the sanitizer aborting when a decoder's `try_reserve` asks the allocator
       # for a corrupt-length-sized block — that returns an error, not a crash. A
       # genuine *infallible* over-allocation still aborts via `handle_alloc_error`;
-      # `-rss_limit_mb` bounds real growth (kept finite so a bomb triggers a clean
-      # libFuzzer OOM + reproducer rather than an OS OOM-kill).
+      # `-rss_limit_mb` bounds real growth (finite so a bomb is a clean libFuzzer
+      # OOM + reproducer, not an OS OOM-kill); `-timeout` caps a single slow unit
+      # so a pathological input can't hang the run for the default 20 minutes.
       - name: Fuzz
         run: >
           cargo +nightly fuzz run ${{ matrix.target }} --
           -max_total_time=${{ github.event.inputs.max_total_time || '120' }}
           -rss_limit_mb=4096
           -malloc_limit_mb=0
+          -timeout=30
       - name: Upload crash reproducer
         if: failure()
         uses: actions/upload-artifact@v4
