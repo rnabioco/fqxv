@@ -919,7 +919,9 @@ mod tests {
     fn take_rejects_overflowing_length_without_panicking() {
         // A stream whose length varint overflows `pos + n` must error, not panic
         // (debug) or wrap (release). Found by the cargo-fuzz `tokenizer` target.
-        let src = [0x01, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x37];
+        let src = [
+            0x01, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x37,
+        ];
         assert!(decode(&src).is_err());
     }
 
