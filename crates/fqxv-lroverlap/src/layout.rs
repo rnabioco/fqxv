@@ -356,10 +356,29 @@ mod tests {
     /// of repeat-driven misplacement. A contig COUNT is not a correctness check;
     /// span-vs-genome is (see the `layout span:` line in examples/encode.rs).
     ///
-    /// The likely real fix is structural, not a reordering: drop contained reads
-    /// (they carry no layout information yet dominate every top-16) and keep only
-    /// the best left- and right-extension per read — i.e. a string graph, which
-    /// is what miniasm does to get 7 unitigs on this same data.
+    /// NOR BY A STRING GRAPH. This doc used to propose one — drop contained
+    /// reads, keep only the best left/right extension per read, as miniasm does
+    /// to get 7 unitigs on this data. It has now been built TWICE, both times to
+    /// green tests, and measured worse at BOTH coverages (0.3669 and 0.1948 at
+    /// 40x against the original's 0.1427; 1.3699 at 300x against 0.7255).
+    ///
+    /// It cannot work here, and the reason is specific to the data rather than to
+    /// the implementation: *E. coli* has seven ~5 kb rRNA operons. A read ending
+    /// in one operon and a read beginning in a **different** copy of it form a
+    /// geometrically **perfect dovetail** — flush at both ends, no overhang to
+    /// measure. Hang-based classification is blind to it by construction, because
+    /// the geometry really is that of a true extension; only graph structure
+    /// (transitive reduction, bubble popping) can tell the two apart. Every knob
+    /// on the hang test trades fragmentation against collapse and neither end is
+    /// the original.
+    ///
+    /// The plan the measurements DO support is to stop fixing the layout for 300x
+    /// and **feed it 40x**: it is excellent there and starves only at depth.
+    /// Subsample for overlaps/layout/consensus, then place *all* reads on the
+    /// resulting consensi — [`place_against`](crate::place_against) is linear and
+    /// never reads a layout offset, so the deep vote and the encode are untouched.
+    /// Amortising the reference over 8x more bases predicts ~0.098 bits/base at
+    /// 300x, and cuts this phase ~64x on the side.
     #[test]
     #[ignore = "known failure: extension starves at high coverage; naive fix \
                 collapses the genome (measured 0.1427 -> 1.2592). See doc."]
