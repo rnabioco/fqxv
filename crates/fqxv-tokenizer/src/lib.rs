@@ -668,7 +668,12 @@ impl<'a> Cursor<'a> {
         Ok(b)
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        let end = self.pos + n;
+        // `n` is an untrusted length (a varint), so guard the add: a huge value
+        // overflows `usize` (a debug-build panic; a silent wrap in release).
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or(Error::Malformed("truncated slice"))?;
         let s = self
             .buf
             .get(self.pos..end)
@@ -908,6 +913,14 @@ mod tests {
         let mut r = Cursor::new(&data);
         let err = read_op_rle(&mut r, usize::MAX).unwrap_err();
         assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn take_rejects_overflowing_length_without_panicking() {
+        // A stream whose length varint overflows `pos + n` must error, not panic
+        // (debug) or wrap (release). Found by the cargo-fuzz `tokenizer` target.
+        let src = [0x01, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x37];
+        assert!(decode(&src).is_err());
     }
 
     #[test]
