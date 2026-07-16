@@ -19,29 +19,30 @@
 //! against each other. Each read is therefore aligned to the growing reference
 //! and votes through that alignment.
 //!
-//! # KNOWN BROKEN: the draft is a mosaic
+//! ## The draft is built by alignment, not by offset
 //!
-//! Measured on ecoli_hifi: this consensus is **0.0078 edits/base from the true
-//! genome, where a raw read is 0.0025** — three times *worse* than an arbitrary
-//! single read. A 40x plurality vote should be ~0. Coding against it is worse
-//! than read-vs-read (0.005), so the margin above is currently negative. This is
-//! the binding defect in the codec; nothing downstream can recover it.
+//! An earlier draft laid every read down at its layout offset, "first read
+//! covering a position wins". With reads starting every ~322 bases (15.5k reads
+//! over 5 Mb at 40x) that made the draft ~322-base fragments from **15,183
+//! different reads**, spliced wherever an offset happened to be wrong. Reads
+//! could not align across ~40 such splices, so their votes landed in the wrong
+//! columns and the consensus never rose above the mosaic it started from —
+//! measured at **0.0078 edits/base from truth where a raw read is 0.0025**,
+//! i.e. three times *worse* than an arbitrary single read, which made the margin
+//! above negative. It also did precisely what the section above says not to do.
 //!
-//! The cause is the DRAFT below, not the vote. "First read covering a position
-//! wins" with reads starting every ~322 bases (15.5k reads over 5 Mb at 40x)
-//! makes the draft ~322-base fragments from **15,183 different reads**, spliced
-//! at offsets that each carry error. A 12.9 kb read crosses ~40 such splices and
-//! cannot align across them within the band, so its votes land in the wrong
-//! columns and the consensus never rises above the mosaic it started from. Note
-//! the draft does exactly what the section above says not to do: it lays reads
-//! down BY OFFSET.
+//! Now: [`tiling`] picks the ~1/40th of reads needed to span the contig, and
+//! [`build_draft`] places each against the draft *as it actually is* and appends
+//! only its novel tail. Every junction is alignment-verified, and there are ~400
+//! of them instead of ~15,000.
 //!
-//! The fix is a coherent draft — OLC-style extension (seed read; align each next
-//! read; append its tail) or POA — not a mosaic. Do not chase this through
-//! placement: re-placing against a fixed frame ([`place_against`](crate::
-//! place_against)) was tried and gained 2.6%. Verify any change by dumping the
-//! consensus (`FQXV_DUMP_CONS`) and aligning it to a reference; that number is
-//! the only one that matters here.
+//! Do not chase draft quality through placement — re-placing reads against a
+//! fixed frame ([`place_against`](crate::place_against)) was tried and gained
+//! 2.6%; a precise placement onto a bad reference is still bad. Verify any
+//! change here by dumping the consensus (`FQXV_DUMP_CONS` in
+//! `examples/encode.rs`) and aligning it to a known genome. Consensus-vs-truth
+//! is the only number that matters for this module, and bits/base is a lagging,
+//! confounded proxy for it.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -49,8 +50,20 @@ use rayon::prelude::*;
 
 use crate::{
     align::{align_banded, Op},
-    Contig,
+    place_against, ChainOpts, Contig, Sketch,
 };
+
+/// How much of the draft's end to index when placing the next tiling read.
+///
+/// The next read must overlap the draft's end, so only the tail can match.
+/// Indexing the whole draft each step would make construction quadratic — at
+/// 5 Mb and ~400 steps that is 2 Gbase of indexing for no gain.
+const TAIL_WINDOW: usize = 60_000;
+
+/// Minimum overlap between consecutive tiling reads, in bases. Enough that the
+/// chain has plenty of anchors to place against; below this a read is not a safe
+/// extension and is skipped.
+const MIN_TILE_OVERLAP: u32 = 2_000;
 
 /// Consensus options.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -61,6 +74,10 @@ pub struct ConsensusOpts {
     /// stands. Guards the contig ends, where coverage tails off and a single
     /// erroneous read would otherwise dictate the consensus.
     pub min_votes: u32,
+    /// Sketch used to place reads onto the draft. Must match the platform: the
+    /// draft is built and voted by chaining, so a sketch too sparse for the
+    /// error rate loses reads from both.
+    pub sketch: Sketch,
 }
 
 impl Default for ConsensusOpts {
@@ -68,6 +85,7 @@ impl Default for ConsensusOpts {
         Self {
             band: 64,
             min_votes: 3,
+            sketch: Sketch::ont(),
         }
     }
 }
@@ -182,6 +200,127 @@ impl Column {
     }
 }
 
+/// Pick a minimal set of reads that tiles the contig, left to right.
+///
+/// At 40x coverage roughly one read in forty is needed to span the contig; the
+/// other thirty-nine add nothing to the draft's *shape* and only add splices.
+/// Classic greedy interval cover: from the reads that still overlap the current
+/// end by at least [`MIN_TILE_OVERLAP`], take the one reaching furthest.
+///
+/// Returns indices into `contig.reads`. Ties break on read index, so the tiling
+/// is a pure function of the layout.
+fn tiling(contig: &Contig, lens: &[u32]) -> Vec<usize> {
+    let end_of = |i: usize| {
+        let p = &contig.reads[i];
+        p.offset + lens[p.read as usize]
+    };
+    let mut picked = vec![0usize];
+    let mut cur_end = end_of(0);
+    let mut i = 1usize;
+    while i < contig.reads.len() {
+        // Candidates: start early enough to overlap the current end, and extend
+        // past it. `contig.reads` is sorted by offset, so once a read starts
+        // beyond reach, so does every read after it.
+        let mut best: Option<(u32, usize)> = None;
+        let mut j = i;
+        while j < contig.reads.len() {
+            let p = &contig.reads[j];
+            if p.offset + MIN_TILE_OVERLAP > cur_end {
+                break; // and so will all later reads
+            }
+            let e = end_of(j);
+            if e > cur_end && best.is_none_or(|(be, _)| e > be) {
+                best = Some((e, j));
+            }
+            j += 1;
+        }
+        match best {
+            Some((e, idx)) => {
+                picked.push(idx);
+                cur_end = e;
+                i = idx + 1;
+            }
+            // Nothing overlaps the end: a coverage gap. Restart the tiling from
+            // the next read rather than splicing across a region no read spans.
+            None => {
+                if j >= contig.reads.len() {
+                    break;
+                }
+                picked.push(j);
+                cur_end = end_of(j);
+                i = j + 1;
+            }
+        }
+    }
+    picked
+}
+
+/// Build a draft by ALIGNING each tiling read onto the growing draft and
+/// appending only its novel tail.
+///
+/// This replaces laying reads down at their layout offsets. That produced a
+/// mosaic — ~322-base fragments from thousands of reads, spliced wherever an
+/// offset happened to be wrong — which no vote could recover, because reads
+/// could not align across the splices to vote in the first place.
+///
+/// Here every junction is placed by a chain against the draft *as it actually
+/// is*, so the draft stays a coherent sequence, and only the tiling reads
+/// (~1/40th at 40x) contribute junctions at all.
+fn build_draft(contig: &Contig, reads: &[Vec<u8>], lens: &[u32], sketch: Sketch) -> Vec<u8> {
+    let picked = tiling(contig, lens);
+    let seed = &contig.reads[picked[0]];
+    let mut draft = reads[seed.read as usize].clone();
+    // The draft's end in LAYOUT coordinates. Needed for the fallback below: it
+    // lets a failed chain still extend the draft rather than stall it.
+    let mut end_layout = seed.offset + lens[seed.read as usize];
+
+    for &idx in &picked[1..] {
+        let p = &contig.reads[idx];
+        let r = &reads[p.read as usize];
+        if r.is_empty() {
+            continue;
+        }
+        // Only the draft's tail can overlap the next read, and indexing the whole
+        // draft every step would be quadratic.
+        let tail_start = draft.len().saturating_sub(TAIL_WINDOW);
+        let placed = place_against(
+            &draft[tail_start..],
+            &[r.as_slice()],
+            sketch,
+            ChainOpts::default(),
+        );
+        // Where this read starts on the draft. A chain is exact; the layout is
+        // approximate but always available.
+        let start = match placed[0] {
+            // Reads are pre-oriented by the layout, so a flip means the layout
+            // and the draft disagree — do not trust that placement.
+            Some(a) if !a.flip => tail_start + a.offset as usize,
+            _ => {
+                // FALLBACK — never stall. An earlier version skipped the read
+                // here, which truncated the draft: the next tiling read is even
+                // further along, so it could not overlap the stalled end either,
+                // and one failure killed every read after it. That collapsed the
+                // draft from 4.92 Mb to 1.15 Mb and dumped three quarters of the
+                // reads into literals at ~2 bits/base.
+                //
+                // The layout's coordinates are approximate, so this splice may be
+                // off by an indel or two — which the vote repairs. A truncated
+                // draft cannot be repaired by anything.
+                let overlap = end_layout.saturating_sub(p.offset) as usize;
+                draft.len().saturating_sub(overlap)
+            }
+        };
+        let start = start.min(draft.len());
+        // Append only what extends past the draft's end.
+        if start + r.len() > draft.len() {
+            let already = draft.len() - start;
+            draft.extend_from_slice(&r[already..]);
+            end_layout = p.offset + lens[p.read as usize];
+        }
+    }
+    draft
+}
+
 #[inline]
 fn base_idx(b: u8) -> Option<usize> {
     match b {
@@ -222,22 +361,14 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Con
         let to_cons = (0..=seq.len() as u32).collect();
         return Consensus { seq, to_cons };
     }
-
-    // 1. Draft: first read to cover each position wins. Good enough to align
-    //    against; the vote is what makes it accurate.
-    let mut draft: Vec<u8> = vec![0; contig.len as usize];
-    for p in &contig.reads {
-        let s = &reads[p.read as usize];
-        for (i, &b) in s.iter().enumerate() {
-            let at = p.offset as usize + i;
-            if at < draft.len() && draft[at] == 0 {
-                draft[at] = b;
-            }
-        }
+    // `reads` is indexed by read id; recover per-read lengths for the tiling.
+    let mut lens = vec![0u32; reads.len()];
+    for (i, r) in reads.iter().enumerate() {
+        lens[i] = r.len() as u32;
     }
-    // Positions no read covered (a gapped layout) hold 0; drop them so the draft
-    // is a real sequence.
-    draft.retain(|&b| b != 0);
+
+    // 1. Draft: built by ALIGNMENT, not by offset. See `build_draft`.
+    let draft = build_draft(contig, reads, &lens, opts.sketch);
     if draft.is_empty() {
         return Consensus {
             seq: Vec::new(),
@@ -245,15 +376,31 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Con
         };
     }
 
-    // 2. Vote: align each read to the draft and tally through the alignment, so
-    //    indels shift the register rather than corrupting every column after.
-    //    Reads vote CONCURRENTLY — the alignment is the expensive part and there
-    //    are tens of thousands of them per contig. Tallies are atomic and
-    //    increments commute, so the result does not depend on thread count.
+    // 2. Vote. Reads are placed against the DRAFT, not at their layout offsets:
+    //    the draft is built by alignment so its coordinates are its own, and a
+    //    layout offset would point at the wrong column. One hop against a fixed
+    //    frame, so nothing accumulates.
+    //
+    //    Reads vote CONCURRENTLY — the alignment dominates and there are tens of
+    //    thousands per contig. Tallies are atomic and increments commute, so the
+    //    result does not depend on thread count.
+    let oriented: Vec<&[u8]> = contig
+        .reads
+        .iter()
+        .map(|p| reads[p.read as usize].as_slice())
+        .collect();
+    let anchored = place_against(&draft, &oriented, opts.sketch, ChainOpts::default());
+
     let cols: Vec<AtomicColumn> = (0..draft.len()).map(|_| AtomicColumn::default()).collect();
-    contig.reads.par_iter().for_each(|p| {
+    contig.reads.par_iter().enumerate().for_each(|(ri, p)| {
         let s = &reads[p.read as usize];
-        let from = (p.offset as usize).min(draft.len());
+        let Some(a) = anchored[ri] else {
+            return; // no confident placement on the draft: cannot vote
+        };
+        if a.flip {
+            return; // layout and draft disagree on orientation
+        }
+        let from = (a.offset as usize).min(draft.len());
         let to = (from + s.len()).min(draft.len());
         if from >= to {
             return;
@@ -300,6 +447,40 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Con
         }
     });
     let cols: Vec<Column> = cols.iter().map(AtomicColumn::load).collect();
+    if std::env::var("FQXV_DIAG_COLS").is_ok() {
+        let covered = cols
+            .iter()
+            .filter(|c| c.acgt.iter().sum::<u32>() + c.del > 0)
+            .count();
+        let deep = cols
+            .iter()
+            .filter(|c| c.acgt.iter().sum::<u32>() + c.del >= opts.min_votes)
+            .count();
+        let mean: f64 = cols
+            .iter()
+            .map(|c| f64::from(c.acgt.iter().sum::<u32>() + c.del))
+            .sum::<f64>()
+            / cols.len() as f64;
+        eprintln!(
+            "DIAG cols={} covered={covered} deep(>= {})={deep} mean_votes={mean:.2}",
+            cols.len(),
+            opts.min_votes
+        );
+        for i in [1000usize, 5000, 20000] {
+            if let Some(c) = cols.get(i) {
+                eprintln!(
+                    "DIAG col {i}: A={} C={} G={} T={} del={} -> {:?} (draft {})",
+                    c.acgt[0],
+                    c.acgt[1],
+                    c.acgt[2],
+                    c.acgt[3],
+                    c.del,
+                    c.call(opts.min_votes).map(|b| b as char),
+                    draft[i] as char
+                );
+            }
+        }
+    }
 
     // 3. Call each column, recording where each draft position landed. A dropped
     //    column maps to the next surviving position, so a layout offset that
@@ -384,11 +565,19 @@ mod tests {
     ///
     /// A positional (Hamming) comparison measures nothing on these sequences:
     /// the reads contain INDELS, so after the first one every downstream base is
-    /// shifted and the count reports the shift rather than the errors. It scores
-    /// a perfect consensus and a raw read almost identically, which is exactly
-    /// the coordinate-drift trap the whole codec exists to handle.
+    /// shifted and the count reports the shift rather than the errors.
+    ///
+    /// The band must absorb the **cumulative** indel drift, not merely the length
+    /// difference. A consensus with deletions spread through it drifts from the
+    /// truth by the total number of them, which is far more than
+    /// `|len(a) - len(b)|` when the ends happen to line up. Too narrow a band
+    /// loses the diagonal and degrades to substituting everything — on random
+    /// ACGT that reports ~0.33/base regardless of the real answer, which looks
+    /// exactly like a broken consensus. It cost an hour of chasing a working
+    /// vote before the tallies showed it was unanimous.
     fn edit_dist(a: &[u8], b: &[u8]) -> u32 {
-        align_banded(a, b, 256).dist
+        let band = (a.len().max(b.len()) / 8).max(a.len().abs_diff(b.len()) * 2 + 256);
+        align_banded(a, b, band).dist
     }
 
     #[test]
@@ -504,6 +693,191 @@ mod tests {
         }
         // Past the end saturates rather than panicking.
         assert_eq!(cons.map(u32::MAX), cons.seq.len() as u32);
+    }
+
+    #[test]
+    fn a_tiled_contig_beats_a_raw_read() {
+        // The property the entire margin rests on, and the one the mosaic draft
+        // failed in production while every unit test here passed: a consensus
+        // must be closer to the truth than the reads it was built from.
+        //
+        // Every other test in this module stacks reads at offset 0, where a
+        // mosaic cannot form. This TILES reads across a genome, which is what
+        // real data looks like and what broke: the old draft spliced ~322-base
+        // fragments from every read and landed 3x WORSE than a single read.
+        // Kept small on purpose: scoring needs a band wide enough to absorb the
+        // consensus's cumulative drift from truth, and a banded DP costs
+        // len * band. At 60 kb that is a multi-GB table just to grade the test.
+        let truth = rand_seq(16_000, 91);
+        let read_len = 4_000usize;
+        let step = 400usize; // 10x coverage — a vote needs depth to be a vote
+        let n = (truth.len() - read_len) / step;
+
+        let mut by_id: Vec<Vec<u8>> = Vec::with_capacity(n);
+        let mut places = Vec::with_capacity(n);
+        for i in 0..n {
+            let o = i * step;
+            by_id.push(mutate(&truth[o..o + read_len], 0.04, 400 + i as u32));
+            places.push(Placement {
+                read: i as u32,
+                contig: 0,
+                offset: o as u32,
+                flip: false,
+            });
+        }
+        let c = Contig {
+            id: 0,
+            len: truth.len() as u32,
+            reads: places,
+        };
+
+        // Isolate the two stages: a bad draft and a bad vote look identical in
+        // the final number, and guessing which has cost enough already.
+        let lens: Vec<u32> = by_id.iter().map(|r| r.len() as u32).collect();
+        let picked = tiling(&c, &lens);
+        let draft = build_draft(&c, &by_id, &lens, Sketch::ont());
+        let dn = draft.len().min(truth.len());
+        let draft_rate = f64::from(edit_dist(&draft[..dn], &truth[..dn])) / dn as f64;
+        println!(
+            "DIAG tiling={} reads of {} · draft={} bp (truth {}) · draft err {:.4}/base",
+            picked.len(),
+            c.reads.len(),
+            draft.len(),
+            truth.len(),
+            draft_rate
+        );
+
+        // How well are reads placed onto that draft? A read misplaced by more
+        // than the band (64) aligns two unrelated windows and votes garbage into
+        // every column it touches.
+        let refs: Vec<&[u8]> = c
+            .reads
+            .iter()
+            .map(|p| by_id[p.read as usize].as_slice())
+            .collect();
+        let anch = crate::place_against(&draft, &refs, Sketch::ont(), ChainOpts::default());
+        let (mut placed, mut within_band, mut worst) = (0usize, 0usize, 0u32);
+        for (ri, p) in c.reads.iter().enumerate() {
+            if let Some(a) = anch[ri] {
+                placed += 1;
+                // The draft tracks truth coordinates closely, so a read from
+                // truth offset `p.offset` should land near there.
+                let err = a.offset.abs_diff(p.offset);
+                if err <= 64 {
+                    within_band += 1;
+                }
+                worst = worst.max(err);
+            }
+        }
+        println!(
+            "DIAG placed {placed}/{} · within band-64 of true offset: {within_band} · worst off-by {worst}",
+            c.reads.len()
+        );
+
+        let cons = consensus(&c, &by_id, ConsensusOpts::default());
+        println!(
+            "DIAG consensus={} bp · err {:.4}/base",
+            cons.seq.len(),
+            f64::from(edit_dist(
+                &cons.seq[..cons.seq.len().min(truth.len())],
+                &truth[..cons.seq.len().min(truth.len())]
+            )) / cons.seq.len().min(truth.len()) as f64
+        );
+        assert!(!cons.is_empty(), "a tiled contig must produce a consensus");
+
+        // Compare EQUAL-LENGTH prefixes. The tiling only spans up to the last
+        // read's start (~58.5 kb of a 60 kb truth), so scoring the consensus
+        // against the FULL truth with a global alignment charges the ~1.5 kb it
+        // never covered as ~1500 edits — 0.025/base of pure length artifact,
+        // which is most of the score and nothing to do with quality. Both reads
+        // start at truth[0], so equal-length prefixes are the like-for-like
+        // comparison.
+        let n_cmp = cons.seq.len().min(truth.len());
+        assert!(
+            n_cmp > truth.len() / 2,
+            "the draft must span most of the contig, got {} of {}",
+            cons.seq.len(),
+            truth.len()
+        );
+        let cons_err = edit_dist(&cons.seq[..n_cmp], &truth[..n_cmp]);
+        let mean_read_err: u32 = (0..n.min(8))
+            .map(|i| {
+                let o = i * step;
+                edit_dist(&by_id[i], &truth[o..o + read_len])
+            })
+            .sum::<u32>()
+            / n.min(8) as u32;
+
+        let cons_rate = f64::from(cons_err) / n_cmp as f64;
+        let read_rate = f64::from(mean_read_err) / read_len as f64;
+        let draft_rate_cmp = draft_rate;
+
+        // Two assertions, because this metric cannot be made tight here.
+        //
+        // `edit_dist` is a GLOBAL alignment, so it charges any extent mismatch as
+        // error: the consensus drops columns the vote deletes, ending ~200 bases
+        // shorter than the draft, and every one of those is billed as an edit
+        // against `truth[..n]` (~0.014/base here — a third of the score, and
+        // nothing to do with quality). A clean measure needs free end gaps, which
+        // `align_banded` deliberately does not do. The authoritative check is
+        // minimap2 against a real genome (`FQXV_DUMP_CONS`, see the module docs);
+        // this test's job is to catch a GROSS regression, like the mosaic draft
+        // that was 3x worse than a raw read.
+        assert!(
+            cons_rate < read_rate,
+            "consensus ({cons_rate:.4}/base over {n_cmp} bp) must beat a raw read \
+             ({read_rate:.4}/base) — if it does not, coding against it is pointless"
+        );
+        assert!(
+            cons_rate < draft_rate_cmp,
+            "the vote must improve on the draft it was built from \
+             ({cons_rate:.4} vs {draft_rate_cmp:.4}/base) — otherwise it is not voting"
+        );
+    }
+
+    #[test]
+    fn one_unplaceable_read_does_not_truncate_the_draft() {
+        // Regression: a read that will not chain used to be skipped, but the next
+        // tiling read is further along the genome, so it could not overlap the
+        // stalled draft end either — one failure killed every read after it. On
+        // real data that collapsed the draft from 4.92 Mb to 1.15 Mb and dumped
+        // three quarters of the reads into literals at ~2 bits/base.
+        //
+        // Here read 4 is replaced with junk that cannot chain. The draft must
+        // still span the contig.
+        let truth = rand_seq(16_000, 77);
+        let read_len = 4_000usize;
+        let step = 400usize;
+        let n = (truth.len() - read_len) / step;
+
+        let mut by_id: Vec<Vec<u8>> = Vec::with_capacity(n);
+        let mut places = Vec::with_capacity(n);
+        for i in 0..n {
+            let o = i * step;
+            by_id.push(mutate(&truth[o..o + read_len], 0.04, 500 + i as u32));
+            places.push(Placement {
+                read: i as u32,
+                contig: 0,
+                offset: o as u32,
+                flip: false,
+            });
+        }
+        // Sabotage a read the tiling is likely to pick: unrelated sequence.
+        by_id[10] = rand_seq(read_len, 4242);
+
+        let c = Contig {
+            id: 0,
+            len: truth.len() as u32,
+            reads: places,
+        };
+        let lens: Vec<u32> = by_id.iter().map(|r| r.len() as u32).collect();
+        let draft = build_draft(&c, &by_id, &lens, Sketch::ont());
+        assert!(
+            draft.len() > truth.len() * 3 / 4,
+            "an unplaceable read must not truncate the draft: got {} of {}",
+            draft.len(),
+            truth.len()
+        );
     }
 
     #[test]

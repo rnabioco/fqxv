@@ -210,7 +210,17 @@ fn main() {
             for (i, p) in c.reads.iter().enumerate() {
                 by_id[p.read as usize] = oriented[i].clone();
             }
-            let cons = consensus(c, &by_id, ConsensusOpts::default());
+            // The sketch must match the platform: the draft is built and voted
+            // by chaining, so a sketch too sparse for the error rate loses reads
+            // from both.
+            let cons = consensus(
+                c,
+                &by_id,
+                ConsensusOpts {
+                    sketch,
+                    ..ConsensusOpts::default()
+                },
+            );
             // Dump the consensus so its quality can be measured directly against
             // the true genome, rather than inferred from the bits/base it
             // produces. FQXV_DUMP_CONS=<dir> writes one FASTA per contig.
