@@ -13,6 +13,28 @@
 //! (CoLoRd/NanoSpring/minimap2): **minimizers → chain colinear anchors → keep
 //! the best-scoring targets**.
 //!
+//! ## Consensus vs read-vs-read: where the margin comes from
+//!
+//! Measured on this data, HiFi read error is **0.0025 edits/base** and a crude
+//! edit coder costs **12.39 bits/edit**. That decomposes the design space:
+//!
+//! | approach | edits/base | total bits/base |
+//! | --- | --- | --- |
+//! | read-vs-read (code A against read B) | ~0.005 — *both* reads' errors | ~0.068 |
+//! | consensus (code A against a voted consensus) | 0.0025 — one read's error | ~0.040 |
+//!
+//! Those are exactly CoLoRd's measured 0.0676 and our measured 0.0401. **CoLoRd
+//! is read-vs-read, and the entire gap to it is the factor of two you pay for
+//! coding against another erroneous read rather than a voted consensus.** Its
+//! edit model is not weaker than ours; it is solving a harder problem than it
+//! needs to.
+//!
+//! So: read-vs-read is the simpler build and lands at parity — the fallback, not
+//! the goal. The consensus is the whole margin, and it is affordable only
+//! because the assembly collapses (miniasm on this data: 1.01x the genome in 7
+//! unitigs, so the reference costs ~0.006 bits/base — far less than the ~0.03
+//! that halving the edit term saves).
+//!
 //! ## Why chaining, not a single anchor
 //!
 //! `fqxv-reorder` anchors each read on one global minimum k-mer and compares
@@ -36,11 +58,13 @@
 
 mod chain;
 mod index;
+mod layout;
 mod minimizer;
 mod overlap;
 
 pub use chain::{chain, Anchor, Chain, ChainOpts};
 pub use index::{Index, Occ, Repeat};
+pub use layout::{layout, Contig, LayoutOpts, Placement};
 pub use minimizer::{minimizers, Minimizer};
 pub use overlap::{find_overlaps, Overlap};
 

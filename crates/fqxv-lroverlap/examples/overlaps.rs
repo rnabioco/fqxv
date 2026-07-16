@@ -116,7 +116,10 @@ fn main() {
         total_ov as f64 / total_partners.max(1) as f64
     );
     println!("  median partners  : {median}");
-    println!("  max partners     : {}", sorted.last().copied().unwrap_or(0));
+    println!(
+        "  max partners     : {}",
+        sorted.last().copied().unwrap_or(0)
+    );
     println!(
         "  reads with none  : {orphans} ({:.2}%)  <- these fall back to order-k coding",
         100.0 * orphans as f64 / n
