@@ -437,8 +437,7 @@ pub(crate) fn encode_reordered<W: Write>(
     // 7. Write: header, then n / flip / perm / seq blocks / name+qual blocks.
     let platform = resolve_platform_block(params.platform, &all);
     let mut w = BufWriter::new(writer);
-    let mut flags =
-        FLAG_PLUS_NORMALIZED | FLAG_REORDERED | FLAG_GLOBAL_REORDER | platform.flag_bits();
+    let mut flags = FLAG_PLUS_NORMALIZED | FLAG_REORDERED | FLAG_GLOBAL_REORDER;
     if keep_order {
         flags |= FLAG_KEEP_ORDER;
     }
@@ -454,6 +453,7 @@ pub(crate) fn encode_reordered<W: Write>(
         binning_tag(params.quality_binning),
         flags,
         g,
+        platform,
     )?;
     w.write_all(&(n as u64).to_le_bytes())?;
     write_framed(&mut w, &flip_bits)?;

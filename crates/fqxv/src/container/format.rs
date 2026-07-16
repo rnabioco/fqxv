@@ -10,8 +10,18 @@ use super::*;
 /// the binding limit and this never triggers.
 pub(crate) const MAX_BLOCK_SEQ_BYTES: usize = 256 << 20;
 /// Header fields covered by the header CRC: magic(4) + version(2) + seq_order(1)
-/// + quality-binning tag(1) + flags(1) + group size(1).
-pub(crate) const HEADER_FIELDS_LEN: usize = 10;
+/// + quality-binning tag(1) + flags(1) + group size(1) + platform(1).
+///
+/// The platform tag has its own byte rather than sharing the flags byte. It used
+/// to occupy flags bits 5-7, which collided with [`FLAG_GLOBAL_REFERENCE`]
+/// (0x20 == bit 5): `Platform::Illumina`'s code is 1, so its bits were exactly
+/// the reference flag. An Illumina archive in the global-reorder layout that did
+/// not adopt a reference therefore still advertised one and failed to decode.
+/// Six flags plus a 3-bit platform tag do not fit in one byte, so the tag moved
+/// out. (Pre-existing archives are not a concern — the format is not yet stable
+/// and the widened CRC coverage rejects a stale header rather than misreading
+/// it.)
+pub(crate) const HEADER_FIELDS_LEN: usize = 11;
 /// Full on-disk header prefix: the [`HEADER_FIELDS_LEN`] fields followed by a
 /// CRC-32C over them, so a flipped header byte (version, flags, the lossy binning
 /// tag, group size) is caught on read rather than silently changing decode — in
@@ -60,6 +70,8 @@ pub(crate) const FLAG_REGEN_NAMES: u8 = 0x10;
 /// archive, and only when the reference nets a whole-file byte win over the
 /// block-local (v2/v3) codecs; otherwise no reference frame is written.
 pub(crate) const FLAG_GLOBAL_REFERENCE: u8 = 0x20;
+// Bits 0x40 and 0x80 are free: the platform tag that used to occupy bits 5-7
+// now has its own header byte (see `HEADER_FIELDS_LEN`).
 
 /// Write the `HEADER_FIELDS_LEN` header fields followed by a CRC-32C over them,
 /// so a flipped header byte is caught on read instead of silently altering decode.
@@ -71,6 +83,7 @@ pub(crate) fn write_header_prefix<W: Write>(
     binning: u8,
     flags: u8,
     group_size: u8,
+    platform: Platform,
 ) -> Result<()> {
     let mut hdr = [0u8; HEADER_FIELDS_LEN];
     hdr[..4].copy_from_slice(&MAGIC);
@@ -79,6 +92,7 @@ pub(crate) fn write_header_prefix<W: Write>(
     hdr[7] = binning;
     hdr[8] = flags;
     hdr[9] = group_size;
+    hdr[10] = platform.to_code();
     w.write_all(&hdr)?;
     w.write_all(&crc32c(&hdr).to_le_bytes())?;
     Ok(())
@@ -94,13 +108,13 @@ pub(crate) fn write_header<W: Write>(
     // The block layout is always non-reorder — reorder (both keep-order modes)
     // uses the whole-file path, which writes its own header.
     debug_assert!(!params.reorder);
-    let flags = FLAG_PLUS_NORMALIZED | platform.flag_bits();
     write_header_prefix(
         w,
         params.seq_order,
         binning_tag(params.quality_binning),
-        flags,
+        FLAG_PLUS_NORMALIZED,
         group_size,
+        platform,
     )
 }
 
@@ -207,6 +221,9 @@ pub(crate) struct Header {
     pub(crate) quality_binning: u8,
     pub(crate) flags: u8,
     pub(crate) group_size: u8,
+    /// Sequencing platform tag ([`Platform::to_code`]) — its own byte, never
+    /// packed into `flags` (see [`HEADER_FIELDS_LEN`]).
+    pub(crate) platform: u8,
 }
 
 pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
@@ -235,6 +252,7 @@ pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
         quality_binning: fields[7],
         flags: fields[8],
         group_size,
+        platform: fields[10],
     })
 }
 

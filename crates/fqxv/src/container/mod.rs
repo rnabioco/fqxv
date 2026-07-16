@@ -8,12 +8,16 @@
 //! [1] quality binning tag
 //! [1] flags (bit0: '+' normalized; bit1: reordered; bit2: order preserved;
 //!            bit3: global-cluster reorder; bit4: names regenerated;
-//!            bits5-7: platform tag)
+//!            bit5: global reference frame present; bits6-7: free)
 //! [1] group size G (reads interleaved per spot: 1 single-end, 2 paired,
 //!                   3-4 single-cell R1/R2/I1[/I2], ...)
-//! [4] header_crc (LE) -- CRC-32C over the 10 header-field bytes above, verified
-//!     on read so a flipped version/flags/binning-tag/group-size byte is caught
-//!     rather than silently changing decode. Present in both layouts.
+//! [1] platform tag (0 unknown, 1 Illumina, 2 Nanopore, 3 PacBio, 4 MGI/BGI).
+//!     Its own byte: it previously shared flags bits5-7, where Illumina's code
+//!     collided with the global-reference bit and made Illumina reorder archives
+//!     undecodable.
+//! [4] header_crc (LE) -- CRC-32C over the 11 header-field bytes above, verified
+//!     on read so a flipped version/flags/binning-tag/group-size/platform byte is
+//!     caught rather than silently changing decode. Present in both layouts.
 //! repeated until the terminator:
 //!   [4] BLOCK_MAGIC "FQXB" -- per-block sync marker; recovery scans for it to
 //!       resynchronize to a block boundary when the footer is lost or a length

@@ -14,9 +14,12 @@ seek to any of them without scanning the file.
 [1]  quality binning tag        (0 lossless, 1 bin8, 2 bin4, 3 bin2)
 [1]  flags                      (bit0 '+' normalized; bit1 reordered;
                                  bit2 keep-order; bit3 global-reorder;
-                                 bit4 regen-names; bit5 global-reference)
+                                 bit4 regen-names; bit5 global-reference;
+                                 bits6-7 free)
 [1]  group size G               (1 single-end, 2 paired, 3-4 single-cell)
-[4]  header CRC-32C (LE)        (over the 10 header-field bytes above)
+[1]  platform tag               (0 unknown, 1 Illumina, 2 Nanopore,
+                                 3 PacBio, 4 MGI/BGI)
+[4]  header CRC-32C (LE)        (over the 11 header-field bytes above)
 repeated until the terminator:
   [4]  block sync marker "FQXB"          (recovery scans for it to resync)
   [8]  block payload length (LE, nonzero)
