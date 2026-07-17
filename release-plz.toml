@@ -10,3 +10,12 @@ git_release_enable = true
 git_tag_enable = true
 # Keep crate versions in lockstep so the workspace ships coherently.
 dependencies_update = true
+
+# The Python bindings ship as PyPI wheels (see .github/workflows/wheels.yml), not
+# on crates.io. `publish = false` in its Cargo.toml keeps `cargo publish` away;
+# this suppresses release-plz's changelog/tag churn for it. It still inherits the
+# lockstep version bump via `version.workspace = true`, so the wheel version
+# tracks the released crates.
+[[package]]
+name = "fqxv-python"
+release = false

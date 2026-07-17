@@ -17,6 +17,14 @@ Cargo.lock.orig
 *.fastq.gz
 *.fqxv
 
+# Python bindings: virtualenvs, caches, and wheel build outputs
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+/crates/fqxv-python/dist
+*.egg-info/
+
 # editor/OS cruft
 .DS_Store
 *.swp

@@ -1,0 +1,91 @@
+# Build and publish the `fqxv` Python wheels (crates/fqxv-python).
+#
+# Separate from release.yml (CLI binaries) and release-plz.yml (crates.io). A
+# `v*` tag triggers all three; this one builds abi3 wheels for every platform and
+# publishes them to PyPI via Trusted Publishing (OIDC — no API token secret).
+name: wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The repo's .cargo/config.toml pins `target-cpu=x86-64-v3` for the
+  # x86_64-unknown-linux-gnu target — exactly the manylinux wheel triple. A wheel
+  # built with that would SIGILL on pre-AVX2 CPUs. A present RUSTFLAGS makes cargo
+  # ignore the config's target.<triple>.rustflags entirely (same trick as
+  # release.yml), and fqxv-rans still selects AVX2 at runtime via CPU detection.
+  RUSTFLAGS: ""
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ""
+
+jobs:
+  build:
+    name: wheel (${{ matrix.os }} / ${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { os: ubuntu-latest, target: aarch64, manylinux: auto }
+          - { os: macos-latest, target: x86_64 }
+          - { os: macos-latest, target: aarch64 }
+          - { os: windows-latest, target: x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist --manifest-path crates/fqxv-python/Cargo.toml
+          sccache: true
+          # Forward the empty RUSTFLAGS into the manylinux docker container so the
+          # v3 pin cannot leak in.
+          docker-options: -e RUSTFLAGS= -e CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=
+        env:
+          RUSTFLAGS: ""
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path crates/fqxv-python/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  publish:
+    name: publish to PyPI
+    needs: [build, sdist]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
