@@ -36,6 +36,26 @@ against several of them to verify correctness.
 These are the algorithmic references for the read-reordering engine in
 `fqxv-reorder`, reimplemented from the papers.
 
+## Long reads
+
+- **CoLoRd** — Kokot, Gudyś, Li & Deorowicz, *Nature Methods* 2022. The
+  algorithmic reference for long-read compression, and the tool we measure
+  against in [Long-read support](design/longread.md). Its platform-specific
+  quality tables are the source of the cutpoints in our `--quality-bin ont` and
+  `--quality-bin hifi` bins, and its edit-script approach — code each read
+  against a similar earlier read — is the shape the `fqxv-lroverlap` sequence
+  work follows.
+- **minimap2** — Heng Li, *Bioinformatics* 2018. Its minimizer indexing and
+  colinear-anchor chaining are the proven recipe for finding overlaps through a
+  noisy channel; `fqxv-lroverlap`'s chainer follows that shape.
+- **miniasm** — Heng Li, *Bioinformatics* 2016. The overlap–layout–consensus
+  reference we checked our assembly's collapse against.
+- **NanoSpring** — approximate-assembly long-read sequence compression; field
+  context for the same lever (overlap index → align → consensus graph).
+
+As with everything else here, these are reimplemented from the published papers
+— no CoLoRd, minimap2, or miniasm source is vendored or translated.
+
 ## Licenses
 
 All of the above are permissive (BSD 3-Clause / MIT) or public domain and impose

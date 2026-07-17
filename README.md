@@ -74,9 +74,14 @@ fqxv decompress reads.fqxv -o reads.fastq
 
 Paired-end and single-cell inputs interleave into one archive
 (`fqxv compress R1.fq.gz R2.fq.gz -o sample.fqxv`). Lossless by default;
-`--quality-bin {bin8,bin4,bin2}` opts into lossy quality and `--max` chases the
-best ratio. Add `--verify` to re-decode the new archive and confirm it round-trips
-before you trust (or delete) the source. Run `fqxv --help` for the full option set.
+`--quality-bin {bin8,bin4,bin2,ont,hifi}` opts into lossy quality (`ont`/`hifi`
+are the long-read tables) and `--max` chases the best ratio. Add `--verify` to
+re-decode the new archive and confirm it round-trips before you trust (or delete)
+the source. Run `fqxv --help` for the full option set.
+
+Long reads (ONT/PacBio) compress correctly today, and the quality stream is
+already at parity with CoLoRd; the sequence stream is not yet competitive at high
+coverage. See [long-read support](docs/design/longread.md) for the measurements.
 
 ## Acknowledgments
 
@@ -100,6 +105,9 @@ cross-checked against several of them for correctness:
 - **SPRING** (Chandak et al., *Bioinformatics* 2019) and **PgRC2** (Kowalski &
   Grabowski, *Bioinformatics* 2025) — the algorithmic references for the
   read-reordering engine.
+- **CoLoRd** (Kokot et al., *Nature Methods* 2022) and **minimap2** / **miniasm**
+  (Heng Li, *Bioinformatics* 2018 / 2016) — the references for the long-read
+  quality-binning tables and the long-read overlap work.
 
 See [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) for licenses and full
 attribution.

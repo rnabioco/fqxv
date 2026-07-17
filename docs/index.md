@@ -74,5 +74,7 @@ crates.
 - [Quick Start](getting-started/quickstart.md) — compress, inspect, decompress
 - [CLI Reference](cli/index.md) — every command and flag
 - [Design](design/index.md) — codecs, container format, and reordering
+- [Long-read support](design/longread.md) — ONT/PacBio: what works today, and the
+  measured gap to CoLoRd
 - [Benchmarks](benchmarks.md) — how fqxv stacks up against gzip, fqz_comp, SPRING
 - [Acknowledgments](acknowledgments.md) — the prior work fqxv builds on

@@ -200,5 +200,5 @@ sink instead.
 Read name + description, sequence, and quality bytes are preserved exactly. The
 `+` separator line is normalized to a bare `+` (its optional repeated header is
 not retained), matching SPRING and fqz_comp. With `--quality-bin`, quality is
-mapped through the chosen Illumina binning table before coding — an explicit,
-opt-in lossy transform.
+mapped through the chosen binning table (Illumina, ONT, or PacBio HiFi) before
+coding — an explicit, opt-in lossy transform.

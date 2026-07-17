@@ -26,5 +26,18 @@ reference implementations we cross-checked against for correctness.
   (Chandak et al., *Bioinformatics* 2019) — algorithmic references for the
   pseudogenome / read-reordering engine. Reimplemented from the papers.
 
+## Long reads (quality binning, overlap codec)
+
+- CoLoRd (Kokot, Gudyś, Li & Deorowicz, *Nature Methods* 2022, MIT) —
+  algorithmic reference for long-read compression. The `--quality-bin ont` and
+  `--quality-bin hifi` cutpoints follow its platform-specific quality tables,
+  and its edit-script sequence model is the reference for the `fqxv-lroverlap`
+  overlap work. Reimplemented from the paper.
+- minimap2 (Heng Li, *Bioinformatics* 2018, MIT) — the minimizer-index and
+  colinear-chaining design that `fqxv-lroverlap`'s overlap detection follows.
+  Reimplemented from the paper; no source translated.
+- miniasm (Heng Li, *Bioinformatics* 2016, MIT) — overlap–layout–consensus
+  reference used to check the long-read assembly's collapse.
+
 None of the above impose obligations beyond attribution; all are permissive
 (BSD 3-Clause / MIT) or public domain. This project is licensed MIT OR Apache-2.0.
