@@ -5,7 +5,7 @@ directly from Python — no subprocess, no intermediate FASTQ file. Compression
 stays in the [CLI](../cli/index.md); the Python side reads.
 
 ```bash
-pip install fqxv
+uv pip install fqxv
 ```
 
 The wheels are `abi3` (one per platform, CPython ≥ 3.9) and carry the native
@@ -13,7 +13,7 @@ codecs, so there is no separate Rust toolchain to install. To build from a
 checkout instead:
 
 ```bash
-pip install maturin
+uv pip install maturin
 maturin develop            # from crates/fqxv-python/
 ```
 

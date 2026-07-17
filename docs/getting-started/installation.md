@@ -57,7 +57,7 @@ A read-only Python package reads `.fqxv` archives directly — see the
 [Python API](../python/index.md):
 
 ```bash
-pip install fqxv
+uv pip install fqxv
 ```
 
 ## Development
