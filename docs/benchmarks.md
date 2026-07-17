@@ -79,21 +79,29 @@ regardless of thread count):
 Long-read FASTQ compresses correctly today — read lengths are `u32` end to end,
 blocks are cut by a raw-byte budget so ragged reads still parallelize, and the
 short-read reorder codec auto-disables. The open question is **ratio**, measured
-per-stream against CoLoRd `-q org` (its lossless quality mode):
+per-stream against CoLoRd `-q org` (its lossless quality mode).
+
+fqxv's columns come from `fqxv info`, which reports its real streams. CoLoRd has
+no such split, so its columns are taken by difference — `-q none` discards
+quality, and quality is `org - none` — which makes the rows additive by
+construction. `-q none` still carries names and container overhead, so CoLoRd's
+non-quality column is an upper bound on its sequence stream. See
+[Long-read support](design/longread.md) for the method and `bench/colord_split.sh`
+to re-run it.
 
 **`ecoli_ont`** (DRR205413, 287M bases, mean Q≈11.5 — noisy older basecaller):
 
-| Tool | Total | Sequence | Quality | Sequence bits/base |
+| Tool | Total | Non-quality | Quality | Non-quality bits/base |
 | --- | ---: | ---: | ---: | ---: |
-| CoLoRd `-q org` | 188.7M | **31.4M** | 166.5M | 0.87 |
-| `fqxv -l9` | 224.4M | 58.8M | **165.5M** | 1.64 |
+| CoLoRd `-q org` | 197.9M | **31.4M** | 166.5M | 0.88 |
+| `fqxv -l9` | 224.4M | 58.8M (seq only) | **165.5M** | 1.64 |
 
 **`ecoli_hifi`** (SRR11434954 subset, 1.55G bases, mean Q≈27, ~300×):
 
-| Tool | Total | Sequence | Quality | Sequence bits/base |
+| Tool | Total | Non-quality | Quality | Non-quality bits/base |
 | --- | ---: | ---: | ---: | ---: |
-| CoLoRd `-q org` | 665.4M | **13.1M** | 684.3M | 0.068 |
-| `fqxv -l9` | 837.7M | 126.3M | 711.2M | 0.653 |
+| CoLoRd `-q org` | 697.7M | **13.4M** | 684.3M | 0.069 |
+| `fqxv -l9` | 837.7M | 126.3M (seq only) | 711.2M | 0.653 |
 
 Two facts hold on both platforms:
 
@@ -102,7 +110,9 @@ Two facts hold on both platforms:
   166.5M), CoLoRd is ~4% smaller on HiFi (684.3M vs 711.2M). There is no
   meaningful headroom on this stream.
 - **The entire lossless gap is the sequence stream**, and it widens with
-  coverage: 1.87× on ONT, 9.7× on HiFi. At ~300× the same locus is read hundreds
+  coverage: 1.87× on ONT, 9.7× on HiFi (against CoLoRd's directly-measured
+  sequence stream, 0.0676 bits/base; the table's 0.069 is the names-inclusive
+  upper bound). At ~300× the same locus is read hundreds
   of times; CoLoRd codes each read against a similar earlier read, while fqxv's
   within-read order-k model re-encodes every copy.
 
