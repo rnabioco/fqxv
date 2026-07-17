@@ -45,6 +45,21 @@ pub struct Anchored {
     pub flip: bool,
     /// Chain score — how much to trust this placement.
     pub score: i32,
+    /// How far the chain's diagonal moved between its first and last anchor, in
+    /// bases: the net indel between read and reference across the chained span.
+    ///
+    /// [`offset`](Self::offset) anchors the read on the chain's FIRST diagonal,
+    /// so an aligner working from it must be allowed to travel this far
+    /// off-diagonal or it cannot reach the alignment that exists. That is a
+    /// per-read number and it varies by orders of magnitude — most reads drift a
+    /// handful of bases, a few drift hundreds — so a caller without it has to
+    /// pick one band for every read and pay the worst case on all of them.
+    /// Measured: a global band of 384 costs 4x the DP work of 96 to buy 16% of
+    /// ratio, because 96 could not reach the tail of this distribution.
+    ///
+    /// It is a floor, not a bound: it measures drift only across the chained
+    /// span, and says nothing about the read's unanchored ends. Add a margin.
+    pub drift: u32,
 }
 
 /// Re-place `reads` against `refseq`, one hop each.
@@ -100,11 +115,19 @@ pub fn place_against(
             } else {
                 off.max(0) as u32
             };
+            // The chain's diagonal at its last anchor against its diagonal at
+            // the first: the net indel across the chained span. Taken in the
+            // query's frame, where both coordinates already live, and only its
+            // magnitude is used — reflecting into the reference's frame for an
+            // RC hit negates the shift but cannot change how far it is.
+            let d_end = i64::from(best.t_end) - i64::from(best.q_end);
+            let drift = (d_end - off).unsigned_abs() as u32;
             Some(Anchored {
                 read: i as u32,
                 offset,
                 flip: best.strand,
                 score: best.score,
+                drift,
             })
         })
         .collect()

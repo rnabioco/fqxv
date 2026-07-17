@@ -397,10 +397,20 @@ fn main() {
     // drift the chain saw. Widening it globally pays that drift's WORST case on
     // every read. Threading the per-read drift out of `place_against` should get
     // 0.0699 nearer to band-96 cost.
-    let band: usize = env::var("FQXV_BAND")
+    // Per-read: the chain's own drift plus a margin for the unanchored ends,
+    // capped so one pathological chain cannot allocate a quadratic table. A
+    // fixed band charges every read the tail's worst case; this charges each
+    // read what its own chain says it needs. FQXV_BAND overrides with a constant
+    // for A/B.
+    let band_margin: usize = env::var("FQXV_BAND_MARGIN")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(384);
+        .unwrap_or(96);
+    let band_fixed: Option<usize> = env::var("FQXV_BAND").ok().and_then(|v| v.parse().ok());
+    let band_cap: usize = env::var("FQXV_BAND_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048);
     let mut per_contig: Vec<Streams> = consensi
         .par_iter()
         .enumerate()
@@ -424,6 +434,9 @@ fn main() {
                     if start >= end {
                         return None;
                     }
+                    let band = band_fixed
+                        .unwrap_or_else(|| a.drift as usize + band_margin)
+                        .min(band_cap);
                     Some((start, align_banded(&cs[start..end], &read, band).ops))
                 })
                 .collect();
