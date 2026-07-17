@@ -99,28 +99,67 @@ pub struct Stats {
 
 /// Compress single-end FASTQ from `reader` into a `.fqxv` stream.
 ///
-/// The whole input is read into memory and parsed in parallel (see
-/// [`parse_chunks`]) before the blocks are compressed — the serial FASTQ parse
-/// was otherwise the dominant single-threaded cost and left most cores idle.
-/// Output is byte-identical regardless of thread count.
+/// Streams the input through the block pipeline rather than buffering it whole
+/// (a single-member [`compress_multi`]): the reader parses blocks one at a time
+/// and hands them to a pool of compressors, so peak memory is bounded by the
+/// blocks in flight, not the file size (#112). Output is byte-identical
+/// regardless of thread count.
 #[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, reorder = params.reorder, threads = params.threads))]
-pub fn compress<R: Read + Send, W: Write>(
-    mut reader: R,
+pub fn compress<'a, R: Read + Send + 'a, W: Write>(
+    reader: R,
     writer: W,
     params: Params,
 ) -> Result<Stats> {
     if params.reorder {
         return compress_reordered_whole(reader, writer, params, 1);
     }
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf)?;
-    compress_buffered(&buf, writer, params, 1)
+    compress_multi(
+        vec![Box::new(reader) as Box<dyn Read + Send + 'a>],
+        writer,
+        params,
+    )
 }
 
 /// How many leading records [`compress_auto`] reads to decide whether a single
 /// stream is interleaved paired data. Four spots' worth is plenty to be
 /// confident while staying cheap for the common single-end case.
 pub(crate) const AUTODETECT_PEEK: usize = 8;
+
+/// Read from `r` into `buf` until it holds `need` complete FASTQ records or the
+/// reader is exhausted; returns `true` at EOF. A record is four newline-terminated
+/// lines, so this counts to `4 * need` line terminators — unambiguous, unlike the
+/// `@`-heuristic boundary finders, which matters because the count routes paired
+/// vs single-end detection.
+fn read_leading_records<R: Read>(r: &mut R, buf: &mut Vec<u8>, need: usize) -> Result<bool> {
+    const STEP: usize = 64 << 10;
+    let (mut lines, mut scan) = (0usize, 0usize);
+    loop {
+        while lines < need * 4 {
+            match memchr::memchr(b'\n', &buf[scan..]) {
+                Some(k) => {
+                    scan += k + 1;
+                    lines += 1;
+                }
+                None => break,
+            }
+        }
+        if lines >= need * 4 {
+            return Ok(false);
+        }
+        let before = buf.len();
+        buf.resize(before + STEP, 0);
+        let mut got = 0;
+        while got < STEP {
+            match r.read(&mut buf[before + got..])? {
+                0 => {
+                    buf.truncate(before + got);
+                    return Ok(true);
+                }
+                k => got += k,
+            }
+        }
+    }
+}
 
 /// Split a read name into its mate-independent base and an optional mate marker.
 /// Handles the two common conventions: a `/1`|`/2` name suffix, and a mate digit
@@ -175,17 +214,18 @@ pub(crate) fn detect_group_size(peeked: &[noodles_fastq::Record]) -> u8 {
 /// detected grouping too: paired input is globally clustered and a permutation
 /// restores the mate interleaving (see [`encode_reordered`]).
 #[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, reorder = params.reorder, threads = params.threads))]
-pub fn compress_auto<R: Read + Send, W: Write>(
+pub fn compress_auto<'a, R: Read + Send + 'a, W: Write>(
     mut reader: R,
     writer: W,
     params: Params,
 ) -> Result<Stats> {
-    let mut buf = Vec::new();
-    reader.read_to_end(&mut buf)?;
+    // Read only enough to peek the leading records for layout detection. FASTQ is
+    // strictly four lines per record, so `AUTODETECT_PEEK` records is exactly
+    // `4 * AUTODETECT_PEEK` complete lines — no whole-file buffer just to decide.
+    let mut prefix = Vec::new();
+    let eof = read_leading_records(&mut reader, &mut prefix, AUTODETECT_PEEK)?;
 
-    // Peek the leading records to decide the layout. `&[u8]` is `BufRead`, so the
-    // noodles reader parses straight out of the buffer with no extra copy.
-    let mut fq = noodles_fastq::io::Reader::new(&buf[..]);
+    let mut fq = noodles_fastq::io::Reader::new(&prefix[..]);
     let mut peeked: Vec<noodles_fastq::Record> = Vec::with_capacity(AUTODETECT_PEEK);
     for _ in 0..AUTODETECT_PEEK {
         let mut rec = noodles_fastq::Record::default();
@@ -196,10 +236,20 @@ pub fn compress_auto<R: Read + Send, W: Write>(
     }
     let g = detect_group_size(&peeked);
     info!(group_size = g, reorder = params.reorder, "detected layout");
-    if params.reorder {
-        return encode_reordered(buffer_records(&buf)?, writer, params, g);
+
+    // Single-end, non-reorder: stream the peeked prefix then the rest through the
+    // drive path (#112). The other layouts need the whole input — reorder for its
+    // global clustering, interleaved for spot regrouping — so complete the buffer.
+    if g == 1 && !params.reorder {
+        return compress(prefix.as_slice().chain(reader), writer, params);
     }
-    compress_buffered(&buf, writer, params, g)
+    if !eof {
+        reader.read_to_end(&mut prefix)?;
+    }
+    if params.reorder {
+        return encode_reordered(buffer_records(&prefix)?, writer, params, g);
+    }
+    compress_buffered(&prefix, writer, params, g)
 }
 
 /// Compress a single FASTQ stream whose records are *already* interleaved per
@@ -411,13 +461,11 @@ where
     W: Write,
     F: FnMut(&mut RawBlock) -> Result<usize> + Send,
 {
-    let pool = build_pool(params.threads)?;
-    let batch = pool.current_num_threads().max(1);
+    let nworkers = resolve_threads(params.threads);
     debug!(
-        threads = pool.current_num_threads(),
-        batch,
+        threads = nworkers,
         backend = ?fqxv_rans::Backend::detect(),
-        "compress pool ready"
+        "compress pipeline ready"
     );
     let mut w = CrcWriter::new(BufWriter::new(writer));
     write_header(&mut w, &params, group_size, platform)?;
@@ -426,66 +474,96 @@ where
         group_size,
         ..Stats::default()
     };
-    // One batch of buffering: the reader parses the next batch while this thread
-    // compresses and writes the current one.
     let mut index = FooterIndex::new();
-    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<RawBlock>>>(1);
+
+    // A true block-level pipeline, not a batch barrier. The reader parses blocks
+    // one at a time (the FASTQ stream is sequential) and streams them to a pool of
+    // `nworkers` compressors; a writer drains completed blocks in index order. So
+    // the reader parses block N+k while the workers compress N..N+k-1 and the
+    // writer emits everything before N — the serial parse overlaps the parallel
+    // compression instead of preceding it. The old code accumulated a whole batch
+    // before compressing any of it, which on a file of only a few blocks meant a
+    // serial parse phase with every core idle, then a compress phase.
+    //
+    // Determinism is unaffected: blocks are compressed independently and the
+    // writer reorders by index, so the output is byte-identical regardless of how
+    // the workers interleave. Bound the channels by `nworkers` so at most ~2x that
+    // many blocks are ever resident.
+    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<(usize, RawBlock)>(nworkers);
+    let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
+    #[allow(clippy::type_complexity)]
+    let (done_tx, done_rx) =
+        std::sync::mpsc::sync_channel::<(usize, RawBlock, Result<Vec<u8>>)>(nworkers);
+
     std::thread::scope(|scope| -> Result<()> {
-        let reader = scope.spawn(move || {
+        // Reader: serial parse, streaming each block as it is built.
+        let reader = scope.spawn(move || -> Result<()> {
+            let mut idx = 0usize;
             loop {
-                let mut blocks: Vec<RawBlock> = Vec::with_capacity(batch);
-                let mut eof = false;
-                for _ in 0..batch {
-                    let mut b = RawBlock::default();
-                    match fill(&mut b) {
-                        Ok(0) => {
-                            eof = true;
-                            break;
+                let mut b = RawBlock::default();
+                match fill(&mut b)? {
+                    0 => break,
+                    _ => {
+                        if work_tx.send((idx, b)).is_err() {
+                            break; // workers gone (downstream error)
                         }
-                        Ok(_) => blocks.push(b),
-                        // Surface the parse error to the consumer, then stop.
-                        Err(e) => {
-                            let _ = tx.send(Err(e));
-                            return;
-                        }
+                        idx += 1;
                     }
                 }
-                if !blocks.is_empty() && tx.send(Ok(blocks)).is_err() {
-                    return; // consumer went away (write/compress error)
-                }
-                if eof {
-                    return;
-                }
             }
+            Ok(()) // dropping work_tx signals EOF to the workers
         });
 
-        // Consume batches; funnel every error through `result` so the receiver
-        // is always dropped before the scope joins the reader (a reader blocked
-        // on `send` would otherwise deadlock the join).
+        // Workers: pull the next block under a short lock, compress, hand on.
+        let params_ref = &params;
+        for _ in 0..nworkers {
+            let work_rx = std::sync::Arc::clone(&work_rx);
+            let done_tx = done_tx.clone();
+            scope.spawn(move || {
+                loop {
+                    let item = work_rx.lock().expect("work lock").recv();
+                    match item {
+                        Ok((idx, blk)) => {
+                            let payload = compress_block(&blk, params_ref);
+                            if done_tx.send((idx, blk, payload)).is_err() {
+                                break; // writer gone
+                            }
+                        }
+                        Err(_) => break, // reader done and channel drained
+                    }
+                }
+            });
+        }
+        drop(done_tx); // so `done_rx` ends once every worker has finished
+
+        // Writer: reorder completed blocks by index and emit contiguously.
         let mut result = Ok(());
-        for msg in &rx {
-            let blocks = match msg {
-                Ok(blocks) => blocks,
-                Err(e) => {
+        let mut pending: std::collections::HashMap<usize, (RawBlock, Result<Vec<u8>>)> =
+            std::collections::HashMap::new();
+        let mut next = 0usize;
+        for (idx, blk, payload) in &done_rx {
+            pending.insert(idx, (blk, payload));
+            while let Some((blk, payload)) = pending.remove(&next) {
+                if let Err(e) = write_blocks(&mut w, &[blk], vec![payload], &mut stats, &mut index)
+                {
                     result = Err(e);
                     break;
                 }
-            };
-            debug!(blocks = blocks.len(), "compressing batch");
-            let compressed: Vec<Result<Vec<u8>>> = pool.install(|| {
-                blocks
-                    .par_iter()
-                    .map(|b| compress_block(b, &params))
-                    .collect()
-            });
-            if let Err(e) = write_blocks(&mut w, &blocks, compressed, &mut stats, &mut index) {
-                result = Err(e);
+                next += 1;
+            }
+            if result.is_err() {
                 break;
             }
         }
-        drop(rx);
-        reader.join().expect("reader thread panicked");
-        result
+        // Drain any remaining messages so a worker blocked on `send` cannot
+        // deadlock the scope join after a write error.
+        drop(done_rx);
+        // Reader errors (parse failures) take priority over a downstream error,
+        // matching the buffered path, which sees the parse error first.
+        match reader.join().expect("reader thread panicked") {
+            Err(e) => Err(e),
+            Ok(()) => result,
+        }
     })?;
 
     let footer_bytes = write_footer(&mut w, &index, stats.reads)?;

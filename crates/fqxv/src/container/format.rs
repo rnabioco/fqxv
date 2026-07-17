@@ -433,20 +433,24 @@ pub(crate) fn read_u32<R: Read>(r: &mut R) -> Result<u32> {
     Ok(u32::from_le_bytes(b))
 }
 
-pub(crate) fn build_pool(threads: usize) -> Result<rayon::ThreadPool> {
-    // Resolve the effective worker count: 0 means "all available cores", and any
-    // explicit request is clamped to what physically exists so we never
-    // over-subscribe the pool.
+/// Resolve the effective worker count: 0 means "all available cores", and any
+/// explicit request is clamped to what physically exists so we never
+/// over-subscribe.
+pub(crate) fn resolve_threads(threads: usize) -> usize {
     let available = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    let n = if threads == 0 {
+    if threads == 0 {
         available
     } else {
         threads.min(available)
-    };
+    }
+    .max(1)
+}
+
+pub(crate) fn build_pool(threads: usize) -> Result<rayon::ThreadPool> {
     rayon::ThreadPoolBuilder::new()
-        .num_threads(n)
+        .num_threads(resolve_threads(threads))
         .build()
         .map_err(|e| Error::Io(io::Error::other(e.to_string())))
 }
