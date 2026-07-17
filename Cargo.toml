@@ -24,6 +24,7 @@ fqxv-fqzcomp = { path = "crates/fqxv-fqzcomp", version = "0.2.0" }
 fqxv-tokenizer = { path = "crates/fqxv-tokenizer", version = "0.2.0" }
 fqxv-seq = { path = "crates/fqxv-seq", version = "0.2.0" }
 fqxv-reorder = { path = "crates/fqxv-reorder", version = "0.2.0" }
+fqxv-lroverlap = { path = "crates/fqxv-lroverlap", version = "0.2.0" }
 fqxv = { path = "crates/fqxv", version = "0.2.0" }
 
 # Shared third-party deps, versions pinned once here.

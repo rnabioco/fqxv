@@ -58,6 +58,7 @@
 
 mod align;
 mod chain;
+mod codec;
 mod consensus;
 mod index;
 mod layout;
@@ -68,6 +69,7 @@ mod script;
 
 pub use align::{align_banded, apply, Alignment, Op};
 pub use chain::{Anchor, Chain, ChainOpts, Chainer};
+pub use codec::{decode, encode, EncodeOpts};
 pub use consensus::{consensus, Consensus, ConsensusOpts};
 pub use index::{Index, Occ, Repeat};
 pub use layout::{layout, Contig, LayoutOpts, Placement};
@@ -88,6 +90,9 @@ pub enum Error {
         /// Number of sequence bytes provided.
         seq: usize,
     },
+    /// A compressed block is malformed, truncated, or from an unknown version.
+    #[error("malformed lroverlap block")]
+    Corrupt,
 }
 
 /// The result type for this crate.

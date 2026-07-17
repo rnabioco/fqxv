@@ -229,9 +229,10 @@ pub fn decode_names(coded: &[u8]) -> Result<Vec<Vec<u8>>> {
 }
 
 /// Decode a projected **sequence** stream into `(per-read lengths, concatenated
-/// bases)`. Slice read `i` out with the lengths' running sum.
+/// bases)`. Slice read `i` out with the lengths' running sum. The stream carries
+/// a leading codec-method byte (order-k or long-read overlap).
 pub fn decode_sequence(coded: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
-    Ok(fqxv_seq::decode(coded)?)
+    super::block::decode_sequence_stream(coded)
 }
 
 /// Decode a projected **quality** stream into `(per-read lengths, concatenated

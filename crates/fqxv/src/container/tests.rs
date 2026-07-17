@@ -639,6 +639,49 @@ fn long_reads_skip_reorder() {
 }
 
 #[test]
+fn long_reads_use_overlap_codec_roundtrip_and_determinism() {
+    // Long reads tiling a small genome engage the overlap sequence codec
+    // (`fqxv-lroverlap`) through the real container. Assert the two invariants
+    // that matter: the archive round-trips byte-exact, and it is byte-identical
+    // regardless of thread count.
+    let genome: Vec<u8> = (0..3000u32)
+        .map(|i| b"ACGT"[((i.wrapping_mul(2_654_435_761) >> 13) & 3) as usize])
+        .collect();
+    let mut input = Vec::new();
+    for i in 0..60u32 {
+        let start = (i as usize * 41) % (genome.len() - 800);
+        let mut s = genome[start..start + 800].to_vec();
+        // A couple of substitutions the aligner must code (and an N, so the
+        // exception path is exercised end to end through the container).
+        s[100] = b"ACGT"[((i as usize) + 1) & 3];
+        s[400] = b'N';
+        let qual = vec![b'I'; s.len()];
+        write_record(&mut input, format!("read.{i}").as_bytes(), &s, &qual);
+    }
+
+    let mut archives = Vec::new();
+    for threads in [1usize, 4] {
+        let params = Params {
+            threads,
+            ..Params::default()
+        };
+        let mut archive = Vec::new();
+        compress(&input[..], &mut archive, params).unwrap();
+        archives.push(archive);
+    }
+    assert_eq!(
+        archives[0], archives[1],
+        "long-read (overlap codec) output must not vary by thread count"
+    );
+    let mut out = Vec::new();
+    decompress(&archives[0][..], &mut out, 4).unwrap();
+    assert_eq!(
+        out, input,
+        "long-read overlap archive must round-trip byte-exact"
+    );
+}
+
+#[test]
 fn reorder_free_preserves_records_as_a_set() {
     let input = dup_rich_input('e');
     let params = Params {
