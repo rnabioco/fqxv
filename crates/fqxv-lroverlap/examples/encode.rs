@@ -402,10 +402,22 @@ fn main() {
     // fixed band charges every read the tail's worst case; this charges each
     // read what its own chain says it needs. FQXV_BAND overrides with a constant
     // for A/B.
+    // 96 was a guess; 32 is measured. The margin covers a read's unanchored ends,
+    // which the chain's drift cannot see, and it turns out to be nearly free of
+    // ratio once it is non-zero — the per-read drift term is doing all the work.
+    // Measured, ecoli_hifi 300x stride 12, on an idle exclusive node:
+    //
+    //     margin      0      8     32     96    256
+    //     b/base 0.0680 0.0672 0.0672 0.0672 0.0671
+    //     wall     58.2s  58.8s  59.7s  91.3s 191.4s
+    //
+    // Zero is measurably worse (1.2%), so the ends do need slack; past ~8 the
+    // ratio is flat and only the DP bill grows. 32 keeps headroom over the knee
+    // for datasets whose ends drift more, at the same cost as 8.
     let band_margin: usize = env::var("FQXV_BAND_MARGIN")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(96);
+        .unwrap_or(32);
     let band_fixed: Option<usize> = env::var("FQXV_BAND").ok().and_then(|v| v.parse().ok());
     let band_cap: usize = env::var("FQXV_BAND_CAP")
         .ok()
