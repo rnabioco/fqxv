@@ -9,7 +9,7 @@ seek to any of them without scanning the file.
 
 ```text
 [4]  magic "FQXV"
-[2]  format version (LE)        (currently v1)
+[2]  format version (LE)        (currently v3)
 [1]  sequence context order (k)
 [1]  quality binning tag        (0 lossless, 1 bin8, 2 bin4, 3 bin2,
                                  4 ont, 5 hifi)
@@ -31,6 +31,10 @@ footer:
   [4]  n_row_groups (LE)
   per row group: [8] byte_offset (LE)   (points at the group's frame marker)
                  [4] read_count  (LE)
+                 per stream (names, sequence, quality, in that order):
+                   [8] stream_offset (LE)   (absolute offset of the coded bytes)
+                   [4] stream_len    (LE)   (coded length)
+                   [4] stream_crc32c (LE)   (over exactly those coded bytes)
   [8]  total_reads (LE)
   [4]  whole_file_crc (LE)              (CRC-32C of byte 0 .. total_reads)
   [4]  footer_crc (LE)                  (CRC-32C of the footer body above)
@@ -42,11 +46,21 @@ trailer (at EOF):
 Each block payload:
 
 ```text
+[8]  content_digest (LE)               (xxh3-64 of the block's decoded content)
 [4]  n_reads (LE)
 [4]  names_len (LE)  [ ] names   (fqxv-tokenizer)
 [4]  seq_len   (LE)  [ ] seq     (fqxv-seq)
 [4]  qual_len  (LE)  [ ] qual    (fqxv-fqzcomp)
 ```
+
+The three streams are contiguous within the payload, so each one's absolute
+`(offset, len, crc32c)` is recorded in the footer index (above). That is what
+lets a reader fetch a single **column** — just the names, or just the
+sequence — without reading the whole block; see
+[Column projection](#footer-index-info-and-random-access). The `content_digest`
+is an end-to-end round-trip check over the block's *decoded* content (names,
+sequence, post-binning quality), verified after decode — see
+[Integrity](#integrity).
 
 ## Streaming vs. seeking
 
@@ -61,20 +75,44 @@ seeking reader skips straight past it.
 
 ## Footer index, `info`, and random access
 
-The footer records, per row group, the byte offset of its length field and its
-read count (read-start is the running sum). It covers the plain layout; reordered
-archives use a distinct self-describing layout (below). This buys two things over
-the old scan-everything approach:
+The footer records, per row group, its frame-marker byte offset, its read count
+(read-start is the running sum), and — since v3 — an `(offset, len, crc32c)`
+triple for each of the three coded streams (names, sequence, quality). It covers
+the plain layout; reordered archives use a distinct self-describing layout
+(below). This buys three things over the old scan-everything approach:
 
-- **`info` is O(row groups), not O(bytes).** It reads the footer for the read
-  and block totals, then seeks to each row group and reads only its small block
-  header (the `n_reads` and three stream length prefixes), skipping every coded
-  payload.
+- **`info` is O(row groups), not O(bytes).** The per-stream sizes live in the
+  footer itself, so `info` reads the footer once and sums them — no per-block
+  seeks at all.
 - **Coarse random access.** The per-group `read_count` (read-start is the running
   sum) locates the row groups overlapping any read range, so a reader can seek to
   and decode just those. Granularity is the row group, not the read — every codec
   carries model state across the reads within a group, so a group is the smallest
   independently decodable unit.
+- **Column projection.** Because the footer pins each stream's absolute
+  `(offset, len)`, a reader can fetch a **single column** across some or all row
+  groups — just the read names, or just the sequence — with one range request per
+  group and never touch the others. Read names are typically <1% of the archive,
+  so a client that only wants IDs (counting reads, building an external index)
+  fetches ~100× less than the whole file; a sequence-only client (k-mer
+  screening, taxonomic classification, alignment-free QC) skips the quality
+  stream entirely. The per-stream `crc32c` makes the projection verifiable: the
+  block `content_digest` covers all three decoded streams jointly and so cannot
+  check one fetched column in isolation, so each stream carries its own CRC-32C.
+
+### Random-access API
+
+This is exposed IO-free so a caller can drive fetching however it likes (a local
+`File`, `object_store`, async HTTP over `Range` requests). The `fqxv` library
+provides an `Index` that parses from a seekable reader (`Index::read`) or from a
+fetched archive **tail** (`Index::from_suffix`, which reports the exact longer
+tail to refetch when the first suffix fell short of the footer). From it,
+`Index::byte_ranges(groups, stream)` yields the byte ranges to fetch,
+`Index::verify_stream` checks a fetched column against its CRC, and
+`decode_names` / `decode_sequence` / `decode_quality` (or `decode_block_contents`
+for a whole fetched block) turn the fetched bytes back into reads. The reordered
+layout has no footer index, so `Index::read` rejects it — its streams are
+mutually dependent and cannot be projected.
 
 ## Blocks and parallelism
 
@@ -174,13 +212,18 @@ the whole codec stack is pure-Rust clean-room):
 Every archive carries CRC-32C (Castagnoli) checksums — the same checksum family
 BGZF/BAM and CRAM use — layered so a single flipped bit is both *detected* and
 *localized* rather than silently decoded into wrong bases or quality scores.
-Three checksums sit at three levels of the layout above:
+Four checksums sit at four levels of the layout above:
 
 - **Per-block payload CRC.** Each block frame is `[8] length · [4] CRC-32C · [ ]
   payload`; the CRC is verified *before* the payload is handed to the codecs, so
   corruption is caught and confined to one row group. This is what makes
   [`decompress --recover`](../cli/decompress.md#recovering-a-corrupted-archive)
   possible — a bad block is identified and skipped, not decoded into garbage.
+- **Per-stream CRC.** The footer's per-group `(offset, len, crc32c)` triples carry
+  a CRC-32C over each coded stream's bytes, so a projected single-column fetch
+  ([Column projection](#footer-index-info-and-random-access)) stays verifiable —
+  the per-block payload CRC and the `content_digest` both cover all three streams
+  jointly and cannot check one fetched column in isolation.
 - **Footer CRC** (`footer_crc`) guards the row-group index. It covers the footer
   body and is checked before any byte offset in the index is trusted, so a
   damaged footer can't send a seeking reader to a bogus location.
@@ -188,12 +231,19 @@ Three checksums sit at three levels of the layout above:
   through the `total_reads` field — a single end-to-end digest of everything but
   the two footer CRCs and the trailer.
 
-[`fqxv verify`](../cli/verify.md) checks all three in one pass without running any
-codec: it re-hashes the archive prefix against `whole_file_crc`, validates
-`footer_crc`, and confirms every per-block CRC — far cheaper than a full
-`decompress`. The globally-clustered [reordered layout](#reordered-archives)
-carries no footer, so `verify` there drives every frame CRC by decoding into a
-sink instead.
+A fifth check is not a CRC: each block payload leads with an xxh3-64
+`content_digest` over its *decoded* content (names, sequence, post-binning
+quality), verified after decode. Where the CRCs catch corruption of the *stored*
+bytes, the digest catches a codec that turned CRC-valid bytes into
+wrong-but-in-bounds output.
+
+[`fqxv verify`](../cli/verify.md) checks the whole-file, footer, and per-block
+CRCs in one pass without running any codec: it re-hashes the archive prefix
+against `whole_file_crc`, validates `footer_crc`, and confirms every per-block
+CRC — far cheaper than a full `decompress`. (The per-stream CRCs are checked on
+demand by the projection path rather than by `verify`.) The globally-clustered
+[reordered layout](#reordered-archives) carries no footer, so `verify` there
+drives every frame CRC by decoding into a sink instead.
 
 ## Losslessness
 

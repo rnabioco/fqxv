@@ -141,6 +141,6 @@ fqxv info sample.fqxv --stats
 | `reordered` | Whether reads were clustered/reordered for a better ratio. |
 | `read order` | For reordered archives, whether the original order is restored. |
 | `plus line` | Whether the `+` line was normalized. |
-| `format` | On-disk container format version (currently 1). |
+| `format` | On-disk container format version (currently 3). |
 | `whole-file crc` | Stored whole-file CRC-32C (hex); the value `verify` recomputes. |
 | `names` / `sequence` / `quality` | Compressed bytes per stream, with share of the three-stream total. |
