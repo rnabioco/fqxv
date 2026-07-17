@@ -144,6 +144,32 @@ pub(crate) fn encode_reordered<W: Write>(
     }
     offs.push(acc);
 
+    // `offs` is derived from `lens` alone, and everything below indexes `seq` and
+    // `qual` with it — so if the lengths disagree with the buffers, every one of
+    // those slices is out of bounds and the process ABORTS (the release profile is
+    // `panic = "abort"`). A truncated FASTQ does exactly that: it is the most
+    // ordinary corruption there is, and `--order any` core-dumped on it while
+    // `--order preserve` rejected it cleanly, because preserve hands the whole
+    // buffer to a codec that checks. Check here, once, before the first slice.
+    //
+    // Raised as the codecs' own errors rather than a new one, so both `--order`
+    // modes fail with the identical message for the identical input — the two
+    // modes disagreeing about whether a file is valid is the actual bug.
+    if acc != all.seq.len() {
+        return Err(fqxv_seq::Error::LengthMismatch {
+            lens: acc,
+            seq: all.seq.len(),
+        }
+        .into());
+    }
+    if acc != all.qual.len() {
+        return Err(fqxv_fqzcomp::Error::LengthMismatch {
+            lens: acc,
+            quals: all.qual.len(),
+        }
+        .into());
+    }
+
     // 2. One global clustering pass over every read.
     let plan = pool.install(|| fqxv_reorder::plan(&all.lens, &all.seq, REORDER_K));
 
