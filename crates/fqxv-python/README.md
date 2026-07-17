@@ -34,6 +34,6 @@ iterate those. Everything here is read-only — compression stays in the CLI.
 ## Build from source
 
 ```bash
-pip install maturin
+uv pip install maturin
 maturin develop            # from crates/fqxv-python/
 ```

@@ -51,6 +51,15 @@ share; the codecs pull it in transitively, so you rarely depend on it directly.)
 
 Every crate is dual-licensed **MIT OR Apache-2.0**.
 
+## Python
+
+A read-only Python package reads `.fqxv` archives directly — see the
+[Python API](../python/index.md):
+
+```bash
+uv pip install fqxv
+```
+
 ## Development
 
 ```bash

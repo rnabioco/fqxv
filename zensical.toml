@@ -20,6 +20,7 @@ nav = [
     { "verify" = "cli/verify.md" },
     { "info" = "cli/info.md" },
   ] },
+  { "Python API" = "python/index.md" },
   { "Design" = [
     { "Overview" = "design/index.md" },
     { "Container Format" = "design/container.md" },
