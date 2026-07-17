@@ -127,9 +127,24 @@ fn code(b: u8) -> u8 {
 /// including `N`, are passed through), reversed.
 #[must_use]
 pub fn revcomp(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .rev()
-        .map(|&b| match b {
+    let mut out = vec![0u8; seq.len()];
+    revcomp_into(seq, &mut out);
+    out
+}
+
+/// Reverse-complement `seq` into `dst`, allocating nothing.
+///
+/// The same mapping as [`revcomp`] — which now delegates here, so the two cannot
+/// drift apart. For callers that already own the destination (a flat arena of
+/// clustered reads, say), this is the difference between one heap allocation per
+/// read and none.
+///
+/// # Panics
+/// If `dst.len() != seq.len()`.
+pub fn revcomp_into(seq: &[u8], dst: &mut [u8]) {
+    assert_eq!(dst.len(), seq.len(), "revcomp_into: length mismatch");
+    for (d, &b) in dst.iter_mut().zip(seq.iter().rev()) {
+        *d = match b {
             b'A' => b'T',
             b'C' => b'G',
             b'G' => b'C',
@@ -139,8 +154,8 @@ pub fn revcomp(seq: &[u8]) -> Vec<u8> {
             b'g' => b'c',
             b't' => b'a',
             other => other,
-        })
-        .collect()
+        };
+    }
 }
 
 /// Minimum canonical k-mer of `read` and whether that minimizer sits on the
@@ -757,6 +772,126 @@ fn try_place(contig: &[Column], cur: &[u8], off: usize) -> Option<(usize, Vec<us
     (mism.len() <= overlap / 4 && novel_n + mism.len() * 2 < cur.len()).then_some((overlap, mism))
 }
 
+/// Cheapest gapped answer to "would one small indel have saved this read?".
+///
+/// A banded Levenshtein between `cur` and the contig's consensus at `off`,
+/// returning `(edits, indels)` for the best alignment, or `None` if the band
+/// cannot reach the end. `band` is tiny (a few bases): the question is whether a
+/// *small* indel explains an ungapped rejection, not whether some arbitrary
+/// gapped alignment exists.
+///
+/// Deliberately its own routine rather than `fqxv-lroverlap`'s `align_banded`:
+/// that crate is a sibling in the DAG, and a diagnostic is not a reason to add an
+/// edge. If the answer here says indels are worth coding, the real fix should
+/// reuse that aligner properly — see issue #102.
+fn gapped_edits(contig: &[Column], cur: &[u8], off: usize, band: usize) -> Option<(usize, usize)> {
+    if off > contig.len() {
+        return None;
+    }
+    let refr: Vec<u8> = contig[off..(off + cur.len() + band).min(contig.len())]
+        .iter()
+        .map(|c| c.base)
+        .collect();
+    let (n, m) = (refr.len(), cur.len());
+    if n == 0 || m == 0 {
+        return None;
+    }
+    // (edits, indels) per cell, minimising edits then indels. Full table: reads
+    // are ~150 bp here, so this is a few thousand cells and clarity wins.
+    //
+    // The reference's 3' end is FREE: the read may stop anywhere in it, so the
+    // answer is the best "read fully consumed" cell across ALL rows, not the last
+    // one. A global alignment would force the read to consume the whole
+    // reference — `band` extra deletions it never made — which both inflates the
+    // edit count and makes `indels > 0` vacuously true, so every literal would
+    // look indel-rescuable. The read's 5' end stays anchored at `off`, with
+    // ordinary deletion cost for shifting, because that is what `try_place`
+    // itself assumes.
+    let inf = (usize::MAX / 4, usize::MAX / 4);
+    let mut prev: Vec<(usize, usize)> = (0..=m).map(|j| (j, j)).collect();
+    let mut cur_row = vec![inf; m + 1];
+    let mut best = prev[m];
+    for i in 1..=n {
+        cur_row[0] = (i, i);
+        for j in 1..=m {
+            let cost = usize::from(refr[i - 1] != cur[j - 1]);
+            let diag = (prev[j - 1].0 + cost, prev[j - 1].1);
+            let up = (prev[j].0 + 1, prev[j].1 + 1); // consume ref = deletion
+            let left = (cur_row[j - 1].0 + 1, cur_row[j - 1].1 + 1); // insertion
+            cur_row[j] = diag.min(up).min(left);
+        }
+        best = best.min(cur_row[m]);
+        std::mem::swap(&mut prev, &mut cur_row);
+        cur_row.fill(inf);
+    }
+    (best.0 < usize::MAX / 4).then_some(best)
+}
+
+/// Issue #102: does `fqxv-reorder` strand Illumina reads as literals *because it
+/// has no indel op*?
+///
+/// `try_place` is an ungapped compare, so one indel shifts every base after it
+/// and the read mismatches its way past the `overlap / 4` budget — stranding a
+/// read that is otherwise a perfect neighbour. This counts how often that
+/// actually happens, by re-testing every literal against the SAME candidates the
+/// assembler considered, with a small band.
+///
+/// A read is counted `indel_rescuable` only if a gapped compare lands inside the
+/// same budget the ungapped one blew, using at least one indel. That is the
+/// narrowest reading of the question: not "could some aligner place this" but
+/// "was the *lack of an indel op* the reason it was refused".
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IndelProbe {
+    /// Reads examined (excludes exact-duplicate MATCH reads).
+    pub reads: u64,
+    /// Reads the assembler stranded as literals.
+    pub literals: u64,
+    /// Literals a gapped compare would have placed within the same mismatch
+    /// budget, using at least one indel.
+    pub indel_rescuable: u64,
+    /// Literals that stay unplaceable even gapped — genuinely novel sequence.
+    pub truly_novel: u64,
+    /// Bases held in `indel_rescuable` literals: what an indel op could reclaim.
+    pub rescuable_bases: u64,
+    /// Total literal bases, for scale.
+    pub literal_bases: u64,
+}
+
+/// Run the [`IndelProbe`] over one block of clustered reads.
+#[must_use]
+pub fn indel_probe(reads: &[&[u8]], anchors: &[u32], band: usize) -> IndelProbe {
+    let mut st = IndelProbe::default();
+    let mut asm = Assembler::default();
+    for (i, &cur) in reads.iter().enumerate() {
+        if i > 0 && cur == reads[i - 1] {
+            continue; // MATCH: never reaches the placer
+        }
+        st.reads += 1;
+        match asm.place(cur, anchors[i]) {
+            Some(p) => asm.commit(p.ci, cur, p.off, p.overlap),
+            None => {
+                st.literals += 1;
+                st.literal_bases += cur.len() as u64;
+                // Re-test the assembler's own candidates, gapped.
+                let budget = cur.len() / 4;
+                let rescued = asm
+                    .candidates(cur, anchors[i])
+                    .into_iter()
+                    .filter_map(|(ci, off)| gapped_edits(&asm.contigs[ci], cur, off, band))
+                    .any(|(edits, indels)| edits <= budget && indels > 0);
+                if rescued {
+                    st.indel_rescuable += 1;
+                    st.rescuable_bases += cur.len() as u64;
+                } else {
+                    st.truly_novel += 1;
+                }
+                asm.seed(cur, anchors[i]);
+            }
+        }
+    }
+    st
+}
+
 impl Assembler {
     /// Index every k-mer starting in `[from, to)` of contig `ci`'s consensus.
     /// Only called on freshly-appended columns, so cost is linear in new bases;
@@ -799,11 +934,16 @@ impl Assembler {
     /// contig at the anchor-implied offset (the v2 fast path) plus every contig a
     /// sampled read k-mer points at. Deterministic: candidates are deduped and
     /// scored by (mismatches, recency, offset), independent of hash iteration.
-    fn place(&self, cur: &[u8], anchor: u32) -> Option<Placement> {
-        if cur.is_empty() || self.contigs.is_empty() {
-            return None;
-        }
+    /// The (contig, offset) pairs worth validating for `cur`, from its anchor
+    /// against the newest contig plus every k-mer index hit. Split out of
+    /// [`Assembler::place`] so a diagnostic can re-test the SAME candidates the
+    /// codec saw — a probe that generated its own candidates would be measuring
+    /// its own recall, not the codec's.
+    fn candidates(&self, cur: &[u8], anchor: u32) -> Vec<(usize, usize)> {
         let mut cands: Vec<(usize, usize)> = Vec::new();
+        if cur.is_empty() || self.contigs.is_empty() {
+            return cands;
+        }
         let last = self.contigs.len() - 1;
         let center = self.ref_anchors[last] as i64 - anchor as i64;
         if center >= 0 && center as usize <= self.contigs[last].len() {
@@ -825,10 +965,13 @@ impl Assembler {
         }
         cands.sort_unstable();
         cands.dedup();
+        cands
+    }
 
+    fn place(&self, cur: &[u8], anchor: u32) -> Option<Placement> {
         let mut best: Option<Placement> = None;
         let mut best_key = (usize::MAX, usize::MAX, usize::MAX);
-        for (ci, off) in cands {
+        for (ci, off) in self.candidates(cur, anchor) {
             if let Some((overlap, mism)) = try_place(&self.contigs[ci], cur, off) {
                 let key = (mism.len(), self.contigs.len() - 1 - ci, off);
                 if key < best_key {
