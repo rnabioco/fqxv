@@ -1,9 +1,21 @@
 # Long-read (ONT / PacBio) support
 
-Status: **design / scoping note.** fqxv is structurally ready for long reads
-(see "What already works" below); this note scopes the two remaining ratio
-levers — a cross-read **overlap sequence codec** and **long-read quality
-tuning** — against the field (CoLoRd, NanoSpring, ENANO/RENANO).
+Status: **design note + measured results.** fqxv is structurally ready for long
+reads (see "What already works" below); this note scopes the two ratio levers —
+a cross-read **overlap sequence codec** and **long-read quality tuning** —
+against the field (CoLoRd, NanoSpring, ENANO/RENANO).
+
+Where each lever stands:
+
+| Lever | Status |
+| --- | --- |
+| Quality binning (`--quality-bin ont` / `hifi`) | **shipped** — usable from the CLI |
+| Quality base-context | not started; measured headroom is ~nil (see Lever 1) |
+| Overlap sequence codec (`fqxv-lroverlap`) | **measured, not wired in** — reaches parity with CoLoRd in a harness, but no container integration, so users cannot reach it |
+
+The rest of this note is the analysis that set those priorities; it is written
+against the pre-`lroverlap` baseline, so "fqxv seq" rows below are the within-read
+order-k model that long-read archives still use today.
 
 ## Why long reads are different
 
@@ -138,13 +150,15 @@ outputs). Two variants, in increasing cost:
   must plumb the block's seq stream into the quality codec (both directions).
   A cross-cutting but well-bounded change.
 
-**Binning.** `QualityBinning::Bin4/Bin8/Bin2` are Illumina-calibrated (HiSeq /
-NovaSeq cutpoints, absolute Phred). On HiFi's narrow high-Q band they collapse
-almost everything into the top bin. CoLoRd ships platform-specific tables (ONT
-4-level, HiFi 5-level with Q93 kept separate). Add an **ONT** and a **HiFi**
-binning table with cutpoints matched to those distributions; there is published
-evidence that ONT Q-resolution can be reduced with little downstream effect
-(Bonito → 4 levels), so this is a safe, large lossy lever.
+**Binning — shipped.** `QualityBinning::Bin4/Bin8/Bin2` are Illumina-calibrated
+(HiSeq / NovaSeq cutpoints, absolute Phred). On HiFi's narrow high-Q band they
+collapse almost everything into the top bin. CoLoRd ships platform-specific
+tables (ONT 4-level, HiFi 5-level with Q93 kept separate). fqxv now ships the
+same two: `QualityBinning::BinOnt` and `BinHifi` (header tags 4 and 5), exposed
+as `--quality-bin ont` and `--quality-bin hifi`. There is published evidence that
+ONT Q-resolution can be reduced with little downstream effect (Bonito → 4
+levels), so this is a safe, large lossy lever — measured at 3.4× on the ONT
+quality stream above.
 
 Effort: **small** (both changes are local to `fqxv-fqzcomp` + a header bit).
 
@@ -204,6 +218,35 @@ memory and parallelism stay bounded and deterministic):
   today; the codec can never do *worse* than the order-k baseline by more than
   its small per-read header.
 
+### Result (measured)
+
+The design above is implemented in the **`fqxv-lroverlap`** crate: minimizers →
+chain → overlaps → layout → consensus → `place_against` → edit scripts → rANS.
+Measured on `ecoli_hifi` (120k reads, 1547 Mbase, ~300×, 5.16 Mb genome) by its
+own harness, `crates/fqxv-lroverlap/examples/encode.rs`:
+
+| path | seq bits/base |
+| --- | --- |
+| fqxv within-read order-k (today's long-read archives) | 0.653 |
+| **`fqxv-lroverlap`** | **0.067** |
+| CoLoRd | 0.068 |
+| oracle (true reference, known placement) | 0.040 |
+
+This is **parity with CoLoRd, not a win.** Across minimizer strides 4–14 the
+result spans 0.067–0.072 bits/base, and that ~6% spread is sample noise — any
+claim finer than "parity" is unsupported by this data. The oracle bound at 0.040
+says roughly a further 40% is theoretically on the table; per the crate's own
+analysis, that margin is the difference between coding against another erroneous
+read (~0.005 edits/base — *both* reads' errors) and coding against a voted
+consensus (0.0025).
+
+!!! warning "Not wired into the container"
+    Nothing imports `fqxv-lroverlap` — it is absent from every other crate's
+    `Cargo.toml`, so it is inert: no container sequence-method tag, no CLI flag,
+    no effect on any `.fqxv` archive. The numbers above are harness measurements
+    proving the lever is real, not a shipped feature. Container integration
+    (step 4 of the design above) is the remaining work.
+
 ### Cost / benefit
 
 The benchmark settles the priority: the **entire** measured lossless gap to
@@ -217,11 +260,14 @@ the field reaches 0.35 bits/base and fqxv's within-read model cannot.
 
 ### Suggested sequencing
 
-1. **ONT/HiFi lossy binning tables** (from Lever 1) — smallest change, and the
-   biggest *absolute* archive shrink since quality is 72–74% of the file; needs
-   a downstream-fidelity check (`concordance.sh`) to set cutpoints honestly.
-2. **Overlap sequence codec** (Lever 2) — the real work, and the only way to
-   beat CoLoRd on the lossless DNA stream.
+1. ~~**ONT/HiFi lossy binning tables**~~ (from Lever 1) — **done.** Smallest
+   change, and the biggest *absolute* archive shrink since quality is 72–74% of
+   the file. Still needs a downstream-fidelity check (`concordance.sh`) to set
+   cutpoints honestly; the current cutpoints are CoLoRd's, not ones fqxv
+   validated.
+2. **Overlap sequence codec** (Lever 2) — the algorithm is built and measured at
+   parity (`fqxv-lroverlap`); **wiring it into the container is the open work**
+   — a sequence-method tag, `is_long_read` gating, and the decode path.
 3. Quality base-context (rest of Lever 1) — lowest priority; measured headroom
    vs CoLoRd is ~nil on this data, revisit only if HiFi shows otherwise.
 
@@ -230,6 +276,14 @@ the field reaches 0.35 bits/base and fqxv's within-read model cannot.
 `bench/longread.sbatch` builds the worktree fqxv and runs the harness on the
 `ecoli_ont` dataset (DRR205413: 21,140 reads, mean 14.2 kb, max 91.7 kb, mean
 Q≈11.5 — ragged, noisy older-basecaller ONT, ~65× E. coli) against CoLoRd
-(`-q org`, lossless) plus gzip/zstd/xz. Add a PacBio HiFi dataset to
-`datasets.tsv` to exercise the narrow-Q / low-error regime where the DNA lever
-matters most.
+(`-q org`, lossless) plus gzip/zstd/xz.
+
+`bench/longread_hifi.sbatch` covers the narrow-Q / low-error regime where the DNA
+lever matters most: it subsamples SRR11434954 (E. coli E2348/69 HiFi) to ~120k
+reads / ~1.5 Gbp (~300×) as `ecoli_hifi`. `bench/longread_lossy.sbatch` runs the
+binning tables against `colord-lossy`. The `fqxv-lroverlap` bits/base figures come
+from the crate's own harness rather than these scripts:
+
+```bash
+cargo run --release -p fqxv-lroverlap --example encode -- reads.fastq [ont|hifi]
+```

@@ -41,7 +41,7 @@ preserved for the split.
 | `--interleaved <N>` | Interleaving of a *single* input, in members per spot (1 = single-end, 2 = paired as from `sracha get -Z`). Auto-detected from read names by default. Ignored with multiple inputs. |
 | `--keep-order` | With `--order any`, force original read order to be restored (store a permutation, code names/quality in original order). Chosen automatically when it makes the archive smaller. |
 | `--no-rescue` | With `--order any`, disable the adaptive assembly codecs (block-local literal-rescue and the whole-file global reference) and use the faster single-contig sequence codec only. |
-| `--quality-bin <MODE>` | `lossless` (default), `bin8`, `bin4`, `bin2` (lossy). |
+| `--quality-bin <MODE>` | `lossless` (default), or a lossy table: `bin8`, `bin4`, `bin2` (Illumina), `ont`, `hifi` (long read). See [Lossy quality binning](#lossy-quality-binning). |
 | `--platform <NAME>` | Sequencing platform to record: `illumina`, `nanopore`, `pacbio`, `mgi`. Auto-detected from read names by default; pass to override. |
 
 ## Examples
@@ -58,6 +58,10 @@ fqxv compress R1.fq R2.fq I1.fq I2.fq -o sample.fqxv
 
 # lossy quality (Illumina 8-level binning)
 fqxv compress reads.fastq -o reads.fqxv --quality-bin bin8
+
+# lossy quality on long reads (match the table to the platform)
+fqxv compress ont_reads.fastq -o ont_reads.fqxv --quality-bin ont
+fqxv compress hifi_reads.fastq -o hifi_reads.fqxv --quality-bin hifi
 
 # maximum compression (deepest context + read reordering where it helps)
 fqxv compress reads.fastq.gz --max
@@ -128,6 +132,35 @@ works for plain and gzipped inputs alike.
 modeled — its cross-read redundancy grows with read count, so a small sample
 can't capture it. With those flags the estimate is a **conservative lower bound**
 (the real archive comes out that size or smaller), and the report says so.
+
+## Lossy quality binning
+
+Quality is lossless by default. `--quality-bin` maps each quality byte through a
+fixed table before coding — an explicit, opt-in lossy transform that shrinks the
+quality stream (usually the largest part of the archive). Sequence and read names
+are never touched, and a binned read still aligns exactly where the original did.
+
+| Mode | Levels | Calibrated for |
+| --- | --- | --- |
+| `lossless` | all | default; nothing is discarded |
+| `bin8` | 8 | Illumina standard binning |
+| `bin4` | 4 | Illumina documented 4-level (NovaSeq X / RTA4) |
+| `bin2` | 2 | custom, most aggressive |
+| `ont` | 4 | Oxford Nanopore (CoLoRd ONT cutpoints) |
+| `hifi` | 5 | PacBio HiFi (CoLoRd HiFi cutpoints; Q93 kept exact) |
+
+**Match the table to the platform.** The tables are not interchangeable: the
+Illumina bins are absolute-Phred cutpoints that collapse HiFi's narrow high-Q
+band into a single level, and `ont` applied to HiFi data folds the Q93
+max-quality symbol into the 26+ bin, destroying its application meaning (measured
+mean |Δ| 42.84, 99.4% of bases changed). `hifi` keeps Q93 as its own level. On
+ONT data the `ont` and `hifi` tables are byte-identical, since ONT never reaches
+Q93.
+
+On the `ecoli_ont` benchmark, `--quality-bin ont` cuts the quality stream from
+165.5 MB to 49.2 MB (3.4×) at mean |Δ| 3.35. Cutpoints should ultimately be
+judged by downstream fidelity, not raw ratio — see
+[Long-read support](../design/longread.md).
 
 ## Notes
 
