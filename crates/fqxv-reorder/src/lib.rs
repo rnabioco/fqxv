@@ -584,15 +584,29 @@ pub fn decode_clustered(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     if r.u8()? != 2 {
         return Err(Error::Malformed("unsupported version"));
     }
-    let n = r.varint()? as usize;
-    let ops = fqxv_rans::decode(r.take_stream()?)?;
-    let offdelta = fqxv_rans::decode(r.take_stream()?)?;
-    let slen = fqxv_rans::decode(r.take_stream()?)?;
-    let nmis = fqxv_rans::decode(r.take_stream()?)?;
-    let pos = fqxv_rans::decode(r.take_stream()?)?;
-    let subs = fqxv_rans::decode(r.take_stream()?)?;
-    let (_, novel) = fqxv_seq::decode(r.take_stream()?)?;
-    let (lit_lens, lit_seq) = fqxv_seq::decode(r.take_stream()?)?;
+    let n = check_n(r.varint()? as usize)?;
+    // Borrow every stream in the order the encoder wrote them, then decode in an
+    // order that lets each bound the next. `take_stream` borrows from `src`, not
+    // from the cursor, so the two orders need not agree.
+    let s_ops = r.take_stream()?;
+    let s_offdelta = r.take_stream()?;
+    let s_slen = r.take_stream()?;
+    let s_nmis = r.take_stream()?;
+    let s_pos = r.take_stream()?;
+    let s_subs = r.take_stream()?;
+    let s_novel = r.take_stream()?;
+    let s_lit = r.take_stream()?;
+
+    let ops = fqxv_rans::decode_bounded(s_ops, n)?; // exactly one op per read
+    let offdelta = fqxv_rans::decode_bounded(s_offdelta, per_read_varints(n))?;
+    let slen = fqxv_rans::decode_bounded(s_slen, per_read_varints(n))?;
+    let nmis = fqxv_rans::decode_bounded(s_nmis, per_read_varints(n))?;
+    // `subs` is one byte per mismatch, so decoding it first SIZES `pos`, which is
+    // one varint per mismatch. That is a real bound rather than a guess.
+    let subs = fqxv_rans::decode_bounded(s_subs, MAX_DECODED_BASES)?;
+    let pos = fqxv_rans::decode_bounded(s_pos, subs.len().saturating_mul(10))?;
+    let (_, novel) = fqxv_seq::decode(s_novel)?;
+    let (lit_lens, lit_seq) = fqxv_seq::decode(s_lit)?;
 
     let mut c_offdelta = Cursor::new(&offdelta);
     let mut c_slen = Cursor::new(&slen);
@@ -948,16 +962,26 @@ pub fn decode_clustered_rescue(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     if r.u8()? != 3 {
         return Err(Error::Malformed("unsupported version"));
     }
-    let n = r.varint()? as usize;
-    let ops = fqxv_rans::decode(r.take_stream()?)?;
-    let cref = fqxv_rans::decode(r.take_stream()?)?;
-    let offdelta = fqxv_rans::decode(r.take_stream()?)?;
-    let slen = fqxv_rans::decode(r.take_stream()?)?;
-    let nmis = fqxv_rans::decode(r.take_stream()?)?;
-    let pos = fqxv_rans::decode(r.take_stream()?)?;
-    let subs = fqxv_rans::decode(r.take_stream()?)?;
-    let (_, novel) = fqxv_seq::decode(r.take_stream()?)?;
-    let (lit_lens, lit_seq) = fqxv_seq::decode(r.take_stream()?)?;
+    let n = check_n(r.varint()? as usize)?;
+    let s_ops = r.take_stream()?;
+    let s_cref = r.take_stream()?;
+    let s_offdelta = r.take_stream()?;
+    let s_slen = r.take_stream()?;
+    let s_nmis = r.take_stream()?;
+    let s_pos = r.take_stream()?;
+    let s_subs = r.take_stream()?;
+    let s_novel = r.take_stream()?;
+    let s_lit = r.take_stream()?;
+
+    let ops = fqxv_rans::decode_bounded(s_ops, n)?;
+    let cref = fqxv_rans::decode_bounded(s_cref, per_read_varints(n))?;
+    let offdelta = fqxv_rans::decode_bounded(s_offdelta, per_read_varints(n))?;
+    let slen = fqxv_rans::decode_bounded(s_slen, per_read_varints(n))?;
+    let nmis = fqxv_rans::decode_bounded(s_nmis, per_read_varints(n))?;
+    let subs = fqxv_rans::decode_bounded(s_subs, MAX_DECODED_BASES)?;
+    let pos = fqxv_rans::decode_bounded(s_pos, subs.len().saturating_mul(10))?;
+    let (_, novel) = fqxv_seq::decode(s_novel)?;
+    let (lit_lens, lit_seq) = fqxv_seq::decode(s_lit)?;
 
     let mut c_cref = Cursor::new(&cref);
     let mut c_offdelta = Cursor::new(&offdelta);
@@ -1276,8 +1300,24 @@ impl GlobalReference {
     pub fn decode_blocked(src: &[u8]) -> Result<GlobalReference> {
         let mut r = Cursor::new(src);
         let nb = r.varint()? as usize;
-        // `nb` is an untrusted block count; reserve fallibly so a corrupt value
-        // errors instead of aborting on a huge infallible allocation.
+        // `nb` is an untrusted block count. Reserving it FALLIBLY is not enough:
+        // `try_reserve` still asks the allocator for the whole thing, and under
+        // memory overcommit that request is granted and the process is OOM-killed
+        // later while the buffer is touched (the same reason `decode_bounded`
+        // exists — see its docs). The `reorder` fuzz target found this: a 5-byte
+        // input whose leading varint reads 32905357309 produced a single
+        // malloc(789728575416), 24 bytes per `(usize, &[u8])`.
+        //
+        // Unlike an rANS stream, this one has an exact structural bound. Every
+        // block costs at least two varints here (`n_contigs` and `len`), so a
+        // stream of `src.len()` bytes cannot describe more than half that many
+        // blocks. Check it before the reserve, and the count can never multiply
+        // into an allocation the input did not pay for.
+        if nb > src.len() / 2 {
+            return Err(Error::Malformed(
+                "reference block count exceeds stream size",
+            ));
+        }
         let mut blocks: Vec<(usize, &[u8])> = Vec::new();
         blocks
             .try_reserve_exact(nb)
@@ -1558,15 +1598,25 @@ pub fn decode_global_block(src: &[u8], reference: &GlobalReference) -> Result<Ve
     if r.u8()? != 4 {
         return Err(Error::Malformed("unsupported version"));
     }
-    let n = r.varint()? as usize;
-    let ops = fqxv_rans::decode(r.take_stream()?)?;
-    let cid = fqxv_rans::decode(r.take_stream()?)?;
-    let offdelta = fqxv_rans::decode(r.take_stream()?)?;
-    let slen = fqxv_rans::decode(r.take_stream()?)?;
-    let nmis = fqxv_rans::decode(r.take_stream()?)?;
-    let pos = fqxv_rans::decode(r.take_stream()?)?;
-    let subs = fqxv_rans::decode(r.take_stream()?)?;
-    let tail = fqxv_rans::decode(r.take_stream()?)?;
+    let n = check_n(r.varint()? as usize)?;
+    let s_ops = r.take_stream()?;
+    let s_cid = r.take_stream()?;
+    let s_offdelta = r.take_stream()?;
+    let s_slen = r.take_stream()?;
+    let s_nmis = r.take_stream()?;
+    let s_pos = r.take_stream()?;
+    let s_subs = r.take_stream()?;
+    let s_tail = r.take_stream()?;
+
+    let ops = fqxv_rans::decode_bounded(s_ops, n)?;
+    let cid = fqxv_rans::decode_bounded(s_cid, per_read_varints(n))?;
+    let offdelta = fqxv_rans::decode_bounded(s_offdelta, per_read_varints(n))?;
+    let slen = fqxv_rans::decode_bounded(s_slen, per_read_varints(n))?;
+    let nmis = fqxv_rans::decode_bounded(s_nmis, per_read_varints(n))?;
+    let subs = fqxv_rans::decode_bounded(s_subs, MAX_DECODED_BASES)?;
+    let pos = fqxv_rans::decode_bounded(s_pos, subs.len().saturating_mul(10))?;
+    // Novel tail bases: one byte each, so the block's sequence budget bounds it.
+    let tail = fqxv_rans::decode_bounded(s_tail, MAX_DECODED_BASES)?;
 
     let mut c_cid = Cursor::new(&cid);
     let mut c_offdelta = Cursor::new(&offdelta);
@@ -2018,6 +2068,43 @@ pub fn merge_reference_with(
 /// Shared byte cursor specialized to this crate's [`Error`].
 type Cursor<'a> = fqxv_bytes::Reader<'a, Error>;
 
+/// The largest sequence, in bytes, this codec will reconstruct from one block.
+///
+/// Every rANS stream in a block is bounded by what the block could legitimately
+/// hold, and this is that ceiling. It mirrors the container's per-block sequence
+/// budget (`MAX_BLOCK_SEQ_BYTES`, 256 MiB) — a block never carries more, so no
+/// honest stream decodes past it.
+///
+/// Duplicating the container's constant rather than taking it as a parameter is
+/// deliberate: this crate sits *below* the container in the DAG, so it cannot
+/// read it, and every public decode here is reachable from untrusted bytes (the
+/// `reorder` fuzz target calls [`decode_clustered_auto`] on arbitrary input). If
+/// the container's budget ever grows past this, decoding fails loudly here rather
+/// than silently allowing a larger allocation.
+pub const MAX_DECODED_BASES: usize = 256 << 20;
+
+/// The largest read count this codec will accept in one block.
+///
+/// `n` arrives as a varint from an untrusted header and every per-read bound is
+/// derived from it, so it must be sanity-checked before it multiplies. 2^26 reads
+/// is far past any block the container writes and still keeps `n * 10` well under
+/// a gigabyte.
+pub const MAX_DECODED_READS: usize = 1 << 26;
+
+/// Reject an untrusted read count before it is used to size anything.
+fn check_n(n: usize) -> Result<usize> {
+    if n > MAX_DECODED_READS {
+        return Err(Error::Malformed("read count exceeds decode limit"));
+    }
+    Ok(n)
+}
+
+/// Bound for a stream holding one varint per read: 10 bytes is the longest LEB128
+/// encoding of a `u64`, so no honest stream of `n` varints exceeds this.
+fn per_read_varints(n: usize) -> usize {
+    n.saturating_mul(10)
+}
+
 impl ReaderError for Error {
     fn truncated() -> Self {
         Error::Malformed("truncated")
@@ -2136,6 +2223,66 @@ mod tests {
     fn clustered_empty() {
         let enc = encode_clustered(&[], &[], 4).unwrap();
         assert!(decode_clustered(&enc).unwrap().is_empty());
+    }
+
+    /// A crafted archive must not be able to dictate an allocation.
+    ///
+    /// Each rANS stream states its own decoded length as a `u64` in its header,
+    /// and unbounded `decode` simply believes it: claim 2 GiB and 2 GiB is
+    /// allocated before a byte is validated. The container CRCs every payload
+    /// first, which is why this was survivable — but a CRC detects accidents, not
+    /// intent, and recomputing a valid one over a hostile stream is free. So the
+    /// bound, not the CRC, is what closes this.
+    ///
+    /// Rewrites the declared length of the FIRST stream (`ops`), which is exactly
+    /// one byte per read and so is bounded by `n`.
+    #[test]
+    fn a_crafted_output_length_cannot_force_an_allocation() {
+        let reads: Vec<&[u8]> = vec![b"ACGTACGTACGT", b"ACGTACGTACGT", b"ACGTAAGTACGT"];
+        let mut enc = encode_clustered(&reads, &vec![0u32; reads.len()], 4).expect("encode");
+        assert!(decode_clustered(&enc).is_ok(), "fixture must decode clean");
+
+        // [version u8][varint n][varint comp_len][rANS stream ...], and the rANS
+        // header carries the decoded length at its bytes 1..9.
+        let mut pos = 1usize;
+        fqxv_bytes::read_varint(&enc, &mut pos).expect("n");
+        let comp_len = fqxv_bytes::read_varint(&enc, &mut pos).expect("comp_len") as usize;
+        assert!(
+            comp_len >= 9 && pos + 9 <= enc.len(),
+            "stream header present"
+        );
+        enc[pos + 1..pos + 9].copy_from_slice(&(1u64 << 31).to_le_bytes()); // claim 2 GiB
+
+        // Assert WHICH error, not merely that there is one. `is_err()` alone does
+        // not test this: unbounded `decode` also returns Err here — it allocates
+        // and zeroes the 2 GiB first, then fails on input exhaustion. Measured,
+        // this test passes either way and takes 10.9s unbounded against 0.38s
+        // bounded, the runtime being the only tell. "Returned an error" and
+        // "refused to allocate" are different claims, and only the second one is
+        // the fix.
+        let err = decode_clustered(&enc).expect_err("2 GiB claim must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds caller bound"),
+            "must be refused BY THE BOUND, before allocating; got: {msg}"
+        );
+    }
+
+    /// The read count is the seed for every per-read bound, and it arrives as an
+    /// untrusted varint — so it has to be checked before it multiplies.
+    #[test]
+    fn an_absurd_read_count_is_refused() {
+        let reads: Vec<&[u8]> = vec![b"ACGTACGTACGT"];
+        let enc = encode_clustered(&reads, &[0u32], 4).expect("encode");
+        let mut bomb = vec![enc[0]];
+        fqxv_bytes::write_varint(&mut bomb, u64::MAX / 2);
+        bomb.extend_from_slice(&enc[2..]);
+        let err = decode_clustered(&bomb).expect_err("absurd read count must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read count exceeds decode limit"),
+            "must be refused by the count check, before it seeds any bound; got: {msg}"
+        );
     }
 
     #[test]
