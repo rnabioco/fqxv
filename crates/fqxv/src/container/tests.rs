@@ -1662,3 +1662,235 @@ fn reorder_archive_detects_frame_corruption() {
     archive[mid] ^= 0xFF;
     assert!(verify(io::Cursor::new(&archive)).is_err());
 }
+
+// --- random access: per-stream column projection (Gap 1 + Gap 3) -------------
+
+/// One record's `(header, sequence, quality)` bytes.
+type Record = (Vec<u8>, Vec<u8>, Vec<u8>);
+/// A per-read column of byte slices (names, sequences, or qualities).
+type Column = Vec<Vec<u8>>;
+
+/// FASTQ with per-read varied names, sequence lengths, and quality, plus the
+/// matching [`Record`] triples for checking a projection reconstructs exactly
+/// what was stored.
+fn varied_records(n: usize) -> (Vec<u8>, Vec<Record>) {
+    let bases = *b"ACGT";
+    let mut bytes = Vec::new();
+    let mut recs = Vec::with_capacity(n);
+    for i in 0..n {
+        let len = 20 + (i % 30);
+        let seq: Vec<u8> = (0..len).map(|j| bases[(i + j) % 4]).collect();
+        let qual: Vec<u8> = (0..len).map(|j| b'!' + ((i + j) % 40) as u8).collect();
+        let header = format!("read.{i} sample:{i}").into_bytes();
+        bytes.push(b'@');
+        bytes.extend_from_slice(&header);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&seq);
+        bytes.extend_from_slice(b"\n+\n");
+        bytes.extend_from_slice(&qual);
+        bytes.push(b'\n');
+        recs.push((header, seq, qual));
+    }
+    (bytes, recs)
+}
+
+/// Slice a group's concatenated stream buffer back into per-read pieces.
+fn split_by_lens(buf: &[u8], lens: &[u32]) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(lens.len());
+    let mut off = 0usize;
+    for &l in lens {
+        out.push(buf[off..off + l as usize].to_vec());
+        off += l as usize;
+    }
+    out
+}
+
+/// The footer's per-stream index lets each column be fetched and decoded in
+/// isolation, and every projected stream reconstructs exactly what was stored.
+#[test]
+fn index_projects_every_stream_and_roundtrips() {
+    let (input, recs) = varied_records(130);
+    // Small groups so the index has several rows to project across.
+    let archive = compress_bytes(
+        &input,
+        Params {
+            block_reads: 16,
+            ..Params::default()
+        },
+    );
+    let index = Index::read(io::Cursor::new(&archive)).unwrap();
+    assert_eq!(index.total_reads(), recs.len() as u64);
+    assert!(index.groups().len() >= 4, "expected several row groups");
+
+    let (mut names, mut seqs, mut quals): (Column, Column, Column) =
+        (Vec::new(), Vec::new(), Vec::new());
+    for g in 0..index.groups().len() {
+        // Names.
+        let r = &index.byte_ranges(&[g], Stream::Names).unwrap()[0];
+        let coded = &archive[r.start as usize..r.end as usize];
+        index.verify_stream(g, Stream::Names, coded).unwrap();
+        names.extend(decode_names(coded).unwrap());
+        // Sequence.
+        let r = &index.byte_ranges(&[g], Stream::Sequence).unwrap()[0];
+        let coded = &archive[r.start as usize..r.end as usize];
+        index.verify_stream(g, Stream::Sequence, coded).unwrap();
+        let (lens, seq) = decode_sequence(coded).unwrap();
+        seqs.extend(split_by_lens(&seq, &lens));
+        // Quality.
+        let r = &index.byte_ranges(&[g], Stream::Quality).unwrap()[0];
+        let coded = &archive[r.start as usize..r.end as usize];
+        index.verify_stream(g, Stream::Quality, coded).unwrap();
+        let (lens, qual) = decode_quality(coded).unwrap();
+        quals.extend(split_by_lens(&qual, &lens));
+    }
+
+    let exp_names: Vec<Vec<u8>> = recs.iter().map(|(h, _, _)| h.clone()).collect();
+    let exp_seqs: Vec<Vec<u8>> = recs.iter().map(|(_, s, _)| s.clone()).collect();
+    let exp_quals: Vec<Vec<u8>> = recs.iter().map(|(_, _, q)| q.clone()).collect();
+    assert_eq!(names, exp_names, "projected names");
+    assert_eq!(seqs, exp_seqs, "projected sequences");
+    assert_eq!(quals, exp_quals, "projected qualities");
+}
+
+/// A whole fetched block payload decodes via the public IO-free entry point.
+#[test]
+fn index_decodes_a_whole_fetched_block() {
+    let (input, recs) = varied_records(40);
+    let archive = compress_bytes(
+        &input,
+        Params {
+            block_reads: 16,
+            ..Params::default()
+        },
+    );
+    let index = Index::read(io::Cursor::new(&archive)).unwrap();
+    let g = &index.groups()[0];
+    // Fetch the block frame at its offset, check the frame CRC, decode the payload.
+    let payload = read_block(&mut io::Cursor::new(&archive[g.block_offset as usize..]), 0)
+        .unwrap()
+        .unwrap();
+    let block = decode_block_contents(&payload).unwrap();
+    assert_eq!(block.names.len(), g.read_count as usize);
+    assert_eq!(block.names[0], recs[0].0, "first read name");
+    let first_len = block.lengths[0] as usize;
+    assert_eq!(
+        &block.sequence[..first_len],
+        &recs[0].1[..],
+        "first read seq"
+    );
+}
+
+/// A bit flipped in a projected stream is caught by the index's per-stream CRC —
+/// the guarantee the joint block content digest can't provide on a column fetch.
+#[test]
+fn index_stream_crc_detects_corruption() {
+    let (input, _) = varied_records(40);
+    let archive = compress_bytes(
+        &input,
+        Params {
+            block_reads: 16,
+            ..Params::default()
+        },
+    );
+    let index = Index::read(io::Cursor::new(&archive)).unwrap();
+    let r = &index.byte_ranges(&[0], Stream::Sequence).unwrap()[0];
+    let mut coded = archive[r.start as usize..r.end as usize].to_vec();
+    coded[0] ^= 0xFF;
+    let err = index
+        .verify_stream(0, Stream::Sequence, &coded)
+        .unwrap_err();
+    assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
+}
+
+/// `from_suffix` parses the index out of a fetched tail, and asks for a longer
+/// tail (with the exact length) when the first fetch was too short.
+#[test]
+fn index_from_suffix_handles_short_and_full_tails() {
+    let (input, recs) = varied_records(200);
+    let archive = compress_bytes(
+        &input,
+        Params {
+            block_reads: 16,
+            ..Params::default()
+        },
+    );
+    let file_len = archive.len() as u64;
+    let full = Index::read(io::Cursor::new(&archive)).unwrap();
+
+    // The whole file as a suffix parses to the same index.
+    match Index::from_suffix(&archive, file_len).unwrap() {
+        SuffixParse::Parsed(idx) => {
+            assert_eq!(idx.total_reads(), recs.len() as u64);
+            assert_eq!(idx.groups().len(), full.groups().len());
+            assert_eq!(idx.whole_file_crc(), full.whole_file_crc());
+        }
+        SuffixParse::NeedAtLeast(_) => panic!("full file should parse"),
+    }
+
+    // A tiny tail can't reach the footer; it reports the exact length to refetch,
+    // and that refetch then parses.
+    let tiny = 16usize.min(archive.len());
+    let need = match Index::from_suffix(&archive[archive.len() - tiny..], file_len).unwrap() {
+        SuffixParse::NeedAtLeast(n) => n,
+        SuffixParse::Parsed(_) => panic!("tiny tail should be insufficient"),
+    };
+    assert!(need as usize > tiny && need <= file_len);
+    let refetched = &archive[archive.len() - need as usize..];
+    match Index::from_suffix(refetched, file_len).unwrap() {
+        SuffixParse::Parsed(idx) => {
+            assert_eq!(idx.groups().len(), full.groups().len());
+        }
+        SuffixParse::NeedAtLeast(_) => panic!("exact refetch should parse"),
+    }
+}
+
+/// The per-stream sizes `inspect` reports equal the sum of the index's per-stream
+/// lengths — the same footer data, read two ways.
+#[test]
+fn index_stream_sizes_match_inspect() {
+    let (input, _) = varied_records(90);
+    let archive = compress_bytes(
+        &input,
+        Params {
+            block_reads: 16,
+            ..Params::default()
+        },
+    );
+    let index = Index::read(io::Cursor::new(&archive)).unwrap();
+    let sum = |s: Stream| -> u64 {
+        index
+            .groups()
+            .iter()
+            .map(|g| {
+                let r = g.stream_range(s);
+                r.end - r.start
+            })
+            .sum()
+    };
+    let info = inspect(io::Cursor::new(&archive)).unwrap();
+    assert_eq!(info.names_bytes, sum(Stream::Names));
+    assert_eq!(info.seq_bytes, sum(Stream::Sequence));
+    assert_eq!(info.qual_bytes, sum(Stream::Quality));
+}
+
+/// The footer-less reorder layout has no row-group index, so `Index::read`
+/// rejects it rather than pretending random access is possible.
+#[test]
+fn index_rejects_reorder_layout() {
+    let input = make_reads("z", 200);
+    let mut archive = Vec::new();
+    compress(
+        &input[..],
+        &mut archive,
+        Params {
+            reorder: true,
+            keep_order: true,
+            rescue: false,
+            block_reads: 64,
+            ..Params::default()
+        },
+    )
+    .unwrap();
+    let err = Index::read(io::Cursor::new(&archive)).unwrap_err();
+    assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
+}

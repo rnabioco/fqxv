@@ -37,6 +37,7 @@ preserved for the split.
 | Option | Description |
 | --- | --- |
 | `-l, --level <N>` | Effort 1–9; higher raises the sequence context order and block size. Default: 5. |
+| `--block-reads <N>` | Reads per row group, overriding the size `--level` would pick. Decouples random-access granularity from effort: smaller groups give finer remote/parallel access and more parallelism at some ratio cost; larger groups the reverse. Sequence order still follows `--level`. Ignored by the reorder path (`--order any`/`--max`). See [Row-group sizing](#row-group-sizing). |
 | `--order <MODE>` | Read-order guarantee: `preserve` (default, restores original order), `any` (allows reordering for a better ratio; single-end order may change), or `shuffle` (like `any`, but discards order and regenerates purely positional names — reorder-lossy, single-end only). |
 | `--interleaved <N>` | Interleaving of a *single* input, in members per spot (1 = single-end, 2 = paired as from `sracha get -Z`). Auto-detected from read names by default. Ignored with multiple inputs. |
 | `--keep-order` | With `--order any`, force original read order to be restored (store a permutation, code names/quality in original order). Chosen automatically when it makes the archive smaller. |
@@ -62,6 +63,9 @@ fqxv compress reads.fastq -o reads.fqxv --quality-bin bin8
 # lossy quality on long reads (match the table to the platform)
 fqxv compress ont_reads.fastq -o ont_reads.fqxv --quality-bin ont
 fqxv compress hifi_reads.fastq -o hifi_reads.fqxv --quality-bin hifi
+
+# finer row groups for remote/parallel access (smaller range fetches)
+fqxv compress reads.fastq.gz -o reads.fqxv --block-reads 65536
 
 # maximum compression (deepest context + read reordering where it helps)
 fqxv compress reads.fastq.gz --max
@@ -132,6 +136,29 @@ works for plain and gzipped inputs alike.
 modeled — its cross-read redundancy grows with read count, so a small sample
 can't capture it. With those flags the estimate is a **conservative lower bound**
 (the real archive comes out that size or smaller), and the report says so.
+
+## Row-group sizing
+
+The archive is a run of independently-coded **row groups** (blocks); the row
+group is the unit of parallelism, of coarse random access, and of remote column
+projection. By default its size comes from `--level` — higher effort uses larger
+groups, which train the sequence model on more reads for a better ratio. Pass
+`--block-reads <N>` to set it directly and decouple granularity from effort.
+
+The trade-off is real. Smaller groups mean finer random access and more
+parallelism, but a worse ratio (the order-*k* sequence model has fewer reads to
+train on per group) and a slightly larger footer index. Larger groups compress
+better but make the smallest independently-fetchable unit coarser. When archiving
+to object storage where clients issue small `Range` reads — say, fetching just
+the read names, or just one row group — a smaller `--block-reads` makes those
+fetches cheaper; for a write-once/read-sequentially archive the `--level` default
+is the right call.
+
+The per-group and per-stream byte offsets recorded in the footer are what make
+this projection possible without reading whole blocks — see
+[Container format → Column projection](../design/container.md#footer-index-info-and-random-access).
+The reorder path (`--order any`/`--max`) clusters globally and does not use this
+sizing, so `--block-reads` is ignored there.
 
 ## Lossy quality binning
 

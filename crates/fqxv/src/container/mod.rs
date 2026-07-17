@@ -32,6 +32,14 @@
 //!   [4] n_row_groups (LE)
 //!   per row group: [8] byte_offset (LE, points at the group's frame marker)
 //!                  [4] read_count  (LE)
+//!                  per stream (names, sequence, quality, in that order):
+//!                    [8] stream_offset (LE, absolute offset of the coded bytes)
+//!                    [4] stream_len    (LE, coded length)
+//!                    [4] stream_crc32c (LE, over exactly those coded bytes)
+//!     The per-stream triple lets a remote client project one column — fetch just
+//!     the names (~1% of the archive) or just the sequence — with a single range
+//!     request and verify it against `stream_crc32c` (the block content digest
+//!     covers all three streams jointly, so it can't check one in isolation).
 //!   [8] total_reads (LE)
 //!   [4] whole_file_crc (LE)  -- CRC-32C of the archive from byte 0 through the
 //!       total_reads field; a one-pass end-to-end integrity check (`verify`)
@@ -97,6 +105,7 @@ mod estimate;
 mod format;
 mod inspect;
 mod parse;
+mod random_access;
 mod reorder;
 mod verify;
 
@@ -118,6 +127,10 @@ pub use compress::{compress, compress_auto, compress_interleaved, compress_multi
 pub use decompress::{content_stats, decompress, decompress_recover, decompress_split, Recovery};
 pub use estimate::{estimate, Estimate};
 pub use inspect::{inspect, peek, ContentStats, Info, Platform, QUAL_MAX};
+pub use random_access::{
+    decode_block_contents, decode_names, decode_quality, decode_sequence, BlockContents, GroupLoc,
+    Index, Stream, SuffixParse,
+};
 pub use verify::{
     expected_reads, verify, verify_quick, verify_report, verify_roundtrip, VerifyCheck,
     VerifyReport,

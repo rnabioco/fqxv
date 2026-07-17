@@ -118,11 +118,34 @@ pub(crate) fn write_header<W: Write>(
     )
 }
 
+/// Absolute on-disk location of one coded stream (names, sequence, or quality)
+/// within a block, recorded in the footer index so a remote client can fetch and
+/// verify a single stream without reading the whole block.
+///
+/// `offset` is the absolute byte offset of the stream's *coded* bytes (past the
+/// block frame head, content digest, `n_reads`, and this stream's length prefix);
+/// `len` is that coded length; `crc` is CRC-32C of exactly those `len` bytes. The
+/// block's `content_digest` covers all three decoded streams jointly and so cannot
+/// be checked on a projected fetch — this per-stream CRC is the substitute that
+/// keeps a single-stream read verifiable.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct StreamLoc {
+    pub(crate) offset: u64,
+    pub(crate) len: u32,
+    pub(crate) crc: u32,
+}
+
+/// Per-group footer bytes: `[8 off][4 read_count]` plus a `[8 off][4 len][4 crc]`
+/// triple for each of the three streams (names, sequence, quality).
+pub(crate) const FOOTER_GROUP_BYTES: usize = 12 + 3 * 16;
+
 /// Row-group index accumulated as blocks are written, serialized into the v1
 /// footer. `offset` tracks the current byte position from the start of the file,
-/// so each entry records where its row group's `[8] length` field begins.
+/// so each entry records where its row group's frame marker begins. `streams` is
+/// parallel to `entries`: `streams[i]` locates group `i`'s three coded streams.
 pub(crate) struct FooterIndex {
     pub(crate) entries: Vec<(u64, u32)>,
+    pub(crate) streams: Vec<[StreamLoc; 3]>,
     pub(crate) offset: u64,
 }
 
@@ -131,6 +154,7 @@ impl FooterIndex {
         // Blocks begin right after the fixed header.
         FooterIndex {
             entries: Vec::new(),
+            streams: Vec::new(),
             offset: HEADER_LEN as u64,
         }
     }
@@ -157,11 +181,17 @@ pub(crate) fn write_footer<W: Write>(
     w.write_all(&0u64.to_le_bytes())?;
     let footer_offset = index.offset + BLOCK_MAGIC.len() as u64 + 8;
 
-    let mut body = Vec::with_capacity(4 + index.entries.len() * 12 + 8 + FOOTER_CRC_TAIL);
+    let mut body =
+        Vec::with_capacity(4 + index.entries.len() * FOOTER_GROUP_BYTES + 8 + FOOTER_CRC_TAIL);
     body.extend_from_slice(&(index.entries.len() as u32).to_le_bytes());
-    for &(off, read_count) in &index.entries {
+    for (&(off, read_count), streams) in index.entries.iter().zip(&index.streams) {
         body.extend_from_slice(&off.to_le_bytes());
         body.extend_from_slice(&read_count.to_le_bytes());
+        for s in streams {
+            body.extend_from_slice(&s.offset.to_le_bytes());
+            body.extend_from_slice(&s.len.to_le_bytes());
+            body.extend_from_slice(&s.crc.to_le_bytes());
+        }
     }
     body.extend_from_slice(&total_reads.to_le_bytes());
     // Feed the body-so-far through the tee; the tee's CRC is now the digest of
@@ -262,14 +292,21 @@ pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
 /// globally-clustered layout is self-describing — see the module docs).
 ///
 /// On-disk body (at `footer_offset`, i.e. just past the terminator):
-/// `[4 n_groups] [8 off][4 read_count]* [8 total_reads] [4 whole_file_crc] [4 footer_crc]`.
-/// `footer_crc` covers the body up to (not including) itself, so the index can be
-/// trusted without rereading the whole archive; `whole_file_crc` covers every
-/// byte from the header through `total_reads` and is checked only by the
-/// whole-archive verify/recover path.
+/// `[4 n_groups] ([8 off][4 read_count] ([8 s_off][4 s_len][4 s_crc])×3)*
+///  [8 total_reads] [4 whole_file_crc] [4 footer_crc]`.
+/// Each row group records its block offset and read count, then a
+/// `(offset, len, crc32c)` triple locating each of its three coded streams
+/// (names, sequence, quality) for remote column projection. `footer_crc` covers
+/// the body up to (not including) itself, so the index can be trusted without
+/// rereading the whole archive; `whole_file_crc` covers every byte from the header
+/// through `total_reads` and is checked only by the whole-archive verify/recover
+/// path.
 pub(crate) struct Footer {
-    /// `(byte offset of the row group's [8] length field, its read count)`.
+    /// `(byte offset of the row group's frame marker, its read count)`.
     pub(crate) groups: Vec<(u64, u32)>,
+    /// Parallel to `groups`: `stream_locs[i]` locates group `i`'s three coded
+    /// streams (names, sequence, quality) for single-stream projection.
+    pub(crate) stream_locs: Vec<[StreamLoc; 3]>,
     pub(crate) total_reads: u64,
     /// CRC-32C of the archive from byte 0 through the `total_reads` field.
     pub(crate) whole_file_crc: u32,
@@ -314,7 +351,19 @@ pub(crate) fn read_footer<R: Read + Seek>(r: &mut R) -> Result<Footer> {
     body.resize(body_len, 0);
     r.seek(SeekFrom::Start(footer_offset))?;
     r.read_exact(&mut body)?;
+    parse_footer_body(&body, footer_offset)
+}
 
+/// Parse and CRC-check a footer body already in memory. `body` is the bytes from
+/// `footer_offset` up to (not including) the EOF trailer — the `[4 n_groups] …
+/// [8 total_reads] [4 whole_file_crc] [4 footer_crc]` region. Shared by
+/// [`read_footer`] (seek-based) and the IO-free suffix parser in `random_access`,
+/// so both apply exactly the same validation before any offset is trusted.
+pub(crate) fn parse_footer_body(body: &[u8], footer_offset: u64) -> Result<Footer> {
+    let body_len = body.len();
+    if body_len < 4 + 8 + FOOTER_CRC_TAIL {
+        return Err(Error::Malformed("footer body too short"));
+    }
     let (covered, footer_crc_bytes) = body.split_at(body_len - CRC_LEN);
     let footer_crc = u32::from_le_bytes(footer_crc_bytes.try_into().unwrap());
     if crc32c(covered) != footer_crc {
@@ -325,21 +374,43 @@ pub(crate) fn read_footer<R: Read + Seek>(r: &mut R) -> Result<Footer> {
 
     let mut c = Cursor::new(covered);
     let n_groups = c.u32()? as usize;
-    // `covered` = [4 n_groups][12*n_groups][8 total_reads][4 whole_file_crc]; the
-    // CRC just passed already implies a self-consistent length, but bound the
-    // allocation independently in case of a hash collision.
-    let max_groups = covered.len().saturating_sub(4 + 8 + CRC_LEN) / 12;
+    // `covered` = [4 n_groups][FOOTER_GROUP_BYTES*n_groups][8 total_reads][4
+    // whole_file_crc]; the CRC just passed already implies a self-consistent
+    // length, but bound the allocation independently in case of a hash collision.
+    let max_groups = covered.len().saturating_sub(4 + 8 + CRC_LEN) / FOOTER_GROUP_BYTES;
     if n_groups > max_groups {
         return Err(Error::Malformed("footer group count exceeds footer size"));
     }
     let mut groups = Vec::with_capacity(n_groups);
+    let mut stream_locs = Vec::with_capacity(n_groups);
     for _ in 0..n_groups {
         let off = u64::from_le_bytes(c.take(8)?.try_into().unwrap());
         let rc = u32::from_le_bytes(c.take(4)?.try_into().unwrap());
         if off < HEADER_LEN as u64 || off >= footer_offset {
             return Err(Error::Malformed("footer row-group offset out of range"));
         }
+        let mut streams = [StreamLoc::default(); 3];
+        for s in &mut streams {
+            let s_off = u64::from_le_bytes(c.take(8)?.try_into().unwrap());
+            let s_len = u32::from_le_bytes(c.take(4)?.try_into().unwrap());
+            let s_crc = u32::from_le_bytes(c.take(4)?.try_into().unwrap());
+            // A stream lives inside its block, which starts at `off` and ends
+            // before the footer; reject an index that points a stream outside the
+            // block region before any caller dereferences it over the wire.
+            let end = s_off
+                .checked_add(u64::from(s_len))
+                .ok_or(Error::Malformed("footer stream offset overflow"))?;
+            if s_off < off || end > footer_offset {
+                return Err(Error::Malformed("footer stream location out of range"));
+            }
+            *s = StreamLoc {
+                offset: s_off,
+                len: s_len,
+                crc: s_crc,
+            };
+        }
         groups.push((off, rc));
+        stream_locs.push(streams);
     }
     let total_reads = u64::from_le_bytes(c.take(8)?.try_into().unwrap());
     let whole_file_crc = c.u32()?;
@@ -348,6 +419,7 @@ pub(crate) fn read_footer<R: Read + Seek>(r: &mut R) -> Result<Footer> {
     let covered_len = footer_offset + (body_len - FOOTER_CRC_TAIL) as u64;
     Ok(Footer {
         groups,
+        stream_locs,
         total_reads,
         whole_file_crc,
         covered_len,
