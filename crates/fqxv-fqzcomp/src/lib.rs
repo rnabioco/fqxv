@@ -219,6 +219,109 @@ fn context(q1: u8, q2: u8, q3: u8, delta: u8, pos: usize) -> usize {
         | ((pos_bucket(pos) & 0xF) << 14) // bits 14..17
 }
 
+/// Size-class dispatch for the per-context quality models.
+///
+/// `SimpleModel<N>` is `[u16; N] + u32`, so the `N_CTX`-entry table costs
+/// `N_CTX * (2N + 4)` bytes — 48 MiB at `N = QMAX = 94`. Only the first `k`
+/// symbols are ever active (`with_active`), and the coder never touches a slot
+/// past `k`: `encode` reads `freq[..=sym]` with `sym < k`, and `decode`'s scan
+/// stops at `k-1` because `cum + freq[k-1] == tot > target`. So any `N >= k`
+/// produces a byte-identical stream; picking the smallest class that fits `k`
+/// shrinks the table (and the cache footprint) without touching the format.
+macro_rules! by_size_class {
+    ($k:expr, $f:ident, $($arg:expr),* $(,)?) => {
+        match $k {
+            0..=4 => $f::<4>($($arg),*),
+            5..=8 => $f::<8>($($arg),*),
+            9..=16 => $f::<16>($($arg),*),
+            17..=32 => $f::<32>($($arg),*),
+            33..=64 => $f::<64>($($arg),*),
+            _ => $f::<QMAX>($($arg),*),
+        }
+    };
+}
+
+fn encode_payload<const NM: usize>(
+    lens: &[u32],
+    binned: &[u8],
+    dense: &[u8; 256],
+    qmin: u8,
+    k: usize,
+) -> Vec<u8> {
+    let mut models = vec![SimpleModel::<NM>::with_active(k); N_CTX];
+    let mut enc = Encoder::new();
+    let mut rest: &[u8] = binned;
+    for &l in lens {
+        let (read, tail) = rest.split_at(l as usize);
+        rest = tail;
+        let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
+        let mut delta = 0u8;
+        for (pos, &b) in read.iter().enumerate() {
+            let cv = b - qmin;
+            let dv = dense[b as usize];
+            let c = context(q1, q2, q3, delta, pos);
+            debug_assert!(c < N_CTX);
+            // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
+            unsafe { models.get_unchecked_mut(c) }.encode(&mut enc, dv as usize);
+            if pos > 0 && cv != q1 {
+                delta = (delta + 1).min(DELTA_MAX);
+            }
+            q3 = q2;
+            q2 = q1;
+            q1 = cv;
+        }
+    }
+    enc.finish()
+}
+
+fn dispatch_encode(lens: &[u32], binned: &[u8], dense: &[u8; 256], qmin: u8, k: usize) -> Vec<u8> {
+    by_size_class!(k, encode_payload, lens, binned, dense, qmin, k)
+}
+
+fn decode_payload<const NM: usize>(
+    lens: &[u32],
+    syms: &[u8],
+    qmin: u8,
+    k: usize,
+    dec: &mut Decoder<'_>,
+    quals: &mut Vec<u8>,
+) -> Result<()> {
+    let mut models = vec![SimpleModel::<NM>::with_active(k); N_CTX];
+    for &l in lens {
+        let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
+        let mut delta = 0u8;
+        for pos in 0..l as usize {
+            let c = context(q1, q2, q3, delta, pos);
+            debug_assert!(c < N_CTX);
+            // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
+            let dv = unsafe { models.get_unchecked_mut(c) }.decode(dec);
+            let b = *syms
+                .get(dv)
+                .ok_or(Error::Malformed("decoded symbol outside alphabet"))?;
+            let cv = b - qmin;
+            quals.push(b);
+            if pos > 0 && cv != q1 {
+                delta = (delta + 1).min(DELTA_MAX);
+            }
+            q3 = q2;
+            q2 = q1;
+            q1 = cv;
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_decode(
+    lens: &[u32],
+    syms: &[u8],
+    qmin: u8,
+    k: usize,
+    dec: &mut Decoder<'_>,
+    quals: &mut Vec<u8>,
+) -> Result<()> {
+    by_size_class!(k, decode_payload, lens, syms, qmin, k, dec, quals)
+}
+
 /// Encode per-read quality strings.
 ///
 /// `lens` gives each read's quality length; `quals` is their concatenation.
@@ -248,33 +351,7 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
     // capacity — see `SimpleModel::with_active`. Context features stay on the
     // original Phred scale (`cv = b - qmin`); only the coded symbol is the dense
     // index (`dv`).
-    let mut models = vec![SimpleModel::<QMAX>::with_active(k); N_CTX];
-    let mut enc = Encoder::new();
-    // Walk `binned` as a cursor rather than a running `idx`, so the per-quality
-    // access iterates a slice directly and carries no bounds check. `total`
-    // (checked above) equals `binned.len()`, so every `split_at` is in range.
-    let mut rest: &[u8] = &binned;
-    for &l in lens {
-        let (read, tail) = rest.split_at(l as usize);
-        rest = tail;
-        let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
-        let mut delta = 0u8;
-        for (pos, &b) in read.iter().enumerate() {
-            let cv = b - qmin; // context value (original Phred scale)
-            let dv = dense[b as usize]; // dense coding symbol
-            let c = context(q1, q2, q3, delta, pos);
-            debug_assert!(c < N_CTX);
-            // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
-            unsafe { models.get_unchecked_mut(c) }.encode(&mut enc, dv as usize);
-            if pos > 0 && cv != q1 {
-                delta = (delta + 1).min(DELTA_MAX);
-            }
-            q3 = q2;
-            q2 = q1;
-            q1 = cv;
-        }
-    }
-    let payload = enc.finish();
+    let payload = dispatch_encode(lens, &binned, &dense, qmin, k);
 
     let mut out = Vec::with_capacity(16 + k + lens.len() + payload.len());
     out.push(FORMAT_VERSION);
@@ -302,7 +379,6 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     let qmin = syms[0];
     let lens = read_lens(&mut r)?;
 
-    let mut models = vec![SimpleModel::<QMAX>::with_active(k); N_CTX];
     // Checked sum: a malformed stream can declare lengths whose total wraps
     // `usize`, which would under-allocate `quals` and then over-push.
     let total = lens
@@ -331,29 +407,7 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     quals
         .try_reserve(total)
         .map_err(|_| Error::Malformed("declared total length too large to allocate"))?;
-    for &l in &lens {
-        let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
-        let mut delta = 0u8;
-        for pos in 0..l as usize {
-            let c = context(q1, q2, q3, delta, pos);
-            debug_assert!(c < N_CTX);
-            // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
-            let dv = unsafe { models.get_unchecked_mut(c) }.decode(&mut dec);
-            // `with_active(k)` only ever assigns probability to symbols `0..k`, so
-            // a well-formed stream decodes within `syms`; guard anyway.
-            let b = *syms
-                .get(dv)
-                .ok_or(Error::Malformed("decoded symbol outside alphabet"))?;
-            let cv = b - qmin;
-            quals.push(b);
-            if pos > 0 && cv != q1 {
-                delta = (delta + 1).min(DELTA_MAX);
-            }
-            q3 = q2;
-            q2 = q1;
-            q1 = cv;
-        }
-    }
+    dispatch_decode(&lens, &syms, qmin, k, &mut dec, &mut quals)?;
     Ok((lens, quals))
 }
 
@@ -406,6 +460,51 @@ impl ReaderError for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The size-class dispatch is only legitimate if every `N >= k` codes to the
+    /// SAME bytes — otherwise picking a class by `k` silently rewrites archives.
+    ///
+    /// That rests on a property of `SimpleModel`, which lives in a crate BELOW
+    /// this one: phantom slots (`freq[k..]`) must stay at frequency 0 forever, so
+    /// they never enter `tot` and never shift a code. They do, because the
+    /// rescale is `(f + 1) >> 1` and `(0 + 1) >> 1 == 0`. If that ever becomes
+    /// `max(1, f / 2)` — which its own comment, "halve, keep >= 1", already
+    /// describes and which is the obvious "fix" for a coder that must not emit
+    /// zero-probability symbols — every phantom goes live, `tot` diverges by
+    /// class, and this dispatch changes the output of every archive it touches
+    /// while every round-trip test still passes.
+    ///
+    /// So pin the property here rather than trusting a comment in another crate.
+    #[test]
+    fn every_size_class_codes_identically() {
+        // A 3-symbol alphabet, so `k = 3` and the dispatch picks `N = 4`, while
+        // the classes above it are all phantom-heavy.
+        let mut quals = Vec::new();
+        let mut x: u32 = 12345;
+        for _ in 0..20_000 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            quals.push(b'#' + ((x >> 16) % 3) as u8);
+        }
+        let lens = vec![100u32; quals.len() / 100];
+        let (syms, dense) = dense_alphabet(&quals).expect("alphabet");
+        let (qmin, k) = (syms[0], syms.len());
+        assert_eq!(k, 3, "fixture must land in the smallest size class");
+
+        let want = encode_payload::<QMAX>(&lens, &quals, &dense, qmin, k);
+        for got in [
+            encode_payload::<4>(&lens, &quals, &dense, qmin, k),
+            encode_payload::<8>(&lens, &quals, &dense, qmin, k),
+            encode_payload::<16>(&lens, &quals, &dense, qmin, k),
+            encode_payload::<32>(&lens, &quals, &dense, qmin, k),
+            encode_payload::<64>(&lens, &quals, &dense, qmin, k),
+        ] {
+            assert_eq!(
+                got, want,
+                "a size class changed the coded bytes: the model's phantom slots \
+                 are no longer inert, and the dispatch is now a format change"
+            );
+        }
+    }
     // Only the corruption tests hand-build streams; `write_lens` moved to
     // fqxv-bytes, so this varint helper is no longer used outside tests.
     use fqxv_bytes::write_varint;
