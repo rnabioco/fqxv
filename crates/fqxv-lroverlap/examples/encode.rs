@@ -371,6 +371,36 @@ fn main() {
         v.sort_unstable();
     }
 
+    // The band the read-vs-reference alignment is allowed.
+    //
+    // This was 96, and 96 was throttling the codec. Ground truth (minimap2) puts
+    // a read at 0.00374 edits/base against these consensi — 0.00235 of that is
+    // the read's own error against the true genome, the rest the consensus's
+    // 0.00155 — while the codec was emitting 0.0078. A banded DP cannot find a
+    // path that leaves the band, so it was paying for edits that are not there.
+    // Every one of them also splits a match run, which is why `match-runs` is
+    // half the archive. Measured, ecoli_hifi 300x stride 8:
+    //
+    //     band    ops raw    bits/base   scripts
+    //       96      22.8M       0.0835       94s
+    //      384      17.2M       0.0704     ~350s
+    //      768      17.0M       0.0699      717s
+    //
+    // It plateaus at ~384: the drift a read needs is real and BOUNDED, not
+    // runaway placement error (which would keep improving). 768 buys 0.7% for
+    // double the work; 384 buys 16% for four times it, which an archiver should
+    // take — compression is paid once.
+    //
+    // 384 is still a workaround. `align_banded` asks callers to "size `band` from
+    // the chain's observed diagonal drift", and this hardcodes a constant instead
+    // — it cannot do better, because `Anchored` carries an offset but not the
+    // drift the chain saw. Widening it globally pays that drift's WORST case on
+    // every read. Threading the per-read drift out of `place_against` should get
+    // 0.0699 nearer to band-96 cost.
+    let band: usize = env::var("FQXV_BAND")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(384);
     let mut per_contig: Vec<Streams> = consensi
         .par_iter()
         .enumerate()
@@ -394,7 +424,7 @@ fn main() {
                     if start >= end {
                         return None;
                     }
-                    Some((start, align_banded(&cs[start..end], &read, 96).ops))
+                    Some((start, align_banded(&cs[start..end], &read, band).ops))
                 })
                 .collect();
 
