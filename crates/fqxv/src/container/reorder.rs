@@ -174,20 +174,46 @@ pub(crate) fn encode_reordered<W: Write>(
     let plan = pool.install(|| fqxv_reorder::plan(&all.lens, &all.seq, REORDER_K));
 
     // 3. Clustered, oriented sequences (parallel copy/revcomp) + flip bitmap.
-    let cl_reads: Vec<Vec<u8>> = pool.install(|| {
-        plan.order
-            .par_iter()
-            .map(|&oi| {
-                let oi = oi as usize;
+    //
+    // A flat arena plus offsets, not a `Vec<Vec<u8>>`. The old shape cost one heap
+    // allocation per read — 256Ki of them per block, `malloc`/`free` measuring
+    // ~6.9% of the reorder encode — and it held each read behind its own pointer
+    // when `RawBlock` already hands us exactly this layout for the input side.
+    // Every consumer only ever wanted a `&[u8]`.
+    let mut cl_offs = Vec::with_capacity(n + 1);
+    let mut cl_acc = 0usize;
+    for &oi in &plan.order {
+        cl_offs.push(cl_acc);
+        cl_acc += all.lens[oi as usize] as usize;
+    }
+    cl_offs.push(cl_acc);
+    debug_assert_eq!(cl_acc, acc, "clustering is a permutation: same total bases");
+
+    let mut cl_seq = vec![0u8; cl_acc];
+    {
+        // Hand each read its own disjoint destination up front. Splitting serially
+        // is a few pointer moves and keeps the parallel fill safe — no `unsafe`,
+        // no per-read allocation, and each worker writes only its own slice.
+        let mut dsts: Vec<&mut [u8]> = Vec::with_capacity(n);
+        let mut rest: &mut [u8] = &mut cl_seq;
+        for j in 0..n {
+            let (head, tail) = rest.split_at_mut(cl_offs[j + 1] - cl_offs[j]);
+            dsts.push(head);
+            rest = tail;
+        }
+        pool.install(|| {
+            dsts.par_iter_mut().enumerate().for_each(|(j, dst)| {
+                let oi = plan.order[j] as usize;
                 let s = &all.seq[offs[oi]..offs[oi + 1]];
                 if plan.flip[oi] {
-                    fqxv_reorder::revcomp(s)
+                    fqxv_reorder::revcomp_into(s, dst);
                 } else {
-                    s.to_vec()
+                    dst.copy_from_slice(s);
                 }
-            })
-            .collect()
-    });
+            });
+        });
+    }
+    let cl_read = |j: usize| -> &[u8] { &cl_seq[cl_offs[j]..cl_offs[j + 1]] };
     let mut flip_bits = vec![0u8; n.div_ceil(8)];
     for (j, &oi) in plan.order.iter().enumerate() {
         if plan.flip[oi as usize] {
@@ -237,7 +263,7 @@ pub(crate) fn encode_reordered<W: Write>(
     // what used to be the compress-time floor. Only run when v4 is a candidate
     // (the adaptive `rescue` path).
     let global = if params.rescue && n > 0 {
-        let refs_all: Vec<&[u8]> = cl_reads.iter().map(Vec::as_slice).collect();
+        let refs_all: Vec<&[u8]> = (0..n).map(cl_read).collect();
         let (reference, places) = pool.install(|| {
             fqxv_reorder::assemble_global_windowed(&refs_all, &cl_anchors, ASSEMBLY_WINDOWS)
         });
@@ -274,7 +300,7 @@ pub(crate) fn encode_reordered<W: Write>(
         ranges
             .par_iter()
             .map(|&(s, e)| -> Result<BlockChoice> {
-                let refs: Vec<&[u8]> = cl_reads[s..e].iter().map(Vec::as_slice).collect();
+                let refs: Vec<&[u8]> = (s..e).map(cl_read).collect();
                 let anch = &cl_anchors[s..e];
                 let mut block_local = fqxv_reorder::encode_clustered(&refs, anch, order)?;
                 if params.rescue {

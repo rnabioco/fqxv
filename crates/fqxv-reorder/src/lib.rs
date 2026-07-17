@@ -127,9 +127,24 @@ fn code(b: u8) -> u8 {
 /// including `N`, are passed through), reversed.
 #[must_use]
 pub fn revcomp(seq: &[u8]) -> Vec<u8> {
-    seq.iter()
-        .rev()
-        .map(|&b| match b {
+    let mut out = vec![0u8; seq.len()];
+    revcomp_into(seq, &mut out);
+    out
+}
+
+/// Reverse-complement `seq` into `dst`, allocating nothing.
+///
+/// The same mapping as [`revcomp`] — which now delegates here, so the two cannot
+/// drift apart. For callers that already own the destination (a flat arena of
+/// clustered reads, say), this is the difference between one heap allocation per
+/// read and none.
+///
+/// # Panics
+/// If `dst.len() != seq.len()`.
+pub fn revcomp_into(seq: &[u8], dst: &mut [u8]) {
+    assert_eq!(dst.len(), seq.len(), "revcomp_into: length mismatch");
+    for (d, &b) in dst.iter_mut().zip(seq.iter().rev()) {
+        *d = match b {
             b'A' => b'T',
             b'C' => b'G',
             b'G' => b'C',
@@ -139,8 +154,8 @@ pub fn revcomp(seq: &[u8]) -> Vec<u8> {
             b'g' => b'c',
             b't' => b'a',
             other => other,
-        })
-        .collect()
+        };
+    }
 }
 
 /// Minimum canonical k-mer of `read` and whether that minimizer sits on the
