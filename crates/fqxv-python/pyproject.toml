@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "fqxv"
+description = "Read-only Python bindings for the fqxv FASTQ archiver"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+readme = "README.md"
+keywords = ["fastq", "compression", "bioinformatics", "genomics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+# Version is inherited from the Cargo workspace (`version.workspace = true`).
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/rnabioco/fqxv"
+
+[tool.maturin]
+# The crate lives in the workspace; point maturin at its manifest.
+manifest-path = "Cargo.toml"
+module-name = "fqxv"
+# abi3 wheels: one wheel per platform, forward-compatible with CPython >= 3.9.
+features = ["pyo3/extension-module"]

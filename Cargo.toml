@@ -44,6 +44,9 @@ indicatif = "0.18"
 owo-colors = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Python bindings (fqxv-python cdylib only). Features are selected per-crate;
+# fqxv-python re-enables `macros` (a dropped default) alongside abi3/extension-module.
+pyo3 = { version = "0.24", default-features = false }
 
 # Dev/bench deps.
 proptest = "1"

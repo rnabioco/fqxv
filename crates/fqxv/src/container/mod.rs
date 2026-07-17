@@ -106,6 +106,7 @@ mod format;
 mod inspect;
 mod parse;
 mod random_access;
+mod records;
 mod reorder;
 mod verify;
 
@@ -131,6 +132,7 @@ pub use random_access::{
     decode_block_contents, decode_names, decode_quality, decode_sequence, BlockContents, GroupLoc,
     Index, Stream, SuffixParse,
 };
+pub use records::{decompress_records, Record, RecordReader};
 pub use verify::{
     expected_reads, verify, verify_quick, verify_report, verify_roundtrip, VerifyCheck,
     VerifyReport,

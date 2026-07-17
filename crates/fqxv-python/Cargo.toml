@@ -1,0 +1,27 @@
+[package]
+name = "fqxv-python"
+description = "Python bindings for the fqxv FASTQ archiver (read-only)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+# The Python extension module is distributed as a wheel, not on crates.io.
+publish = false
+
+[lib]
+# The produced module object and Python import name is `fqxv`; the crate name
+# stays `fqxv-python` to avoid colliding with the `fqxv` library dependency.
+name = "fqxv"
+crate-type = ["cdylib"]
+
+[dependencies]
+# The produced module (and this crate's `[lib] name`) is `fqxv`, which would
+# collide with a dependency also named `fqxv`; import the library under an alias.
+fqxv_core = { path = "../fqxv", version = "0.2.0", package = "fqxv" }
+# `macros` (a pyo3 default we dropped at the workspace level) provides the
+# #[pyclass]/#[pymethods]/#[pyfunction] attributes; abi3-py39 → one forward-
+# compatible wheel per platform; extension-module keeps libpython unlinked.
+pyo3 = { workspace = true, features = ["abi3-py39", "extension-module", "macros"] }
