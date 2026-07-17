@@ -3,6 +3,7 @@
 Field comparison against general-purpose and FASTQ-specific compressors on two
 real Illumina RNA-seq runs spanning both quality regimes. Produced by the
 harness in `bench/`, 4M-read subsets, 44 threads per tool, single node.
+[Long reads](#long-reads-ont-pacbio) are measured separately, against CoLoRd.
 
 !!! note
     Ratios and throughput vary with data type (WGS vs RNA-seq), coverage, and
@@ -72,6 +73,76 @@ regardless of thread count):
 - **Lossy quality is a separate tier.** `fqxv --quality-bin bin8|bin4|bin2` and
   SPRING's `ill_bin` / `binary` modes quantize quality for more ratio; compare
   those against each other, not against the lossless rows above.
+
+## Long reads (ONT / PacBio)
+
+Long-read FASTQ compresses correctly today — read lengths are `u32` end to end,
+blocks are cut by a raw-byte budget so ragged reads still parallelize, and the
+short-read reorder codec auto-disables. The open question is **ratio**, measured
+per-stream against CoLoRd `-q org` (its lossless quality mode).
+
+fqxv's columns come from `fqxv info`, which reports its real streams. CoLoRd has
+no such split, so its columns are taken by difference — `-q none` discards
+quality, and quality is `org - none` — which makes the rows additive by
+construction. `-q none` still carries names and container overhead, so CoLoRd's
+non-quality column is an upper bound on its sequence stream. See
+[Long-read support](design/longread.md) for the method and `bench/colord_split.sh`
+to re-run it.
+
+**`ecoli_ont`** (DRR205413, 287M bases, mean Q≈11.5 — noisy older basecaller):
+
+| Tool | Total | Non-quality | Quality | Non-quality bits/base |
+| --- | ---: | ---: | ---: | ---: |
+| CoLoRd `-q org` | 197.9M | **31.4M** | 166.5M | 0.88 |
+| `fqxv -l9` | 224.4M | 58.8M (seq only) | **165.5M** | 1.64 |
+
+**`ecoli_hifi`** (SRR11434954 subset, 1.55G bases, mean Q≈27, ~300×):
+
+| Tool | Total | Non-quality | Quality | Non-quality bits/base |
+| --- | ---: | ---: | ---: | ---: |
+| CoLoRd `-q org` | 697.7M | **13.4M** | 684.3M | 0.069 |
+| `fqxv -l9` | 837.7M | 126.3M (seq only) | 711.2M | 0.653 |
+
+Two facts hold on both platforms:
+
+- **Quality is already at parity.** fqxv's quality stream matches CoLoRd's
+  lossless quality within a few percent — fqxv is smaller on ONT (165.5M vs
+  166.5M), CoLoRd is ~4% smaller on HiFi (684.3M vs 711.2M). There is no
+  meaningful headroom on this stream.
+- **The entire lossless gap is the sequence stream**, and it widens with
+  coverage: 1.87× on ONT, 9.7× on HiFi (against CoLoRd's directly-measured
+  sequence stream, 0.0676 bits/base; the table's 0.069 is the names-inclusive
+  upper bound). At ~300× the same locus is read hundreds
+  of times; CoLoRd codes each read against a similar earlier read, while fqxv's
+  within-read order-k model re-encodes every copy.
+
+### Lossy quality
+
+`--quality-bin ont` cuts the ONT quality stream from 165.5M to 49.2M (3.4×) at
+mean |Δ| 3.35. The tables work — but binning removes the stream fqxv is good at
+and leaves the one it is not, so sequence becomes 57–62% of the lossy archive and
+the gap above dominates the total. `colord-lossy` remains smaller overall
+(ONT 73.2M vs 114.6M for `fqxv --quality-bin ont`). Match the table to the
+platform: see [Lossy quality binning](cli/compress.md#lossy-quality-binning).
+
+### The sequence lever
+
+`fqxv-lroverlap` is a crate that measures the missing lever: minimizers → chain →
+overlaps → layout → consensus → edit scripts → rANS. On `ecoli_hifi` (120k reads,
+1547 Mbase, ~300×, 5.16 Mb genome) it takes the sequence stream from **0.653 to
+0.067 bits/base** — **parity with CoLoRd's 0.068**, not a win. Across minimizer
+strides 4–14 the result spans 0.067–0.072 bits/base; that ~6% spread is sample
+noise, so the honest claim is parity. The oracle bound (coding against the true
+reference with known placement) is 0.040 bits/base, so headroom remains.
+
+!!! warning "Not usable yet"
+    `fqxv-lroverlap` is **not wired into the container** — no crate imports it and
+    no CLI flag reaches it. The numbers above come from its measurement harness
+    (`crates/fqxv-lroverlap/examples/encode.rs`), not from a `.fqxv` archive.
+    Long-read archives written today use the within-read sequence model and get
+    the 0.653 bits/base row.
+
+See [Long-read support](design/longread.md) for the full analysis.
 
 ## Round-trip fidelity (alignment level)
 
