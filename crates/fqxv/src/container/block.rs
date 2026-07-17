@@ -174,9 +174,75 @@ pub(crate) fn content_digest<'a>(
     h.digest()
 }
 
-/// Code one non-reorder block: names (tokenizer), sequence (order-k), and quality
-/// (fqzcomp), each length-prefixed, behind a leading [`content_digest`]. Reorder
-/// uses the whole-file path instead.
+/// Sequence-stream codec, recorded as a leading method byte (v4). Short reads use
+/// the order-k context model; long reads the cross-read overlap-assembly codec.
+pub(crate) const SEQ_METHOD_ORDERK: u8 = 0;
+/// See [`SEQ_METHOD_ORDERK`].
+pub(crate) const SEQ_METHOD_OVERLAP: u8 = 1;
+
+fn order_k_stream(lens: &[u32], seq: &[u8], params: &Params) -> Result<Vec<u8>> {
+    let coded = fqxv_seq::encode_hashed(
+        lens,
+        seq,
+        params.seq_order as usize,
+        params.seq_hash_order as usize,
+        u32::from(params.seq_hash_bits),
+    )?;
+    let mut out = Vec::with_capacity(coded.len() + 1);
+    out.push(SEQ_METHOD_ORDERK);
+    out.extend_from_slice(&coded);
+    Ok(out)
+}
+
+/// Encode the sequence stream, choosing the codec by a leading method byte.
+///
+/// Short reads always use the order-k context model. Long reads (mean length over
+/// [`REORDER_MAX_MEAN_LEN`]) carry cross-read redundancy the within-read model
+/// cannot see, so the overlap-assembly codec is tried — but its advantage
+/// depends on within-block coverage, which the per-block budget bounds, so both
+/// are coded and the **smaller** kept. The overlap codec then never regresses a
+/// block against order-k (low coverage, a large genome, or few reads all fall
+/// back automatically), the same "keep the smaller" rule the reference coder and
+/// the per-stream entropy coder already use. The choice is per block, so a file
+/// of mixed lengths codes each block with whichever fits.
+pub(crate) fn encode_sequence_stream(lens: &[u32], seq: &[u8], params: &Params) -> Result<Vec<u8>> {
+    if !super::reorder::is_long_read(lens) {
+        return order_k_stream(lens, seq, params);
+    }
+    let (overlap, order_k) = rayon::join(
+        || {
+            fqxv_lroverlap::encode(lens, seq, &fqxv_lroverlap::EncodeOpts::default()).map(|coded| {
+                let mut out = Vec::with_capacity(coded.len() + 1);
+                out.push(SEQ_METHOD_OVERLAP);
+                out.extend_from_slice(&coded);
+                out
+            })
+        },
+        || order_k_stream(lens, seq, params),
+    );
+    let (overlap, order_k) = (overlap?, order_k?);
+    Ok(if overlap.len() < order_k.len() {
+        overlap
+    } else {
+        order_k
+    })
+}
+
+/// Decode a method-tagged sequence stream back to `(per-read lengths, bases)`.
+pub(crate) fn decode_sequence_stream(coded: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
+    let (&method, rest) = coded
+        .split_first()
+        .ok_or(Error::Malformed("empty sequence stream"))?;
+    match method {
+        SEQ_METHOD_ORDERK => Ok(fqxv_seq::decode(rest)?),
+        SEQ_METHOD_OVERLAP => Ok(fqxv_lroverlap::decode(rest)?),
+        _ => Err(Error::Malformed("unknown sequence codec method")),
+    }
+}
+
+/// Code one non-reorder block: names (tokenizer), sequence (method-tagged), and
+/// quality (fqzcomp), each length-prefixed, behind a leading [`content_digest`].
+/// Reorder uses the whole-file path instead.
 pub(crate) fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
     let header_refs = b.header_refs();
     // The three streams are independent; code them concurrently so a block's
@@ -188,15 +254,7 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
         || fqxv_tokenizer::encode(&header_refs),
         || {
             rayon::join(
-                || {
-                    fqxv_seq::encode_hashed(
-                        &b.lens,
-                        &b.seq,
-                        params.seq_order as usize,
-                        params.seq_hash_order as usize,
-                        u32::from(params.seq_hash_bits),
-                    )
-                },
+                || encode_sequence_stream(&b.lens, &b.seq, params),
                 || fqxv_fqzcomp::encode(&b.lens, &b.qual, params.quality_binning),
             )
         },
@@ -304,7 +362,12 @@ pub(crate) fn decode_block_parts(buf: &[u8]) -> Result<BlockParts> {
     let (names_s, seq_s, qual_s) = (c.slice_u32()?, c.slice_u32()?, c.slice_u32()?);
     let (names, (seq_r, qual_r)) = rayon::join(
         || fqxv_tokenizer::decode(names_s),
-        || rayon::join(|| fqxv_seq::decode(seq_s), || fqxv_fqzcomp::decode(qual_s)),
+        || {
+            rayon::join(
+                || decode_sequence_stream(seq_s),
+                || fqxv_fqzcomp::decode(qual_s),
+            )
+        },
     );
     let names = names?;
     let (seq_lens, seq) = seq_r?;

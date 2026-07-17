@@ -22,6 +22,7 @@ fqxv-fqzcomp.workspace = true
 fqxv-tokenizer.workspace = true
 fqxv-seq.workspace = true
 fqxv-reorder.workspace = true
+fqxv-lroverlap.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 noodles-fastq.workspace = true

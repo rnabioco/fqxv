@@ -11,11 +11,12 @@ Where each lever stands:
 | --- | --- |
 | Quality binning (`--quality-bin ont` / `hifi`) | **shipped** — usable from the CLI |
 | Quality base-context | not started; measured headroom is ~nil (see Lever 1) |
-| Overlap sequence codec (`fqxv-lroverlap`) | **measured, not wired in** — reaches parity with CoLoRd in a harness, but no container integration, so users cannot reach it |
+| Overlap sequence codec (`fqxv-lroverlap`) | **shipped** (`FORMAT_VERSION` 4) — auto-selected for long-read blocks, kept only when it beats the order-k model; codes the HiFi sequence stream ~5× smaller through a real archive. See [Wiring](#wiring-and-the-per-block-coverage-cap). |
 
 The rest of this note is the analysis that set those priorities; it is written
-against the pre-`lroverlap` baseline, so "fqxv seq" rows below are the within-read
-order-k model that long-read archives still use today.
+against the pre-`lroverlap` baseline, so the "fqxv seq" rows below are the
+within-read order-k model — now the *fallback*, used only when the overlap codec
+does not win a block.
 
 ## Why long reads are different
 
@@ -250,8 +251,8 @@ own harness, `crates/fqxv-lroverlap/examples/encode.rs`:
 
 | path | seq bits/base |
 | --- | --- |
-| fqxv within-read order-k (today's long-read archives) | 0.653 |
-| **`fqxv-lroverlap`** | **0.067** |
+| fqxv within-read order-k (the fallback) | 0.653 |
+| **`fqxv-lroverlap`, whole-file harness** | **0.067** |
 | CoLoRd | 0.068 |
 | oracle (true reference, known placement) | 0.040 |
 
@@ -263,12 +264,26 @@ analysis, that margin is the difference between coding against another erroneous
 read (~0.005 edits/base — *both* reads' errors) and coding against a voted
 consensus (0.0025).
 
-!!! warning "Not wired into the container"
-    Nothing imports `fqxv-lroverlap` — it is absent from every other crate's
-    `Cargo.toml`, so it is inert: no container sequence-method tag, no CLI flag,
-    no effect on any `.fqxv` archive. The numbers above are harness measurements
-    proving the lever is real, not a shipped feature. Container integration
-    (step 4 of the design above) is the remaining work.
+### Wiring and the per-block coverage cap
+
+`fqxv-lroverlap` is wired into the container (`FORMAT_VERSION` 4). The block
+sequence stream carries a leading method byte; long-read blocks (mean length
+over 500 bp) code with both the overlap codec and the order-k model and keep the
+smaller, so the overlap path never regresses a block. Selection is automatic —
+no CLI flag — and the archive round-trips exactly (per-block content digest plus
+`compress --verify`) and is byte-identical across thread counts.
+
+**The wired codec runs per block, and that caps its coverage.** Each 256 MiB
+block self-assembles its own reference — which is what preserves blocked
+parallelism, per-block random access, and thread-determinism — but a block holds
+only ~256 MiB of bases, so on a 5 Mb genome one block sees tens of ×, not the
+whole file's 300×. The harness's 0.067 codes the *whole file* as one reference;
+the container cannot without giving up the per-block invariants. Measured through
+a real, round-trip-verified archive of the whole `ecoli_hifi` file (120k reads,
+1.55 Gbase, 6 blocks at ~52×) the sequence stream is **0.107 bits/base — 6.1×
+smaller than the 0.653 fallback** (total archive 4.04×), but above CoLoRd's
+whole-file 0.068. Closing that remaining gap means more coverage per reference —
+larger long-read blocks, or a reference shared across blocks — the open lever.
 
 ### Cost / benefit
 

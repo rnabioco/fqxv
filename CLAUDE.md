@@ -64,6 +64,11 @@ ones. Build understanding bottom-up:
   exception list. Not a raw 2-bit *packing* path — every base is context-coded.
 - **`fqxv-reorder`** (→ rans, seq) — PgRC2/SPRING-class read reordering
   (minimizer clustering, reverse-complement aware) for cross-read redundancy.
+- **`fqxv-lroverlap`** (→ rans, range, seq) — long-read cross-read overlap codec
+  (minimizers → overlaps → layout → consensus → per-read banded edit script →
+  rANS). `encode`/`decode` are the container's sequence path for long-read blocks
+  (auto-selected, kept only when it beats order-k). Sibling of `fqxv-reorder`;
+  never depends on it.
 - **`fqxv`** — the `.fqxv` container format; composes all codec crates into
   `compress`/`compress_multi`/`decompress`/`decompress_split`/`inspect`. This is
   where the on-disk layout lives (`src/container.rs`).
@@ -71,8 +76,9 @@ ones. Build understanding bottom-up:
 
 The container (`crates/fqxv/src/container.rs`) is a 10-byte header followed by
 independent, parallel-codable blocks. Each block splits FASTQ into three streams
-handled by three codecs: **names** (tokenizer), **sequence** (seq or reorder),
-**quality** (fqzcomp). The exact byte layout is documented in the module doc
+handled by three codecs: **names** (tokenizer), **sequence** (order-k seq,
+reorder, or the long-read overlap codec — a leading method byte per block picks
+one), **quality** (fqzcomp). The exact byte layout is documented in the module doc
 comment at the top of `container.rs` — read it before touching the format.
 
 ## Invariants to preserve

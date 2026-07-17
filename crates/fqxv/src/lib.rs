@@ -60,10 +60,13 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 /// - prefixes every block frame with a `BLOCK_MAGIC` sync marker (v2) so
 ///   [`decompress_recover`] can resynchronize to a block boundary by scanning —
 ///   recovering intact blocks even when the footer index is lost (a truncated
-///   tail) or a block's length prefix is corrupt.
+///   tail) or a block's length prefix is corrupt;
+/// - tags each block's sequence stream with a leading method byte (v4) so the
+///   codec is chosen per block: the order-k context model for short reads, the
+///   cross-read overlap-assembly codec (`fqxv-lroverlap`) for long reads.
 ///
 /// See `container.rs` for the full layout.
-pub const FORMAT_VERSION: u16 = 3;
+pub const FORMAT_VERSION: u16 = 4;
 
 /// Errors returned by the archiver.
 #[derive(Debug, Error)]
@@ -103,6 +106,9 @@ pub enum Error {
     /// Read-reordering codec failure.
     #[error(transparent)]
     Reorder(#[from] fqxv_reorder::Error),
+    /// Long-read overlap sequence codec failure.
+    #[error(transparent)]
+    Lroverlap(#[from] fqxv_lroverlap::Error),
     /// rANS coder failure (permutation stream).
     #[error(transparent)]
     Rans(#[from] fqxv_rans::Error),

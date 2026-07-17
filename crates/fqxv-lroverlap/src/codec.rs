@@ -1,0 +1,793 @@
+//! The lossless container codec: `encode` reads → a self-contained byte block,
+//! `decode` the block → the exact reads back, in the original order.
+//!
+//! [`encode`] runs the crate's pipeline (subsample → overlaps → layout →
+//! consensus → place every read → banded edit script) and, unlike
+//! `examples/encode.rs` (which only *measures* the stream sizes), serialises
+//! every stream the decoder needs into one framed blob:
+//!
+//! - the per-contig **reference** consensi (stored raw, entropy-coded);
+//! - a **manifest** — for each read, in encode order, its original id and
+//!   whether it was coded as an edit script or as a standalone literal — which
+//!   is what lets [`decode`] restore the *original* read order from the
+//!   reference-grouped streams;
+//! - the per-read **flip / placement / op / run / sub / indel** streams;
+//! - **literals** for reads that landed on no reference;
+//! - a **non-ACGT exception list** `(global base index, byte)`, applied last, so
+//!   losslessness never depends on how the aligner coded an `N` or a lowercase
+//!   base.
+//!
+//! Read lengths terminate each read's op run on decode (ops are consumed until
+//! the produced length equals `lens[r]`), so the format self-describes lengths
+//! the same way [`fqxv_seq`] does.
+
+use std::collections::HashSet;
+
+use rayon::prelude::*;
+
+use fqxv_bytes::{read_varint, write_varint};
+
+use crate::{
+    align_banded, apply, consensus, find_overlaps, layout, place_against, Anchored, ChainOpts,
+    ConsensusOpts, Error, Index, LayoutOpts, Op, Repeat, Sketch,
+};
+
+/// Format tag for a `fqxv-lroverlap` sequence block.
+const MAGIC: [u8; 3] = *b"LRO";
+/// Bitstream version. Bump on any layout change (nothing on disk is stable yet).
+const VERSION: u8 = 1;
+
+/// Coverage the layout is fed after subsampling. The layout is excellent at
+/// ~40× and starves past it (see `layout.rs`); every read is then placed against
+/// the consensus it produces, so the reference is amortised over the whole
+/// block. Deriving the stride from this target keeps it out of the caller's API.
+const TARGET_LAYOUT_COVERAGE: u64 = 40;
+
+/// One extra reference base past a read's own length, so the banded aligner has
+/// somewhere to place a trailing deletion.
+const REF_TAIL: usize = 64;
+
+/// Options for [`encode`]. None affect [`decode`] — the block self-describes.
+#[derive(Debug, Clone)]
+pub struct EncodeOpts {
+    /// Minimizer sketch; pick [`Sketch::hifi`] for low-error long reads,
+    /// [`Sketch::ont`] for noisy ones. Affects ratio and speed, not correctness.
+    pub sketch: Sketch,
+    /// Layout subsample stride. `None` derives it from estimated coverage so the
+    /// layout sees ~40×; `Some(1)` disables subsampling.
+    pub stride: Option<usize>,
+    /// Slack added to each read's own chain drift when sizing its alignment band.
+    pub band_margin: usize,
+    /// Hard cap on the band, so one pathological chain cannot allocate a
+    /// quadratic DP table.
+    pub band_cap: usize,
+}
+
+impl Default for EncodeOpts {
+    fn default() -> Self {
+        Self {
+            sketch: Sketch::ont(),
+            stride: None,
+            band_margin: 32,
+            band_cap: 2048,
+        }
+    }
+}
+
+/// Strict 2-bit base code: `A C G T` → `0 1 2 3`, everything else → `4` (a
+/// placeholder the exception list overwrites on decode). Deliberately *not*
+/// case-folding — a lowercase base is preserved verbatim through the exceptions.
+#[inline]
+fn base_code(b: u8) -> u8 {
+    match b {
+        b'A' => 0,
+        b'C' => 1,
+        b'G' => 2,
+        b'T' => 3,
+        _ => 4,
+    }
+}
+
+/// Inverse of [`base_code`] for the four canonical bases; `4` decodes to `A` and
+/// is corrected by the exception list.
+#[inline]
+fn base_char(c: u8) -> u8 {
+    match c {
+        0 => b'A',
+        1 => b'C',
+        2 => b'G',
+        3 => b'T',
+        _ => b'A',
+    }
+}
+
+#[inline]
+fn is_acgt(b: u8) -> bool {
+    matches!(b, b'A' | b'C' | b'G' | b'T')
+}
+
+fn revcomp(s: &[u8]) -> Vec<u8> {
+    s.iter()
+        .rev()
+        .map(|&b| match b {
+            b'A' => b'T',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'T' => b'A',
+            x => x,
+        })
+        .collect()
+}
+
+/// Entropy-code `raw` with the smaller of order-0 / order-1 rANS and frame it as
+/// `[varint raw_len][varint enc_len][enc bytes]`. Empty streams store only a
+/// zero length. The order tag lives inside the rANS header, so [`get_stream`]
+/// needs no discriminator of its own.
+fn put_stream(out: &mut Vec<u8>, raw: &[u8]) -> Result<(), Error> {
+    write_varint(out, raw.len() as u64);
+    if raw.is_empty() {
+        return Ok(());
+    }
+    let e0 = fqxv_rans::encode(raw, fqxv_rans::Order::Zero).map_err(|_| Error::Corrupt)?;
+    let e1 = fqxv_rans::encode(raw, fqxv_rans::Order::One).map_err(|_| Error::Corrupt)?;
+    let enc = if e1.len() <= e0.len() { e1 } else { e0 };
+    write_varint(out, enc.len() as u64);
+    out.extend_from_slice(&enc);
+    Ok(())
+}
+
+fn get_stream(src: &[u8], pos: &mut usize) -> Result<Vec<u8>, Error> {
+    let raw_len = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
+    if raw_len == 0 {
+        return Ok(Vec::new());
+    }
+    let enc_len = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
+    let end = pos.checked_add(enc_len).ok_or(Error::Corrupt)?;
+    let enc = src.get(*pos..end).ok_or(Error::Corrupt)?;
+    *pos = end;
+    let out = fqxv_rans::decode_bounded(enc, raw_len).map_err(|_| Error::Corrupt)?;
+    if out.len() != raw_len {
+        return Err(Error::Corrupt);
+    }
+    Ok(out)
+}
+
+/// A single read's contribution to the seven edit streams, plus its literal
+/// bases when it lands on no reference.
+#[derive(Default)]
+struct Streams {
+    ops: Vec<u8>,
+    runs: Vec<u8>,
+    subs: Vec<u8>,
+    ins_bases: Vec<u8>,
+    indel_lens: Vec<u8>,
+    placements: Vec<u8>,
+    flips: Vec<u8>,
+    literals: Vec<u8>,
+    /// Manifest, encode order: original read id of every read in this group.
+    read_ids: Vec<u8>,
+    /// Manifest, encode order: `0` = edit-script coded, `1` = literal.
+    kinds: Vec<u8>,
+}
+
+impl Streams {
+    fn merge(&mut self, o: &Streams) {
+        self.ops.extend_from_slice(&o.ops);
+        self.runs.extend_from_slice(&o.runs);
+        self.subs.extend_from_slice(&o.subs);
+        self.ins_bases.extend_from_slice(&o.ins_bases);
+        self.indel_lens.extend_from_slice(&o.indel_lens);
+        self.placements.extend_from_slice(&o.placements);
+        self.flips.extend_from_slice(&o.flips);
+        self.literals.extend_from_slice(&o.literals);
+        self.read_ids.extend_from_slice(&o.read_ids);
+        self.kinds.extend_from_slice(&o.kinds);
+    }
+}
+
+/// Estimate the block's fold coverage from its distinct-minimizer count
+/// (genome ≈ distinct × (w+1)/2, minimizer density 2/(w+1)) and turn it into a
+/// layout stride targeting [`TARGET_LAYOUT_COVERAGE`]. Repeats bias the genome
+/// estimate low and the stride high; both are bounded and only affect ratio.
+fn derive_stride(sketch: Sketch, reads: &[&[u8]], total_bases: u64) -> usize {
+    let mut distinct: HashSet<u64> = HashSet::new();
+    for r in reads {
+        for m in sketch.minimizers(r) {
+            distinct.insert(m.hash);
+        }
+    }
+    if distinct.is_empty() {
+        return 1;
+    }
+    let genome = (distinct.len() as u64 * (sketch.w as u64 + 1) / 2).max(1);
+    let coverage = total_bases / genome;
+    ((coverage / TARGET_LAYOUT_COVERAGE) as usize).max(1)
+}
+
+/// Compress a block of long reads. `lens[r]` is the length of read `r`; `seq` is
+/// their bases concatenated in order. Returns a self-contained block that
+/// [`decode`] inverts exactly.
+pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Error> {
+    let sketch = opts.sketch;
+    let n = lens.len();
+
+    let mut offs = Vec::with_capacity(n + 1);
+    let mut acc = 0usize;
+    for &l in lens {
+        offs.push(acc);
+        acc += l as usize;
+    }
+    offs.push(acc);
+    if acc != seq.len() {
+        return Err(Error::Corrupt);
+    }
+    let read_at = |r: usize| &seq[offs[r]..offs[r + 1]];
+    let all_refs: Vec<&[u8]> = (0..n).map(read_at).collect();
+    let total_bases: u64 = lens.iter().map(|&l| u64::from(l)).sum();
+
+    // ---- subsample the layout ------------------------------------------
+    let stride = match opts.stride {
+        Some(s) => s.max(1),
+        None => derive_stride(sketch, &all_refs, total_bases),
+    };
+    let sub: Vec<u32> = (0..n as u32).step_by(stride).collect();
+    let sub_lens: Vec<u32> = sub.iter().map(|&r| lens[r as usize]).collect();
+    let mut sub_seq: Vec<u8> = Vec::new();
+    for &r in &sub {
+        sub_seq.extend_from_slice(read_at(r as usize));
+    }
+    let mut sub_offs = Vec::with_capacity(sub.len() + 1);
+    let mut acc = 0usize;
+    for &l in &sub_lens {
+        sub_offs.push(acc);
+        acc += l as usize;
+    }
+    sub_offs.push(acc);
+    let sub_read_at = |i: usize| &sub_seq[sub_offs[i]..sub_offs[i + 1]];
+
+    // ---- overlaps → layout → consensus over the subsample --------------
+    let idx = Index::build(&sub_lens, &sub_seq, sketch, Repeat::default())?;
+    let ovs: Vec<Vec<_>> = (0..sub.len())
+        .into_par_iter()
+        .map(|r| find_overlaps(&idx, r as u32, sub_read_at(r), ChainOpts::default()))
+        .collect();
+    let contigs = layout(&sub_lens, &ovs, LayoutOpts::default());
+
+    let consensi: Vec<Vec<u8>> = contigs
+        .par_iter()
+        .filter(|c| c.reads.len() > 1)
+        .filter_map(|c| {
+            let mut by_id: Vec<Vec<u8>> = vec![Vec::new(); sub.len()];
+            for p in &c.reads {
+                let r = sub_read_at(p.read as usize);
+                by_id[p.read as usize] = if p.flip { revcomp(r) } else { r.to_vec() };
+            }
+            let cons = consensus(
+                c,
+                &by_id,
+                ConsensusOpts {
+                    sketch,
+                    ..ConsensusOpts::default()
+                },
+            );
+            if cons.is_empty() {
+                None
+            } else {
+                Some(cons.seq)
+            }
+        })
+        .collect();
+
+    // ---- place every read on its best-scoring reference ----------------
+    let placed: Vec<Vec<Option<_>>> = consensi
+        .iter()
+        .map(|cs| place_against(cs, &all_refs, sketch, ChainOpts::default()))
+        .collect();
+    let mut best: Vec<Option<(usize, Anchored)>> = vec![None; n];
+    for (ci, per_read) in placed.iter().enumerate() {
+        for (r, a) in per_read.iter().enumerate() {
+            let Some(a) = a else { continue };
+            let take = match best[r] {
+                None => true,
+                Some((_, b)) => a.score > b.score,
+            };
+            if take {
+                best[r] = Some((ci, *a));
+            }
+        }
+    }
+
+    // Group placed reads by reference, ordered by (offset, read) so delta-coded
+    // placements are small and the order is total.
+    let mut by_ref: Vec<Vec<(u32, u32)>> = vec![Vec::new(); consensi.len()];
+    for (r, b) in best.iter().enumerate() {
+        if let Some((ci, a)) = b {
+            by_ref[*ci].push((a.offset, r as u32));
+        }
+    }
+    for v in &mut by_ref {
+        v.sort_unstable();
+    }
+
+    // ---- code each read against its reference --------------------------
+    let per_contig: Vec<Streams> = consensi
+        .par_iter()
+        .enumerate()
+        .map(|(ci, cs)| {
+            let aligned: Vec<Option<(usize, Vec<Op>)>> = by_ref[ci]
+                .par_iter()
+                .map(|&(_, r)| {
+                    let a = best[r as usize].expect("assigned").1;
+                    let raw = read_at(r as usize);
+                    let read = if a.flip { revcomp(raw) } else { raw.to_vec() };
+                    let start = a.offset as usize;
+                    let end = (start + read.len() + REF_TAIL).min(cs.len());
+                    if start >= end {
+                        return None;
+                    }
+                    let band = (a.drift as usize + opts.band_margin).min(opts.band_cap);
+                    Some((start, align_banded(&cs[start..end], &read, band).ops))
+                })
+                .collect();
+
+            let mut s = Streams::default();
+            let mut prev_start: i64 = 0;
+            for (idx, slot) in aligned.into_iter().enumerate() {
+                let r = by_ref[ci][idx].1 as usize;
+                write_varint(&mut s.read_ids, r as u64);
+                let Some((start, mut ops)) = slot else {
+                    s.kinds.push(1);
+                    s.literals.extend(read_at(r).iter().map(|&b| base_code(b)));
+                    continue;
+                };
+                // Trailing deletions consume only reference (the `REF_TAIL`
+                // slack), never query, so they carry no information the decoder
+                // needs — and it terminates a read's ops when the produced length
+                // reaches `lens[r]`, so a trailing Del would desync the stream.
+                while matches!(ops.last(), Some(Op::Del(_))) {
+                    ops.pop();
+                }
+                s.kinds.push(0);
+                s.flips.push(u8::from(best[r].expect("assigned").1.flip));
+                let d = start as i64 - prev_start;
+                prev_start = start as i64;
+                write_varint(&mut s.placements, fqxv_bytes::zigzag(d));
+                for op in &ops {
+                    match op {
+                        Op::Match(m) => {
+                            s.ops.push(0);
+                            write_varint(&mut s.runs, u64::from(*m));
+                        }
+                        Op::Sub(b) => {
+                            s.ops.push(1);
+                            s.subs.push(base_code(*b));
+                        }
+                        Op::Ins(bs) => {
+                            s.ops.push(2);
+                            write_varint(&mut s.indel_lens, bs.len() as u64);
+                            s.ins_bases.extend(bs.iter().map(|&b| base_code(b)));
+                        }
+                        Op::Del(m) => {
+                            s.ops.push(3);
+                            write_varint(&mut s.indel_lens, u64::from(*m));
+                        }
+                    }
+                }
+            }
+            s
+        })
+        .collect();
+
+    // Orphans — reads on no reference — as a final literal-only group.
+    let mut orphans = Streams::default();
+    let mut orphan_count = 0u64;
+    for (r, b) in best.iter().enumerate() {
+        if b.is_none() {
+            write_varint(&mut orphans.read_ids, r as u64);
+            orphans.kinds.push(1);
+            orphans
+                .literals
+                .extend(read_at(r).iter().map(|&x| base_code(x)));
+            orphan_count += 1;
+        }
+    }
+
+    // Group counts (encode order): one per contig, then the orphan group.
+    let mut counts: Vec<u64> = by_ref.iter().map(|v| v.len() as u64).collect();
+    counts.push(orphan_count);
+
+    let mut all = Streams::default();
+    for s in &per_contig {
+        all.merge(s);
+    }
+    all.merge(&orphans);
+
+    // Non-ACGT exceptions, in original order: overwrite the placeholder after
+    // reconstruction, so correctness never depends on how a base was coded.
+    let mut exc_pos: Vec<u8> = Vec::new();
+    let mut exc_bytes: Vec<u8> = Vec::new();
+    let mut prev_pos: u64 = 0;
+    for (i, &b) in seq.iter().enumerate() {
+        if !is_acgt(b) {
+            write_varint(&mut exc_pos, i as u64 - prev_pos);
+            prev_pos = i as u64;
+            exc_bytes.push(b);
+        }
+    }
+
+    // ---- serialise -----------------------------------------------------
+    let mut out = Vec::new();
+    out.extend_from_slice(&MAGIC);
+    out.push(VERSION);
+    write_varint(&mut out, n as u64);
+    write_varint(&mut out, total_bases);
+
+    let mut lens_raw = Vec::new();
+    for &l in lens {
+        write_varint(&mut lens_raw, u64::from(l));
+    }
+    put_stream(&mut out, &lens_raw)?;
+
+    write_varint(&mut out, consensi.len() as u64);
+    let mut ref_lens_raw = Vec::new();
+    let mut ref_bytes = Vec::new();
+    for cs in &consensi {
+        write_varint(&mut ref_lens_raw, cs.len() as u64);
+        ref_bytes.extend_from_slice(cs);
+    }
+    put_stream(&mut out, &ref_lens_raw)?;
+    put_stream(&mut out, &ref_bytes)?;
+
+    let mut counts_raw = Vec::new();
+    for &c in &counts {
+        write_varint(&mut counts_raw, c);
+    }
+    put_stream(&mut out, &counts_raw)?;
+
+    put_stream(&mut out, &all.read_ids)?;
+    put_stream(&mut out, &all.kinds)?;
+    put_stream(&mut out, &all.flips)?;
+    put_stream(&mut out, &all.placements)?;
+    put_stream(&mut out, &all.ops)?;
+    put_stream(&mut out, &all.runs)?;
+    put_stream(&mut out, &all.subs)?;
+    put_stream(&mut out, &all.ins_bases)?;
+    put_stream(&mut out, &all.indel_lens)?;
+    put_stream(&mut out, &all.literals)?;
+    put_stream(&mut out, &exc_pos)?;
+    put_stream(&mut out, &exc_bytes)?;
+
+    Ok(out)
+}
+
+/// Decompress a block produced by [`encode`], returning `(lens, seq)` in the
+/// original read order.
+pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
+    let mut pos = 0usize;
+    if src.get(..3) != Some(&MAGIC) {
+        return Err(Error::Corrupt);
+    }
+    pos += 3;
+    let version = *src.get(pos).ok_or(Error::Corrupt)?;
+    pos += 1;
+    if version != VERSION {
+        return Err(Error::Corrupt);
+    }
+    let n = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let total_bases = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+
+    // Lengths.
+    let lens_raw = get_stream(src, &mut pos)?;
+    let mut lp = 0usize;
+    let mut lens = Vec::with_capacity(n);
+    for _ in 0..n {
+        let l = read_varint(&lens_raw, &mut lp).ok_or(Error::Corrupt)?;
+        lens.push(u32::try_from(l).map_err(|_| Error::Corrupt)?);
+    }
+    let mut offs = Vec::with_capacity(n + 1);
+    let mut acc = 0usize;
+    for &l in &lens {
+        offs.push(acc);
+        acc += l as usize;
+    }
+    offs.push(acc);
+    if acc != total_bases {
+        return Err(Error::Corrupt);
+    }
+
+    // References.
+    let n_contigs = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let ref_lens_raw = get_stream(src, &mut pos)?;
+    let ref_bytes = get_stream(src, &mut pos)?;
+    let mut rlp = 0usize;
+    let mut refs: Vec<&[u8]> = Vec::with_capacity(n_contigs);
+    let mut roff = 0usize;
+    for _ in 0..n_contigs {
+        let rl = read_varint(&ref_lens_raw, &mut rlp).ok_or(Error::Corrupt)? as usize;
+        let end = roff.checked_add(rl).ok_or(Error::Corrupt)?;
+        refs.push(ref_bytes.get(roff..end).ok_or(Error::Corrupt)?);
+        roff = end;
+    }
+
+    // Groups + manifest + streams.
+    let counts_raw = get_stream(src, &mut pos)?;
+    let mut cp = 0usize;
+    let mut counts = Vec::with_capacity(n_contigs + 1);
+    for _ in 0..n_contigs + 1 {
+        counts.push(read_varint(&counts_raw, &mut cp).ok_or(Error::Corrupt)? as usize);
+    }
+
+    let read_ids = get_stream(src, &mut pos)?;
+    let kinds = get_stream(src, &mut pos)?;
+    let flips = get_stream(src, &mut pos)?;
+    let placements = get_stream(src, &mut pos)?;
+    let ops = get_stream(src, &mut pos)?;
+    let runs = get_stream(src, &mut pos)?;
+    let subs = get_stream(src, &mut pos)?;
+    let ins_bases = get_stream(src, &mut pos)?;
+    let indel_lens = get_stream(src, &mut pos)?;
+    let literals = get_stream(src, &mut pos)?;
+    let exc_pos = get_stream(src, &mut pos)?;
+    let exc_bytes = get_stream(src, &mut pos)?;
+
+    let mut seq = vec![0u8; total_bases];
+    // Cursors into each stream, advanced in the exact order `encode` wrote them.
+    let mut idp = 0usize; // read_ids
+    let mut kp = 0usize; // kinds
+    let mut fp = 0usize; // flips
+    let mut pp = 0usize; // placements
+    let mut op = 0usize; // ops
+    let mut rp = 0usize; // runs
+    let mut sp = 0usize; // subs
+    let mut ip = 0usize; // ins_bases
+    let mut dp = 0usize; // indel_lens
+    let mut litp = 0usize; // literals
+
+    let write_read = |seq: &mut [u8], r: usize, bytes: &[u8]| -> Result<(), Error> {
+        let want = lens[r] as usize;
+        if bytes.len() != want {
+            return Err(Error::Corrupt);
+        }
+        seq[offs[r]..offs[r + 1]].copy_from_slice(bytes);
+        Ok(())
+    };
+
+    for (ci, &count) in counts.iter().enumerate() {
+        let is_orphan_group = ci == n_contigs;
+        let mut prev_start: i64 = 0;
+        for _ in 0..count {
+            let r = read_varint(&read_ids, &mut idp).ok_or(Error::Corrupt)? as usize;
+            if r >= n {
+                return Err(Error::Corrupt);
+            }
+            let kind = *kinds.get(kp).ok_or(Error::Corrupt)?;
+            kp += 1;
+            if kind == 1 {
+                // Literal: `lens[r]` base codes, corrected later by exceptions.
+                let want = lens[r] as usize;
+                let bytes: Vec<u8> = literals
+                    .get(litp..litp + want)
+                    .ok_or(Error::Corrupt)?
+                    .iter()
+                    .map(|&c| base_char(c))
+                    .collect();
+                litp += want;
+                write_read(&mut seq, r, &bytes)?;
+                continue;
+            }
+            if is_orphan_group {
+                return Err(Error::Corrupt); // orphan group is literal-only
+            }
+            let flip = *flips.get(fp).ok_or(Error::Corrupt)? != 0;
+            fp += 1;
+            let d = fqxv_bytes::unzigzag(read_varint(&placements, &mut pp).ok_or(Error::Corrupt)?);
+            let start = (prev_start + d) as usize;
+            prev_start += d;
+            let cs = *refs.get(ci).ok_or(Error::Corrupt)?;
+            let cs = cs.get(start..).ok_or(Error::Corrupt)?;
+
+            // Rebuild this read's ops until it has produced `lens[r]` bases.
+            let want = lens[r] as usize;
+            let mut produced = 0usize;
+            let mut read_ops: Vec<Op> = Vec::new();
+            while produced < want {
+                let code = *ops.get(op).ok_or(Error::Corrupt)?;
+                op += 1;
+                match code {
+                    0 => {
+                        let m = read_varint(&runs, &mut rp).ok_or(Error::Corrupt)? as usize;
+                        produced += m;
+                        read_ops.push(Op::Match(m as u32));
+                    }
+                    1 => {
+                        let b = base_char(*subs.get(sp).ok_or(Error::Corrupt)?);
+                        sp += 1;
+                        produced += 1;
+                        read_ops.push(Op::Sub(b));
+                    }
+                    2 => {
+                        let k = read_varint(&indel_lens, &mut dp).ok_or(Error::Corrupt)? as usize;
+                        let bs: Vec<u8> = ins_bases
+                            .get(ip..ip + k)
+                            .ok_or(Error::Corrupt)?
+                            .iter()
+                            .map(|&c| base_char(c))
+                            .collect();
+                        ip += k;
+                        produced += k;
+                        read_ops.push(Op::Ins(bs));
+                    }
+                    3 => {
+                        let m = read_varint(&indel_lens, &mut dp).ok_or(Error::Corrupt)? as u32;
+                        read_ops.push(Op::Del(m));
+                    }
+                    _ => return Err(Error::Corrupt),
+                }
+            }
+            if produced != want {
+                return Err(Error::Corrupt);
+            }
+            let oriented = apply(cs, &read_ops);
+            if oriented.len() != want {
+                return Err(Error::Corrupt);
+            }
+            let read = if flip { revcomp(&oriented) } else { oriented };
+            write_read(&mut seq, r, &read)?;
+        }
+    }
+
+    // Apply non-ACGT exceptions last.
+    let mut ep = 0usize;
+    let mut gpos: u64 = 0;
+    for &b in &exc_bytes {
+        let delta = read_varint(&exc_pos, &mut ep).ok_or(Error::Corrupt)?;
+        gpos += delta;
+        let idx = gpos as usize;
+        *seq.get_mut(idx).ok_or(Error::Corrupt)? = b;
+        // The first delta is the absolute index; subsequent are gaps. Because
+        // the first `prev_pos` was 0 and the first stored value is the index
+        // itself, gpos already holds the absolute position.
+    }
+
+    Ok((lens, seq))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic pseudo-random ACGT of `len` bases from `seed`.
+    fn rand_seq(len: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..len)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                b"ACGT"[(s & 3) as usize]
+            })
+            .collect()
+    }
+
+    fn roundtrip(reads: &[Vec<u8>], opts: &EncodeOpts) {
+        let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
+        let seq: Vec<u8> = reads.iter().flat_map(|r| r.iter().copied()).collect();
+        let enc = encode(&lens, &seq, opts).expect("encode");
+        let (dl, ds) = decode(&enc).expect("decode");
+        assert_eq!(dl, lens, "lengths");
+        assert_eq!(ds, seq, "sequence must round-trip exactly");
+    }
+
+    fn owned(reads: &[&[u8]]) -> Vec<Vec<u8>> {
+        reads.iter().map(|r| r.to_vec()).collect()
+    }
+
+    #[test]
+    fn empty_and_singletons() {
+        let opts = EncodeOpts {
+            stride: Some(1),
+            ..EncodeOpts::default()
+        };
+        roundtrip(&[], &opts);
+        roundtrip(&owned(&[b"ACGTACGTACGT"]), &opts);
+        roundtrip(&owned(&[b"", b"A", b"ACGT"]), &opts);
+    }
+
+    #[test]
+    fn non_acgt_and_lowercase_survive() {
+        let opts = EncodeOpts {
+            stride: Some(1),
+            ..EncodeOpts::default()
+        };
+        // These form no contig, so they exercise the literal + exception path.
+        roundtrip(&owned(&[b"ACGTNNNNacgtACGTRYKM"]), &opts);
+        roundtrip(&owned(&[b"NNNN", b"acgtacgt", b"ACGTNacgtN"]), &opts);
+    }
+
+    /// Reads that tile a genome form a contig and are coded against its
+    /// consensus — the edit-script/reference path, plus an unrelated orphan and
+    /// embedded non-ACGT bases that must survive it.
+    fn tiled_reads(seed: u64) -> Vec<Vec<u8>> {
+        let genome = rand_seq(30_000, seed);
+        let mut reads: Vec<Vec<u8>> = (0..10)
+            .map(|i| {
+                let mut s = genome[i * 2000..i * 2000 + 6000].to_vec();
+                // ~0.7% substitutions: sequencing error the aligner must code.
+                for (j, b) in s.iter_mut().enumerate() {
+                    if (i * 7 + j) % 143 == 0 {
+                        *b = b"ACGT"[((*b as usize) + 1) & 3];
+                    }
+                }
+                // Every other read comes off the sequencer reverse-complemented.
+                if i % 2 == 1 {
+                    revcomp(&s)
+                } else {
+                    s
+                }
+            })
+            .collect();
+        // A non-ACGT base and a lowercase base inside a placed read.
+        reads[0][100] = b'N';
+        reads[2][250] = b'n';
+        // An unrelated read: lands on no reference, coded as a literal orphan.
+        reads.push(rand_seq(4000, seed ^ 0xdead));
+        reads
+    }
+
+    #[test]
+    fn tiled_contig_roundtrips_through_edit_scripts() {
+        let opts = EncodeOpts {
+            sketch: Sketch::ont(),
+            stride: Some(1),
+            ..EncodeOpts::default()
+        };
+        for seed in [1u64, 88, 12345] {
+            roundtrip(&tiled_reads(seed), &opts);
+        }
+    }
+
+    proptest::proptest! {
+        /// Any pile of arbitrary-byte reads round-trips exactly — the exception
+        /// list makes losslessness independent of the alphabet, and short/empty
+        /// reads exercise the boundaries.
+        #[test]
+        fn arbitrary_reads_round_trip(
+            reads in proptest::collection::vec(
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 0..40),
+                0..24,
+            )
+        ) {
+            let opts = EncodeOpts { stride: Some(1), ..EncodeOpts::default() };
+            let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
+            let seq: Vec<u8> = reads.iter().flat_map(|r| r.iter().copied()).collect();
+            let enc = encode(&lens, &seq, &opts).expect("encode");
+            let (dl, ds) = decode(&enc).expect("decode");
+            proptest::prop_assert_eq!(dl, lens);
+            proptest::prop_assert_eq!(ds, seq);
+        }
+    }
+
+    #[test]
+    fn output_is_thread_count_invariant() {
+        let reads = tiled_reads(88);
+        let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
+        let seq: Vec<u8> = reads.iter().flat_map(|r| r.iter().copied()).collect();
+        let opts = EncodeOpts {
+            sketch: Sketch::ont(),
+            stride: Some(1),
+            ..EncodeOpts::default()
+        };
+        let run = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| encode(&lens, &seq, &opts).expect("encode"))
+        };
+        assert_eq!(
+            run(1),
+            run(8),
+            "encode output must be byte-identical regardless of thread count"
+        );
+    }
+}
