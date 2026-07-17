@@ -1674,7 +1674,7 @@ type Column = Vec<Vec<u8>>;
 /// matching [`Record`] triples for checking a projection reconstructs exactly
 /// what was stored.
 fn varied_records(n: usize) -> (Vec<u8>, Vec<Record>) {
-    let bases = [b'A', b'C', b'G', b'T'];
+    let bases = *b"ACGT";
     let mut bytes = Vec::new();
     let mut recs = Vec::with_capacity(n);
     for i in 0..n {
