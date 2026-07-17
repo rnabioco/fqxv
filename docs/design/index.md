@@ -35,7 +35,8 @@ graph TD
   frequency model; the backend for the quality and sequence context models.
 - **`fqxv-fqzcomp`** — a fqzcomp-style quality model: each symbol is coded under
   a context of the two previous qualities and position, one adaptive model per
-  context, reset at read boundaries. Opt-in Illumina 2/4/8-level binning.
+  context, reset at read boundaries. Opt-in lossy binning: Illumina 2/4/8-level,
+  plus ONT and PacBio HiFi tables (see [Long-read support](longread.md)).
 - **`fqxv-seq`** — an order-k adaptive base model over a 2-bit A/C/G/T alphabet;
   non-ACGT bytes go to a delta-coded exception list.
 - **`fqxv-tokenizer`** — splits names into digit/non-digit runs and models each
@@ -43,6 +44,11 @@ graph TD
   / literal), rANS-coding the op and payload streams.
 - **`fqxv-reorder`** — canonical-minimizer read clustering (see
   [Read Reordering](reordering.md)).
+- **`fqxv-lroverlap`** — cross-read overlap detection for long reads
+  (minimizers → chaining → layout → consensus → edit scripts). **Not wired into
+  the container**: nothing imports it yet, so it is not reachable from the CLI.
+  It exists to measure the long-read sequence lever — see
+  [Long-read support](longread.md).
 - **`fqxv-bytes`** — a leaf crate of shared byte-serialization primitives
   (LEB128 varints, zig-zag) that `fqxv-seq`, `fqxv-reorder`, `fqxv-fqzcomp`, and
   `fqxv-tokenizer` all read/write on disk; the single source of truth for those
@@ -71,5 +77,7 @@ in-tree order-k `fqxv-seq` model.
 
 ## See also
 
+- [Long-read support](longread.md) — what works on ONT/PacBio today, the
+  measured per-stream gap to CoLoRd, and the overlap codec that closes it.
 - [Testing & Robustness](testing.md) — coverage map, decoder-robustness
   guarantees, and roadmap drawn from the upstream tools' issue trackers.

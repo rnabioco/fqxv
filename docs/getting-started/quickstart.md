@@ -82,9 +82,21 @@ fqxv decompress sample.fqxv -Z | bwa mem -p ref.fa -     # interleaved, raw, on 
 
 ## Lossy quality (optional)
 
-Quality is lossless by default. Opt into Illumina-style binning for smaller
-archives when you don't need exact quality:
+Quality is lossless by default. Opt into binning for smaller archives when you
+don't need exact quality:
 
 ```bash
 fqxv compress reads.fastq -o reads.fqxv --quality-bin bin8   # or bin4 / bin2
 ```
+
+The `bin8`/`bin4`/`bin2` tables are Illumina-calibrated. Long reads have their
+own, and the tables are not interchangeable — pick the one matching your
+platform:
+
+```bash
+fqxv compress ont_reads.fastq -o ont_reads.fqxv --quality-bin ont    # Nanopore
+fqxv compress hifi_reads.fastq -o hifi_reads.fqxv --quality-bin hifi # PacBio HiFi
+```
+
+See [Lossy quality binning](../cli/compress.md#lossy-quality-binning) for what
+each table costs.
