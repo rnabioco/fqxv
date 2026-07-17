@@ -17,6 +17,46 @@ fn compress_bytes(input: &[u8], params: Params) -> Vec<u8> {
     out
 }
 
+/// A truncated FASTQ must be an error in BOTH `--order` modes, not an abort in
+/// one of them.
+///
+/// The reorder path derives its byte offsets from `lens` alone and then indexes
+/// `seq`/`qual` with them, so a quality line cut short made every slice out of
+/// bounds — and the release profile is `panic = "abort"`, so `--order any`
+/// core-dumped on a file `--order preserve` rejected cleanly. Truncation is the
+/// most ordinary corruption there is (an interrupted download, a broken pipe),
+/// and the two modes disagreeing about whether a file is valid is the bug.
+///
+/// Asserts they agree, rather than merely that each returns something: an
+/// `is_err()` on the reorder path alone would have passed while it aborted, since
+/// an abort is not an `Err`.
+#[test]
+fn a_truncated_fastq_errors_in_both_order_modes() {
+    // Last record's quality line is cut short: lens sum past the qual buffer.
+    let truncated = b"@r1\nACGTACGTACGT\n+\nIIIIIIIIIIII\n@r2\nTTGGCCAATTGG\n+\nFFF";
+
+    let plain = compress(&truncated[..], &mut Vec::new(), Params::default());
+    let reordered = compress(
+        &truncated[..],
+        &mut Vec::new(),
+        Params {
+            reorder: true,
+            ..Params::default()
+        },
+    );
+
+    assert!(plain.is_err(), "plain path must reject a truncated record");
+    assert!(
+        reordered.is_err(),
+        "reorder path must reject it too — it used to abort here"
+    );
+    assert_eq!(
+        plain.unwrap_err().to_string(),
+        reordered.unwrap_err().to_string(),
+        "both modes must reject the same input with the same message"
+    );
+}
+
 #[test]
 fn roundtrip_normalizes_plus() {
     let archive = compress_bytes(SAMPLE, Params::default());
