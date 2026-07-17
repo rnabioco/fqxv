@@ -56,22 +56,45 @@ streams, how do we close the gap to CoLoRd?
 ## Where the bytes are (measured)
 
 Measured per-stream, lossless, vs CoLoRd `-q org` (its lossless quality mode).
-Two datasets, deliberately spanning the regimes:
+Two datasets, deliberately spanning the regimes.
+
+**How the split is measured.** fqxv has real separate streams, so its columns come
+straight from `fqxv info`. CoLoRd does not, so its split is taken by difference:
+`-q org` is the whole lossless archive, `-q none` discards quality (Q1 for every
+base), and the quality column is `org - none`. That is **additive by
+construction** — non-quality + quality equals the total, to the byte — which is
+the point: an earlier version of this table took the total from a *different*
+CoLoRd run than the columns beside it, and the rows did not add up (its quality
+stream alone exceeded its whole archive).
+
+Note the caveat this method carries: `-q none` still contains **names and
+container overhead**, so CoLoRd's non-quality column is an *upper bound* on its
+sequence stream, while fqxv's `seq` is the real thing.
+
+For a seq-vs-seq comparison use **M1b's direct measurement of CoLoRd's sequence
+stream: 0.0676 bits/base** (13.1M on `ecoli_hifi`), which excludes names — that is
+the number the 9.7× gap below is computed from, and it is consistent with the
+0.069 upper bound here (the difference is names, ~0.0014 bits/base).
+
+The three sources are what went wrong before: the old table took `seq` from M1b,
+`qual` from `org - none`, and `total` from the benchmark harness — three separate
+runs, so the rows could not add up and the HiFi quality column exceeded its own
+archive. Each column above now comes from the same pair of runs.
 
 **`ecoli_ont`** (DRR205413, 287M bases, mean Q≈11.5 — noisy older-basecaller):
 
-| tool | total | seq | qual | seq bits/base |
+| tool | total | non-quality (seq+names) | qual | non-quality bits/base |
 | --- | --- | --- | --- | --- |
-| CoLoRd `-q org` | 188.7M | **31.4M** | 166.5M | 0.87 |
-| fqxv `-l9` | 224.4M | **58.8M** | 165.5M | 1.64 |
+| CoLoRd `-q org` | 197.9M | **31.4M** | 166.5M | 0.88 |
+| fqxv `-l9` | 224.4M | **58.8M** (seq only) | 165.5M | 1.64 |
 
 **`ecoli_hifi`** (SRR11434954 subset, 1.55G bases, mean Q≈27, ~300× — narrow
 high-Q, low error):
 
-| tool | total | seq | qual | seq bits/base |
+| tool | total | non-quality (seq+names) | qual | non-quality bits/base |
 | --- | --- | --- | --- | --- |
-| CoLoRd `-q org` | 665.4M | **13.1M** | 684.3M | 0.068 |
-| fqxv `-l9` | 837.7M | **126.3M** | 711.2M | 0.653 |
+| CoLoRd `-q org` | 697.7M | **13.4M** | 684.3M | 0.069 |
+| fqxv `-l9` | 837.7M | **126.3M** (seq only) | 711.2M | 0.653 |
 
 Two facts, confirmed on **both** platforms:
 
@@ -81,7 +104,7 @@ Two facts, confirmed on **both** platforms:
    base-context. Lever 1 is **not** where the gap lives.
 2. **The entire lossless gap to CoLoRd is the sequence stream, and it widens
    with coverage/fidelity.** ONT: 1.87× (0.87 vs 1.64 bits/base). HiFi:
-   **9.7×** (0.068 vs 0.653 bits/base). At ~300× HiFi the same genome is read
+   **9.7×** (0.0676 vs 0.653 bits/base). At ~300× HiFi the same genome is read
    hundreds of times; CoLoRd's overlap assembly encodes it once + diffs
    (0.068 bits/base — its published high-coverage regime) while fqxv's
    within-read model re-encodes every copy. **Lever 2 is the priority lever**,
