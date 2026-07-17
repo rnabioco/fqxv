@@ -552,6 +552,15 @@ mod tests {
         /// Encode valid data, corrupt the stream, then decode: a mutated rANS
         /// stream must never panic or abort — only return Ok/Err. Covers both
         /// orders and whichever backend `decode` dispatches to on this CPU.
+        ///
+        /// Uses `decode_bounded`, because that is the entry point this scenario
+        /// describes. `corrupt` rewrites arbitrary offsets, including the 8-byte
+        /// output length at `src[1..9]`, and plain `decode` is documented to
+        /// allocate whatever that says — so calling it here tested the one API
+        /// that is explicitly not for untrusted bytes, and duly allocated on
+        /// them: 15.6 GB resident and a 120s CI timeout, from a seed rare enough
+        /// that 20000 cases under a 4 GB cap never hit it. The bound is the only
+        /// thing separating "handles corruption" from "obeys corruption".
         #[test]
         fn decode_survives_mutation(
             data in proptest::collection::vec(0u8..40, 0..2000),
@@ -562,7 +571,8 @@ mod tests {
         ) {
             let order = if zero_order { Order::Zero } else { Order::One };
             let enc = encode(&data, order).expect("encode");
-            let _ = decode(&corrupt(enc, &subs, wipe, trunc));
+            // What a caller legitimately expects back: the data we encoded.
+            let _ = decode_bounded(&corrupt(enc, &subs, wipe, trunc), data.len());
         }
     }
 }

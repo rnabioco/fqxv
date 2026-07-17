@@ -763,7 +763,14 @@ pub(crate) fn read_reordered_streams<R: Read>(
 pub(crate) fn unpermute_sequences(s: &mut ReorderStreams) -> Result<Vec<Vec<u8>>> {
     let n = s.n;
     let perm: Vec<u32> = {
-        let pb = fqxv_rans::decode(&s.perm_c).map_err(|_| Error::Malformed("bad permutation"))?;
+        // The permutation is four byte-planes of `n` u32s, so `n * 4` is not an
+        // estimate — it is the only length this can be, and it was already being
+        // checked one line down. Checking it BEFORE the decode is what makes it a
+        // bound: the length in the stream header is untrusted, and unbounded
+        // `decode` allocates whatever it claims. The container CRCs each payload
+        // first, but a CRC detects accidents, not a crafted archive.
+        let pb = fqxv_rans::decode_bounded(&s.perm_c, n.saturating_mul(4))
+            .map_err(|_| Error::Malformed("bad permutation"))?;
         if pb.len() != n * 4 {
             return Err(Error::Malformed("permutation length mismatch"));
         }

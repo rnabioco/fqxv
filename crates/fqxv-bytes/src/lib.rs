@@ -182,15 +182,45 @@ pub fn write_lens(out: &mut Vec<u8>, lens: &[u32]) {
     }
 }
 
+/// The largest read count [`read_lens`] will accept from an untrusted stream.
+///
+/// This is the honest ceiling rather than a guess: a container block carries at
+/// most 256 MiB of sequence, and a read is at least one base, so no legitimate
+/// block describes more than 2^28 reads. At 4 bytes per length that caps the
+/// allocation at 1 GiB — which is what a genuine maximum-size block costs, and
+/// nothing beyond it is a block this codec could have written.
+///
+/// It lives here rather than being passed in because this is the leaf crate: the
+/// codecs that call [`read_lens`] ([`fqxv-seq`], [`fqxv-fqzcomp`],
+/// [`fqxv-tokenizer`]) are themselves handed nothing but untrusted bytes, so
+/// there is no caller further up with a better number to give.
+pub const MAX_LENS: usize = 1 << 28;
+
 /// Deserialize a read-length array written by [`write_lens`].
+///
+/// Rejects a count above [`MAX_LENS`]: the fixed path allocates from `n` alone,
+/// so an untrusted `n` is an allocation primitive if it is not checked first.
 pub fn read_lens<E: ReaderError>(r: &mut Reader<'_, E>) -> Result<Vec<u32>, E> {
     let n = r.varint()? as usize;
     let fixed = r.u8()? != 0;
     let mut lens = Vec::new();
     if fixed {
         // The fixed path allocates all `n` entries up front regardless of how
-        // many input bytes remain, so an untrusted `n` must not abort the
-        // process on a hostile allocation — turn it into a clean error.
+        // many input bytes remain — that compactness is the whole point of it,
+        // and it is also why `n` has no structural bound here the way the varint
+        // path below does.
+        //
+        // `try_reserve_exact` alone does NOT close that. It still asks the
+        // allocator for the whole thing, and under memory overcommit (Linux by
+        // default, macOS always) the request is granted, `resize` then touches
+        // every page, and the process is OOM-killed — a clean `Err` never
+        // happens. Fuzzing found exactly this: the `seq` and `fqzcomp` targets
+        // both reached here and requested 2.5 TB and 13.5 TB respectively.
+        //
+        // So reject the count before it reaches the allocator. See `MAX_LENS`.
+        if n > MAX_LENS {
+            return Err(E::oversized());
+        }
         if n > 0 {
             let f = r.varint()? as u32;
             lens.try_reserve_exact(n).map_err(|_| E::oversized())?;

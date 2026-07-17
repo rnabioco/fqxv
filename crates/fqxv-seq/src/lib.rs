@@ -505,7 +505,13 @@ fn read_exceptions(r: &mut ByteReader<'_>) -> Result<Vec<(usize, u8)>> {
     let mut v = Vec::with_capacity(n.min(1 << 20));
     let mut pos = 0usize;
     for _ in 0..n {
-        pos += r.varint()? as usize;
+        // Deltas are untrusted varints, so the running position overflows. Release
+        // builds disable overflow checks, so this wrapped to a small index and the
+        // downstream bounds check happened to catch it — right answer, wrong
+        // reason. The fuzz build has debug assertions and panicked here.
+        pos = pos
+            .checked_add(r.varint()? as usize)
+            .ok_or(Error::Malformed("exception position overflows"))?;
         let byte = r.u8()?;
         v.push((pos, byte));
     }
