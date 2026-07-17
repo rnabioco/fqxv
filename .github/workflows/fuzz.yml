@@ -3,16 +3,23 @@ name: Fuzz
 # Non-blocking: a separate workflow from CI, so it never gates a PR. See
 # fuzz/README.md.
 #
-# The weekly `schedule:` runs only the targets verified OOM-clean (container,
-# rans, tokenizer). The other decoders (seq, fqzcomp, reorder) still surface
-# decompression-bomb OOMs — a header can declare a large output the codec
-# allocates for, up to the RSS limit, before erroring — so they would make a
-# scheduled run go red. They stay available on manual dispatch, which runs all
-# six; bounding those decode allocations by input size (issue #90) is what lets
-# them join the schedule.
+# The weekly `schedule:` runs ALL six targets. It used to be held back because
+# seq, fqzcomp and reorder surfaced decompression-bomb OOMs — a header could
+# declare a large output that the codec allocated for — which would have made a
+# scheduled run go red on known findings. #104 bounded those allocations by input
+# size (the #90 item), and each target was then re-verified clean at this
+# workflow's own `-rss_limit_mb`:
+#
+#   reorder 23453 runs · seq 18454 · rans 388833 · tokenizer 1539907 ·
+#   container 27716 · fqzcomp 249
+#
+# fqzcomp's count is not a typo: it allocates ~50 MB of context models per decode
+# (2^18 contexts), so it runs ~0.7 exec/s under ASan. It is clean, just slow, and
+# a short scheduled slice of it is worth little — but it costs nothing to include
+# and going red is what matters here.
 on:
   schedule:
-    - cron: "0 6 * * 1" # Mondays 06:00 UTC — verified-clean targets only
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
   workflow_dispatch:
     inputs:
       max_total_time:
@@ -43,8 +50,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Schedule: only the verified OOM-clean targets. Manual dispatch: all six.
-        target: ${{ (github.event_name == 'schedule') && fromJSON('["container","rans","tokenizer"]') || fromJSON('["container","rans","tokenizer","seq","fqzcomp","reorder"]') }}
+        target: [container, rans, tokenizer, seq, fqzcomp, reorder]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
