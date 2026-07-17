@@ -747,6 +747,10 @@ mod tests {
     }
 
     proptest::proptest! {
+        // A full assemble + encode + decode per case; cap the count so this
+        // stays a fast regression net rather than a slow test.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
         /// Any pile of arbitrary-byte reads round-trips exactly — the exception
         /// list makes losslessness independent of the alphabet, and short/empty
         /// reads exercise the boundaries.

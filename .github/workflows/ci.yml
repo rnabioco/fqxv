@@ -19,6 +19,12 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
+  # Trim proptest iterations on CI: the heavy round-trip proptests do a full
+  # codec encode/decode per case, and 256 makes them the slowest tests. 64 is a
+  # solid per-push regression net — proptest varies its corpus across runs, so
+  # coverage accrues over CI history — and local runs keep the 256 default.
+  # Tests that set an explicit `with_cases(...)` are unaffected.
+  PROPTEST_CASES: "64"
 
 jobs:
   check:

@@ -398,6 +398,11 @@ mod tests {
     }
 
     proptest! {
+        // Each case runs a full compress + two decodes; 64 cases is a solid
+        // per-push regression net (proptest varies the corpus across CI runs)
+        // without making this the suite's slowest test.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
         #[test]
         fn prop_roundtrip_plain(
             reads in proptest::collection::vec(

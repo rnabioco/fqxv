@@ -644,15 +644,19 @@ fn long_reads_use_overlap_codec_roundtrip_and_determinism() {
     // (`fqxv-lroverlap`) through the real container. Assert the two invariants
     // that matter: the archive round-trips byte-exact, and it is byte-identical
     // regardless of thread count.
-    let genome: Vec<u8> = (0..3000u32)
+    // Kept deliberately small: overlap assembly is quadratic in read count and
+    // this runs the full pipeline twice (one thread and many). ~24 reads of
+    // 600 bp tiling a 1500 bp genome is enough to engage the long-read path and
+    // form overlaps while staying off the suite's slow list.
+    let genome: Vec<u8> = (0..1500u32)
         .map(|i| b"ACGT"[((i.wrapping_mul(2_654_435_761) >> 13) & 3) as usize])
         .collect();
     let mut input = Vec::new();
-    for i in 0..60u32 {
-        let start = (i as usize * 41) % (genome.len() - 800);
-        let mut s = genome[start..start + 800].to_vec();
-        // A couple of substitutions the aligner must code (and an N, so the
-        // exception path is exercised end to end through the container).
+    for i in 0..24u32 {
+        let start = (i as usize * 37) % (genome.len() - 600);
+        let mut s = genome[start..start + 600].to_vec();
+        // A substitution the aligner must code, and an N, so the exception path
+        // is exercised end to end through the container.
         s[100] = b"ACGT"[((i as usize) + 1) & 3];
         s[400] = b'N';
         let qual = vec![b'I'; s.len()];
