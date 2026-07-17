@@ -47,14 +47,14 @@ aborting. A genuine *infallible* over-allocation still aborts via
 `handle_alloc_error`, and a hang is caught by libFuzzer's per-input timeout — both
 are real crashes.
 
-**Known: decompression-bomb OOMs.** The `seq` and `reorder` targets can OOM: a
-header may declare a large read count / length that the *standalone* codec API
-allocates for before erroring. That is resource exhaustion, not a memory-safety
-bug — and the **container** (the real trust boundary) bounds it structurally, so
-its target is bomb-resistant. The `rans` and `seq` targets carry small input
-guards to keep exploration fast; bounding these allocations by the input size in
-the codecs (which would let the weekly schedule run green) is tracked in the
-project's data-integrity follow-up issue.
+**Known: decompression-bomb OOMs.** The `seq`, `fqzcomp`, and `reorder` targets
+can OOM: a header may declare a large output the *standalone* codec API allocates
+for (up to the RSS limit) before erroring. That is resource exhaustion, not a
+memory-safety bug — and the **container** (the real trust boundary) bounds it
+structurally, so its target is bomb-resistant. `rans` and `tokenizer` have their
+count/length-driven allocations bounded by input size, so they are clean too.
+Bounding the remaining three the same way (issue #90) is what lets them join the
+weekly schedule; until then they run on manual dispatch only.
 
 A crash writes a reproducer under `fuzz/artifacts/<target>/`; replay it with:
 
@@ -78,7 +78,9 @@ an empty corpus; seeding still speeds them up (drop any encoded stream in
 
 ## CI
 
-`.github/workflows/fuzz.yml` runs each target for a short, bounded time on a
-weekly schedule and on manual dispatch. It is **non-blocking** — a separate
-workflow from `ci.yml`, so it never gates a PR. A crash uploads its reproducer as
-an artifact and fails that run for visibility.
+`.github/workflows/fuzz.yml` runs the fuzz targets for a short, bounded time. The
+**weekly schedule** (Mondays) runs only the verified OOM-clean targets
+(`container`, `rans`, `tokenizer`); **manual dispatch** runs all six (for hunting,
+where the decompression-bomb OOMs above are expected findings to triage). It is
+**non-blocking** — a separate workflow from `ci.yml`, so it never gates a PR. A
+crash uploads its reproducer as an artifact and fails that run for visibility.

@@ -155,10 +155,20 @@ pub(crate) fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     if lens_raw_len > max_plausible {
         return Err(Error::Malformed("refpack: lens length exceeds capacity"));
     }
+    // `lens_coded_len` is an untrusted varint, so `p + lens_coded_len` overflows.
+    // Release builds disable overflow checks, so it wrapped to a value below `p`,
+    // `get` saw an inverted range and returned None, and the error was right for
+    // the wrong reason — but the fuzz build has debug assertions and panicked
+    // here ("attempt to add with overflow", found by the `reorder` target once the
+    // OOM above stopped masking it). Add checked, like every other offset in this
+    // function already does.
+    let end = p
+        .checked_add(lens_coded_len)
+        .ok_or(Error::Malformed("refpack: lens stream length overflows"))?;
     let lens_coded = src
-        .get(p..p + lens_coded_len)
+        .get(p..end)
         .ok_or(Error::Malformed("refpack: truncated lens stream"))?;
-    p += lens_coded_len;
+    p = end;
     let lens_raw = reflzma::lzma_decode(lens_coded, lens_raw_len)?;
     let mut lens = Vec::with_capacity(nc.min(1 << 20));
     let mut lp = 0usize;

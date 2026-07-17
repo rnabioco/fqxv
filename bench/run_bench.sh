@@ -26,7 +26,7 @@ INPUT_MODE="${FQXV_INPUT:-r1}"
 # (`-q binary`, 2-level) are SPRING's lossy quality modes — the only field tools
 # with Illumina-comparable binning, so they are the like-for-like lossy rivals to
 # fqxv-bin8 and fqxv-bin2 (fqz_comp/fqzcomp5 have no Illumina binning mode).
-ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-max fqxv-shuffle fqxv-bin8 fqxv-bin4 fqxv-bin2 fqxv-reorder-bin8 fqxv-reorder-bin4 fqxv-reorder-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary colord"
+ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-max fqxv-shuffle fqxv-bin8 fqxv-bin4 fqxv-bin2 fqxv-binont fqxv-binhifi fqxv-reorder-bin8 fqxv-reorder-bin4 fqxv-reorder-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary colord colord-lossy"
 TOOLS="${FQXV_TOOLS:-$ALL_TOOLS}"
 # The fqxv binary (built with `cargo build --release`). Cargo honors
 # CARGO_TARGET_DIR (set to $SCRATCH on this HPC), so the build lands there, NOT
@@ -180,6 +180,11 @@ compress() {  # tool input out_prefix
     fqxv-bin8)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin bin8 --threads "$THREADS" ;;
     fqxv-bin4)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin bin4 --threads "$THREADS" ;;
     fqxv-bin2)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin bin2 --threads "$THREADS" ;;
+    # Long-read lossy quality bins (CoLoRd-matched cutpoints). Like-for-like vs
+    # colord-lossy below. bin_scheme -> none, so rt verifies names+bases only
+    # plus quality-distortion metrics (as for spring-*), not the exact table.
+    fqxv-binont)   COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin ont --threads "$THREADS" ;;
+    fqxv-binhifi)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin hifi --threads "$THREADS" ;;
     # reorder + binning combined — the like-for-like rivals to SPRING's lossy
     # modes (spring-illbin vs fqxv-reorder-bin8, spring-binary vs -bin2), since
     # SPRING always reorders. The plain fqxv-bin* rows keep original order.
@@ -195,6 +200,9 @@ compress() {  # tool input out_prefix
     # CoLoRd long-read SOTA, lossless quality (`-q org`). Compresses sequence and
     # quality; the meaningful bar for our ONT streams.
     colord)   COMP="$pfx.colord"; measure bash -c "rm -f '$COMP'; colord compress-ont -t $THREADS -q org '$in' '$COMP'" ;;
+    # colord-lossy: CoLoRd's DEFAULT (lossy) quality mode — the apples-to-apples
+    # rival to fqxv-binont. rt is n/a (lossy, table not asserted), like colord.
+    colord-lossy) COMP="$pfx.colord"; measure bash -c "rm -f '$COMP'; colord compress-ont -t $THREADS '$in' '$COMP'" ;;
     # spring-illbin: Illumina 8-level binning (like-for-like vs fqxv-bin8).
     spring-illbin) COMP="$pfx.spring"; mkdir -p "$WORK/spring_c_$$"; measure spring -c -t "$THREADS" -q ill_bin -i "$in" -o "$COMP" -w "$WORK/spring_c_$$/" ;;
     # spring-binary thr=25 high=37 low=15 mirrors fqxv-bin2 (q<25 -> 15, else 37).
@@ -205,14 +213,14 @@ compress() {  # tool input out_prefix
 decompress() {  # tool comp out_rt
   local tool="$1" comp="$2" rt="$3"
   case "$tool" in
-    fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-shuffle|fqxv-bin8|fqxv-bin4|fqxv-bin2|fqxv-reorder-bin8|fqxv-reorder-bin4|fqxv-reorder-bin2) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --force --threads "$THREADS" ;;
+    fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-shuffle|fqxv-bin8|fqxv-bin4|fqxv-bin2|fqxv-binont|fqxv-binhifi|fqxv-reorder-bin8|fqxv-reorder-bin4|fqxv-reorder-bin2) measure "$FQXV_BIN" decompress "$comp" -o "$rt" --force --threads "$THREADS" ;;
     gzip)     measure bash -c "pigz -d -p $THREADS -c '$comp' > '$rt'" ;;
     zstd19)   measure bash -c "zstd -d -q -f -o '$rt' '$comp'" ;;
     xz9)      measure bash -c "xz -d -T$THREADS -c '$comp' > '$rt'" ;;
     fqz_comp) measure bash -c "fqz_comp -d < '$comp' > '$rt'" ;;
     fqzcomp5) measure bash -c "fqzcomp5 -d < '$comp' > '$rt'" ;;
     spring|spring-illbin|spring-binary)   mkdir -p "$WORK/spring_d_$$"; measure spring -d -t "$THREADS" -i "$comp" -o "$rt" -w "$WORK/spring_d_$$/" ;;
-    colord)   measure bash -c "rm -f '$rt'; colord decompress '$comp' '$rt'" ;;
+    colord|colord-lossy)   measure bash -c "rm -f '$rt'; colord decompress '$comp' '$rt'" ;;
   esac
 }
 
@@ -285,9 +293,10 @@ for row in "${rows[@]}"; do
     # Map tool label -> binary name to probe availability.
     case "$tool" in
       gzip) bin=pigz ;; zstd19) bin=zstd ;; xz9) bin=xz ;; pgrc) bin=PgRC ;;
-      fqxv|fqxv9|fqxv-reorder|fqxv-max|fqxv-shuffle|fqxv-bin8|fqxv-bin4|fqxv-bin2|fqxv-reorder-bin8|fqxv-reorder-bin4|fqxv-reorder-bin2) bin="$FQXV_BIN" ;;
       spring-illbin|spring-binary) bin=spring ;;
-      *) bin="$tool" ;;
+      colord-lossy) bin=colord ;;
+      # Any fqxv variant (incl. fqxv-binont/binhifi) shares the one binary.
+      *) if is_fqxv "$tool"; then bin="$FQXV_BIN"; else bin="$tool"; fi ;;
     esac
     if is_fqxv "$tool"; then
       [[ -x "$bin" ]] || { echo "  [miss] $tool ($bin — run: cargo build --release)"; continue; }
@@ -364,6 +373,8 @@ for row in "${rows[@]}"; do
         fqxv-bin8)    "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin4)    "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-bin2)    "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-binont)  "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin ont --threads 1 >/dev/null 2>&1 || true ;;
+        fqxv-binhifi) "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin hifi --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-reorder-bin8) "$FQXV_BIN" compress "$in" -o "$det1" --force --order any --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-reorder-bin4) "$FQXV_BIN" compress "$in" -o "$det1" --force --order any --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
         fqxv-reorder-bin2) "$FQXV_BIN" compress "$in" -o "$det1" --force --order any --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;

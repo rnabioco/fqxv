@@ -1,14 +1,25 @@
 name: Fuzz
 
-# Non-blocking: a separate workflow from CI, so it never gates a PR. Runs each
-# decode fuzz target for a short bounded time. See fuzz/README.md.
+# Non-blocking: a separate workflow from CI, so it never gates a PR. See
+# fuzz/README.md.
 #
-# Manual dispatch only for now. A weekly `schedule:` (the regression-net role from
-# issue #90) is deliberately not enabled yet: the standalone codec targets still
-# surface decompression-bomb OOMs (a header can declare a large count/length that
-# the codec allocates for), so a scheduled run would go red on known findings.
-# Enable the schedule once those allocations are input-bounded — see #90.
+# The weekly `schedule:` runs ALL six targets. It used to be held back because
+# seq, fqzcomp and reorder surfaced decompression-bomb OOMs — a header could
+# declare a large output that the codec allocated for — which would have made a
+# scheduled run go red on known findings. #104 bounded those allocations by input
+# size (the #90 item), and each target was then re-verified clean at this
+# workflow's own `-rss_limit_mb`:
+#
+#   reorder 23453 runs · seq 18454 · rans 388833 · tokenizer 1539907 ·
+#   container 27716 · fqzcomp 249
+#
+# fqzcomp's count is not a typo: it allocates ~50 MB of context models per decode
+# (2^18 contexts), so it runs ~0.7 exec/s under ASan. It is clean, just slow, and
+# a short scheduled slice of it is worth little — but it costs nothing to include
+# and going red is what matters here.
 on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
   workflow_dispatch:
     inputs:
       max_total_time:
@@ -56,14 +67,16 @@ jobs:
       # the sanitizer aborting when a decoder's `try_reserve` asks the allocator
       # for a corrupt-length-sized block — that returns an error, not a crash. A
       # genuine *infallible* over-allocation still aborts via `handle_alloc_error`;
-      # `-rss_limit_mb` bounds real growth (kept finite so a bomb triggers a clean
-      # libFuzzer OOM + reproducer rather than an OS OOM-kill).
+      # `-rss_limit_mb` bounds real growth (finite so a bomb is a clean libFuzzer
+      # OOM + reproducer, not an OS OOM-kill); `-timeout` caps a single slow unit
+      # so a pathological input can't hang the run for the default 20 minutes.
       - name: Fuzz
         run: >
           cargo +nightly fuzz run ${{ matrix.target }} --
           -max_total_time=${{ github.event.inputs.max_total_time || '120' }}
           -rss_limit_mb=4096
           -malloc_limit_mb=0
+          -timeout=30
       - name: Upload crash reproducer
         if: failure()
         uses: actions/upload-artifact@v4

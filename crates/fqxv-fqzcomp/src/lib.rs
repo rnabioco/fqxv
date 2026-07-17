@@ -56,6 +56,15 @@ pub enum QualityBinning {
     Bin4,
     /// Custom 2-level (binary) binning — no Illumina equivalent.
     Bin2,
+    /// Long-read **Oxford Nanopore** 4-level binning; representatives
+    /// `{3, 10, 18, 35}`. Cutpoints match CoLoRd's ONT table (validated to
+    /// preserve downstream analysis), not Illumina's cycle-quality profile.
+    BinOnt,
+    /// Long-read **PacBio HiFi** 5-level binning; representatives
+    /// `{3, 10, 18, 35}` plus Q93 kept exact. HiFi packs most bases near the top
+    /// of the scale and encodes the max-quality symbol (Q93) with application
+    /// meaning, so it is preserved as its own level (CoLoRd's HiFi table).
+    BinHifi,
 }
 
 impl QualityBinning {
@@ -65,6 +74,8 @@ impl QualityBinning {
             QualityBinning::Bin8 => 1,
             QualityBinning::Bin4 => 2,
             QualityBinning::Bin2 => 3,
+            QualityBinning::BinOnt => 4,
+            QualityBinning::BinHifi => 5,
         }
     }
 
@@ -74,6 +85,8 @@ impl QualityBinning {
             1 => QualityBinning::Bin8,
             2 => QualityBinning::Bin4,
             3 => QualityBinning::Bin2,
+            4 => QualityBinning::BinOnt,
+            5 => QualityBinning::BinHifi,
             _ => return Err(Error::Malformed("unknown quality-binning tag")),
         })
     }
@@ -106,6 +119,23 @@ impl QualityBinning {
             QualityBinning::Bin2 => match q {
                 0..=24 => 15,
                 _ => 37,
+            },
+            // CoLoRd ONT 4-level table (representatives 3/10/18/35).
+            QualityBinning::BinOnt => match q {
+                0..=6 => 3,
+                7..=13 => 10,
+                14..=25 => 18,
+                _ => 35,
+            },
+            // CoLoRd HiFi 5-level table: as ONT, but the top Q93 symbol carries
+            // application meaning and is preserved exactly rather than folded
+            // into the 26+ bin.
+            QualityBinning::BinHifi => match q {
+                0..=6 => 3,
+                7..=13 => 10,
+                14..=25 => 18,
+                26..=92 => 35,
+                _ => 93,
             },
             QualityBinning::Lossless => q,
         };
@@ -447,8 +477,20 @@ mod tests {
             QualityBinning::Bin8,
             QualityBinning::Bin4,
             QualityBinning::Bin2,
+            QualityBinning::BinOnt,
+            QualityBinning::BinHifi,
         ] {
             roundtrip(&[100, 100, 100], &quals, b);
+        }
+    }
+
+    #[test]
+    fn roundtrip_binned_hifi_high_q() {
+        // HiFi packs quality near the top of the scale and keeps Q93 exact;
+        // exercise the wide-alphabet path with values through Q93.
+        let quals: Vec<u8> = (0..300).map(|i| b'!' + (i % 94) as u8).collect();
+        for b in [QualityBinning::BinHifi, QualityBinning::BinOnt] {
+            roundtrip(&[150, 150], &quals, b);
         }
     }
 
@@ -495,6 +537,31 @@ mod tests {
         // Bin2 (custom binary): <Q25 -> Q15, Q25+ -> Q37.
         for (q, want) in [(0, 15), (24, 15), (25, 37), (41, 37)] {
             assert_eq!(QualityBinning::Bin2.apply(ch(q)), ch(want), "Bin2 q={q}");
+        }
+        // BinOnt (CoLoRd ONT 4-level): 0-6->3, 7-13->10, 14-25->18, 26+->35.
+        for (q, want) in [
+            (0, 3),
+            (6, 3),
+            (7, 10),
+            (13, 10),
+            (14, 18),
+            (25, 18),
+            (26, 35),
+            (93, 35),
+        ] {
+            assert_eq!(
+                QualityBinning::BinOnt.apply(ch(q)),
+                ch(want),
+                "BinOnt q={q}"
+            );
+        }
+        // BinHifi (CoLoRd HiFi 5-level): as ONT below 26, 26-92->35, Q93 exact.
+        for (q, want) in [(0, 3), (6, 3), (14, 18), (26, 35), (92, 35), (93, 93)] {
+            assert_eq!(
+                QualityBinning::BinHifi.apply(ch(q)),
+                ch(want),
+                "BinHifi q={q}"
+            );
         }
         // Lossless is the identity.
         for q in 0..=42 {
