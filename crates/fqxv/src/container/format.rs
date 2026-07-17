@@ -385,6 +385,8 @@ pub(crate) fn binning_tag(b: QualityBinning) -> u8 {
         QualityBinning::Bin8 => 1,
         QualityBinning::Bin4 => 2,
         QualityBinning::Bin2 => 3,
+        QualityBinning::BinOnt => 4,
+        QualityBinning::BinHifi => 5,
     }
 }
 

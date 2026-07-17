@@ -14,3 +14,9 @@ SRR453566	rnaseq_fullrange	GAIIx	paired	full-range	500MB	-
 # ~14 kb mean read length. sracha writes this as DRR205413.fastq (no _1 suffix);
 # run_bench.sh falls back to that name for single-end layouts.
 DRR205413	ecoli_ont	MinION	single	full-range	260MB	-
+# Long-read (PacBio HiFi) — E. coli E2348/69, same DNA as the Wick 2021
+# comparison (BioProject PRJNA602597, run SRR11434954, HiFi/CCS). The full run
+# is ~23 Gbp (~5000x); longread_hifi.sbatch subsamples it to ~120k reads
+# (~1.5 Gbp, still ~300x) into $DATA_DIR/ecoli_hifi.fastq. Narrow high-Q, low
+# error — the regime where the cross-read DNA lever matters most.
+ecoli_hifi	ecoli_hifi	SequelII	single	full-range	subsampled	-

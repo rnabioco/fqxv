@@ -340,6 +340,10 @@ enum QualityBin {
     Bin4,
     /// Custom 2-level binning (lossy).
     Bin2,
+    /// Oxford Nanopore 4-level binning (lossy; CoLoRd ONT cutpoints).
+    Ont,
+    /// PacBio HiFi 5-level binning (lossy; CoLoRd HiFi cutpoints, Q93 kept).
+    Hifi,
 }
 
 /// Sequencing platform override for `compress --platform` (absent = auto-detect).
@@ -373,6 +377,8 @@ impl From<QualityBin> for fqxv::QualityBinning {
             QualityBin::Bin8 => fqxv::QualityBinning::Bin8,
             QualityBin::Bin4 => fqxv::QualityBinning::Bin4,
             QualityBin::Bin2 => fqxv::QualityBinning::Bin2,
+            QualityBin::Ont => fqxv::QualityBinning::BinOnt,
+            QualityBin::Hifi => fqxv::QualityBinning::BinHifi,
         }
     }
 }
@@ -1021,6 +1027,8 @@ fn info_json_report(fi: &FileInfo) -> InfoReport {
         1 => "lossy (Illumina 8-bin)",
         2 => "lossy (Illumina 4-bin, RTA4)",
         3 => "lossy (2-bin, custom)",
+        4 => "lossy (Nanopore 4-bin)",
+        5 => "lossy (PacBio HiFi 5-bin)",
         _ => "unknown",
     };
     let spots = (info.group_size > 1).then(|| info.reads / info.group_size.max(1) as u64);
@@ -1111,6 +1119,8 @@ fn print_info_human(fi: &FileInfo) {
         1 => "lossy (Illumina 8-bin)",
         2 => "lossy (Illumina 4-bin, RTA4)",
         3 => "lossy (2-bin, custom)",
+        4 => "lossy (Nanopore 4-bin)",
+        5 => "lossy (PacBio HiFi 5-bin)",
         _ => "unknown",
     };
     let spots = (info.group_size > 1).then(|| info.reads / info.group_size.max(1) as u64);
@@ -1547,6 +1557,8 @@ fn warn_redundant_binning(inputs: &[PathBuf], binning: fqxv::QualityBinning) {
         fqxv::QualityBinning::Bin8 => ("bin8", 8usize),
         fqxv::QualityBinning::Bin4 => ("bin4", 4),
         fqxv::QualityBinning::Bin2 => ("bin2", 2),
+        fqxv::QualityBinning::BinOnt => ("ont", 4),
+        fqxv::QualityBinning::BinHifi => ("hifi", 5),
     };
     let Some(path) = inputs.first() else { return };
     if path.as_os_str() == "-" {

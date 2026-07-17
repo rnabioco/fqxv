@@ -11,7 +11,8 @@ seek to any of them without scanning the file.
 [4]  magic "FQXV"
 [2]  format version (LE)        (currently v1)
 [1]  sequence context order (k)
-[1]  quality binning tag        (0 lossless, 1 bin8, 2 bin4, 3 bin2)
+[1]  quality binning tag        (0 lossless, 1 bin8, 2 bin4, 3 bin2,
+                                 4 ont, 5 hifi)
 [1]  flags                      (bit0 '+' normalized; bit1 reordered;
                                  bit2 keep-order; bit3 global-reorder;
                                  bit4 regen-names; bit5 global-reference;
