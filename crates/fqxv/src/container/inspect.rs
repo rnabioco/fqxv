@@ -473,11 +473,13 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
             info.reads = footer.total_reads;
             info.blocks = footer.groups.len() as u64;
             info.whole_file_crc = Some(footer.whole_file_crc);
-            for &(off, _) in &footer.groups {
-                // Position past the frame head ([4] marker, [8] length, [4] CRC),
-                // at the block payload, then walk its stream frames.
-                r.seek(SeekFrom::Start(off + FRAME_HEAD_LEN as u64))?;
-                scan_block_header(&mut r, info.reordered, &mut info)?;
+            // Per-stream sizes are recorded in the footer index itself (v3), so
+            // summing them needs no per-block seeks — one footer read is the whole
+            // metadata cost. The three streams are names, sequence, quality.
+            for streams in &footer.stream_locs {
+                info.names_bytes += u64::from(streams[0].len);
+                info.seq_bytes += u64::from(streams[1].len);
+                info.qual_bytes += u64::from(streams[2].len);
             }
         }
         Err(_) => scan_blocks_sequentially(&mut r, &mut info)?,

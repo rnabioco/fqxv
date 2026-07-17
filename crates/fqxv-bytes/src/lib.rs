@@ -159,6 +159,13 @@ impl<'a, E: ReaderError> Reader<'a, E> {
     pub fn rest(&self) -> &'a [u8] {
         &self.buf[self.pos..]
     }
+
+    /// The current cursor offset into the original buffer (bytes consumed so far).
+    /// Lets a caller record where a just-read length prefix left the cursor — i.e.
+    /// the byte offset of the stream that follows it.
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
 }
 
 /// Serialize a read-length array with a fixed-length fast path.

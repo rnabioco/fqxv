@@ -117,6 +117,11 @@ pub(crate) fn write_blocks<W: Write>(
     for (b, payload) in blocks.iter().zip(compressed) {
         let payload = payload?;
         index.entries.push((index.offset, b.n_reads() as u32));
+        // Record each coded stream's absolute (offset, len, crc) for the footer's
+        // column-projection index, before `index.offset` advances past this block.
+        index
+            .streams
+            .push(payload_stream_locs(&payload, index.offset)?);
         // Frame: [4 BLOCK_MAGIC][8 payload_len][4 crc32c(payload)][payload].
         w.write_all(&BLOCK_MAGIC)?;
         w.write_all(&(payload.len() as u64).to_le_bytes())?;
@@ -256,6 +261,34 @@ where
         }
     }
     Ok(())
+}
+
+/// Locate a block's three coded streams (names, sequence, quality) as absolute
+/// `(offset, len, crc32c)` triples, given the payload bytes and the block frame's
+/// absolute offset. Used to build the footer's per-stream projection index.
+///
+/// The payload is `[8 digest][4 n_reads] ([4 len][bytes])×3`, so each stream's
+/// coded bytes start right after its length prefix; the returned offset is
+/// absolute (past the frame head), and the CRC is over exactly those `len` bytes —
+/// the same slice a remote client fetches, so it can verify a projected stream the
+/// joint content digest can't cover.
+pub(crate) fn payload_stream_locs(payload: &[u8], block_offset: u64) -> Result<[StreamLoc; 3]> {
+    let base = block_offset + FRAME_HEAD_LEN as u64;
+    let mut c = Cursor::new(payload);
+    c.u64()?; // content digest
+    c.u32()?; // n_reads
+    let mut locs = [StreamLoc::default(); 3];
+    for loc in &mut locs {
+        let len = c.u32()?;
+        let off_in_payload = c.pos();
+        let bytes = c.take(len as usize)?;
+        *loc = StreamLoc {
+            offset: base + off_in_payload as u64,
+            len,
+            crc: crc32c(bytes),
+        };
+    }
+    Ok(locs)
 }
 
 /// Decoded block streams: (n_reads, names, per-read lengths, sequence, quality).

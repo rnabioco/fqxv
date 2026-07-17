@@ -147,6 +147,15 @@ enum Command {
         /// Compression effort level (1-9); higher raises the sequence order.
         #[arg(short, long, default_value_t = 5, help_heading = "Advanced")]
         level: u8,
+        /// Reads per row group (block). Overrides the block size `--level` would
+        /// pick, decoupling granularity from effort: smaller groups give finer
+        /// random access and more parallelism at some ratio cost (the order-k
+        /// sequence model trains on fewer reads), larger groups the reverse. Useful
+        /// when archiving to object storage where you want to fetch small ranges.
+        /// Sequence order still follows `--level`. Ignored by the reorder path
+        /// (`--order any`/`--max`), which clusters globally.
+        #[arg(long, value_name = "N", help_heading = "Advanced")]
+        block_reads: Option<usize>,
 
         /// Interleaving of a single input, in members per spot. Auto-detected
         /// from read names by default; pass to force (1 = single-end, 2 = paired
@@ -452,6 +461,7 @@ fn main() -> anyhow::Result<()> {
             output,
             force,
             level,
+            block_reads,
             max,
             interleaved,
             order,
@@ -483,7 +493,12 @@ fn main() -> anyhow::Result<()> {
                 seq_order: level_to_order(level),
                 seq_hash_order: level_to_hash(level).0,
                 seq_hash_bits: level_to_hash(level).1,
-                block_reads: level_to_block(level),
+                // An explicit --block-reads overrides the level's block size,
+                // decoupling random-access granularity from effort. A zero is
+                // meaningless; treat it as "unset" and fall back to the level.
+                block_reads: block_reads
+                    .filter(|&n| n > 0)
+                    .unwrap_or(level_to_block(level)),
                 quality_binning: quality_bin.into(),
                 reorder: reorders,
                 keep_order: keep_order && reorders,

@@ -16,10 +16,12 @@ mod container;
 mod crc;
 
 pub use container::{
-    compress, compress_auto, compress_interleaved, compress_multi, content_stats, decompress,
+    compress, compress_auto, compress_interleaved, compress_multi, content_stats,
+    decode_block_contents, decode_names, decode_quality, decode_sequence, decompress,
     decompress_recover, decompress_split, estimate, expected_reads, inspect, peek, verify,
-    verify_quick, verify_report, verify_roundtrip, ContentStats, Estimate, Info, Params, Platform,
-    Recovery, Stats, VerifyCheck, VerifyReport, QUAL_MAX,
+    verify_quick, verify_report, verify_roundtrip, BlockContents, ContentStats, Estimate, GroupLoc,
+    Index, Info, Params, Platform, Recovery, Stats, Stream, SuffixParse, VerifyCheck, VerifyReport,
+    QUAL_MAX,
 };
 pub use fqxv_fqzcomp::QualityBinning;
 
@@ -38,10 +40,13 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 ///
 /// The v1 container:
 /// - appends a footer index (`[u32 n_row_groups]`, per-group
-///   `[u64 offset][u32 read_count]`, `[u64 total_reads]`, `[u32 whole_file_crc]`,
-///   `[u32 footer_crc]`) plus an EOF trailer (`[u64 footer_offset]["FQXF"]`) after
-///   a zero-length terminator block, so `inspect` and random access can seek
-///   straight to the row-group index;
+///   `[u64 offset][u32 read_count]` followed by a `[u64 offset][u32 len][u32
+///   crc32c]` triple for each of the three streams (names, sequence, quality),
+///   `[u64 total_reads]`, `[u32 whole_file_crc]`, `[u32 footer_crc]`) plus an EOF
+///   trailer (`[u64 footer_offset]["FQXF"]`) after a zero-length terminator block,
+///   so `inspect` and random access can seek straight to the row-group index — and
+///   a remote client can project a single stream (e.g. read names, ~1% of the
+///   archive) with one range request, verifying it against the per-stream CRC;
 /// - carries a CRC-32C on every coded payload, so on-disk corruption is detected
 ///   and localized rather than silently decoded;
 /// - prepends an xxh3-64 digest of each block's *decoded* content (names,
@@ -58,7 +63,7 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 ///   tail) or a block's length prefix is corrupt.
 ///
 /// See `container.rs` for the full layout.
-pub const FORMAT_VERSION: u16 = 2;
+pub const FORMAT_VERSION: u16 = 3;
 
 /// Errors returned by the archiver.
 #[derive(Debug, Error)]

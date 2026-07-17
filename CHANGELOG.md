@@ -5,9 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The on-disk `.fqxv` format is **not yet stable**: `FORMAT_VERSION` is `1` and
-archives are not guaranteed to be readable across releases until a `1.0.0` (each
-build reads only its own format version).
+The on-disk `.fqxv` format is **not yet stable**: `FORMAT_VERSION` is bumped
+freely and archives are not guaranteed to be readable across releases until a
+`1.0.0` (each build reads only its own format version).
+
+## [Unreleased]
+
+### Added
+
+- **Remote / parallel column projection** — the footer row-group index now
+  records, per group, a `(offset, len, crc32c)` triple for each of the three
+  coded streams (names, sequence, quality). A client can fetch the archive tail,
+  parse the index, and issue a single range request for just one stream — read
+  names are <1% of the archive, so an ID-only client fetches ~100× less than
+  before, and a sequence-only client (k-mer screening, classification) skips the
+  quality stream. The joint block content digest can't verify a single fetched
+  stream, so each stream carries its own CRC-32C.
+- **Random-access API** — a public, IO-free `Index` (parse from a seekable
+  reader or a fetched suffix buffer via `Index::from_suffix`), `Index::byte_ranges`
+  to turn `(groups, stream)` into byte ranges to `GET`, `Index::verify_stream`,
+  and per-stream (`decode_names`/`decode_sequence`/`decode_quality`) and
+  whole-block (`decode_block_contents`) decoders. The caller drives fetching
+  (local `File`, `object_store`, async HTTP, …).
+- **`compress --block-reads N`** — set the reads-per-row-group directly,
+  decoupling random-access granularity from the `--level` effort knob. Smaller
+  groups give finer remote access and more parallelism at some ratio cost.
+
+### Changed
+
+- **`FORMAT_VERSION` → 3** for the extended footer index above. As always in the
+  pre-1.0 format, a build reads only its own version.
+- **`inspect`** now sums per-stream sizes straight from the footer index instead
+  of seeking to each block header — one footer read is the whole metadata cost.
 
 ## [0.2.0] - 2026-07-15
 
