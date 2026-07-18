@@ -149,18 +149,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    fn revcomp(s: &[u8]) -> Vec<u8> {
-        s.iter()
-            .rev()
-            .map(|&b| match b {
-                b'A' => b'T',
-                b'C' => b'G',
-                b'G' => b'C',
-                b'T' => b'A',
-                x => x,
-            })
-            .collect()
-    }
+    use fqxv_dna::revcomp_acgt as revcomp;
 
     #[test]
     fn empty_and_short() {

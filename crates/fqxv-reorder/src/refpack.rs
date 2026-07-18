@@ -21,25 +21,9 @@
 //! container.
 
 use fqxv_bytes::{read_varint, write_varint};
+use fqxv_dna::{code_strict, SYM2BASE};
 
 use crate::{reflzma, Error, Result};
-
-const SYM2BASE: [u8; 4] = *b"ACGT";
-
-/// Strict, case-SENSITIVE base code: only uppercase `A/C/G/T` pack to `0..4`;
-/// everything else (lowercase, `N`, IUPAC) is `255` and exception-coded, so the
-/// unpack restores the exact byte. (The shared [`code`](crate::code) is
-/// case-insensitive and would upper-case lowercase bases — not byte-exact.)
-#[inline]
-fn pack_code(b: u8) -> u8 {
-    match b {
-        b'A' => 0,
-        b'C' => 1,
-        b'G' => 2,
-        b'T' => 3,
-        _ => 255,
-    }
-}
 
 /// 2-bit-pack `seq` (4 bases/byte, little-endian within a byte). Non-ACGT bytes
 /// are packed as `A` (code 0) and recorded as `(index, byte)` exceptions for
@@ -50,7 +34,9 @@ fn pack(seq: &[u8]) -> (Vec<u8>, Vec<(usize, u8)>) {
     let mut cur = 0u8;
     let mut nb = 0u8;
     for (i, &b) in seq.iter().enumerate() {
-        let c = pack_code(b);
+        // Case-sensitive: lowercase and other non-ACGT bytes become exceptions,
+        // so the unpack restores the exact byte.
+        let c = code_strict(b);
         let two = if c < 4 {
             c
         } else {

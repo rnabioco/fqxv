@@ -16,6 +16,7 @@ workspace = true
 
 [dependencies]
 fqxv-bytes.workspace = true
+fqxv-dna.workspace = true
 fqxv-range.workspace = true
 thiserror.workspace = true
 

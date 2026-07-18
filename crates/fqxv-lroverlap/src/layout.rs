@@ -225,18 +225,7 @@ mod tests {
             .collect()
     }
 
-    fn revcomp(s: &[u8]) -> Vec<u8> {
-        s.iter()
-            .rev()
-            .map(|&b| match b {
-                b'A' => b'T',
-                b'C' => b'G',
-                b'G' => b'C',
-                b'T' => b'A',
-                x => x,
-            })
-            .collect()
-    }
+    use fqxv_dna::revcomp_acgt as revcomp;
 
     fn ov(target: u32, score: i32, q_start: u32, t_start: u32) -> Overlap {
         ov_s(target, score, q_start, t_start, false)

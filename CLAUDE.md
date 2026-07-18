@@ -44,6 +44,12 @@ ones. Build understanding bottom-up:
   over each crate's `Error` via the `ReaderError` trait), and the read-length
   array codec (`write_lens`/`read_lens`). No dependencies; the single source of
   truth for these encodings.
+- **`fqxv-dna`** — leaf crate of nucleotide primitives shared by the sequence
+  codecs: the 2-bit ACGT lookup (`BASE_LUT`, `code_strict` case-sensitive /
+  `code_fold` case-insensitive, `SYM2BASE`, `base_of_sym`, `is_acgt`) and reverse
+  complement (`revcomp`/`revcomp_into` complement both cases; `revcomp_acgt`
+  complements uppercase only, passing lowercase through). No dependencies; the
+  single source of truth so the previously copy-pasted variants can't drift.
 - **`fqxv-rans`** — rANS Nx16 entropy coder (CRAM 3.1). 32 interleaved states;
   order-0/order-1 models. Backends live behind one API and are chosen at runtime
   via `is_x86_feature_detected!`: **scalar** (all orders, the correctness
@@ -59,12 +65,15 @@ ones. Build understanding bottom-up:
   `fqxv::QualityBinning`.
 - **`fqxv-tokenizer`** (→ rans) — positional read-name tokenizer with per-column
   delta bucketing; entropy backend is rANS.
-- **`fqxv-seq`** (→ range) — order-k adaptive context model over 2-bit ACGT
+- **`fqxv-seq`** (→ dna, range) — order-k adaptive context model over 2-bit ACGT
   symbols (range-coded, variable read lengths); non-ACGT bytes go to an
   exception list. Not a raw 2-bit *packing* path — every base is context-coded.
-- **`fqxv-reorder`** (→ rans, seq) — PgRC2/SPRING-class read reordering
+- **`fqxv-reorder`** (→ dna, rans, seq) — PgRC2/SPRING-class read reordering
   (minimizer clustering, reverse-complement aware) for cross-read redundancy.
-- **`fqxv-lroverlap`** (→ rans, range, seq) — long-read cross-read overlap codec
+  `lib.rs` holds only the crate-common core (`Error`, `IntMap`, decode limits);
+  the codec lives in sibling modules (`plan`, `column`, `clustered`, `rescue`,
+  `global`, `merge`, plus `refpack`/`reflzma`) re-exported flat from the root.
+- **`fqxv-lroverlap`** (→ dna, rans, range, seq) — long-read cross-read overlap codec
   (minimizers → overlaps → layout → consensus → per-read banded edit script →
   rANS). `encode`/`decode` are the container's sequence path for long-read blocks
   (auto-selected, kept only when it beats order-k). Sibling of `fqxv-reorder`;

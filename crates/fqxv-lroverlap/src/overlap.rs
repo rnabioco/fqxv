@@ -142,18 +142,7 @@ mod tests {
             .collect()
     }
 
-    fn revcomp(s: &[u8]) -> Vec<u8> {
-        s.iter()
-            .rev()
-            .map(|&b| match b {
-                b'A' => b'T',
-                b'C' => b'G',
-                b'G' => b'C',
-                b'T' => b'A',
-                x => x,
-            })
-            .collect()
-    }
+    use fqxv_dna::revcomp_acgt as revcomp;
 
     /// Apply substitutions and indels at roughly `rate`, like a noisy read.
     fn mutate(s: &[u8], rate: f64, seed: u32) -> Vec<u8> {

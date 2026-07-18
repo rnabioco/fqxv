@@ -26,6 +26,7 @@ use std::collections::HashSet;
 use rayon::prelude::*;
 
 use fqxv_bytes::{read_varint, write_varint};
+use fqxv_dna::{base_of_sym, is_acgt, revcomp_acgt};
 
 use crate::{
     align_banded, apply, consensus, find_overlaps, layout, place_against, Anchored, ChainOpts,
@@ -86,37 +87,6 @@ fn base_code(b: u8) -> u8 {
         b'T' => 3,
         _ => 4,
     }
-}
-
-/// Inverse of [`base_code`] for the four canonical bases; `4` decodes to `A` and
-/// is corrected by the exception list.
-#[inline]
-fn base_char(c: u8) -> u8 {
-    match c {
-        0 => b'A',
-        1 => b'C',
-        2 => b'G',
-        3 => b'T',
-        _ => b'A',
-    }
-}
-
-#[inline]
-fn is_acgt(b: u8) -> bool {
-    matches!(b, b'A' | b'C' | b'G' | b'T')
-}
-
-fn revcomp(s: &[u8]) -> Vec<u8> {
-    s.iter()
-        .rev()
-        .map(|&b| match b {
-            b'A' => b'T',
-            b'C' => b'G',
-            b'G' => b'C',
-            b'T' => b'A',
-            x => x,
-        })
-        .collect()
 }
 
 /// Entropy-code `raw` with the smaller of order-0 / order-1 rANS and frame it as
@@ -260,7 +230,7 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
             let mut by_id: Vec<Vec<u8>> = vec![Vec::new(); sub.len()];
             for p in &c.reads {
                 let r = sub_read_at(p.read as usize);
-                by_id[p.read as usize] = if p.flip { revcomp(r) } else { r.to_vec() };
+                by_id[p.read as usize] = if p.flip { revcomp_acgt(r) } else { r.to_vec() };
             }
             let cons = consensus(
                 c,
@@ -319,7 +289,11 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
                 .map(|&(_, r)| {
                     let a = best[r as usize].expect("assigned").1;
                     let raw = read_at(r as usize);
-                    let read = if a.flip { revcomp(raw) } else { raw.to_vec() };
+                    let read = if a.flip {
+                        revcomp_acgt(raw)
+                    } else {
+                        raw.to_vec()
+                    };
                     let start = a.offset as usize;
                     let end = (start + read.len() + REF_TAIL).min(cs.len());
                     if start >= end {
@@ -569,7 +543,7 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
                     .get(litp..litp + want)
                     .ok_or(Error::Corrupt)?
                     .iter()
-                    .map(|&c| base_char(c))
+                    .map(|&c| base_of_sym(c))
                     .collect();
                 litp += want;
                 write_read(&mut seq, r, &bytes)?;
@@ -600,7 +574,7 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
                         read_ops.push(Op::Match(m as u32));
                     }
                     1 => {
-                        let b = base_char(*subs.get(sp).ok_or(Error::Corrupt)?);
+                        let b = base_of_sym(*subs.get(sp).ok_or(Error::Corrupt)?);
                         sp += 1;
                         produced += 1;
                         read_ops.push(Op::Sub(b));
@@ -611,7 +585,7 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
                             .get(ip..ip + k)
                             .ok_or(Error::Corrupt)?
                             .iter()
-                            .map(|&c| base_char(c))
+                            .map(|&c| base_of_sym(c))
                             .collect();
                         ip += k;
                         produced += k;
@@ -631,7 +605,11 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
             if oriented.len() != want {
                 return Err(Error::Corrupt);
             }
-            let read = if flip { revcomp(&oriented) } else { oriented };
+            let read = if flip {
+                revcomp_acgt(&oriented)
+            } else {
+                oriented
+            };
             write_read(&mut seq, r, &read)?;
         }
     }
@@ -720,7 +698,7 @@ mod tests {
                 }
                 // Every other read comes off the sequencer reverse-complemented.
                 if i % 2 == 1 {
-                    revcomp(&s)
+                    revcomp_acgt(&s)
                 } else {
                     s
                 }

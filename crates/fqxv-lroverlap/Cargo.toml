@@ -20,6 +20,7 @@ workspace = true
 # internals into a public API they were not designed for.
 [dependencies]
 fqxv-bytes.workspace = true
+fqxv-dna.workspace = true
 fqxv-rans.workspace = true
 fqxv-range.workspace = true
 fqxv-seq.workspace = true
