@@ -26,6 +26,18 @@ echo "==> prep on $(hostname), $FQXV_THREADS threads, $(date)"
 echo "==> building release binary"
 ( cd "$ROOT" && cargo build --release -j "$FQXV_THREADS" )
 
+# Stage subsampled long-read inputs declared 'subsampled' in datasets.tsv (the
+# HiFi run is ~23 Gbp; we bench a ~120k-read / ~1.5 Gbp / ~300x subset). seqkit
+# head streams only the first N reads, so this is cheap even on the 44 GB source.
+DATA_DIR="${FQXV_DATA_DIR:-$HOME/scratch/fqxv/data}"
+HIFI_SRC="$DATA_DIR/SRR11434954.fastq"
+HIFI_SUB="$DATA_DIR/ecoli_hifi.fastq"
+N_READS="${HIFI_SUBSAMPLE_READS:-120000}"
+if [[ ! -s "$HIFI_SUB" && -s "$HIFI_SRC" ]]; then
+  echo "==> subsample HiFi $HIFI_SRC -> $HIFI_SUB (first $N_READS reads)"
+  pixi run --manifest-path "$HERE/pixi.toml" seqkit head -n "$N_READS" "$HIFI_SRC" -o "$HIFI_SUB"
+fi
+
 echo "==> computing per-dataset meta + input digests"
 export FQXV_PREP_ONLY=1
 pixi run --manifest-path "$HERE/pixi.toml" bash "$HERE/run_bench.sh"
