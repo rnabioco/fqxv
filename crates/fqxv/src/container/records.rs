@@ -426,7 +426,14 @@ mod tests {
                 input.extend(seq.iter().map(|_| b'I'));
                 input.push(b'\n');
             }
-            let archive = compress_bytes(&input, params_plain());
+            // This property is about record framing (RecordReader vs decompress
+            // agreement), not the sequence coder — and it runs a full compress +
+            // two decodes per case. The default order-11 model allocates a 4^11
+            // context table each of those three times, which dominates the tiny
+            // inputs here; a low order round-trips identically at a fraction of the
+            // cost. Default-order end-to-end coverage lives in the non-proptest
+            // round-trip tests.
+            let archive = compress_bytes(&input, Params { seq_order: 2, ..params_plain() });
             let recs: Vec<Record> = RecordReader::new(io::Cursor::new(archive.clone()), 1)
                 .map(|r| r.expect("record"))
                 .collect();
