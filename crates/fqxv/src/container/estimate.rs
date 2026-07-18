@@ -92,7 +92,10 @@ pub fn estimate<R: Read>(reader: R, params: Params, sample_reads: usize) -> Resu
     // scale-invariant baseline, and a lower bound for reorder (module doc).
     let mut p = params;
     p.reorder = false;
-    let payload = compress_block(&blk, &p)?;
+    // Detect (or honour the override) the platform from the sample so a long-read
+    // estimate picks the same overlap-codec sketch the real run would.
+    let platform = resolve_platform_block(p.platform, &blk);
+    let payload = compress_block(&blk, &p, platform)?;
 
     // Recover the three stream sizes from the payload framing
     // (`[24 digests][4 n_reads][ (u32 len + bytes) × 3 ]`).

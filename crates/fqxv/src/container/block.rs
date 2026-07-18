@@ -201,6 +201,22 @@ pub(crate) const SEQ_METHOD_ORDERK: u8 = 0;
 /// See [`SEQ_METHOD_ORDERK`].
 pub(crate) const SEQ_METHOD_OVERLAP: u8 = 1;
 
+/// Minimizer sketch for the long-read overlap codec, chosen by the detected
+/// platform. PacBio's <1% error rate leaves nearly every k-mer intact, so its
+/// sparse `map-hifi` sketch suffices; everything else falls back to the dense
+/// `map-ont` sketch, the conservative default that also works on HiFi (it only
+/// costs index size) whereas HiFi's sparse sketch misses ONT overlaps. The
+/// sketch affects ratio and speed only — the block self-describes `(w, k)`, so
+/// decode is unaffected, and the keep-the-smaller rule in
+/// [`encode_sequence_stream`] means a mis-detected platform can never regress a
+/// block below order-k.
+pub(crate) fn sketch_for(platform: Platform) -> fqxv_lroverlap::Sketch {
+    match platform {
+        Platform::PacBio => fqxv_lroverlap::Sketch::hifi(),
+        _ => fqxv_lroverlap::Sketch::ont(),
+    }
+}
+
 fn order_k_stream(lens: &[u32], seq: &[u8], params: &Params) -> Result<Vec<u8>> {
     let coded = fqxv_seq::encode_hashed(
         lens,
@@ -226,13 +242,25 @@ fn order_k_stream(lens: &[u32], seq: &[u8], params: &Params) -> Result<Vec<u8>> 
 /// back automatically), the same "keep the smaller" rule the reference coder and
 /// the per-stream entropy coder already use. The choice is per block, so a file
 /// of mixed lengths codes each block with whichever fits.
-pub(crate) fn encode_sequence_stream(lens: &[u32], seq: &[u8], params: &Params) -> Result<Vec<u8>> {
+///
+/// `platform` selects the overlap codec's minimizer sketch (see [`sketch_for`]);
+/// short-read blocks never reach the overlap codec, so it is unused there.
+pub(crate) fn encode_sequence_stream(
+    lens: &[u32],
+    seq: &[u8],
+    params: &Params,
+    platform: Platform,
+) -> Result<Vec<u8>> {
     if !super::reorder::is_long_read(lens) {
         return order_k_stream(lens, seq, params);
     }
+    let opts = fqxv_lroverlap::EncodeOpts {
+        sketch: sketch_for(platform),
+        ..Default::default()
+    };
     let (overlap, order_k) = rayon::join(
         || {
-            fqxv_lroverlap::encode(lens, seq, &fqxv_lroverlap::EncodeOpts::default()).map(|coded| {
+            fqxv_lroverlap::encode(lens, seq, &opts).map(|coded| {
                 let mut out = Vec::with_capacity(coded.len() + 1);
                 out.push(SEQ_METHOD_OVERLAP);
                 out.extend_from_slice(&coded);
@@ -267,7 +295,7 @@ pub(crate) fn decode_sequence_stream(coded: &[u8]) -> Result<(Vec<u32>, Vec<u8>)
 /// Code one non-reorder block: names (tokenizer), sequence (method-tagged), and
 /// quality (fqzcomp), each length-prefixed, behind three leading per-stream
 /// [`stream_digests`]. Reorder uses the whole-file path instead.
-pub(crate) fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
+pub(crate) fn compress_block(b: &RawBlock, params: &Params, platform: Platform) -> Result<Vec<u8>> {
     let header_refs = b.header_refs();
     // The three streams are independent; code them concurrently so a block's
     // wall time is its slowest stream, not their sum. Nested inside the
@@ -278,7 +306,7 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
         || fqxv_tokenizer::encode(&header_refs),
         || {
             rayon::join(
-                || encode_sequence_stream(&b.lens, &b.seq, params),
+                || encode_sequence_stream(&b.lens, &b.seq, params, platform),
                 || fqxv_fqzcomp::encode(&b.lens, &b.qual, params.quality_binning),
             )
         },
