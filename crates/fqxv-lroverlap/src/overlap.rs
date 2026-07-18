@@ -71,7 +71,16 @@ pub fn find_overlaps(
     // sorted rather than a hash map, so iteration order is never a factor.
     let mut buckets: Vec<(u32, bool, Anchor)> = Vec::new();
     for m in &mins {
-        for o in idx.query(m.hash) {
+        // Cap the per-minimizer fan-out. A minimizer shared by every read (the
+        // amplicon case: one locus, ~150k near-identical copies) otherwise
+        // contributes an occurrence per read, so `buckets` grows as
+        // `minimizers × reads` and OOM-kills the block (#139). A run longer than
+        // the cap is subsampled with a fixed stride — deterministic, and an even
+        // spread of targets rather than a biased prefix, so the reads picked
+        // still represent the locus.
+        let occ = idx.query(m.hash);
+        let step = occ.len().div_ceil(opts.max_fanout.max(1)).max(1);
+        for o in occ.iter().step_by(step) {
             if o.read == query_read {
                 continue;
             }
@@ -124,6 +133,10 @@ pub fn find_overlaps(
             .then(a.target.cmp(&b.target))
             .then(a.q_start.cmp(&b.q_start))
     });
+    // Keep only the highest-scoring overlaps. This bounds the caller's
+    // `Vec<Vec<Overlap>>` at `reads × max_overlaps`; layout uses far fewer per
+    // read, so on normal blocks (where no read reaches the cap) it is a no-op.
+    out.truncate(opts.max_overlaps);
     out
 }
 
@@ -316,6 +329,81 @@ mod tests {
         let a = find_overlaps(&idx, 0, &reads[0], ChainOpts::default());
         let b = find_overlaps(&idx, 0, &reads[0], ChainOpts::default());
         assert_eq!(a, b, "overlap search must be a pure function");
+    }
+
+    #[test]
+    fn high_redundancy_overlaps_are_bounded() {
+        // The #139 OOM shape: a large amplicon locus, many near-identical noisy
+        // copies. Every read shares (almost) every minimizer, so an unbounded
+        // search makes one query's anchor buffer grow as `minimizers × reads`.
+        // The caps must bound both the returned overlaps and the work behind
+        // them, while still finding the (abundant) real overlaps.
+        let locus = rand_seq(1500, 61);
+        let reads: Vec<Vec<u8>> = (0..400)
+            .map(|i| mutate(&locus, 0.003, 400 + i as u32))
+            .collect();
+        let (idx, _) = build(&reads);
+
+        let cap = 32;
+        let opts = ChainOpts {
+            max_overlaps: cap,
+            ..ChainOpts::default()
+        };
+        let ov = find_overlaps(&idx, 0, &reads[0], opts);
+        assert!(
+            ov.len() <= cap,
+            "the per-query overlap count must be capped, got {}",
+            ov.len()
+        );
+        assert!(
+            !ov.is_empty(),
+            "the locus is shared by every read — overlaps must still be found"
+        );
+        // The kept overlaps are the highest-scoring: no overlap outside the cap
+        // may outscore one inside it.
+        let uncapped = find_overlaps(
+            &idx,
+            0,
+            &reads[0],
+            ChainOpts {
+                max_overlaps: usize::MAX,
+                ..ChainOpts::default()
+            },
+        );
+        let worst_kept = ov.iter().map(|o| o.score).min().unwrap();
+        let best_dropped = uncapped.iter().skip(cap).map(|o| o.score).max();
+        if let Some(best_dropped) = best_dropped {
+            assert!(
+                worst_kept >= best_dropped,
+                "truncation kept a worse overlap ({worst_kept}) than it dropped ({best_dropped})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_low_fanout_still_finds_overlaps() {
+        // A fan-out far below the redundancy must still surface real overlaps:
+        // the cap sheds duplicate anchors, not the signal. 40 copies of one
+        // locus, clamped to 4 occurrences per minimizer — every kept anchor is a
+        // genuine same-locus hit, so the query must still chain against copies.
+        let locus = rand_seq(2000, 71);
+        let reads: Vec<Vec<u8>> = (0..40)
+            .map(|i| mutate(&locus, 0.003, 71 + i as u32))
+            .collect();
+        let (idx, _) = build(&reads);
+        let ov = find_overlaps(
+            &idx,
+            0,
+            &reads[0],
+            ChainOpts {
+                max_fanout: 4,
+                ..ChainOpts::default()
+            },
+        );
+        assert!(
+            !ov.is_empty(),
+            "real overlaps must survive aggressive fan-out clamping"
+        );
     }
 
     #[test]

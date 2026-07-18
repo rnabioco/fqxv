@@ -56,6 +56,28 @@ pub struct ChainOpts {
     pub min_score: i32,
     /// Chains with fewer anchors than this are discarded.
     pub min_anchors: u32,
+    /// Overlap-search memory bound, consumed by
+    /// [`find_overlaps`](crate::find_overlaps) — NOT the chainer. The maximum
+    /// occurrences of a single minimizer expanded into candidate anchors; a run
+    /// longer than this is evenly subsampled down to it.
+    ///
+    /// Without it, high-redundancy input (amplicon: ~150k near-identical reads of
+    /// one locus) makes every minimizer occur once per read, so a single query's
+    /// anchor buffer grows as `minimizers × reads` — quadratic in the block, tens
+    /// of GB, an OOM-kill (#139). The repeat filter cannot catch this: the whole
+    /// frequency distribution is uniformly high, so there is no "top fraction" to
+    /// drop. At the layout subsample's target coverage (~40x) a single-copy
+    /// minimizer occurs far below this, so normal long-read blocks never reach the
+    /// cap and are byte-identical; only the pathological case is bounded.
+    pub max_fanout: usize,
+    /// Overlap-search memory bound, consumed by
+    /// [`find_overlaps`](crate::find_overlaps) — NOT the chainer. The maximum
+    /// overlaps returned per query, keeping the highest-scoring. Bounds the
+    /// materialized `Vec<Vec<Overlap>>` at `reads × this` regardless of how many
+    /// reads share a locus. [`layout`](crate::layout) consumes only its top
+    /// `max_candidates` (16) per read, so any value well above the subsample's
+    /// per-read overlap count is lossless downstream.
+    pub max_overlaps: usize,
 }
 
 impl Default for ChainOpts {
@@ -67,6 +89,8 @@ impl Default for ChainOpts {
             max_dist: 5_000,
             min_score: 40,
             min_anchors: 3,
+            max_fanout: 512,
+            max_overlaps: 512,
         }
     }
 }

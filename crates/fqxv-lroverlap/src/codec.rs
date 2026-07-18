@@ -29,7 +29,7 @@ use fqxv_bytes::{read_varint, write_varint};
 use fqxv_dna::{base_of_sym, is_acgt, revcomp_acgt};
 
 use crate::{
-    align_banded, apply, consensus, find_overlaps, layout, place_against, Anchored, ChainOpts,
+    align_banded, apply, consensus, find_overlaps, layout, place_all, Anchored, ChainOpts,
     ConsensusOpts, Error, Index, LayoutOpts, Op, Repeat, Sketch,
 };
 
@@ -43,6 +43,21 @@ const VERSION: u8 = 1;
 /// the consensus it produces, so the reference is amortised over the whole
 /// block. Deriving the stride from this target keeps it out of the caller's API.
 const TARGET_LAYOUT_COVERAGE: u64 = 40;
+
+/// Hard ceiling on the layout subsample, independent of the coverage estimate.
+///
+/// The subsample exists only to build reference consensi — a few tens of ×
+/// coverage of each locus is ample and the layout starves past ~40× anyway, so
+/// no locus needs more than this many reads. The estimate that sizes the stride
+/// (`derive_stride`) collapses on high-redundancy input — an amplicon block is
+/// one locus copied ~150k times, whose sequencing errors explode the
+/// distinct-minimizer genome estimate, so the estimated coverage floors and the
+/// stride falls to 1. Every read then enters the overlap→layout→consensus
+/// pipeline: the search runs for minutes and the fragmented layout's placement
+/// matrix OOM-kills the block (#139). This cap bounds the subsample regardless.
+/// It sits far above what any normal block subsamples to (target coverage of a
+/// real genome), so those blocks keep their exact stride and stay byte-identical.
+const MAX_LAYOUT_SUBSAMPLE: usize = 32_768;
 
 /// One extra reference base past a read's own length, so the banded aligner has
 /// somewhere to place a trailing deletion.
@@ -200,6 +215,9 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
         Some(s) => s.max(1),
         None => derive_stride(sketch, &all_refs, total_bases),
     };
+    // Raise the stride if needed so the subsample cannot exceed the ceiling; a
+    // stride of `ceil(n / cap)` yields at most `cap` subsampled reads (#139).
+    let stride = stride.max(n.div_ceil(MAX_LAYOUT_SUBSAMPLE.max(1)));
     let sub: Vec<u32> = (0..n as u32).step_by(stride).collect();
     let sub_lens: Vec<u32> = sub.iter().map(|&r| lens[r as usize]).collect();
     let mut sub_seq: Vec<u8> = Vec::new();
@@ -249,23 +267,13 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
         .collect();
 
     // ---- place every read on its best-scoring reference ----------------
-    let placed: Vec<Vec<Option<_>>> = consensi
-        .iter()
-        .map(|cs| place_against(cs, &all_refs, sketch, ChainOpts::default()))
-        .collect();
-    let mut best: Vec<Option<(usize, Anchored)>> = vec![None; n];
-    for (ci, per_read) in placed.iter().enumerate() {
-        for (r, a) in per_read.iter().enumerate() {
-            let Some(a) = a else { continue };
-            let take = match best[r] {
-                None => true,
-                Some((_, b)) => a.score > b.score,
-            };
-            if take {
-                best[r] = Some((ci, *a));
-            }
-        }
-    }
+    // One combined index over all consensi, queried once per read, rather than
+    // one `place_against` pass per consensus (`consensi × reads` overlap searches
+    // — tens of millions on an amplicon block, the encode-time sink of #139).
+    // `place_all` returns `(consensus index, placement)` per read; a read on no
+    // reference stays `None` and codes standalone.
+    let best: Vec<Option<(usize, Anchored)>> =
+        place_all(&consensi, &all_refs, sketch, ChainOpts::default());
 
     // Group placed reads by reference, ordered by (offset, read) so delta-coded
     // placements are small and the order is total.
