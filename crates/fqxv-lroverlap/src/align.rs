@@ -35,6 +35,26 @@ pub struct Alignment {
 /// Cell value meaning "outside the band" — never selected as a predecessor.
 const INF: u32 = u32::MAX / 4;
 
+/// Upper bound on the number of DP cells a single [`align_banded`] call may
+/// allocate. Each cell costs 5 bytes (a `u32` cost and a `u8` traceback), so
+/// this caps one call at ~160 MB — independent of read length — keeping a full
+/// rayon pool of concurrent alignments to a few GB rather than an OOM. The band
+/// is narrowed to honour it (see [`align_banded`]); narrowing only costs ratio,
+/// never correctness. Reads short enough for the requested band to fit are
+/// unaffected: at the default band this is every segment up to ~7.8 kb, and the
+/// budget shrinks the band only on the ultra-long tail that would otherwise
+/// blow up.
+const MAX_DP_CELLS: usize = 32 << 20;
+
+/// The widest band whose DP table fits [`MAX_DP_CELLS`] for a reference of
+/// length `n`: the largest `b` with `(n + 1) * (2*b + 1) <= MAX_DP_CELLS`.
+/// Returns at least 1 so a valid (if degenerate) band is always produced; the
+/// caller checks the correctness floor separately.
+fn max_band_for(n: usize) -> usize {
+    let per_row = MAX_DP_CELLS / (n + 1); // widest stride (2*b + 1) that fits
+    (per_row.saturating_sub(1) / 2).max(1)
+}
+
 /// Align `refr` to `query` under unit edit costs, restricted to a diagonal band
 /// of half-width `band`.
 ///
@@ -67,7 +87,35 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
     }
     // The band must at least span the length difference, or no path reaches the
     // corner and the result is garbage rather than merely suboptimal.
-    let band = band.max(n.abs_diff(m)) + 1;
+    let need = n.abs_diff(m);
+    let mut band = band.max(need) + 1;
+
+    // MEMORY CEILING. The DP below is `(n + 1) * (2*band + 1)` cells (a u32 and a
+    // u8 each), so on an ultra-long read a wide band is gigabytes in one call —
+    // measured at ~6 GB for a single 286 kb ONT read at band 2048, which times a
+    // rayon pool OOM-kills the whole compress. Bound the allocation to
+    // [`MAX_DP_CELLS`] regardless of read length by *narrowing the band*. A
+    // narrower band only ever costs ratio — any band `>= |n - m|` still reaches
+    // the corner, so the alignment still round-trips exactly; it just degrades a
+    // large indel it can no longer span into substitutions. Callers keep the
+    // smaller of overlap-coded and order-k, so a ratio regression here can never
+    // make a block worse than the within-read model.
+    let max_band = max_band_for(n);
+    if band > max_band {
+        if need + 1 > max_band {
+            // Even the correctness floor (`|n - m|`) exceeds the budget: the two
+            // segments differ so much in length that no bounded band spans the
+            // corner. That is a read hanging far off its reference, not a real
+            // overlap. Emit a trivial rewrite — delete the reference, insert the
+            // query — which round-trips exactly in O(m) memory. "Keep the
+            // smaller" discards it against order-k, so ratio is unaffected.
+            return Alignment {
+                ops: vec![Op::Del(n as u32), Op::Ins(query.to_vec())],
+                dist: (n + m) as u32,
+            };
+        }
+        band = max_band;
+    }
 
     // BAND-LIMITED STORAGE. Only row `i`'s window `[i-band, i+band]` is ever
     // computed, so only that slice is stored: memory is O(n * band), not
@@ -326,6 +374,58 @@ mod tests {
         let al = align_banded(&a, &b, 32);
         assert_eq!(apply(&a, &al.ops), b, "must still round-trip at length");
         assert!(al.dist <= 4, "a few edits, got {}", al.dist);
+    }
+
+    #[test]
+    fn wide_band_on_a_long_read_stays_within_the_cell_budget() {
+        // The OOM regression guard: a huge requested band on a long read must be
+        // narrowed to honour MAX_DP_CELLS, not allocate O(n * band). The result
+        // must still round-trip — narrowing costs ratio, never correctness.
+        let mut a = Vec::new();
+        let mut x: u32 = 9;
+        for _ in 0..200_000 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            a.push(b"ACGT"[(x >> 16) as usize % 4]);
+        }
+        let mut b = a.clone();
+        b[1000] = b'A';
+        b[150_000] = b'C';
+        // A band of 4096 on a 200 kb read is ~1.6 G cells unbanded-capped; the
+        // ceiling must pull it back to `max_band_for(n)`.
+        let mb = max_band_for(a.len());
+        assert!(mb < 4096, "budget must bind here: max_band={mb}");
+        let al = align_banded(&a, &b, 4096);
+        assert_eq!(apply(&a, &al.ops), b, "must round-trip at the capped band");
+    }
+
+    #[test]
+    fn max_band_never_exceeds_the_cell_budget() {
+        for &n in &[1usize, 1_000, 50_000, 286_296, 1_000_000] {
+            let b = max_band_for(n);
+            assert!(
+                (n + 1) * (2 * b + 1) <= MAX_DP_CELLS,
+                "n={n} band={b} exceeds budget"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_length_mismatch_falls_back_and_round_trips() {
+        // When even the correctness floor |n-m| exceeds the budget (a long read
+        // hanging off a short reference), the trivial delete-all/insert-all
+        // rewrite must still reconstruct the query exactly.
+        let refr = vec![b'A'; 8];
+        let mut query = Vec::new();
+        let mut x: u32 = 3;
+        for _ in 0..40_000_000 {
+            // long enough that need+1 > max_band_for(8)
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            query.push(b"ACGT"[(x >> 16) as usize % 4]);
+        }
+        // Guard: this really is the degenerate branch, not a normal band.
+        assert!(query.len().abs_diff(refr.len()) + 1 > max_band_for(refr.len()));
+        let al = align_banded(&refr, &query, 8);
+        assert_eq!(apply(&refr, &al.ops), query, "fallback must round-trip");
     }
 
     #[test]
