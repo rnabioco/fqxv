@@ -32,3 +32,6 @@ __pycache__/
 /.vscode
 perf.data*
 flamegraph.svg
+
+# claude
+/.claude
