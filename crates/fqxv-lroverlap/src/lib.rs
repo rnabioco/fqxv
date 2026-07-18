@@ -69,6 +69,7 @@ mod minimizer;
 mod overlap;
 mod refine;
 mod script;
+mod wfa;
 
 pub use align::{align_banded, apply, Alignment, Op};
 pub use chain::{Anchor, Chain, ChainOpts, Chainer};
@@ -80,6 +81,7 @@ pub use minimizer::{minimizers, Minimizer};
 pub use overlap::{find_overlaps, Overlap};
 pub use refine::{place_against, place_all, Anchored};
 pub use script::{chain_span, script_from_chain, ScriptOpts};
+pub use wfa::{wfa_align, wfa_cells};
 
 /// Errors returned by this crate.
 #[derive(Debug, thiserror::Error)]
