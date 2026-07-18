@@ -11,7 +11,7 @@ Where each lever stands:
 | --- | --- |
 | Quality binning (`--quality-bin ont` / `hifi`) | **shipped** — usable from the CLI |
 | Quality base-context | not started; measured headroom is ~nil (see Lever 1) |
-| Overlap sequence codec (`fqxv-lroverlap`) | **shipped** (`FORMAT_VERSION` 4) — auto-selected for long-read blocks, kept only when it beats the order-k model; codes the HiFi sequence stream ~5× smaller through a real archive. See [Wiring](#wiring-and-the-per-block-coverage-cap). |
+| Overlap sequence codec (`fqxv-lroverlap`) | **shipped** — auto-selected for long-read blocks, kept only when it beats the order-k model; codes the HiFi sequence stream ~5× smaller through a real archive. See [Wiring](#wiring-and-the-per-block-coverage-cap). |
 
 The rest of this note is the analysis that set those priorities; it is written
 against the pre-`lroverlap` baseline, so the "fqxv seq" rows below are the
@@ -266,7 +266,7 @@ consensus (0.0025).
 
 ### Wiring and the per-block coverage cap
 
-`fqxv-lroverlap` is wired into the container (`FORMAT_VERSION` 4). The block
+`fqxv-lroverlap` is wired into the container. The block
 sequence stream carries a leading method byte; long-read blocks (mean length
 over 500 bp) code with both the overlap codec and the order-k model and keep the
 smaller, so the overlap path never regresses a block. Selection is automatic —

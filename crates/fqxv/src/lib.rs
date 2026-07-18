@@ -50,7 +50,7 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 /// - carries a CRC-32C on every coded payload, so on-disk corruption is detected
 ///   and localized rather than silently decoded;
 /// - prepends three xxh3-64 digests of each block's *decoded* content — one per
-///   stream (names, sequence, post-binning quality) — to the block payload (v5),
+///   stream (names, sequence, post-binning quality) — to the block payload,
 ///   verified after decode, so a codec bug that turns CRC-valid bytes into
 ///   wrong-but-in-bounds output is caught at runtime and localized to the stream
 ///   that regressed, not just to the block;
@@ -58,11 +58,11 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 ///   shared reference can be coded by either the clean-room order-k model or an
 ///   xz pass (whichever is smaller), exploiting long-range repeat structure the
 ///   order-k model can't see;
-/// - prefixes every block frame with a `BLOCK_MAGIC` sync marker (v2) so
+/// - prefixes every block frame with a `BLOCK_MAGIC` sync marker so
 ///   [`decompress_recover`] can resynchronize to a block boundary by scanning —
 ///   recovering intact blocks even when the footer index is lost (a truncated
 ///   tail) or a block's length prefix is corrupt;
-/// - tags each block's sequence stream with a leading method byte (v4) so the
+/// - tags each block's sequence stream with a leading method byte so the
 ///   codec is chosen per block: the order-k context model for short reads, the
 ///   cross-read overlap-assembly codec (`fqxv-lroverlap`) for long reads.
 ///

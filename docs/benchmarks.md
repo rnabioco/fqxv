@@ -81,7 +81,7 @@ blocks are cut by a raw-byte budget so ragged reads still parallelize, and the
 short-read reorder codec auto-disables. The tables below measure each stream
 per-read against CoLoRd `-q org` (its lossless quality mode); the `fqxv -l9`
 rows are the **within-read** sequence baseline. The cross-read overlap codec that
-now ships for long reads (see [The sequence lever](#the-sequence-lever-wired-format_version-4))
+now ships for long reads (see [The sequence lever](#the-sequence-lever-wired))
 replaces that baseline and codes the HiFi sequence stream ~6× smaller.
 
 fqxv's columns come from `fqxv info`, which reports its real streams. CoLoRd has
@@ -129,7 +129,7 @@ the gap above dominates the total. `colord-lossy` remains smaller overall
 (ONT 73.2M vs 114.6M for `fqxv --quality-bin ont`). Match the table to the
 platform: see [Lossy quality binning](cli/compress.md#lossy-quality-binning).
 
-### The sequence lever (wired, `FORMAT_VERSION` 4)
+### The sequence lever (wired)
 
 The cross-read overlap codec `fqxv-lroverlap` (minimizers → overlaps → layout →
 consensus → per-read banded edit script → rANS) is now the container's sequence
