@@ -57,6 +57,40 @@ fn a_truncated_fastq_errors_in_both_order_modes() {
     );
 }
 
+/// A per-record sequence/quality length mismatch must be rejected at parse time,
+/// even when a second record mis-compensates so the *block totals* match.
+///
+/// The block-level check only compares total quality bytes against the summed
+/// read lengths, so `(seq 4, qual 2)` followed by `(seq 2, qual 4)` netted out and
+/// slipped through — then decode sliced both streams with the same `lens` and
+/// silently handed r1 two of r2's quality bytes. Worse, `--verify` re-derived its
+/// digests from that same wrong `lens` and reported success. The fix rejects the
+/// first mis-sized record up front; this asserts it does, in both order modes.
+#[test]
+fn compensating_seq_qual_mismatch_is_rejected() {
+    // Totals are 6 seq / 6 qual, but neither record has seq_len == qual_len.
+    let input = b"@r1\nAAAA\n+\nII\n@r2\nCC\n+\nGGGG\n";
+
+    let plain = compress(&input[..], &mut Vec::new(), Params::default());
+    let reordered = compress(
+        &input[..],
+        &mut Vec::new(),
+        Params {
+            reorder: true,
+            ..Params::default()
+        },
+    );
+
+    assert!(
+        matches!(plain, Err(Error::RecordLengthMismatch { seq: 4, qual: 2 })),
+        "plain path must reject the first mis-sized record, got {plain:?}"
+    );
+    assert!(
+        reordered.is_err(),
+        "reorder path must reject it too, not silently misalign quality"
+    );
+}
+
 #[test]
 fn roundtrip_normalizes_plus() {
     let archive = compress_bytes(SAMPLE, Params::default());

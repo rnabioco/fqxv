@@ -103,6 +103,13 @@ pub(crate) fn read_raw_record<R: BufRead>(
     line.clear();
     r.read_until(b'\n', &mut line)?;
     qual.extend_from_slice(strip_eol(&line));
+    // Same per-record invariant as the parallel parser (see `parse_chunk`).
+    if seq.len() != qual.len() {
+        return Err(Error::RecordLengthMismatch {
+            seq: seq.len(),
+            qual: qual.len(),
+        });
+    }
     Ok(true)
 }
 
@@ -168,6 +175,16 @@ pub(crate) fn parse_chunk(buf: &[u8], start: usize, end: usize) -> Result<ChunkP
         }
         let (_, _, p3) = take_line(buf, p2, end);
         let (qual_off, qual_len, p4) = take_line(buf, p3, end);
+        // A valid FASTQ record has equal sequence and quality lengths. Enforce it
+        // per-record: the block-level quality-vs-lens check catches only a net
+        // mismatch, so two records that mis-compensate (seq>qual then qual>seq)
+        // would otherwise pass and silently slide quality across read boundaries.
+        if seq_len != qual_len {
+            return Err(Error::RecordLengthMismatch {
+                seq: seq_len,
+                qual: qual_len,
+            });
+        }
 
         recs.push(RecMeta {
             hdr_end,
