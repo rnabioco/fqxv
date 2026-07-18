@@ -34,11 +34,11 @@ the reordered stream:
 - **LITERAL** — everything else, coded with the `fqxv-seq` context model.
 
 Duplicates collapse to a single op; the unique reads still get the context
-model. These block-local sequence codecs are versioned on disk (v2 single-contig,
-v3 adds block-local literal-rescue) and the container keeps whichever is smaller
-per block.
+model. Each block records which block-local codec it used in a leading method
+byte (single-contig, or the literal-rescue variant that adds block-local rescue),
+and the container keeps whichever is smaller per block.
 
-**Global reference (v4).** Beyond the block-local codecs, the container can also
+**Global reference.** Beyond the block-local codecs, the container can also
 assemble **one frozen whole-file reference** (SPRING-style) over every clustered
 read and code reads as `(contig, offset, mismatches)` positions on it, so the
 cross-block overlaps the block-local codecs strand as literals collapse to a cheap

@@ -10,10 +10,11 @@ block-based container.
     `fqxv` is in **early development** and the on-disk `.fqxv` format is **not
     frozen**. Do not use it as the only copy of data you care about.
 
-    - **The format changes without notice.** Each build reads only its own
-      `FORMAT_VERSION`, so an archive written today may be unreadable by
-      tomorrow's build. Pin an exact version if you need archives to survive an
-      upgrade — and prefer re-compressing from the original FASTQ.
+    - **The format can change without notice.** A reader refuses an archive whose
+      format major version differs from its own, so an archive written today may be
+      unreadable by a future build that bumps the major. Pin an exact version if you
+      need archives to survive an upgrade — and prefer re-compressing from the
+      original FASTQ.
     - **Bugs are still being found.** Correctness work is ongoing, including
       defects that produced archives which could not be decompressed. Every
       archive is checksummed and `compress --verify` will read one back to
