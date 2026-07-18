@@ -175,12 +175,27 @@ impl Streams {
 /// layout stride targeting [`TARGET_LAYOUT_COVERAGE`]. Repeats bias the genome
 /// estimate low and the stride high; both are bounded and only affect ratio.
 fn derive_stride(sketch: Sketch, reads: &[&[u8]], total_bases: u64) -> usize {
-    let mut distinct: HashSet<u64> = HashSet::new();
-    for r in reads {
-        for m in sketch.minimizers(r) {
-            distinct.insert(m.hash);
-        }
-    }
+    // The distinct minimizer count over every read — a full serial sketch plus a
+    // hash insert per minimizer, which dominated encode setup on deep blocks (a
+    // ~1-core stall of several seconds). Each read's minimizers are independent,
+    // so fold them into per-worker sets on the rayon pool and union the sets. Only
+    // the set *cardinality* feeds the stride, and set union is commutative, so the
+    // result is identical for any worker count — the derived stride, and thus the
+    // whole encoding, stays byte-identical regardless of thread count.
+    let distinct = reads
+        .par_iter()
+        .fold(HashSet::<u64>::new, |mut s, r| {
+            for m in sketch.minimizers(r) {
+                s.insert(m.hash);
+            }
+            s
+        })
+        .reduce(HashSet::<u64>::new, |a, b| {
+            // Extend the larger set with the smaller to minimize rehashing.
+            let (mut big, small) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+            big.extend(small);
+            big
+        });
     if distinct.is_empty() {
         return 1;
     }
