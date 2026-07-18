@@ -325,7 +325,17 @@ pub(crate) struct Header {
 
 pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
     let mut prefix = [0u8; HEADER_PREFIX_LEN];
-    r.read_exact(&mut prefix)?;
+    // A file too short to even hold the fixed header prefix (empty, a stray byte, a
+    // badly truncated download) surfaces `read_exact`'s raw "failed to fill whole
+    // buffer" otherwise — map it to the clear `Truncated` message the rest of the
+    // decode path uses, keeping the corruption diagnostics consistent.
+    r.read_exact(&mut prefix).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            Error::Truncated
+        } else {
+            Error::Io(e)
+        }
+    })?;
     if prefix[..4] != MAGIC {
         return Err(Error::BadMagic);
     }
