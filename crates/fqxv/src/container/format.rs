@@ -9,8 +9,22 @@ use super::*;
 /// `u32` per-stream compressed length. For fixed short reads the read count is
 /// the binding limit and this never triggers.
 pub(crate) const MAX_BLOCK_SEQ_BYTES: usize = 256 << 20;
-/// Header fields covered by the header CRC: magic(4) + version(2) + seq_order(1)
-/// + quality-binning tag(1) + flags(1) + group size(1) + platform(1).
+/// Fixed header prefix, byte offsets within it, up to and including the 2-byte
+/// extension-length field. Layout:
+///
+/// ```text
+/// [0..4]   magic "FQXV"
+/// [4]      version major        -- reader refuses a differing major
+/// [5]      version minor        -- tolerated within a major; informational
+/// [6..14]  required_features    -- u64 LE; a set bit outside KNOWN_FEATURES is
+///                                  refused ([`Error::UnsupportedFeature`])
+/// [14]     sequence context order (k)
+/// [15]     quality-binning tag
+/// [16]     flags
+/// [17]     group size G
+/// [18]     platform tag
+/// [19..21] ext_len              -- u16 LE; bytes of the TLV extension region
+/// ```
 ///
 /// The platform tag has its own byte rather than sharing the flags byte. It used
 /// to occupy flags bits 5-7, which collided with [`FLAG_GLOBAL_REFERENCE`]
@@ -18,16 +32,29 @@ pub(crate) const MAX_BLOCK_SEQ_BYTES: usize = 256 << 20;
 /// the reference flag. An Illumina archive in the global-reorder layout that did
 /// not adopt a reference therefore still advertised one and failed to decode.
 /// Six flags plus a 3-bit platform tag do not fit in one byte, so the tag moved
-/// out. (Pre-existing archives are not a concern — the format is not yet stable
-/// and the widened CRC coverage rejects a stale header rather than misreading
-/// it.)
-pub(crate) const HEADER_FIELDS_LEN: usize = 11;
-/// Full on-disk header prefix: the [`HEADER_FIELDS_LEN`] fields followed by a
-/// CRC-32C over them, so a flipped header byte (version, flags, the lossy binning
-/// tag, group size) is caught on read rather than silently changing decode — in
-/// both the plain and reorder layouts. Also the byte offset at which the first
-/// block / reorder frame begins.
-pub(crate) const HEADER_LEN: usize = HEADER_FIELDS_LEN + CRC_LEN;
+/// out.
+pub(crate) const HEADER_PREFIX_LEN: usize = 21;
+/// Byte offset of the quality-binning tag within the header (see the layout
+/// above). Exposed so tests that poke at a raw header field track the layout by
+/// name instead of a bare literal that silently rots when the field shifts.
+#[cfg(test)]
+pub(crate) const HDR_OFF_BINNING: usize = 15;
+/// Byte offset of the flags byte within the header.
+#[cfg(test)]
+pub(crate) const HDR_OFF_FLAGS: usize = 16;
+/// Header length for an archive with an empty extension region — the size this
+/// build writes (1.0 emits no TLV records). A later minor that appends TLVs makes
+/// the on-disk header longer; readers must use [`Header::header_len`] (not this
+/// constant) for any seek/scan start offset so they stay correct across minors.
+/// Blocks begin right after the header, so this is also the ext-empty block-region
+/// start offset.
+pub(crate) const HEADER_LEN: usize = HEADER_PREFIX_LEN + CRC_LEN;
+/// A header extension record is `[1 tag][2 len LE][len bytes]`. The tag's high bit
+/// marks a *critical* record: a reader that doesn't recognize a critical tag must
+/// refuse the archive ([`Error::UnsupportedExtension`]) rather than skip it; an
+/// unknown non-critical tag is skipped. No tags are defined at 1.0 — the region
+/// exists so a later minor can add skippable header fields without a major bump.
+pub(crate) const EXT_CRITICAL_BIT: u8 = 0x80;
 /// Bytes of CRC-32C appended after a frame's length field (plain block frames)
 /// or after a `[u32 len]` framed slice (reorder layout).
 pub(crate) const CRC_LEN: usize = 4;
@@ -75,12 +102,21 @@ pub(crate) const FLAG_REGEN_NAMES: u8 = 0x10;
 /// block-local (v2/v3) codecs; otherwise no reference frame is written.
 pub(crate) const FLAG_GLOBAL_REFERENCE: u8 = 0x20;
 // Bits 0x40 and 0x80 are free: the platform tag that used to occupy bits 5-7
-// now has its own header byte (see `HEADER_FIELDS_LEN`).
+// now has its own header byte (see `HEADER_PREFIX_LEN`).
 
-/// Write the `HEADER_FIELDS_LEN` header fields followed by a CRC-32C over them,
-/// so a flipped header byte is caught on read instead of silently altering decode.
-/// Shared by the plain ([`write_header`]) and reorder ([`encode_reordered`])
-/// layouts, which differ only in their `flags`.
+/// Write the fixed header prefix (see [`HEADER_PREFIX_LEN`]), then the extension
+/// region (empty at 1.0), then a CRC-32C over prefix+extension — so a flipped
+/// header byte is caught on read instead of silently altering decode. Shared by
+/// the plain ([`write_header`]) and reorder ([`encode_reordered`]) layouts, which
+/// differ only in their `flags`.
+///
+/// `required_features` is the coarse, intent-level capability word: set a bit
+/// here only for a capability a reader must possess to decode the archive *at
+/// all* and that is knowable before the blocks are written (e.g. a whole-file
+/// global reference frame). Fine-grained "this one block used codec X" is carried
+/// by the per-stream method byte and surfaces as an [`Error::UnsupportedMethod`]
+/// on decode, not here. Pass 0 when the archive requires nothing beyond the base
+/// format for its major.
 pub(crate) fn write_header_prefix<W: Write>(
     w: &mut W,
     seq_order: u8,
@@ -88,15 +124,24 @@ pub(crate) fn write_header_prefix<W: Write>(
     flags: u8,
     group_size: u8,
     platform: Platform,
+    required_features: u64,
 ) -> Result<()> {
-    let mut hdr = [0u8; HEADER_FIELDS_LEN];
-    hdr[..4].copy_from_slice(&MAGIC);
-    hdr[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-    hdr[6] = seq_order;
-    hdr[7] = binning;
-    hdr[8] = flags;
-    hdr[9] = group_size;
-    hdr[10] = platform.to_code();
+    // 1.0 emits an empty extension region; a later minor appends TLV records here
+    // and must update HEADER_LEN-based start offsets to use `Header::header_len`.
+    const EXT: &[u8] = &[];
+    let mut hdr = Vec::with_capacity(HEADER_PREFIX_LEN + EXT.len());
+    hdr.extend_from_slice(&MAGIC);
+    hdr.push(FORMAT_MAJOR);
+    hdr.push(FORMAT_MINOR);
+    hdr.extend_from_slice(&required_features.to_le_bytes());
+    hdr.push(seq_order);
+    hdr.push(binning);
+    hdr.push(flags);
+    hdr.push(group_size);
+    hdr.push(platform.to_code());
+    hdr.extend_from_slice(&(EXT.len() as u16).to_le_bytes());
+    hdr.extend_from_slice(EXT);
+    debug_assert_eq!(hdr.len(), HEADER_PREFIX_LEN + EXT.len());
     w.write_all(&hdr)?;
     w.write_all(&crc32c(&hdr).to_le_bytes())?;
     Ok(())
@@ -112,6 +157,10 @@ pub(crate) fn write_header<W: Write>(
     // The block layout is always non-reorder — reorder (both keep-order modes)
     // uses the whole-file path, which writes its own header.
     debug_assert!(!params.reorder);
+    // The plain layout needs nothing beyond the base format for its major: any
+    // per-block codec choice (e.g. the long-read overlap codec) is recorded by the
+    // sequence stream's method byte and rejected per block on decode, not gated
+    // here. So the coarse feature word is empty.
     write_header_prefix(
         w,
         params.seq_order,
@@ -119,6 +168,7 @@ pub(crate) fn write_header<W: Write>(
         FLAG_PLUS_NORMALIZED,
         group_size,
         platform,
+        0,
     )
 }
 
@@ -251,43 +301,110 @@ pub(crate) fn read_framed<R: Read>(r: &mut R, what: &str) -> Result<Vec<u8>> {
 // --- header / block framing --------------------------------------------------
 
 pub(crate) struct Header {
+    /// On-disk format major/minor. `major` always equals [`FORMAT_MAJOR`] for a
+    /// readable archive (a differing major is refused); `minor` may be newer than
+    /// this build's ([`FORMAT_MINOR`]) — additions within a major are tolerated.
+    pub(crate) major: u8,
+    pub(crate) minor: u8,
+    /// Coarse capability word ([`crate::feature`]); every set bit is within
+    /// [`crate::KNOWN_FEATURES`] for a readable archive (unknown bits are refused).
+    pub(crate) required_features: u64,
     pub(crate) seq_order: u8,
     pub(crate) quality_binning: u8,
     pub(crate) flags: u8,
     pub(crate) group_size: u8,
     /// Sequencing platform tag ([`Platform::to_code`]) — its own byte, never
-    /// packed into `flags` (see [`HEADER_FIELDS_LEN`]).
+    /// packed into `flags` (see [`HEADER_PREFIX_LEN`]).
     pub(crate) platform: u8,
+    /// Actual on-disk header length in bytes: prefix + extension region + CRC.
+    /// Equals [`HEADER_LEN`] for a 1.0-written archive (empty extension region);
+    /// larger if a later minor appended TLV records. Any seek/scan that starts at
+    /// the block region must use this, not the [`HEADER_LEN`] constant.
+    pub(crate) header_len: u64,
 }
 
 pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
-    let mut buf = [0u8; HEADER_LEN];
-    r.read_exact(&mut buf)?;
-    let (fields, crc) = buf.split_at(HEADER_FIELDS_LEN);
-    if fields[..4] != MAGIC {
+    let mut prefix = [0u8; HEADER_PREFIX_LEN];
+    r.read_exact(&mut prefix)?;
+    if prefix[..4] != MAGIC {
         return Err(Error::BadMagic);
     }
-    let ver = u16::from_le_bytes([fields[4], fields[5]]);
-    if ver != FORMAT_VERSION {
-        return Err(Error::UnsupportedVersion(ver));
+    let major = prefix[4];
+    let minor = prefix[5];
+    // Refuse a wire-incompatible major before anything else, so a genuinely
+    // foreign or future-major file reports that (most useful) error rather than a
+    // CRC mismatch. A newer minor within our major is tolerated — its additions
+    // ride in the skippable extension region and per-block method bytes.
+    if major != FORMAT_MAJOR {
+        return Err(Error::UnsupportedVersion { major, minor });
     }
-    // Verify the header CRC only after magic/version, so a genuinely foreign or
-    // wrong-version file reports that (more useful) error rather than a CRC
-    // mismatch. Within this version, a flipped field byte is caught here before
-    // it can silently change decode (group size, flags, the lossy binning tag).
-    if u32::from_le_bytes(crc.try_into().unwrap()) != crc32c(fields) {
+    let required_features = u64::from_le_bytes(prefix[6..14].try_into().unwrap());
+    // A required capability this build doesn't have means the archive cannot be
+    // decoded — refuse cleanly, naming the unknown bits, rather than mis-reading a
+    // stream produced by a codec/mode we lack.
+    let unknown = required_features & !KNOWN_FEATURES;
+    if unknown != 0 {
+        return Err(Error::UnsupportedFeature(unknown));
+    }
+    let ext_len = u16::from_le_bytes([prefix[19], prefix[20]]) as usize;
+
+    // The extension region is bounded by a u16 so this can't over-allocate.
+    let mut ext = vec![0u8; ext_len];
+    r.read_exact(&mut ext)?;
+    let mut crcb = [0u8; CRC_LEN];
+    r.read_exact(&mut crcb)?;
+
+    // Verify the header CRC (over prefix + extension) only after magic/version/
+    // features, so those errors win over a CRC mismatch. Within a compatible
+    // header a flipped field byte is caught here before it can silently change
+    // decode (group size, flags, the lossy binning tag, a feature bit).
+    let mut covered = Vec::with_capacity(HEADER_PREFIX_LEN + ext.len());
+    covered.extend_from_slice(&prefix);
+    covered.extend_from_slice(&ext);
+    if u32::from_le_bytes(crcb) != crc32c(&covered) {
         return Err(Error::Corrupt {
             what: "header".to_string(),
         });
     }
-    let group_size = fields[9].max(1);
+    // Walk the TLV records: an unknown *critical* tag is fatal; unknown
+    // non-critical tags are skipped. (No tags are defined at 1.0.)
+    check_header_extensions(&ext)?;
+
+    let group_size = prefix[17].max(1);
     Ok(Header {
-        seq_order: fields[6],
-        quality_binning: fields[7],
-        flags: fields[8],
+        major,
+        minor,
+        required_features,
+        seq_order: prefix[14],
+        quality_binning: prefix[15],
+        flags: prefix[16],
         group_size,
-        platform: fields[10],
+        platform: prefix[18],
+        header_len: (HEADER_PREFIX_LEN + ext_len + CRC_LEN) as u64,
     })
+}
+
+/// Walk the header extension region's `[1 tag][2 len][len bytes]` records. No
+/// tags are known at 1.0, so a known tag is never consumed here yet; an unknown
+/// *critical* tag (high bit set, [`EXT_CRITICAL_BIT`]) is refused, and an unknown
+/// non-critical tag is skipped. A record that overruns the region is malformed.
+fn check_header_extensions(mut ext: &[u8]) -> Result<()> {
+    while !ext.is_empty() {
+        if ext.len() < 3 {
+            return Err(Error::Malformed("truncated header extension record"));
+        }
+        let tag = ext[0];
+        let len = u16::from_le_bytes([ext[1], ext[2]]) as usize;
+        let end = 3 + len;
+        if end > ext.len() {
+            return Err(Error::Malformed("header extension record overruns region"));
+        }
+        if tag & EXT_CRITICAL_BIT != 0 {
+            return Err(Error::UnsupportedExtension(tag));
+        }
+        ext = &ext[end..];
+    }
+    Ok(())
 }
 
 /// The footer index: per row group `(byte_offset, read_count)`, the total read
@@ -485,5 +602,114 @@ impl fqxv_bytes::ReaderError for Error {
     }
     fn oversized() -> Self {
         Error::Truncated
+    }
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Build a header with arbitrary major/minor/features/extension bytes and a
+    /// correct trailing CRC — the low-level mirror of [`write_header_prefix`] used
+    /// to forge headers a current encoder would never emit.
+    fn forge(major: u8, minor: u8, features: u64, ext: &[u8]) -> Vec<u8> {
+        let mut hdr = Vec::new();
+        hdr.extend_from_slice(&MAGIC);
+        hdr.push(major);
+        hdr.push(minor);
+        hdr.extend_from_slice(&features.to_le_bytes());
+        hdr.push(3); // seq_order
+        hdr.push(0); // binning
+        hdr.push(FLAG_PLUS_NORMALIZED);
+        hdr.push(2); // group_size
+        hdr.push(1); // platform (Illumina)
+        hdr.extend_from_slice(&(ext.len() as u16).to_le_bytes());
+        hdr.extend_from_slice(ext);
+        hdr.extend_from_slice(&crc32c(&hdr).to_le_bytes());
+        hdr
+    }
+
+    #[test]
+    fn roundtrips_current_version() {
+        let mut buf = Vec::new();
+        write_header_prefix(
+            &mut buf,
+            3,
+            0,
+            FLAG_PLUS_NORMALIZED,
+            2,
+            Platform::Illumina,
+            0,
+        )
+        .unwrap();
+        assert_eq!(buf.len(), HEADER_LEN, "1.0 writes an ext-empty header");
+        let h = read_header(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!((h.major, h.minor), (FORMAT_MAJOR, FORMAT_MINOR));
+        assert_eq!(h.seq_order, 3);
+        assert_eq!(h.group_size, 2);
+        assert_eq!(h.platform, 1);
+        assert_eq!(h.required_features, 0);
+        assert_eq!(h.header_len, HEADER_LEN as u64);
+    }
+
+    #[test]
+    fn refuses_foreign_major() {
+        let buf = forge(FORMAT_MAJOR + 1, 0, 0, &[]);
+        assert!(matches!(
+            read_header(&mut Cursor::new(&buf)),
+            Err(Error::UnsupportedVersion { major, .. }) if major == FORMAT_MAJOR + 1
+        ));
+    }
+
+    #[test]
+    fn tolerates_newer_minor() {
+        // A newer minor within our major must read: additions are additive.
+        let buf = forge(FORMAT_MAJOR, FORMAT_MINOR + 7, 0, &[]);
+        let h = read_header(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(h.minor, FORMAT_MINOR + 7);
+    }
+
+    #[test]
+    fn refuses_unknown_required_feature() {
+        let unknown = 1u64 << 40; // outside KNOWN_FEATURES
+        let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, unknown, &[]);
+        assert!(matches!(
+            read_header(&mut Cursor::new(&buf)),
+            Err(Error::UnsupportedFeature(bits)) if bits == unknown
+        ));
+    }
+
+    #[test]
+    fn skips_unknown_noncritical_extension() {
+        // tag 0x01 (critical bit clear), 2-byte payload — a later minor's field.
+        let ext = [0x01, 0x02, 0x00, 0xaa, 0xbb];
+        let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, 0, &ext);
+        let h = read_header(&mut Cursor::new(&buf)).unwrap();
+        // Block region starts past the extension region, not at the const.
+        assert_eq!(
+            h.header_len,
+            (HEADER_PREFIX_LEN + ext.len() + CRC_LEN) as u64
+        );
+    }
+
+    #[test]
+    fn refuses_unknown_critical_extension() {
+        let ext = [EXT_CRITICAL_BIT | 0x01, 0x00, 0x00];
+        let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, 0, &ext);
+        assert!(matches!(
+            read_header(&mut Cursor::new(&buf)),
+            Err(Error::UnsupportedExtension(tag)) if tag == EXT_CRITICAL_BIT | 0x01
+        ));
+    }
+
+    #[test]
+    fn catches_flipped_header_byte() {
+        let mut buf = forge(FORMAT_MAJOR, FORMAT_MINOR, 0, &[]);
+        buf[16] ^= 0xff; // flip the flags byte; CRC no longer matches
+        assert!(matches!(
+            read_header(&mut Cursor::new(&buf)),
+            Err(Error::Corrupt { .. })
+        ));
     }
 }

@@ -288,7 +288,10 @@ pub fn verify_report(file: &File, quick: bool) -> Result<VerifyReport> {
         report.push(
             "header",
             true,
-            format!("format v{FORMAT_VERSION}, global-cluster reorder layout"),
+            format!(
+                "format v{}.{}, global-cluster reorder layout",
+                header.major, header.minor
+            ),
         );
         // No footer/per-block index; decoding drives every frame CRC.
         r.seek(SeekFrom::Start(0))?;
@@ -302,7 +305,7 @@ pub fn verify_report(file: &File, quick: bool) -> Result<VerifyReport> {
     report.push(
         "header",
         true,
-        format!("format v{FORMAT_VERSION}, plain layout"),
+        format!("format v{}.{}, plain layout", header.major, header.minor),
     );
 
     // Footer (read_footer verifies the footer's own CRC).

@@ -67,7 +67,32 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 ///   cross-read overlap-assembly codec (`fqxv-lroverlap`) for long reads.
 ///
 /// See `container.rs` for the full layout.
-pub const FORMAT_VERSION: u16 = 5;
+pub const FORMAT_MAJOR: u8 = 1;
+
+/// On-disk format minor version. Bumped for backward-compatible additions — a new
+/// skippable header extension record, or a new optional codec/mode gated by a
+/// [`feature`] bit. A reader tolerates any minor within its [`FORMAT_MAJOR`]; the
+/// value is informational (surfaced by [`inspect`](container::inspect)).
+pub const FORMAT_MINOR: u8 = 0;
+
+/// Coarse capability bits an archive can require in its header `required_features`
+/// word. A reader that sees a set bit outside [`KNOWN_FEATURES`] refuses the
+/// archive with [`Error::UnsupportedFeature`] — a precise "upgrade fqxv" signal
+/// rather than a mis-decode. Set a bit only for a capability a reader must have to
+/// decode the archive *at all*, and that is knowable before the blocks are
+/// written; per-block codec choices are gated by the sequence stream's method byte
+/// instead ([`Error::UnsupportedMethod`]).
+pub mod feature {
+    /// The whole-file reorder layout carries a shared global reference frame
+    /// (SPRING-style); a reader without that decode path cannot reconstruct the
+    /// referenced sequence blocks.
+    pub const GLOBAL_REFERENCE: u64 = 1 << 0;
+}
+
+/// The union of every [`feature`] bit this build understands. A `required_features`
+/// word with any bit outside this mask is rejected by
+/// [`read_header`](container::format::read_header).
+pub const KNOWN_FEATURES: u64 = feature::GLOBAL_REFERENCE;
 
 /// Errors returned by the archiver.
 #[derive(Debug, Error)]
@@ -79,9 +104,37 @@ pub enum Error {
     /// The file was not a recognizable `.fqxv` container.
     #[error("not an fqxv container (bad magic)")]
     BadMagic,
-    /// The container format version is newer than this build understands.
-    #[error("unsupported fqxv format version {0}")]
-    UnsupportedVersion(u16),
+    /// The container format major version differs from this build's
+    /// [`FORMAT_MAJOR`] — the archive is wire-incompatible and cannot be read.
+    #[error(
+        "unsupported fqxv format version {major}.{minor} (this build reads {}.x)",
+        FORMAT_MAJOR
+    )]
+    UnsupportedVersion {
+        /// On-disk major version (differs from [`FORMAT_MAJOR`]).
+        major: u8,
+        /// On-disk minor version (informational).
+        minor: u8,
+    },
+    /// The archive's header requires one or more capabilities ([`feature`]) this
+    /// build doesn't have. The payload is the set of unknown required bits.
+    #[error("fqxv archive requires unsupported features (bits {0:#x}); upgrade fqxv")]
+    UnsupportedFeature(u64),
+    /// The header carried a critical extension record with a tag this build
+    /// doesn't recognize (see the header extension region). The payload is the tag.
+    #[error(
+        "fqxv archive has an unsupported critical header extension (tag {0:#x}); upgrade fqxv"
+    )]
+    UnsupportedExtension(u8),
+    /// A stream was tagged with a codec method byte this build can't decode (e.g.
+    /// a sequence codec added in a newer minor). Localized to the stream and method.
+    #[error("unsupported fqxv {stream} codec method {method}; upgrade fqxv")]
+    UnsupportedMethod {
+        /// Which stream carried the unknown method byte (e.g. `"sequence"`).
+        stream: &'static str,
+        /// The unrecognized method byte.
+        method: u8,
+    },
     /// The stream ended in the middle of a block.
     #[error("truncated fqxv stream")]
     Truncated,
