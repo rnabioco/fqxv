@@ -13,10 +13,10 @@
                                  # amilan defaults via SBATCH_PARTITION=rna.
 #SBATCH --output=fqxv-cell-%A_%a.out    # throughput headroom while still packing.
 ## #SBATCH --account=amc-general
-# Walltime is gated by post-processing, not compression: the 2.1G-base NovaSeq
-# cells spend ~1h in the round-trip/determinism/Δqual verification (a
-# single-thread recompress + char-by-char awk over billions of bases), while the
-# 16-thread compress itself is ~30s. 1h timed the NovaSeq bin2 cell out; keep 2h.
+# Post-processing (round-trip digest + Δqual) is now all compiled fqdigest — the
+# per-variant single-thread determinism recompress and the interpreted per-byte
+# awk are both gone — so cells finish in roughly compress+decompress time. 2h is
+# generous headroom (the slow HiFi/CoLoRd cells are the long pole, not verify).
 #
 # Phase 2 of the parallel harness: one array task per (dataset, tool) cell. Each
 # cell runs one measured tool at a time on its bound cores — the point is never

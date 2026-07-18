@@ -129,17 +129,10 @@ record_digest_binned() {  # file scheme(bin8|bin4|bin2)
 # Per-base quality distortion of a lossy round-trip vs the original: mean absolute
 # error, RMSE, and % of bases whose quality changed. Records are matched by name
 # (order-independent, so it holds for read-reordering tools like SPRING). Prints
-# "mae rmse pct"; "-1 -1 -1" if nothing matched. O(quality bytes) memory, like
-# the digest sort, so only run for lossy tools.
+# "mae rmse pct"; "-1 -1 -1" if nothing matched. Delegated to the compiled fqdigest
+# (`--distort`) — one O(bases) pass instead of the old interpreted per-byte awk.
 qual_distortion() {  # orig rt  ->  "mae rmse pct"
-  awk '
-    BEGIN{ for(i=0;i<256;i++) ord[sprintf("%c",i)]=i }
-    NR==FNR{ if(FNR%4==1) name=$0; else if(FNR%4==0) oq[name]=$0; next }
-    { if(FNR%4==1) name=$0
-      else if(FNR%4==0){ o=oq[name]; r=$0; m=length(r); if(length(o)<m)m=length(o)
-        for(i=1;i<=m;i++){ d=ord[substr(r,i,1)]-ord[substr(o,i,1)]; if(d<0)d=-d; sa+=d; sq+=d*d; if(d>0)ch++; n++ } } }
-    END{ if(n==0) print "-1 -1 -1"; else printf "%.4f %.4f %.4f\n", sa/n, sqrt(sq/n), 100.0*ch/n }
-  ' "$1" "$2"
+  "$FQDIGEST" --distort "$1" "$2"
 }
 
 is_fqxv() { [[ "$1" == fqxv || "$1" == fqxv-* || "$1" == fqxv[0-9] ]]; }

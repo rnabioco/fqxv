@@ -19,9 +19,16 @@
 //! `--no-names` hashes (sequence, quality) only, for tools that renumber reads.
 //! Output: a 32-hex-digit digest. Same digest ⇔ same record multiset.
 //!
+//! `--distort ORIG RT` is a separate mode: per-base quality distortion of a lossy
+//! round-trip `RT` vs the original `ORIG`, matching records by name (so it holds
+//! for read-reordering tools). Prints `mae rmse pct` (mean abs error, RMSE, % of
+//! bases whose quality changed), or `-1 -1 -1` if no records matched. Replaces the
+//! old interpreted per-byte awk loop.
+//!
 //! Not fqxv's own hash — a standalone harness tool. Build:
 //!   rustc -O bench/fqdigest.rs -o <path>/fqdigest
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 
@@ -189,14 +196,94 @@ fn trim(l: &[u8]) -> &[u8] {
     &l[..trim_len(l)]
 }
 
+/// Read one FASTQ record into the reused buffers. Returns false at a clean EOF
+/// (or a truncated final record), matching `digest_reader`'s framing: line 3
+/// (`+`) is consumed but ignored.
+fn read_record<R: BufRead>(
+    br: &mut R,
+    name: &mut Vec<u8>,
+    seq: &mut Vec<u8>,
+    plus: &mut Vec<u8>,
+    qual: &mut Vec<u8>,
+) -> io::Result<bool> {
+    name.clear();
+    if br.read_until(b'\n', name)? == 0 {
+        return Ok(false);
+    }
+    seq.clear();
+    plus.clear();
+    qual.clear();
+    if br.read_until(b'\n', seq)? == 0 {
+        return Ok(false);
+    }
+    br.read_until(b'\n', plus)?;
+    if br.read_until(b'\n', qual)? == 0 {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Per-base quality distortion of round-trip `rt_path` vs original `orig_path`,
+/// records matched by name (order-independent, for read-reordering lossy tools).
+/// Quality bytes are Phred+33; the +33 offset cancels in the difference, so raw
+/// bytes are compared directly. Prints "mae rmse pct" (or "-1 -1 -1" if nothing
+/// matched). Holds the originals' qualities in a name->qual map — the same memory
+/// profile as the awk it replaces, but one compiled O(bases) pass instead of an
+/// interpreted per-byte `substr` loop.
+fn distort(orig_path: &str, rt_path: &str) -> io::Result<()> {
+    let mut map: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let (mut name, mut seq, mut plus, mut qual) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+
+    let mut br = BufReader::with_capacity(1 << 20, File::open(orig_path)?);
+    while read_record(&mut br, &mut name, &mut seq, &mut plus, &mut qual)? {
+        map.insert(trim(&name).to_vec(), trim(&qual).to_vec());
+    }
+
+    let (mut sum_abs, mut sum_sq, mut changed, mut n): (u64, u64, u64, u64) = (0, 0, 0, 0);
+    let mut br = BufReader::with_capacity(1 << 20, File::open(rt_path)?);
+    while read_record(&mut br, &mut name, &mut seq, &mut plus, &mut qual)? {
+        if let Some(oq) = map.get(trim(&name)) {
+            let rq = trim(&qual);
+            let m = oq.len().min(rq.len());
+            for i in 0..m {
+                let d = (rq[i] as i32 - oq[i] as i32).unsigned_abs() as u64;
+                sum_abs += d;
+                sum_sq += d * d;
+                if d > 0 {
+                    changed += 1;
+                }
+                n += 1;
+            }
+        }
+    }
+
+    let mut out = io::stdout().lock();
+    if n == 0 {
+        writeln!(out, "-1 -1 -1")
+    } else {
+        let (nf, mae) = (n as f64, sum_abs as f64 / n as f64);
+        let rmse = (sum_sq as f64 / nf).sqrt();
+        let pct = 100.0 * changed as f64 / nf;
+        writeln!(out, "{:.4} {:.4} {:.4}", mae, rmse, pct)
+    }
+}
+
 fn main() -> io::Result<()> {
     let mut scheme = Bin::None;
     let mut no_qual = false;
     let mut no_names = false;
+    let mut distort_orig: Option<String> = None;
     let mut files: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--distort" => {
+                distort_orig = Some(args.next().unwrap_or_else(|| {
+                    eprintln!("fqdigest: --distort needs an ORIG file");
+                    std::process::exit(2);
+                }));
+            }
             "--bin" => {
                 scheme = match args.next().as_deref() {
                     Some("bin8") => Bin::Bin8,
@@ -215,11 +302,22 @@ fn main() -> io::Result<()> {
             "--no-names" => no_names = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: fqdigest [--bin bin8|bin4|bin2|ont|hifi] [--no-qual] [--no-names] FILE...  (- or none = stdin)"
+                    "usage: fqdigest [--bin bin8|bin4|bin2|ont|hifi] [--no-qual] [--no-names] FILE...  (- or none = stdin)\n       fqdigest --distort ORIG RT   (per-base quality distortion: mae rmse pct)"
                 );
                 return Ok(());
             }
             _ => files.push(a),
+        }
+    }
+
+    // Distortion mode: `--distort ORIG` consumes ORIG; the lone positional is RT.
+    if let Some(orig) = distort_orig {
+        match files.as_slice() {
+            [rt] => return distort(&orig, rt),
+            _ => {
+                eprintln!("fqdigest: --distort ORIG takes exactly one RT file");
+                std::process::exit(2);
+            }
         }
     }
 
