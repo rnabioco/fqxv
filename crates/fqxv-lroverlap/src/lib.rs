@@ -54,7 +54,10 @@
 //! is split into a fixed number of chunks combined in chunk order; and chain DP
 //! ties break on the smallest predecessor index.
 
-#![forbid(unsafe_code)]
+// `deny` rather than `forbid`: the crate is unsafe-free except for the AVX2
+// alignment backend in `align`, which opts back in at three narrowly annotated
+// sites (`#[allow(unsafe_code)]`) and is proptested byte-identical to scalar.
+#![deny(unsafe_code)]
 
 mod align;
 mod chain;

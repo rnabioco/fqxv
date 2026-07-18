@@ -229,6 +229,14 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
 /// SIMD width. The runtime picks the widest available; the anti-diagonal scalar
 /// [`fill_wavefront`] is the correctness reference and the universal fallback.
 fn fill(refr: &[u8], query: &[u8], band: usize, stride: usize, from: &mut [u8]) -> u32 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[allow(unsafe_code)]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: guarded by the runtime AVX2 feature detection above.
+            return unsafe { fill_wavefront_avx2(refr, query, band, stride, from) };
+        }
+    }
     fill_wavefront(refr, query, band, stride, from)
 }
 
@@ -334,6 +342,182 @@ fn fill_wavefront(refr: &[u8], query: &[u8], band: usize, stride: usize, from: &
 
         // Rotate: next iteration needs ad1 = D(d), ad2 = D(d-1); the old ad2
         // buffer (D(d-2), now dead) becomes the scratch ad0.
+        std::mem::swap(&mut ad0, &mut ad1);
+        std::mem::swap(&mut ad0, &mut ad2);
+    }
+
+    dist
+}
+
+/// AVX2 vectorization of the anti-diagonal wavefront ([`fill_wavefront`]).
+///
+/// Byte-identical to the scalar backends by construction:
+///
+/// * **Contiguous neighbours.** Because the rows on one anti-diagonal are
+///   consecutive `i`, the three neighbour arrays are read at contiguous,
+///   `i`-shifted positions (`ad2[i-1]`, `ad1[i-1]`, `ad1[i]`) — plain unaligned
+///   loads, no gathers.
+/// * **INF instead of guards.** Rather than branch on each neighbour's band
+///   window per lane, every buffer position outside the diagonal's live interval
+///   is cleared to [`INF`]; reading an out-of-window neighbour then yields `INF`
+///   exactly as the scalar guard substituted it. `INF` is `u32::MAX / 4`, so
+///   `INF + 1` never overflows an `i32` lane and never saturates — matching the
+///   scalar `saturating_add`.
+/// * **Same tie-break.** `best = min(diag, up, left)` (the chosen value is always
+///   the numeric minimum), and the predecessor is `diag_wins ? 0 : up<=left ? 1 :
+///   2`, reproducing `diag <= up <= left` lane-for-lane.
+///
+/// The two boundary cells per diagonal (row 0 / column 0) and the `< 8` interior
+/// tail are done in scalar; only the uniform interior recurrence is vectorized.
+///
+/// # Safety
+/// The caller must ensure the CPU supports AVX2 (checked in [`fill`]).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[allow(unsafe_code)]
+#[target_feature(enable = "avx2")]
+unsafe fn fill_wavefront_avx2(
+    refr: &[u8],
+    query: &[u8],
+    band: usize,
+    stride: usize,
+    from: &mut [u8],
+) -> u32 {
+    #[cfg(target_arch = "x86")]
+    use std::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let (n, m) = (refr.len(), query.len());
+    let mut ad0 = vec![INF; n + 1];
+    let mut ad1 = vec![INF; n + 1];
+    let mut ad2 = vec![INF; n + 1];
+    let mut dist = INF;
+
+    // Compute one interior cell `(i, d - i)` (both coordinates >= 1) from the
+    // cleared buffers, using the exact scalar recurrence and tie-break.
+    let cell = |ad2: &[u32], ad1: &[u32], i: usize, j: usize| -> (u32, u8) {
+        let cost = u32::from(refr[i - 1] != query[j - 1]);
+        let diag = ad2[i - 1].saturating_add(cost);
+        let up = ad1[i - 1].saturating_add(1);
+        let left = ad1[i].saturating_add(1);
+        if diag <= up && diag <= left {
+            (diag, 0u8)
+        } else if up <= left {
+            (up, 1u8)
+        } else {
+            (left, 2u8)
+        }
+    };
+
+    for d in 0..=(n + m) {
+        let ilo = d.saturating_sub(m).max(d.saturating_sub(band).div_ceil(2));
+        let ihi = n.min(d).min((d + band) / 2);
+        if ilo > ihi {
+            std::mem::swap(&mut ad0, &mut ad1);
+            std::mem::swap(&mut ad0, &mut ad2);
+            continue;
+        }
+
+        // Clear the fresh anti-diagonal's live interval plus its one-cell guard
+        // ends to INF, so out-of-window neighbour reads on later diagonals see
+        // INF. Every position a later diagonal reads from this buffer falls
+        // inside `[ilo-1, ihi+1]` (the bounds advance by at most one per step).
+        let c_lo = ilo.saturating_sub(1);
+        let c_hi = (ihi + 1).min(n);
+        ad0[c_lo..=c_hi].fill(INF);
+
+        // Row 0: dp[0][d] = d (all insertions); the corner (0,0) is 0.
+        if ilo == 0 {
+            ad0[0] = d as u32;
+            tb_set(from, d, if d == 0 { 0 } else { 2 });
+        }
+        // Column 0 (d >= 1): dp[d][0] = d (all deletions). In-window here forces
+        // d <= band, so lo_of(d) = 0 and the cell sits at offset 0 of its row.
+        if ihi == d && d >= 1 {
+            ad0[d] = d as u32;
+            tb_set(from, d * stride, 1);
+        }
+
+        // Interior: i >= 1 and j = d - i >= 1 (so i <= d - 1). Uniform recurrence.
+        let lo_v = ilo.max(1);
+        let hi_v = ihi.min(d.saturating_sub(1));
+        if lo_v <= hi_v {
+            let len = hi_v - lo_v + 1;
+            let full = len / 8;
+            // Pure-compute intrinsics are safe under the enabled `avx2` feature;
+            // only the raw-pointer loads and stores below are `unsafe`.
+            let one = _mm256_set1_epi32(1);
+            let ones = _mm256_set1_epi32(-1);
+            let two = _mm256_set1_epi32(2);
+            let zero = _mm256_setzero_si256();
+            let mut cost = [0i32; 8];
+            let mut fout = [0i32; 8];
+
+            for g in 0..full {
+                let i0 = lo_v + g * 8;
+                for (k, c) in cost.iter_mut().enumerate() {
+                    let i = i0 + k;
+                    let j = d - i;
+                    *c = i32::from(refr[i - 1] != query[j - 1]);
+                }
+                // SAFETY: `i0 - 1 >= 0` (i0 >= lo_v >= 1) and `i0 + 7 <= hi_v <= n`,
+                // so every eight-lane load reads within the `n + 1`-element buffers
+                // and `cost` is exactly eight lanes.
+                let (ad2v, ad1m1, ad1_0, costv) = unsafe {
+                    let ad2p = ad2.as_ptr();
+                    let ad1p = ad1.as_ptr();
+                    (
+                        _mm256_loadu_si256(ad2p.add(i0 - 1).cast()),
+                        _mm256_loadu_si256(ad1p.add(i0 - 1).cast()),
+                        _mm256_loadu_si256(ad1p.add(i0).cast()),
+                        _mm256_loadu_si256(cost.as_ptr().cast()),
+                    )
+                };
+
+                let dg = _mm256_add_epi32(ad2v, costv);
+                let up = _mm256_add_epi32(ad1m1, one);
+                let lf = _mm256_add_epi32(ad1_0, one);
+
+                let best = _mm256_min_epi32(dg, _mm256_min_epi32(up, lf));
+
+                // diag_wins = (diag <= up) & (diag <= left) = !(diag>up) & !(diag>left)
+                let dle_u = _mm256_xor_si256(_mm256_cmpgt_epi32(dg, up), ones);
+                let dle_l = _mm256_xor_si256(_mm256_cmpgt_epi32(dg, lf), ones);
+                let diag_wins = _mm256_and_si256(dle_u, dle_l);
+                let ule_l = _mm256_xor_si256(_mm256_cmpgt_epi32(up, lf), ones);
+                // f = diag_wins ? 0 : (up <= left ? 1 : 2)
+                let f_ul = _mm256_blendv_epi8(two, one, ule_l);
+                let f = _mm256_blendv_epi8(f_ul, zero, diag_wins);
+
+                // SAFETY: `ad0[i0 .. i0 + 8]` is in-bounds (`i0 + 7 <= n`) and
+                // `fout` is exactly eight lanes.
+                unsafe {
+                    _mm256_storeu_si256(ad0.as_mut_ptr().add(i0).cast(), best);
+                    _mm256_storeu_si256(fout.as_mut_ptr().cast(), f);
+                }
+
+                for (k, &fk) in fout.iter().enumerate() {
+                    let i = i0 + k;
+                    let j = d - i;
+                    let lo_i = i.saturating_sub(band);
+                    tb_set(from, i * stride + (j - lo_i), fk as u8);
+                }
+            }
+
+            // Scalar tail (< 8 lanes) with the same recurrence over cleared buffers.
+            for i in (lo_v + full * 8)..=hi_v {
+                let j = d - i;
+                let (val, f) = cell(&ad2, &ad1, i, j);
+                ad0[i] = val;
+                let lo_i = i.saturating_sub(band);
+                tb_set(from, i * stride + (j - lo_i), f);
+            }
+        }
+
+        if d == n + m {
+            dist = ad0[n];
+        }
+
         std::mem::swap(&mut ad0, &mut ad1);
         std::mem::swap(&mut ad0, &mut ad2);
     }
@@ -618,6 +802,32 @@ mod tests {
             let dr = fill_rowmajor(&refr, &query, band, stride, &mut fr);
             prop_assert_eq!(dw, dr, "corner distance diverged");
             prop_assert_eq!(fw, fr, "traceback matrix diverged");
+        }
+
+        /// The AVX2 wavefront fill must be BYTE-IDENTICAL to the scalar
+        /// row-major oracle: same `from` matrix, same corner distance, for all
+        /// inputs. This is the acceptance gate for the vector backend.
+        #[test]
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[allow(unsafe_code)]
+        fn avx2_fill_matches_rowmajor(
+            refr in proptest::collection::vec(proptest::sample::select(&b"ACGT"[..]), 0..80),
+            query in proptest::collection::vec(proptest::sample::select(&b"ACGT"[..]), 0..80),
+            raw_band in 0usize..20,
+        ) {
+            if !std::is_x86_feature_detected!("avx2") {
+                return Ok(());
+            }
+            let (n, m) = (refr.len(), query.len());
+            prop_assume!(n > 0 && m > 0);
+            let (band, stride, size) = prep(n, m, raw_band);
+            let mut fa = vec![0u8; size];
+            let mut fr = vec![0u8; size];
+            // SAFETY: guarded by the AVX2 feature detection above.
+            let da = unsafe { fill_wavefront_avx2(&refr, &query, band, stride, &mut fa) };
+            let dr = fill_rowmajor(&refr, &query, band, stride, &mut fr);
+            prop_assert_eq!(da, dr, "corner distance diverged");
+            prop_assert_eq!(fa, fr, "traceback matrix diverged");
         }
 
         /// The property the codec depends on: replaying an alignment must
