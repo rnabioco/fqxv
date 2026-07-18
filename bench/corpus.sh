@@ -12,18 +12,26 @@
 #   compress -> decompress -> order-independent content round-trip
 #   compress --threads 1 -> byte-compare with the many-threaded archive (det)
 # and classify: PASS / FAIL_RT / FAIL_DET / FAIL_COMPRESS / FAIL_DECOMPRESS /
-# ERROR_FETCH.  Modes: default (-l5 lossless), max (-l9 --order any), and
-# optionally bin8 (lossy Illumina 8-level).
+# ERROR_FETCH.  Modes: default (-l5 lossless), max (-l9 --order any), the Illumina
+# lossy bins (bin8/bin4/bin2), and the long-read lossy bins (ont, hifi).
+#
+# By default the accession list spans every platform fqxv compresses — Illumina,
+# Oxford Nanopore, PacBio/HiFi, and MGI/BGI — so the long-read overlap seq codec
+# and the ONT/HiFi paths are exercised, not just Illumina short reads.
 #
 # Subcommands:
-#   sample [-n N] [-s SEED] [-p PLATFORM]   write a fresh accession list (ENA)
+#   sample [-n N] [-s SEED] [-p PLATFORM]   write a fresh accession list (ENA);
+#                                           no -p = fan out across CORPUS_PLATFORMS
 #   fetch                                   sracha get every accession (login-node OK: IO bound)
 #   run                                     compress/round-trip all fetched (COMPUTE NODE — srun/sbatch)
 #   sbatch                                  submit `run` as a slurm array (one accession per task)
 #   summary                                 print pass/fail tally + failing accessions
 #
 # Env: FQXV_BIN, FQXV_CORPUS_DIR (default $SCRATCH/fqxv/corpus), FQXV_MODES
-#      (default "default max"), FQXV_THREADS (default 16), CORPUS_N, CORPUS_SEED.
+#      (default "default max"), FQXV_THREADS (default 16), CORPUS_N, CORPUS_SEED,
+#      CORPUS_PLATFORMS (default "ILLUMINA OXFORD_NANOPORE PACBIO_SMRT BGISEQ"),
+#      CORPUS_HIFI_MODELS (PacBio instrument filter; default "Revio,Sequel II,
+#      Sequel IIe" for HiFi — set empty to include CLR).
 #
 # Typical flow:
 #   pixi run bash corpus.sh sample                 # -> $CORPUS_DIR/accessions.txt
@@ -92,9 +100,39 @@ compress_args() {  # mode -> echoes fqxv compress flags
     bin8)    echo "--quality-bin bin8" ;;
     bin4)    echo "--quality-bin bin4" ;;
     bin2)    echo "--quality-bin bin2" ;;
+    ont)     echo "--quality-bin ont" ;;    # Nanopore 4-level lossy
+    hifi)    echo "--quality-bin hifi" ;;    # PacBio HiFi 5-level lossy
     l9)      echo "-l 9" ;;
     reorder) echo "--order any" ;;
     *) echo "" ;;
+  esac
+}
+
+# True for the lossy quality-binning modes (their round-trip is checked against a
+# same-binned reference digest, not the lossless one). Mirrors compress_args.
+is_binned_mode() {  # mode -> exit 0 if lossy-binned
+  case "$1" in bin8|bin4|bin2|ont|hifi) return 0 ;; *) return 1 ;; esac
+}
+
+# Per-platform base-count window for sampling. Long-read platforms (Nanopore,
+# PacBio) get a wider ceiling so a run actually carries genuine multi-kb reads
+# and enough of them to exercise the long-read overlap seq codec; short-read
+# platforms keep the modest default so files stay scratch-friendly.
+platform_bases() {  # ENA platform -> echoes "--min-bases N --max-bases N"
+  case "$1" in
+    OXFORD_NANOPORE|PACBIO_SMRT) echo "--min-bases 50000000 --max-bases 2000000000" ;;
+    *)                           echo "--min-bases 20000000 --max-bases 600000000" ;;
+  esac
+}
+
+# Instrument-model filter per platform. ENA has no direct CCS/HiFi flag, so we
+# narrow PacBio to HiFi-capable instruments (Revio is HiFi-only; Sequel II/IIe
+# emit CCS) — the closest proxy for HiFi rather than legacy CLR subread runs.
+# Echoes a comma-separated model list (may contain spaces) or nothing. Set
+# CORPUS_HIFI_MODELS="" to sample any PacBio (CLR included).
+platform_models() {  # ENA platform -> echoes comma-separated instrument models (or empty)
+  case "$1" in
+    PACBIO_SMRT) echo "${CORPUS_HIFI_MODELS-Revio,Sequel II,Sequel IIe}" ;;
   esac
 }
 
@@ -166,7 +204,7 @@ process_accession() {
     # Content round-trip.
     local got want
     got=$(record_digest "$rt")
-    if [[ "$mode" == bin8 || "$mode" == bin4 || "$mode" == bin2 ]]; then
+    if is_binned_mode "$mode"; then
       want=$(record_digest_binned "$mode" "${INPUTS[@]}")
     else
       want="$ref_lossless"
@@ -217,14 +255,44 @@ print_summary() {
 cmd="${1:-}"; shift || true
 case "$cmd" in
   sample)
-    SAMPLE_EXTRA=()
+    # Default corpus spans every platform fqxv can compress so ONT and PacBio/HiFi
+    # long reads are exercised alongside Illumina/MGI short reads, not just the
+    # historical Illumina-only set. `-p PLATFORM` narrows it to one platform.
+    SAMPLE_EXTRA=(); SAMPLE_P=""
     while [[ $# -gt 0 ]]; do case "$1" in
       -n) CORPUS_N="$2"; shift 2 ;; -s|--seed) CORPUS_SEED="$2"; shift 2 ;;
+      -p|--platform) SAMPLE_P="$2"; shift 2 ;;
       *) SAMPLE_EXTRA+=("$1"); shift ;; esac; done
-    ARGS=(-n "$CORPUS_N"); [[ -n "$CORPUS_SEED" ]] && ARGS+=(-s "$CORPUS_SEED")
-    [[ ${#SAMPLE_EXTRA[@]} -gt 0 ]] && ARGS+=("${SAMPLE_EXTRA[@]}")
-    bash "$HERE/sample_accessions.sh" "${ARGS[@]}" > "$ACC_LIST" 2> "$META_FILE"
-    echo "wrote $(grep -cv '^$' "$ACC_LIST") accessions to $ACC_LIST"
+
+    # If the caller pinned a platform, honor it as a single-platform corpus;
+    # otherwise fan out across CORPUS_PLATFORMS (Illumina, Nanopore, PacBio, MGI).
+    if [[ -n "$SAMPLE_P" ]]; then
+      PLATS=("$SAMPLE_P")
+    else
+      # shellcheck disable=SC2206
+      PLATS=(${CORPUS_PLATFORMS:-ILLUMINA OXFORD_NANOPORE PACBIO_SMRT BGISEQ})
+    fi
+
+    : > "$ACC_LIST"; : > "$META_FILE"
+    nplat=${#PLATS[@]}; idx=0
+    for plat in "${PLATS[@]}"; do
+      # Split N as evenly as possible across platforms (remainder to the first few).
+      per=$(( CORPUS_N / nplat )); (( idx < CORPUS_N % nplat )) && per=$((per+1))
+      idx=$((idx+1))
+      [[ "$per" -lt 1 ]] && continue
+      # Deterministic, platform-distinct seed when a base seed is given; else let
+      # sample_accessions pick its own $RANDOM per platform.
+      ARGS=(-n "$per" -p "$plat")
+      [[ -n "$CORPUS_SEED" ]] && ARGS+=(-s "${CORPUS_SEED}-${plat}")
+      # shellcheck disable=SC2206
+      ARGS+=($(platform_bases "$plat"))
+      pmodels=$(platform_models "$plat")
+      [[ -n "$pmodels" ]] && ARGS+=(--instrument-model "$pmodels")
+      [[ ${#SAMPLE_EXTRA[@]} -gt 0 ]] && ARGS+=("${SAMPLE_EXTRA[@]}")
+      echo "# === $plat (n=$per) ===" | tee -a "$ACC_LIST" >> "$META_FILE"
+      bash "$HERE/sample_accessions.sh" "${ARGS[@]}" >> "$ACC_LIST" 2>> "$META_FILE"
+    done
+    echo "wrote $(grep -cv '^\(#\|$\)' "$ACC_LIST") accessions across ${nplat} platform(s) to $ACC_LIST"
     cat "$META_FILE" >&2
     ;;
   fetch)
