@@ -52,6 +52,12 @@ RESULTS_LOCK="$CORPUS_DIR/results.lock"
 
 FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$HERE/.." && pwd)/target}/release/fqxv}"
 THREADS="${FQXV_THREADS:-16}"
+# Second thread count for the once-per-accession determinism check. It only has to
+# DIFFER from THREADS (same count wouldn't test thread-count invariance); we use
+# THREADS/2 so the extra compress stays near the multi-thread speed instead of the
+# old per-mode `--threads 1` re-compress that dominated wall-clock (30-60 min/mode
+# on 1 Gbase ONT). Exhaustive 1-vs-N determinism lives in the crate proptests.
+DET_THREADS="${FQXV_DET_THREADS:-$(( THREADS/2 > 1 ? THREADS/2 : 1 ))}"
 MODES="${FQXV_MODES:-default max}"
 FETCH_THREADS="${FQXV_FETCH_THREADS:-8}"
 CORPUS_N="${CORPUS_N:-20}"
@@ -176,6 +182,12 @@ process_accession() {
   ref_lossless=$(record_digest "${INPUTS[@]}")
 
   local wd="$WORK_DIR/$acc"; mkdir -p "$wd"
+  # Determinism is a property of the parallel pipeline and is essentially mode-
+  # independent, so we check it ONCE per accession (on the first mode) rather than
+  # re-compressing every mode single-threaded. We keep that mode's THREADS archive
+  # and diff it against a DET_THREADS re-compress after the loop.
+  local det_mode; det_mode="${MODES%% *}"   # first mode in the list
+  local keep=""                             # kept THREADS archive of det_mode
   local mode
   for mode in $MODES; do
     local comp="$wd/$mode.fqxv" rt="$wd/$mode.rt.fastq" args t0 rc secs bytes
@@ -217,27 +229,32 @@ process_accession() {
     fi
     rm -f "$rt"
 
-    # Determinism: single-thread archive must be byte-identical.
-    echo "=== determinism ($mode, --threads 1) ===" >> "$log"
-    local comp1="$wd/$mode.t1.fqxv"
-    # shellcheck disable=SC2086
-    if ! "$FQXV_BIN" compress "${INPUTS[@]}" -o "$comp1" --force --threads 1 $args >> "$log" 2>&1; then
-      rc=$?
-      echo "  $acc/$mode: FAIL_COMPRESS (threads=1, rc=$rc)"
-      record "$acc" "$mode" "FAIL_COMPRESS" "threads=1 rc=$rc" "$bytes" "$secs"
-      rm -f "$comp"; continue
-    fi
-    if ! cmp -s "$comp" "$comp1"; then
-      echo "  $acc/$mode: FAIL_DET (threads 1 vs $THREADS differ)"
-      echo "determinism: --threads 1 archive differs from --threads $THREADS" >> "$log"
-      record "$acc" "$mode" "FAIL_DET" "t1!=t$THREADS bytes $(stat -c%s "$comp1")!=$bytes" "$bytes" "$secs"
-      continue   # keep both archives for post-mortem
-    fi
-    rm -f "$comp" "$comp1"
-
     echo "  $acc/$mode: PASS (${bytes}B, ${secs}s)"
     record "$acc" "$mode" "PASS" "-" "$bytes" "$secs"
+
+    # Keep the det_mode archive for the single determinism check below.
+    if [[ "$mode" == "$det_mode" ]]; then mv "$comp" "$wd/keep.fqxv"; keep="$wd/keep.fqxv"; else rm -f "$comp"; fi
   done
+
+  # One determinism check per accession: re-compress det_mode at a DIFFERENT
+  # (still parallel) thread count and require byte-identical output.
+  if [[ -n "$keep" ]]; then
+    echo "=== determinism ($det_mode, --threads $DET_THREADS vs $THREADS) ===" >> "$log"
+    local compd="$wd/det.fqxv" dargs; dargs=$(compress_args "$det_mode")
+    # shellcheck disable=SC2086
+    if ! "$FQXV_BIN" compress "${INPUTS[@]}" -o "$compd" --force --threads "$DET_THREADS" $dargs >> "$log" 2>&1; then
+      rc=$?
+      echo "  $acc/det: FAIL_COMPRESS (threads=$DET_THREADS, rc=$rc)"
+      record "$acc" "det:$det_mode" "FAIL_COMPRESS" "threads=$DET_THREADS rc=$rc" "" ""
+    elif ! cmp -s "$keep" "$compd"; then
+      echo "  $acc/det: FAIL_DET ($DET_THREADS vs $THREADS differ)" | tee -a "$log"
+      record "$acc" "det:$det_mode" "FAIL_DET" "t$DET_THREADS != t$THREADS" "" ""
+    else
+      echo "  $acc/det: PASS ($DET_THREADS==$THREADS)"
+      record "$acc" "det:$det_mode" "PASS" "-" "" ""
+    fi
+    rm -f "$keep" "$compd"
+  fi
   rmdir "$wd" 2>/dev/null || true
 }
 
