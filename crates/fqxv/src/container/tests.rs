@@ -1379,7 +1379,7 @@ fn multiblock_archive(n: usize, block_reads: usize) -> Vec<u8> {
 #[test]
 fn verify_accepts_intact_archive() {
     let archive = multiblock_archive(40, 8);
-    verify(io::Cursor::new(&archive)).expect("intact archive verifies");
+    verify(io::Cursor::new(&archive), 1).expect("intact archive verifies");
 }
 
 #[test]
@@ -1387,7 +1387,7 @@ fn verify_rejects_payload_bit_flip() {
     let mut archive = multiblock_archive(40, 8);
     // Header(10) + [8 len][4 crc]; the first payload byte is at offset 22.
     archive[HEADER_LEN + FRAME_HEAD_LEN] ^= 0x01;
-    let err = verify(io::Cursor::new(&archive)).unwrap_err();
+    let err = verify(io::Cursor::new(&archive), 1).unwrap_err();
     assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
 }
 
@@ -1398,11 +1398,11 @@ fn parallel_whole_file_crc_matches_serial() {
     let data: Vec<u8> = (0..5_000_000u32)
         .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
         .collect();
-    let got = verify_whole_file_crc(&mut io::Cursor::new(&data), data.len() as u64).unwrap();
+    let got = verify_whole_file_crc(&mut io::Cursor::new(&data), data.len() as u64, 0).unwrap();
     assert_eq!(got, crc32c(&data), "full buffer");
     // A partial covered_len must hash only that prefix (not a chunk boundary).
     let partial = 3_000_001usize;
-    let got = verify_whole_file_crc(&mut io::Cursor::new(&data), partial as u64).unwrap();
+    let got = verify_whole_file_crc(&mut io::Cursor::new(&data), partial as u64, 0).unwrap();
     assert_eq!(got, crc32c(&data[..partial]), "partial prefix");
 }
 
@@ -1412,7 +1412,7 @@ fn verify_rejects_footer_bit_flip() {
     // Flip a byte inside the footer body (just before the EOF trailer).
     let i = archive.len() - TRAILER_LEN - 1;
     archive[i] ^= 0x01;
-    let err = verify(io::Cursor::new(&archive)).unwrap_err();
+    let err = verify(io::Cursor::new(&archive), 1).unwrap_err();
     assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
 }
 
@@ -1420,8 +1420,24 @@ fn verify_rejects_footer_bit_flip() {
 fn verify_roundtrip_accepts_intact_archive() {
     // Returns the decoded read count so a caller can cross-check what it wrote.
     let archive = multiblock_archive(40, 8);
-    let reads = verify_roundtrip(io::Cursor::new(&archive)).expect("intact archive round-trips");
+    let reads = verify_roundtrip(io::Cursor::new(&archive), 1).expect("intact archive round-trips");
     assert_eq!(reads, 40);
+}
+
+#[test]
+fn verify_roundtrip_honors_thread_budget() {
+    // The `threads` argument must reach both the whole-file CRC and the decode —
+    // the plumbing that makes a CLI `--verify` respect the command's `--threads`
+    // instead of grabbing every core. Output is thread-count-independent (the
+    // determinism invariant), so a 1-worker and a many-worker verify must agree.
+    let archive = multiblock_archive(40, 8);
+    let single = verify_roundtrip(io::Cursor::new(&archive), 1).expect("1-thread verify");
+    let many = verify_roundtrip(io::Cursor::new(&archive), 8).expect("many-thread verify");
+    assert_eq!(
+        single, many,
+        "verify read count must not depend on thread budget"
+    );
+    assert_eq!(single, 40);
 }
 
 #[test]
@@ -1429,7 +1445,7 @@ fn verify_roundtrip_counts_empty_archive() {
     // An empty input still writes a valid header/terminator/footer; verify must
     // handle the zero-read case without erroring.
     let archive = compress_bytes(b"", Params::default());
-    let reads = verify_roundtrip(io::Cursor::new(&archive)).expect("empty archive round-trips");
+    let reads = verify_roundtrip(io::Cursor::new(&archive), 1).expect("empty archive round-trips");
     assert_eq!(reads, 0);
 }
 
@@ -1437,7 +1453,7 @@ fn verify_roundtrip_counts_empty_archive() {
 fn verify_roundtrip_rejects_payload_bit_flip() {
     let mut archive = multiblock_archive(40, 8);
     archive[HEADER_LEN + FRAME_HEAD_LEN] ^= 0x01;
-    let err = verify_roundtrip(io::Cursor::new(&archive)).unwrap_err();
+    let err = verify_roundtrip(io::Cursor::new(&archive), 1).unwrap_err();
     assert!(matches!(err, Error::Corrupt { .. }), "got {err:?}");
 }
 
@@ -1462,7 +1478,7 @@ fn verify_roundtrip_accepts_reorder_archive() {
         "test archive must use the reorder layout"
     );
     let reads =
-        verify_roundtrip(io::Cursor::new(&archive)).expect("intact reorder archive round-trips");
+        verify_roundtrip(io::Cursor::new(&archive), 1).expect("intact reorder archive round-trips");
     assert_eq!(reads, 40);
 }
 
@@ -1484,7 +1500,7 @@ fn verify_roundtrip_rejects_reorder_corruption() {
     // framing length prefix, which is a separate (allocation-guard) path.
     *archive.last_mut().unwrap() ^= 0xFF;
     assert!(
-        verify_roundtrip(io::Cursor::new(&archive)).is_err(),
+        verify_roundtrip(io::Cursor::new(&archive), 1).is_err(),
         "corrupt reorder archive must not round-trip"
     );
 }
@@ -1513,7 +1529,7 @@ fn verify_roundtrip_rejects_corrupt_reorder_read_count() {
     // The read count is a little-endian u64 at `HEADER_LEN`; set its top byte to
     // blow the value past any real dataset.
     archive[HEADER_LEN + 7] ^= 0xFF;
-    let err = verify_roundtrip(io::Cursor::new(&archive)).unwrap_err();
+    let err = verify_roundtrip(io::Cursor::new(&archive), 1).unwrap_err();
     assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
 }
 
@@ -1533,7 +1549,7 @@ fn temp_archive(bytes: &[u8]) -> (File, std::path::PathBuf) {
 fn verify_quick_accepts_intact_archive() {
     let archive = multiblock_archive(40, 8);
     let (file, path) = temp_archive(&archive);
-    let result = verify_quick(&file);
+    let result = verify_quick(&file, 1);
     std::fs::remove_file(&path).ok();
     result.expect("intact archive passes quick verify");
 }
@@ -1543,7 +1559,7 @@ fn verify_quick_rejects_payload_bit_flip() {
     let mut archive = multiblock_archive(40, 8);
     archive[HEADER_LEN + FRAME_HEAD_LEN] ^= 0x01;
     let (file, path) = temp_archive(&archive);
-    let err = verify_quick(&file).unwrap_err();
+    let err = verify_quick(&file, 1).unwrap_err();
     std::fs::remove_file(&path).ok();
     // The per-block check localizes the failure to the offending block.
     assert!(
@@ -1570,7 +1586,7 @@ fn verify_quick_falls_back_for_reorder_layout() {
         "test archive must use the reorder layout to exercise the fallback"
     );
     let (file, path) = temp_archive(&archive);
-    let result = verify_quick(&file);
+    let result = verify_quick(&file, 1);
     std::fs::remove_file(&path).ok();
     result.expect("intact reorder archive passes quick verify via fallback");
 }
@@ -1579,7 +1595,7 @@ fn verify_quick_falls_back_for_reorder_layout() {
 fn verify_report_intact_lists_passing_checks() {
     let archive = multiblock_archive(40, 8);
     let (file, path) = temp_archive(&archive);
-    let report = verify_report(&file, false).expect("readable archive");
+    let report = verify_report(&file, false, 1).expect("readable archive");
     std::fs::remove_file(&path).ok();
     assert!(report.passed());
     assert!(report.failed_blocks.is_empty());
@@ -1598,7 +1614,7 @@ fn verify_report_localizes_corrupt_block() {
     let mut archive = archive;
     archive[footer.groups[1].0 as usize + FRAME_HEAD_LEN] ^= 0xFF;
     let (file, path) = temp_archive(&archive);
-    let report = verify_report(&file, false).expect("still structurally readable");
+    let report = verify_report(&file, false, 1).expect("still structurally readable");
     std::fs::remove_file(&path).ok();
 
     assert!(!report.passed());
@@ -1620,7 +1636,7 @@ fn verify_report_localizes_corrupt_block() {
 fn verify_report_quick_skips_whole_file_crc() {
     let archive = multiblock_archive(40, 8);
     let (file, path) = temp_archive(&archive);
-    let report = verify_report(&file, true).expect("readable archive");
+    let report = verify_report(&file, true, 1).expect("readable archive");
     std::fs::remove_file(&path).ok();
     assert!(report.passed());
     // Quick mode stops at the per-block CRCs; no whole-file digest row.
@@ -1942,7 +1958,7 @@ fn reorder_archive_detects_frame_corruption() {
     // wrong decode.
     let mid = archive.len() / 2;
     archive[mid] ^= 0xFF;
-    assert!(verify(io::Cursor::new(&archive)).is_err());
+    assert!(verify(io::Cursor::new(&archive), 1).is_err());
 }
 
 // --- random access: per-stream column projection (Gap 1 + Gap 3) -------------

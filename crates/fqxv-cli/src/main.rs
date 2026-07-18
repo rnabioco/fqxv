@@ -573,7 +573,7 @@ fn main() -> anyhow::Result<()> {
                 let decoded = File::open(&output)
                     .with_context(|| format!("reopening {} to verify", output.display()))
                     .and_then(|f| {
-                        fqxv::verify_roundtrip(f)
+                        fqxv::verify_roundtrip(f, cli.threads)
                             .with_context(|| format!("verifying {}", output.display()))
                     })?;
                 if decoded != stats.reads {
@@ -723,7 +723,7 @@ fn main() -> anyhow::Result<()> {
             quick,
             tsv,
             json,
-        } => print_verify(&inputs, quick, tsv, json)?,
+        } => print_verify(&inputs, quick, tsv, json, cli.threads)?,
     }
     Ok(())
 }
@@ -1376,7 +1376,13 @@ struct VerifyJson {
 /// and stays resilient — an unreadable archive becomes a failing entry instead of
 /// aborting the run. Exits the process non-zero when *any* archive is corrupt so
 /// scripts can branch on `$?` regardless of the chosen format.
-fn print_verify(inputs: &[PathBuf], quick: bool, tsv: bool, json: bool) -> anyhow::Result<()> {
+fn print_verify(
+    inputs: &[PathBuf],
+    quick: bool,
+    tsv: bool,
+    json: bool,
+    threads: usize,
+) -> anyhow::Result<()> {
     let (files, batch) = resolve_fqxv_inputs(inputs)?;
 
     // Verify each archive. In single-file mode a bad archive is a hard error (as
@@ -1388,7 +1394,7 @@ fn print_verify(inputs: &[PathBuf], quick: bool, tsv: bool, json: bool) -> anyho
         let r = File::open(path)
             .map_err(|e| format!("opening input {}: {e}", path.display()))
             .and_then(|f| {
-                fqxv::verify_report(&f, quick)
+                fqxv::verify_report(&f, quick, threads)
                     .map_err(|e| format!("{} is not a readable fqxv archive: {e}", path.display()))
             });
         if !batch {

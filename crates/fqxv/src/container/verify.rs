@@ -11,7 +11,7 @@ use rayon::prelude::*;
 /// framing, or the index. For the globally-clustered reorder layout (which has no
 /// footer) it decodes into a sink, so every frame CRC and cross-stream length
 /// check is exercised. Returns `Ok(())` iff the archive is intact.
-pub fn verify<R: Read + Seek>(reader: R) -> Result<()> {
+pub fn verify<R: Read + Seek>(reader: R, threads: usize) -> Result<()> {
     let mut r = BufReader::new(reader);
     let header = read_header(&mut r)?;
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
@@ -21,7 +21,7 @@ pub fn verify<R: Read + Seek>(reader: R) -> Result<()> {
         decode_reordered_whole(
             r,
             io::sink(),
-            0,
+            threads,
             keep_order,
             header.group_size,
             has_reference,
@@ -30,7 +30,7 @@ pub fn verify<R: Read + Seek>(reader: R) -> Result<()> {
     }
     let footer = read_footer(&mut r)?;
     r.seek(SeekFrom::Start(0))?;
-    if verify_whole_file_crc(&mut r, footer.covered_len)? != footer.whole_file_crc {
+    if verify_whole_file_crc(&mut r, footer.covered_len, threads)? != footer.whole_file_crc {
         return Err(Error::Corrupt {
             what: "archive (whole-file crc)".to_string(),
         });
@@ -56,19 +56,24 @@ pub fn verify<R: Read + Seek>(reader: R) -> Result<()> {
 /// proves the archive round-trips to the content that was encoded. Being
 /// page-cache-coherent, it validates the bytes the encoder emitted rather than the
 /// storage medium — latent bit-rot is what a later [`verify`] catches.
-pub fn verify_roundtrip<R: Read + Seek>(mut reader: R) -> Result<u64> {
+///
+/// `threads` sizes the rayon pool for the whole-file CRC and the decode exactly as
+/// it does for [`decompress`] — `0` means all cores. This is what makes a CLI
+/// `--verify` honor the command's `--threads`: the check runs under the same worker
+/// budget as the compression it follows rather than silently grabbing every core.
+pub fn verify_roundtrip<R: Read + Seek>(mut reader: R, threads: usize) -> Result<u64> {
     let header = read_header(&mut BufReader::new(&mut reader))?;
     reader.seek(SeekFrom::Start(0))?;
 
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
         // One decode is both the structural and the content check here.
-        return Ok(decompress(reader, io::sink(), 0)?.reads);
+        return Ok(decompress(reader, io::sink(), threads)?.reads);
     }
 
     // Plain layout: whole-file CRC (structure/framing) then decode (content).
-    verify(&mut reader)?;
+    verify(&mut reader, threads)?;
     reader.seek(SeekFrom::Start(0))?;
-    Ok(decompress(reader, io::sink(), 0)?.reads)
+    Ok(decompress(reader, io::sink(), threads)?.reads)
 }
 
 /// The authoritative number of reads the archive should contain, for detecting a
@@ -103,7 +108,11 @@ pub fn expected_reads<R: Read + Seek>(reader: R) -> Result<Option<u64>> {
 /// result is bit-identical to a single-pass hash for any thread count or
 /// chunking, so this stays exactly as strong a check as the serial version — it
 /// just stops leaving cores idle while the table-driven CRC runs.
-pub(crate) fn verify_whole_file_crc<R: Read>(r: &mut R, covered: u64) -> Result<u32> {
+pub(crate) fn verify_whole_file_crc<R: Read>(
+    r: &mut R,
+    covered: u64,
+    threads: usize,
+) -> Result<u32> {
     /// Per-chunk CRC granularity: large enough that combine/dispatch overhead is
     /// negligible, small enough to keep a batch's buffers bounded in memory.
     const CHUNK: usize = 1 << 20; // 1 MiB
@@ -115,7 +124,7 @@ pub(crate) fn verify_whole_file_crc<R: Read>(r: &mut R, covered: u64) -> Result<
         return Ok(crc32c(&buf));
     }
 
-    let pool = build_pool(0)?;
+    let pool = build_pool(threads)?;
     let batch = pool.current_num_threads().max(1);
     let mut running = crc32c(&[]); // CRC of the empty prefix (0x0000_0000)
     let mut remaining = covered;
@@ -153,24 +162,24 @@ pub(crate) fn verify_whole_file_crc<R: Read>(r: &mut R, covered: u64) -> Result<
 /// The globally-clustered reorder layout has no per-block footer index, so this
 /// transparently falls back to the full decode-driven [`verify`] for that layout
 /// (as does any platform without positioned-read support).
-pub fn verify_quick(file: &File) -> Result<()> {
+pub fn verify_quick(file: &File, threads: usize) -> Result<()> {
     let mut r = BufReader::new(file);
     let header = read_header(&mut r)?;
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
         // No per-block index to check — decoding is the only integrity path.
         r.seek(SeekFrom::Start(0))?;
-        return verify(r);
+        return verify(r, threads);
     }
     let footer = read_footer(&mut r)?;
-    quick_check_blocks(file, &footer)
+    quick_check_blocks(file, &footer, threads)
 }
 
 /// Verify each block's stored CRC in parallel via positioned reads (Unix).
 #[cfg(unix)]
-pub(crate) fn quick_check_blocks(file: &File, footer: &Footer) -> Result<()> {
+pub(crate) fn quick_check_blocks(file: &File, footer: &Footer, threads: usize) -> Result<()> {
     use std::os::unix::fs::FileExt;
 
-    let pool = build_pool(0)?;
+    let pool = build_pool(threads)?;
     pool.install(|| {
         footer
             .groups
@@ -217,8 +226,8 @@ pub(crate) fn quick_check_blocks(file: &File, footer: &Footer) -> Result<()> {
 /// Platforms without positioned reads can't read blocks concurrently from one
 /// handle, so quick verification falls back to the full [`verify`] scan.
 #[cfg(not(unix))]
-pub(crate) fn quick_check_blocks(file: &File, _footer: &Footer) -> Result<()> {
-    verify(BufReader::new(file))
+pub(crate) fn quick_check_blocks(file: &File, _footer: &Footer, threads: usize) -> Result<()> {
+    verify(BufReader::new(file), threads)
 }
 
 /// One named integrity check in a [`VerifyReport`].
@@ -279,7 +288,7 @@ impl VerifyReport {
 /// Returns `Err` only when the input is not a readable fqxv container (bad
 /// magic/version); a recognized-but-corrupt archive comes back as a report whose
 /// [`passed`](VerifyReport::passed) is `false`.
-pub fn verify_report(file: &File, quick: bool) -> Result<VerifyReport> {
+pub fn verify_report(file: &File, quick: bool, threads: usize) -> Result<VerifyReport> {
     let mut r = BufReader::new(file);
     let header = read_header(&mut r)?;
     let mut report = VerifyReport::default();
@@ -295,7 +304,7 @@ pub fn verify_report(file: &File, quick: bool) -> Result<VerifyReport> {
         );
         // No footer/per-block index; decoding drives every frame CRC.
         r.seek(SeekFrom::Start(0))?;
-        match verify(r) {
+        match verify(r, threads) {
             Ok(()) => report.push("streams (decode)", true, "all frame CRCs verified"),
             Err(e) => report.push("streams (decode)", false, e.to_string()),
         }
@@ -328,7 +337,7 @@ pub fn verify_report(file: &File, quick: bool) -> Result<VerifyReport> {
 
     if quick {
         // Weaker, faster: only the per-block payload CRCs (parallel).
-        report.failed_blocks = scan_failed_blocks(file, &footer);
+        report.failed_blocks = scan_failed_blocks(file, &footer, threads);
         let ok_blocks = report.blocks_total - report.failed_blocks.len() as u64;
         let ok = report.failed_blocks.is_empty();
         let detail = if ok {
@@ -346,7 +355,8 @@ pub fn verify_report(file: &File, quick: bool) -> Result<VerifyReport> {
 
     // Default: parallel whole-file CRC; localize block by block only on failure.
     r.seek(SeekFrom::Start(0))?;
-    let crc_ok = verify_whole_file_crc(&mut r, footer.covered_len)? == footer.whole_file_crc;
+    let crc_ok =
+        verify_whole_file_crc(&mut r, footer.covered_len, threads)? == footer.whole_file_crc;
     if crc_ok {
         report.push(
             "block CRCs",
@@ -355,7 +365,7 @@ pub fn verify_report(file: &File, quick: bool) -> Result<VerifyReport> {
         );
         report.push("whole-file CRC", true, "");
     } else {
-        report.failed_blocks = scan_failed_blocks(file, &footer);
+        report.failed_blocks = scan_failed_blocks(file, &footer, threads);
         let ok_blocks = report.blocks_total - report.failed_blocks.len() as u64;
         let detail = if report.failed_blocks.is_empty() {
             format!(
@@ -381,8 +391,8 @@ pub fn verify_report(file: &File, quick: bool) -> Result<VerifyReport> {
 /// collecting *all* failures rather than stopping at the first); a serial
 /// footer-driven scan elsewhere.
 #[cfg(unix)]
-pub(crate) fn scan_failed_blocks(file: &File, footer: &Footer) -> Vec<u64> {
-    let pool = match build_pool(0) {
+pub(crate) fn scan_failed_blocks(file: &File, footer: &Footer, threads: usize) -> Vec<u64> {
+    let pool = match build_pool(threads) {
         Ok(pool) => pool,
         Err(_) => return scan_failed_blocks_serial(file, footer),
     };
@@ -440,7 +450,7 @@ pub(crate) fn scan_failed_blocks_serial(file: &File, footer: &Footer) -> Vec<u64
 }
 
 #[cfg(not(unix))]
-pub(crate) fn scan_failed_blocks(file: &File, footer: &Footer) -> Vec<u64> {
+pub(crate) fn scan_failed_blocks(file: &File, footer: &Footer, _threads: usize) -> Vec<u64> {
     scan_failed_blocks_serial(file, footer)
 }
 

@@ -48,7 +48,7 @@ fn archive(fastq: &[u8], params: Params) -> Vec<u8> {
 /// The cheap, pool-free structural readers — safe to call in a tight exhaustive
 /// loop. Each must not panic on `bytes`.
 fn probe_structural(bytes: &[u8]) {
-    let _ = verify(Cursor::new(bytes));
+    let _ = verify(Cursor::new(bytes), 1);
     let _ = inspect(Cursor::new(bytes));
     let _ = expected_reads(Cursor::new(bytes));
 }
