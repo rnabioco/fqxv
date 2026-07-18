@@ -428,7 +428,7 @@ pub(crate) fn compress_buffered<W: Write>(
                 .map(|bi| {
                     let (gs, ge) = ranges[bi];
                     let blk = build_block(buf, &chunks, &gstart, gs, ge);
-                    let payload = compress_block(&blk, &params);
+                    let payload = compress_block(&blk, &params, platform);
                     (blk, payload)
                 })
                 .unzip()
@@ -524,7 +524,7 @@ where
                     let item = work_rx.lock().expect("work lock").recv();
                     match item {
                         Ok((idx, blk)) => {
-                            let payload = compress_block(&blk, params_ref);
+                            let payload = compress_block(&blk, params_ref, platform);
                             if done_tx.send((idx, blk, payload)).is_err() {
                                 break; // writer gone
                             }

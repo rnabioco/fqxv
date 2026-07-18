@@ -803,6 +803,52 @@ fn container_decodes_overlap_tagged_sequence_stream() {
 }
 
 #[test]
+fn sketch_for_platform_picks_hifi_only_for_pacbio() {
+    // PacBio's low error rate earns the sparse HiFi sketch; every other platform
+    // (including a mis- or undetected one) falls back to the dense ONT sketch,
+    // which also works on HiFi and never misses ONT overlaps.
+    assert_eq!(sketch_for(Platform::PacBio), fqxv_lroverlap::Sketch::hifi());
+    assert_eq!(sketch_for(Platform::Nanopore), fqxv_lroverlap::Sketch::ont());
+    assert_eq!(sketch_for(Platform::Unknown), fqxv_lroverlap::Sketch::ont());
+    assert_eq!(sketch_for(Platform::Illumina), fqxv_lroverlap::Sketch::ont());
+    assert_eq!(sketch_for(Platform::MgiBgi), fqxv_lroverlap::Sketch::ont());
+}
+
+#[test]
+fn pacbio_long_reads_use_hifi_sketch_and_roundtrip() {
+    // Long PacBio reads route the overlap codec through the HiFi sketch (via
+    // `sketch_for`) — a path the ONT default never exercised before. Guard that
+    // the container detects PacBio, drives the HiFi-sketched overlap encode, and
+    // round-trips byte-exact whichever codec ends up smaller. 1000 bp reads
+    // tiling a 3 kb genome at high depth give the overlap codec real overlaps to
+    // work with, the same shape as `container_decodes_overlap_tagged_sequence_stream`.
+    let genome: Vec<u8> = (0..3000u32)
+        .map(|i| b"ACGT"[((i.wrapping_mul(2_654_435_761) >> 13) & 3) as usize])
+        .collect();
+    let (read_len, step) = (1000usize, 100usize);
+    let n = (genome.len() - read_len) / step;
+    let mut input = Vec::new();
+    for i in 0..n {
+        let mut s = genome[i * step..i * step + read_len].to_vec();
+        s[50] = b"ACGT"[(i + 1) & 3]; // a substitution the aligner must code
+        let qual = vec![b'~'; s.len()];
+        // PacBio `movie/zmw/ccs` read name so the platform detector fires.
+        write_record(&mut input, format!("m64012/{i}/ccs").as_bytes(), &s, &qual);
+    }
+
+    let mut archive = Vec::new();
+    compress(&input[..], &mut archive, Params::default()).unwrap();
+    assert_eq!(
+        peek(&archive[..]).unwrap().platform,
+        Platform::PacBio,
+        "container must detect PacBio from movie/zmw/ccs names"
+    );
+    let mut out = Vec::new();
+    decompress(&archive[..], &mut out, 4).unwrap();
+    assert_eq!(out, input, "HiFi-sketched long-read archive must round-trip byte-exact");
+}
+
+#[test]
 fn reorder_free_preserves_records_as_a_set() {
     let input = dup_rich_input('e');
     let params = Params {
