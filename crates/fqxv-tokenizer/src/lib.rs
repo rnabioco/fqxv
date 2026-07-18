@@ -210,6 +210,13 @@ fn read_op_rle(r: &mut Cursor<'_>, n_records: usize, max_out: usize) -> Result<V
     let mut c_lens = Cursor::new(&lens);
     let mut sym_pos = 0usize;
     let mut cols = Vec::with_capacity(MAX_COL + 1);
+    // Aggregate op bytes across every column. The per-column `n_records` guard
+    // below bounds each of the 65 columns alone, but 65 columns can still reach
+    // `65 * n_records` — and `n_records` itself can be as large as `max_out` — so
+    // the columns together (and the delta planes they later size) could allocate
+    // ~65x past the per-stream cap every other stream obeys (#142). The op
+    // content is one logical stream; hold its total to `max_out` too.
+    let mut total_ops = 0usize;
     for _ in 0..=MAX_COL {
         let n_runs = c_counts.varint()?;
         let mut col = Vec::new();
@@ -229,6 +236,10 @@ fn read_op_rle(r: &mut Cursor<'_>, n_records: usize, max_out: usize) -> Result<V
             {
                 return Err(Error::Malformed("op run too long"));
             }
+            total_ops = total_ops
+                .checked_add(run)
+                .filter(|&t| t <= max_out)
+                .ok_or(Error::Malformed("op columns exceed the stream bound"))?;
             // Grow fallibly so even a within-bound run can't abort on OOM.
             col.try_reserve(run)
                 .map_err(|_| Error::Malformed("op run too large to allocate"))?;
@@ -994,5 +1005,36 @@ mod tests {
         let n_delta = [1usize << 61]; // (1<<61)*8 bytes overflows isize
         let err = read_delta_planes(&mut r, &n_delta).unwrap_err();
         assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn read_op_rle_caps_aggregate_across_columns() {
+        // #142 F3: each column is bounded by `n_records`, but the 65 columns
+        // TOGETHER were not — 65 * n_records could allocate ~65x past the
+        // per-stream cap (and then size the delta planes). Two columns, each a
+        // single run of exactly `n_records` (so the per-column guard passes),
+        // must trip the aggregate `max_out` cap on the second.
+        let max_out = 100usize;
+        let mut counts = Vec::new();
+        write_varint(&mut counts, 1); // column 0: one run
+        write_varint(&mut counts, 1); // column 1: one run
+        for _ in 2..=MAX_COL {
+            write_varint(&mut counts, 0); // remaining columns: empty
+        }
+        let mut lens = Vec::new();
+        write_varint(&mut lens, max_out as u64); // col 0: fills to the cap
+        write_varint(&mut lens, max_out as u64); // col 1: pushes the total past it
+        let mut data = Vec::new();
+        push_stream(&mut data, &counts).unwrap();
+        push_stream(&mut data, &[0u8, 0u8]).unwrap(); // syms: two ops
+        push_stream(&mut data, &lens).unwrap();
+        let mut r = Cursor::new(&data);
+        // n_records == max_out, so neither run trips the per-column guard; only
+        // the aggregate cap can reject this.
+        let err = read_op_rle(&mut r, max_out, max_out).unwrap_err();
+        assert!(
+            matches!(err, Error::Malformed("op columns exceed the stream bound")),
+            "expected the aggregate cap, got {err:?}"
+        );
     }
 }

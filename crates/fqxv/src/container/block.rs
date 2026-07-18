@@ -569,13 +569,20 @@ pub(crate) fn read_block<R: Read>(r: &mut R, index: u64) -> Result<Option<Vec<u8
     let mut crc = [0u8; CRC_LEN];
     r.read_exact(&mut crc).map_err(|_| Error::Truncated)?;
     let expected = u32::from_le_bytes(crc);
-    // Fallible allocation: a corrupted-but-in-range length still shouldn't abort
-    // the process with an allocation failure.
+    // Read incrementally rather than `resize(len, 0)` + `read_exact`: `len` is
+    // capped above, but a truncated stream claiming the full cap would still
+    // zero-fill 2 GB up front before the short read is discovered (#142). `take`
+    // bounds the read to the claim, so only the bytes actually present are
+    // allocated; a short read surfaces as `Truncated`.
     let mut buf = Vec::new();
-    buf.try_reserve_exact(len as usize)
-        .map_err(|_| Error::Malformed("block payload too large to allocate"))?;
-    buf.resize(len as usize, 0);
-    r.read_exact(&mut buf).map_err(|_| Error::Truncated)?;
+    let got = r
+        .by_ref()
+        .take(len)
+        .read_to_end(&mut buf)
+        .map_err(|_| Error::Truncated)?;
+    if got as u64 != len {
+        return Err(Error::Truncated);
+    }
     if crc32c(&buf) != expected {
         return Err(Error::Corrupt {
             what: format!("block {index}"),
