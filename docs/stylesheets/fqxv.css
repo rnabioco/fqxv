@@ -158,3 +158,9 @@
 @media (prefers-reduced-motion: reduce) {
   [data-md-color-scheme="slate"] .md-main::before { animation: none; }
 }
+
+/* Drop the drifting letter field on small screens — it hurts readability and
+   scroll performance on mobile. Dark mode stays a plain flat background. */
+@media (max-width: 44.9375em) {
+  [data-md-color-scheme="slate"] .md-main::before { display: none; }
+}
