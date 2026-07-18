@@ -28,6 +28,7 @@ nav = [
     { "Long-read Support" = "design/longread.md" },
   ] },
   { "Benchmarks" = "benchmarks.md" },
+  { "Format comparison" = "format-comparison.md" },
   { "Acknowledgments" = "acknowledgments.md" },
 ]
 
