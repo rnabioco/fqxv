@@ -31,6 +31,7 @@
 //! ```
 
 use fqxv_bytes::{read_lens, write_lens, write_varint, ReaderError};
+use fqxv_dna::{BASE_LUT, SYM2BASE};
 use fqxv_range::{Decoder, Encoder};
 use thiserror::Error;
 
@@ -91,20 +92,10 @@ fn lo_order(k: usize) -> usize {
     (k / 2).max(1)
 }
 
-/// byte -> 2-bit symbol, 255 for non-ACGT (coded as [`NSYM`]).
-const BASE_LUT: [u8; 256] = base_lut();
-const SYM2BASE: [u8; 4] = *b"ACGT";
 /// The fifth model symbol: `N` (or any non-ACGT byte, restored via exceptions).
+/// [`BASE_LUT`] returns `fqxv_dna::NON_ACGT` (255) for these bytes; the model
+/// remaps that sentinel to `NSYM`.
 const NSYM: usize = 4;
-
-const fn base_lut() -> [u8; 256] {
-    let mut t = [255u8; 256];
-    t[b'A' as usize] = 0;
-    t[b'C' as usize] = 1;
-    t[b'G' as usize] = 2;
-    t[b'T' as usize] = 3;
-    t
-}
 
 /// Compact adaptive 5-symbol frequency model driving the range coder.
 ///

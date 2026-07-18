@@ -18,6 +18,7 @@ categories = ["compression", "science"]
 [workspace.dependencies]
 # Internal crates (path + version so they can be published independently).
 fqxv-bytes = { path = "crates/fqxv-bytes", version = "0.2.0" }
+fqxv-dna = { path = "crates/fqxv-dna", version = "0.2.0" }
 fqxv-rans = { path = "crates/fqxv-rans", version = "0.2.0" }
 fqxv-range = { path = "crates/fqxv-range", version = "0.2.0" }
 fqxv-fqzcomp = { path = "crates/fqxv-fqzcomp", version = "0.2.0" }
