@@ -29,9 +29,38 @@ use fqxv_bytes::{read_varint, write_varint};
 use fqxv_dna::{base_of_sym, is_acgt, revcomp_acgt};
 
 use crate::{
-    align_banded, apply, consensus, find_overlaps, layout, place_all, Anchored, ChainOpts,
-    ConsensusOpts, Error, Index, LayoutOpts, Op, Repeat, Sketch,
+    align_banded, apply, consensus, find_overlaps, layout, place_all, wfa_align_opt, Alignment,
+    Anchored, ChainOpts, ConsensusOpts, Error, Index, LayoutOpts, Op, Repeat, Sketch,
 };
+
+/// Above this drift-derived band the banded DP is the faster aligner; at or below
+/// it the read is similar enough to its reference that score-proportional WFA
+/// wins decisively (≈35× at HiFi's ~0.5% error, where a 13 kb read needs ~60
+/// edits). The threshold is the measured WFA-vs-DP crossover (~5% divergence,
+/// band ≈ 32); see `examples/wfa_bench.rs`. Above it — ONT-class reads — WFA's
+/// O(s²) time and memory both lose, so the DP stays.
+const WFA_CODING_MAX_BAND: usize = 32;
+
+/// Align a read to its reference consensus for coding, picking the aligner by the
+/// read's expected divergence (its chain-drift `band`): WFA for the low-drift
+/// (HiFi-class) reads, the banded DP otherwise. WFA returns a different
+/// equal-cost path, so a divergence-gated encoder is NOT byte-identical to the
+/// pure-DP one — but both round-trip, and the decoder is agnostic to which
+/// produced the edit script. On the rare read whose small band under-estimated
+/// its true divergence, WFA caps out and we fall back to the DP for a real
+/// alignment rather than take the bounded `[Del, Ins]` rewrite.
+fn align_for_coding(refr: &[u8], query: &[u8], band: usize) -> Alignment {
+    if band <= WFA_CODING_MAX_BAND {
+        // A low-drift read's true edit distance is ~O(band); cap generously above
+        // it so a genuinely similar read never caps, while a mis-estimated one
+        // bails after O(cap²) work instead of exploring unbounded wavefronts.
+        let cap = (band as u32 * 4).max(64);
+        if let Some(a) = wfa_align_opt(refr, query, cap) {
+            return a;
+        }
+    }
+    align_banded(refr, query, band)
+}
 
 /// Format tag for a `fqxv-lroverlap` sequence block.
 const MAGIC: [u8; 3] = *b"LRO";
@@ -323,7 +352,7 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
                         return None;
                     }
                     let band = (a.drift as usize + opts.band_margin).min(opts.band_cap);
-                    Some((start, align_banded(&cs[start..end], &read, band).ops))
+                    Some((start, align_for_coding(&cs[start..end], &read, band).ops))
                 })
                 .collect();
 

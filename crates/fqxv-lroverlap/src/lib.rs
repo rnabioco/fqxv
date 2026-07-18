@@ -69,6 +69,7 @@ mod minimizer;
 mod overlap;
 mod refine;
 mod script;
+mod wfa;
 
 pub use align::{align_banded, apply, Alignment, Op};
 pub use chain::{Anchor, Chain, ChainOpts, Chainer};
@@ -80,6 +81,7 @@ pub use minimizer::{minimizers, Minimizer};
 pub use overlap::{find_overlaps, Overlap};
 pub use refine::{place_against, place_all, Anchored};
 pub use script::{chain_span, script_from_chain, ScriptOpts};
+pub use wfa::{wfa_align, wfa_align_opt, wfa_cells};
 
 /// Errors returned by this crate.
 #[derive(Debug, thiserror::Error)]
@@ -134,6 +136,16 @@ impl Sketch {
     #[must_use]
     pub fn minimizers(&self, seq: &[u8]) -> Vec<Minimizer> {
         minimizers(seq, self.w, self.k)
+    }
+
+    /// Whether this sketch's platform is low-divergence (HiFi-class, <~1% error)
+    /// rather than noisy (ONT-class). A sparse, long sketch (`k >= 17`) is chosen
+    /// only when nearly every k-mer survives, i.e. at low error. Callers use it to
+    /// pick the score-proportional WFA aligner (a big win when reads sit close to
+    /// their reference) over the banded DP (which wins once divergence is high).
+    #[must_use]
+    pub fn is_low_divergence(&self) -> bool {
+        self.k >= 17
     }
 }
 
