@@ -55,6 +55,24 @@ fn max_band_for(n: usize) -> usize {
     (per_row.saturating_sub(1) / 2).max(1)
 }
 
+/// The traceback matrix stores one of three predecessors per cell (diag/up/left
+/// = 0/1/2), so two bits suffice. Packing four cells per byte quarters the only
+/// full-size allocation [`align_banded`] keeps after the score rows are rolled.
+/// Every cell is written at most once over a zero-initialized buffer, and each
+/// `align_banded` call owns its own buffer, so a masked store needs no ordering.
+#[inline]
+fn tb_set(buf: &mut [u8], idx: usize, val: u8) {
+    let shift = (idx & 3) * 2;
+    let byte = &mut buf[idx >> 2];
+    *byte = (*byte & !(0b11 << shift)) | ((val & 0b11) << shift);
+}
+
+/// Read a two-bit traceback pointer written by [`tb_set`].
+#[inline]
+fn tb_get(buf: &[u8], idx: usize) -> u8 {
+    (buf[idx >> 2] >> ((idx & 3) * 2)) & 0b11
+}
+
 /// Align `refr` to `query` under unit edit costs, restricted to a diagonal band
 /// of half-width `band`.
 ///
@@ -145,7 +163,8 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
     // `j - lo_of(row)` exactly as a full row's slice was. This makes the hot
     // loop's working set the `u8` `from` matrix plus two O(band) rows instead of
     // an O(n·band) `u32` table.
-    let mut from = vec![0u8; (n + 1) * stride]; // 0=diag 1=up(del) 2=left(ins)
+    // 2 bits/cell (0=diag 1=up(del) 2=left(ins)), four cells per byte.
+    let mut from = vec![0u8; ((n + 1) * stride).div_ceil(4)];
     let mut prev = vec![INF; stride];
     let mut cur = vec![INF; stride];
 
@@ -157,7 +176,7 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
     for j in 1..=m.min(band) {
         if let Some(k) = at(0, j) {
             prev[k] = j as u32;
-            from[k] = 2;
+            tb_set(&mut from, k, 2);
         }
     }
     // HOT LOOP. This is O(n * band) and, at 40x on ecoli_hifi, 63% of the entire
@@ -182,7 +201,7 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
             let off = j - lo;
             if j == 0 {
                 cur[off] = i as u32;
-                from[base + off] = 1;
+                tb_set(&mut from, base + off, 1);
                 continue;
             }
             // A neighbour outside the previous row's window has no cell and
@@ -216,7 +235,7 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
                 (left, 2u8)
             };
             cur[off] = best;
-            from[base + off] = f;
+            tb_set(&mut from, base + off, f);
         }
         // `cur` becomes row `i`; reuse the old `prev` buffer as next row's
         // scratch. Stale cells in it are never read — every neighbour access is
@@ -235,7 +254,7 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
         } else if j == 0 {
             1
         } else {
-            at(i, j).map_or(1, |k| from[k])
+            at(i, j).map_or(1, |k| tb_get(&from, k))
         };
         match f {
             0 => {
