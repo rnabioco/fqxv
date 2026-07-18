@@ -7,7 +7,8 @@
 #
 # Usage:
 #   bash sample_accessions.sh [-n N] [-s SEED] [-p PLATFORM] \
-#        [--min-bases N] [--max-bases N] [--library-strategy S] [--pool N]
+#        [--min-bases N] [--max-bases N] [--library-strategy S] [--pool N] \
+#        [--instrument-model "M1,M2,..."]   # OR'd; e.g. PacBio HiFi instruments
 #
 # Defaults: N=20, SEED=$RANDOM, PLATFORM=ILLUMINA, bases 20M-600M (modest files
 # so a ~20-accession corpus fetches quickly and fits scratch).
@@ -25,6 +26,7 @@ MIN_BASES=20000000
 MAX_BASES=600000000
 POOL=5000
 LIBRARY_STRATEGY=""
+INSTRUMENT_MODEL=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -35,6 +37,7 @@ while [[ $# -gt 0 ]]; do
         --max-bases)          MAX_BASES="$2"; shift 2 ;;
         --pool)               POOL="$2"; shift 2 ;;
         --library-strategy)   LIBRARY_STRATEGY="$2"; shift 2 ;;
+        --instrument-model)   INSTRUMENT_MODEL="$2"; shift 2 ;;
         -h|--help)
             sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -51,6 +54,21 @@ else
     QUERY="instrument_platform=${PLATFORM} AND base_count>=${MIN_BASES} AND base_count<=${MAX_BASES}"
 fi
 [[ -n "$LIBRARY_STRATEGY" ]] && QUERY="${QUERY} AND library_strategy=${LIBRARY_STRATEGY}"
+
+# --instrument-model takes a comma-separated list of models and ORs them together
+# (quoted, since ENA model names contain spaces, e.g. "Sequel II"). Used to narrow
+# PacBio to HiFi-capable instruments (Revio is HiFi-only; Sequel II/IIe emit CCS)
+# since ENA has no direct CCS/HiFi flag on read_run.
+if [[ -n "$INSTRUMENT_MODEL" ]]; then
+    MODEL_CLAUSE=""
+    IFS=',' read -ra _models <<< "$INSTRUMENT_MODEL"
+    for m in "${_models[@]}"; do
+        m="${m#"${m%%[![:space:]]*}"}"; m="${m%"${m##*[![:space:]]}"}"   # trim
+        [[ -z "$m" ]] && continue
+        MODEL_CLAUSE="${MODEL_CLAUSE:+${MODEL_CLAUSE} OR }instrument_model=\"${m}\""
+    done
+    [[ -n "$MODEL_CLAUSE" ]] && QUERY="${QUERY} AND (${MODEL_CLAUSE})"
+fi
 
 echo "# sampling N=${N} from ENA pool=${POOL} query=\"${QUERY}\" seed=${SEED}" >&2
 

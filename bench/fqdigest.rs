@@ -14,7 +14,7 @@
 //! through fqxv's bin table first — the expected content of a correct lossy
 //! round-trip (mirrors QualityBinning::apply in fqxv-fqzcomp).
 //!
-//! Usage: fqdigest [--bin bin8|bin4|bin2] [--no-qual] [--no-names] FILE...  (or `-`/none = stdin)
+//! Usage: fqdigest [--bin bin8|bin4|bin2|ont|hifi] [--no-qual] [--no-names] FILE...  (or `-`/none = stdin)
 //! `--no-qual` hashes (name, sequence) only, for tools that drop quality.
 //! `--no-names` hashes (sequence, quality) only, for tools that renumber reads.
 //! Output: a 32-hex-digit digest. Same digest ⇔ same record multiset.
@@ -25,7 +25,8 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 
-/// Illumina quality bin tables. Must mirror QualityBinning::apply.
+/// Quality bin tables. Must mirror fqxv-fqzcomp `QualityBinning::apply`, which
+/// covers Illumina (bin8/bin4/bin2) and the long-read schemes (ONT, HiFi).
 fn bin_q(scheme: Bin, q: u8) -> u8 {
     match scheme {
         Bin::None => q,
@@ -52,6 +53,21 @@ fn bin_q(scheme: Bin, q: u8) -> u8 {
                 37
             }
         }
+        // CoLoRd ONT 4-level table (representatives 3/10/18/35).
+        Bin::Ont => match q {
+            0..=6 => 3,
+            7..=13 => 10,
+            14..=25 => 18,
+            _ => 35,
+        },
+        // CoLoRd HiFi 5-level table: as ONT, but the top Q93 symbol is kept exactly.
+        Bin::Hifi => match q {
+            0..=6 => 3,
+            7..=13 => 10,
+            14..=25 => 18,
+            26..=92 => 35,
+            _ => 93,
+        },
     }
 }
 
@@ -61,6 +77,8 @@ enum Bin {
     Bin8,
     Bin4,
     Bin2,
+    Ont,
+    Hifi,
 }
 
 // wyhash-style multiply-fold primitives. Fast (multi-GB/s) with good avalanche;
@@ -184,6 +202,8 @@ fn main() -> io::Result<()> {
                     Some("bin8") => Bin::Bin8,
                     Some("bin4") => Bin::Bin4,
                     Some("bin2") => Bin::Bin2,
+                    Some("ont") => Bin::Ont,
+                    Some("hifi") => Bin::Hifi,
                     Some("none") | Some("lossless") => Bin::None,
                     other => {
                         eprintln!("fqdigest: unknown --bin {:?}", other);
@@ -195,7 +215,7 @@ fn main() -> io::Result<()> {
             "--no-names" => no_names = true,
             "-h" | "--help" => {
                 eprintln!(
-                    "usage: fqdigest [--bin bin8|bin4|bin2] [--no-qual] [--no-names] FILE...  (- or none = stdin)"
+                    "usage: fqdigest [--bin bin8|bin4|bin2|ont|hifi] [--no-qual] [--no-names] FILE...  (- or none = stdin)"
                 );
                 return Ok(());
             }
