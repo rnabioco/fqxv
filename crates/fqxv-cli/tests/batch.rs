@@ -197,6 +197,33 @@ fn estimate_tsv_reports_file_and_sizes() {
 }
 
 #[test]
+fn estimate_on_empty_input_succeeds() {
+    // An empty input has no reads, but `compress` accepts it, so `--estimate` must
+    // report it cleanly (exit 0) rather than erroring. Covers both output forms.
+    let dir = tmp("estimate_empty");
+    fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("empty.fastq");
+    fs::write(&src, b"").unwrap();
+
+    let human = run(&["compress", src.to_str().unwrap(), "--estimate"]);
+    assert!(
+        String::from_utf8_lossy(&human.stdout).contains("no reads"),
+        "human estimate should note there are no reads"
+    );
+
+    let tsv = run(&["compress", src.to_str().unwrap(), "--estimate", "tsv"]);
+    let stdout = String::from_utf8(tsv.stdout).unwrap();
+    let mut lines = stdout.lines();
+    assert_eq!(
+        lines.next(),
+        Some("file\tinput_bytes\test_fqxv_bytes\tratio")
+    );
+    let row: Vec<&str> = lines.next().unwrap().split('\t').collect();
+    assert_eq!(row.len(), 4);
+    assert_eq!(row[2], "0", "estimated archive bytes are 0 for empty input");
+}
+
+#[test]
 fn compress_verify_confirms_roundtrip() {
     let dir = tmp("compress_verify");
     fs::create_dir_all(&dir).unwrap();

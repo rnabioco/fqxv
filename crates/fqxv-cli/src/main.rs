@@ -1777,6 +1777,35 @@ fn run_estimate(
             projectable = false;
         }
     }
+
+    // Empty input: no reads to sample. Report it cleanly (0 reads / 0 bytes)
+    // rather than projecting a "0x" ratio or mislabeling a file as a streaming
+    // input. Mirrors `compress`, which accepts empty input and writes an empty
+    // archive.
+    if reads == 0 {
+        let file = inputs
+            .iter()
+            .map(|p| {
+                if p.as_os_str() == "-" {
+                    "stdin".to_string()
+                } else {
+                    p.display().to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        match fmt {
+            EstimateFormat::Tsv => {
+                println!("file\tinput_bytes\test_fqxv_bytes\tratio");
+                println!("{file}\t{disk_in}\t0\t0.0000");
+            }
+            EstimateFormat::Human => {
+                println!("{file}: input has no reads — nothing to estimate");
+            }
+        }
+        return Ok(());
+    }
+
     // Machine-readable table: the input file(s), current on-disk size, projected
     // archive size, and their ratio — a header line then one data row (a compress
     // estimate is one archive, even when several inputs interleave into it). When

@@ -62,7 +62,9 @@ impl Estimate {
 /// `reorder` flag in `params` is ignored — the sample is always coded with the
 /// non-reorder path (see the module doc); every other parameter (sequence order,
 /// hashed tier, quality binning) is honoured so the estimate tracks the settings
-/// the real run would use. Errors if the input has no reads.
+/// the real run would use. An empty input yields a zero estimate (0 reads,
+/// `exhausted`), mirroring `compress` — which accepts empty input and writes an
+/// empty archive — rather than erroring.
 pub fn estimate<R: Read>(reader: R, params: Params, sample_reads: usize) -> Result<Estimate> {
     let target = sample_reads.max(1);
     let mut fq = noodles_fastq::io::Reader::new(BufReader::new(reader));
@@ -85,7 +87,18 @@ pub fn estimate<R: Read>(reader: R, params: Params, sample_reads: usize) -> Resu
         blk.push(name, desc, seq, qual);
     }
     if blk.n_reads() == 0 {
-        return Err(Error::Malformed("input has no reads to estimate from"));
+        // An empty input is valid — it compresses to an empty archive — so report a
+        // zero estimate rather than erroring; the caller renders it as "0 reads".
+        return Ok(Estimate {
+            sample_reads: 0,
+            sample_bases: 0,
+            raw_bytes: 0,
+            names_bytes: 0,
+            seq_bytes: 0,
+            qual_bytes: 0,
+            archive_bytes: 0,
+            exhausted: true,
+        });
     }
 
     // Always code the sample with the non-reorder path: it is the accurate,
@@ -193,7 +206,15 @@ mod tests {
     }
 
     #[test]
-    fn estimate_rejects_empty_input() {
-        assert!(estimate(&b""[..], Params::default(), 1000).is_err());
+    fn estimate_empty_input_is_zero() {
+        // Empty input is valid (compresses to an empty archive), so it yields a
+        // zero estimate rather than an error.
+        let est = estimate(&b""[..], Params::default(), 1000).expect("empty is Ok");
+        assert_eq!(est.sample_reads, 0);
+        assert_eq!(est.sample_bases, 0);
+        assert_eq!(est.raw_bytes, 0);
+        assert_eq!(est.archive_bytes, 0);
+        assert!(est.exhausted);
+        assert_eq!(est.ratio(), 0.0);
     }
 }
