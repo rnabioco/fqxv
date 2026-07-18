@@ -38,8 +38,9 @@
 //!                    [4] stream_crc32c (LE, over exactly those coded bytes)
 //!     The per-stream triple lets a remote client project one column — fetch just
 //!     the names (~1% of the archive) or just the sequence — with a single range
-//!     request and verify it against `stream_crc32c` (the block content digest
-//!     covers all three streams jointly, so it can't check one in isolation).
+//!     request and verify it against `stream_crc32c` (the block content digests
+//!     cover the DECODED streams, so they can't check a projected fetch of coded
+//!     bytes in isolation).
 //!   [8] total_reads (LE)
 //!   [4] whole_file_crc (LE)  -- CRC-32C of the archive from byte 0 through the
 //!       total_reads field; a one-pass end-to-end integrity check (`verify`)
@@ -49,11 +50,15 @@
 //!   [8] footer_offset (LE)   -- seek straight to the footer
 //!   [4] magic "FQXF"
 //! block payload:
-//!   [8] content_digest (LE) -- xxh3-64 of this block's DECODED content (names,
-//!       sequence, post-binning quality), verified after decode so a codec bug
-//!       that decodes CRC-valid bytes into wrong-but-in-bounds output is caught
-//!       at runtime. Distinct from the frame CRC, which only covers stored bytes.
-//!       Sits inside the payload, so the frame CRC covers it too.
+//!   [8] names_digest (LE) -- xxh3-64 of this block's DECODED names
+//!   [8] seq_digest   (LE) -- xxh3-64 of this block's DECODED sequence
+//!   [8] qual_digest  (LE) -- xxh3-64 of this block's DECODED post-binning quality
+//!       One digest per stream, each verified after decode so a codec bug that
+//!       decodes CRC-valid bytes into wrong-but-in-bounds output is caught at
+//!       runtime AND localized to the offending stream. Distinct from the frame
+//!       CRC, which only covers stored bytes. Each folds in n_reads + the stream's
+//!       per-read lengths so no byte can slide across a read or stream boundary.
+//!       Sit inside the payload, so the frame CRC covers them too.
 //!   [4] n_reads (LE)
 //!   [4] names_len (LE)  [ ] names   (fqxv-tokenizer)
 //!   [4] seq_len   (LE)  [ ] seq     (fqxv-seq)

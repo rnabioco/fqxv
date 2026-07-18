@@ -95,9 +95,11 @@ pub fn estimate<R: Read>(reader: R, params: Params, sample_reads: usize) -> Resu
     let payload = compress_block(&blk, &p)?;
 
     // Recover the three stream sizes from the payload framing
-    // (`[8 digest][4 n_reads][ (u32 len + bytes) × 3 ]`).
+    // (`[24 digests][4 n_reads][ (u32 len + bytes) × 3 ]`).
     let mut c = Cursor::new(&payload[..]);
-    c.u64()?; // content digest
+    for _ in 0..3 {
+        c.u64()?; // per-stream content digests (names, sequence, quality)
+    }
     c.u32()?; // n_reads
     let names_bytes = c.slice_u32()?.len() as u64;
     let seq_bytes = c.slice_u32()?.len() as u64;

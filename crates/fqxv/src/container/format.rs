@@ -31,11 +31,15 @@ pub(crate) const HEADER_LEN: usize = HEADER_FIELDS_LEN + CRC_LEN;
 /// Bytes of CRC-32C appended after a frame's length field (plain block frames)
 /// or after a `[u32 len]` framed slice (reorder layout).
 pub(crate) const CRC_LEN: usize = 4;
-/// Bytes of xxh3-64 content digest prepended to each plain block payload — an
-/// end-to-end round-trip check over the block's *decoded* content, distinct from
-/// the frame CRC (which only covers stored/compressed bytes). See
-/// [`content_digest`].
+/// Bytes of one xxh3-64 digest. Also the width of the reorder layout's single
+/// `output_digest`.
 pub(crate) const DIGEST_LEN: usize = 8;
+/// Bytes of the three per-stream content digests (names, sequence, quality)
+/// prepended to each plain block payload — an end-to-end round-trip check over the
+/// block's *decoded* content, one digest per stream so a mismatch localizes which
+/// stream a codec round-tripped wrong. Distinct from the frame CRC (which only
+/// covers stored/compressed bytes). See [`stream_digests`].
+pub(crate) const STREAM_DIGESTS_LEN: usize = 3 * DIGEST_LEN;
 /// Upper bound on a single block payload's declared length. A block holds at most
 /// `block_reads` reads and `MAX_BLOCK_SEQ_BYTES` of raw sequence, and the three
 /// compressed streams are each smaller than their raw input in the common case,
@@ -123,11 +127,11 @@ pub(crate) fn write_header<W: Write>(
 /// verify a single stream without reading the whole block.
 ///
 /// `offset` is the absolute byte offset of the stream's *coded* bytes (past the
-/// block frame head, content digest, `n_reads`, and this stream's length prefix);
-/// `len` is that coded length; `crc` is CRC-32C of exactly those `len` bytes. The
-/// block's `content_digest` covers all three decoded streams jointly and so cannot
-/// be checked on a projected fetch — this per-stream CRC is the substitute that
-/// keeps a single-stream read verifiable.
+/// block frame head, the three content digests, `n_reads`, and this stream's length
+/// prefix); `len` is that coded length; `crc` is CRC-32C of exactly those `len`
+/// bytes. The block's content digests cover the *decoded* streams and so cannot be
+/// checked on a projected fetch of *coded* bytes — this per-stream CRC is the
+/// substitute that keeps a single-stream read verifiable.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct StreamLoc {
     pub(crate) offset: u64,
