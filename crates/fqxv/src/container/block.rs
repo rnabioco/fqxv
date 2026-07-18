@@ -141,37 +141,58 @@ pub(crate) fn write_blocks<W: Write>(
     Ok(())
 }
 
-/// xxh3-64 over a block's *decoded canonical form*: the exact (name, sequence,
-/// quality) bytes `decompress` reconstructs, structured so no byte can silently
-/// cross a name/seq/quality boundary. Computed identically on the encode side
-/// (from the post-`QualityBinning` quality — the values actually stored) and the
-/// decode side (from the reconstructed streams). A mismatch means some codec
-/// round-tripped this block into wrong-but-in-bounds output — corruption the
-/// per-payload CRC cannot catch, because the stored bytes were never altered.
+/// One xxh3-64 digest per decoded stream (names, sequence, quality) of a block's
+/// *decoded canonical form* — the exact bytes `decompress` reconstructs.
+pub(crate) struct StreamDigests {
+    pub(crate) names: u64,
+    pub(crate) seq: u64,
+    pub(crate) qual: u64,
+}
+
+/// Digest each of a block's three decoded streams independently, so a mismatch
+/// localizes *which* stream a codec round-tripped into wrong-but-in-bounds output
+/// (corruption the per-payload CRC cannot catch, because the stored bytes were
+/// never altered). Computed identically on the encode side (from the post-
+/// `QualityBinning` quality — the values actually stored) and the decode side (from
+/// the reconstructed streams).
 ///
-/// The digest is over the *stored* (post-binning) form, not the original input,
+/// The digests are over the *stored* (post-binning) form, not the original input,
 /// so a lossy archive verifies against what it emits, not against data it never
-/// promised to reproduce. Name/quality lengths are folded in explicitly to pin
-/// the per-read boundaries; `qual` shares each read's `lens[i]` with `seq`.
-pub(crate) fn content_digest<'a>(
+/// promised to reproduce. Each digest folds in `n_reads` and its stream's per-read
+/// lengths (name lengths for names; `lens` for both sequence and quality, which
+/// share it) so no byte can silently cross a read — or stream — boundary.
+pub(crate) fn stream_digests<'a>(
     n_reads: usize,
     names: impl Iterator<Item = &'a [u8]>,
     lens: &[u32],
     seq: &[u8],
     qual: &[u8],
-) -> u64 {
-    let mut h = Xxh3::new();
-    h.update(&(n_reads as u64).to_le_bytes());
+) -> StreamDigests {
+    let mut hn = Xxh3::new();
+    hn.update(&(n_reads as u64).to_le_bytes());
     for name in names {
-        h.update(&(name.len() as u32).to_le_bytes());
-        h.update(name);
+        hn.update(&(name.len() as u32).to_le_bytes());
+        hn.update(name);
     }
-    for &l in lens {
-        h.update(&l.to_le_bytes());
+
+    // Sequence and quality each pin their per-read boundaries with the shared
+    // `lens`, so a byte sliding between reads changes the digest even at constant
+    // total length.
+    let digest_lens_then = |bytes: &[u8]| {
+        let mut h = Xxh3::new();
+        h.update(&(n_reads as u64).to_le_bytes());
+        for &l in lens {
+            h.update(&l.to_le_bytes());
+        }
+        h.update(bytes);
+        h.digest()
+    };
+
+    StreamDigests {
+        names: hn.digest(),
+        seq: digest_lens_then(seq),
+        qual: digest_lens_then(qual),
     }
-    h.update(seq);
-    h.update(qual);
-    h.digest()
 }
 
 /// Sequence-stream codec, recorded as a leading method byte (v4). Short reads use
@@ -241,8 +262,8 @@ pub(crate) fn decode_sequence_stream(coded: &[u8]) -> Result<(Vec<u32>, Vec<u8>)
 }
 
 /// Code one non-reorder block: names (tokenizer), sequence (method-tagged), and
-/// quality (fqzcomp), each length-prefixed, behind a leading [`content_digest`].
-/// Reorder uses the whole-file path instead.
+/// quality (fqzcomp), each length-prefixed, behind three leading per-stream
+/// [`stream_digests`]. Reorder uses the whole-file path instead.
 pub(crate) fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
     let header_refs = b.header_refs();
     // The three streams are independent; code them concurrently so a block's
@@ -268,7 +289,7 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
         QualityBinning::Lossless => Cow::Borrowed(&b.qual),
         binning => Cow::Owned(b.qual.iter().map(|&q| binning.apply(q)).collect()),
     };
-    let digest = content_digest(
+    let digests = stream_digests(
         b.n_reads(),
         b.header_refs().into_iter(),
         &b.lens,
@@ -276,8 +297,11 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params) -> Result<Vec<u8>> {
         &binned,
     );
 
-    let mut out = Vec::with_capacity(DIGEST_LEN + 16 + names_c.len() + seq_c.len() + qual_c.len());
-    out.extend_from_slice(&digest.to_le_bytes());
+    let mut out =
+        Vec::with_capacity(STREAM_DIGESTS_LEN + 16 + names_c.len() + seq_c.len() + qual_c.len());
+    out.extend_from_slice(&digests.names.to_le_bytes());
+    out.extend_from_slice(&digests.seq.to_le_bytes());
+    out.extend_from_slice(&digests.qual.to_le_bytes());
     out.extend_from_slice(&(b.n_reads() as u32).to_le_bytes());
     for stream in [&names_c, &seq_c, &qual_c] {
         // Stream lengths are stored as u32. The MAX_BLOCK_SEQ_BYTES row-group
@@ -325,15 +349,17 @@ where
 /// `(offset, len, crc32c)` triples, given the payload bytes and the block frame's
 /// absolute offset. Used to build the footer's per-stream projection index.
 ///
-/// The payload is `[8 digest][4 n_reads] ([4 len][bytes])×3`, so each stream's
+/// The payload is `[24 digests][4 n_reads] ([4 len][bytes])×3`, so each stream's
 /// coded bytes start right after its length prefix; the returned offset is
 /// absolute (past the frame head), and the CRC is over exactly those `len` bytes —
 /// the same slice a remote client fetches, so it can verify a projected stream the
-/// joint content digest can't cover.
+/// decoded-content digests can't cover.
 pub(crate) fn payload_stream_locs(payload: &[u8], block_offset: u64) -> Result<[StreamLoc; 3]> {
     let base = block_offset + FRAME_HEAD_LEN as u64;
     let mut c = Cursor::new(payload);
-    c.u64()?; // content digest
+    for _ in 0..3 {
+        c.u64()?; // per-stream content digests (names, sequence, quality)
+    }
     c.u32()?; // n_reads
     let mut locs = [StreamLoc::default(); 3];
     for loc in &mut locs {
@@ -355,7 +381,11 @@ pub(crate) type BlockParts = (usize, Vec<Vec<u8>>, Vec<u32>, Vec<u8>, Vec<u8>);
 /// Decode a block's streams and slice out each read's (name, seq, qual).
 pub(crate) fn decode_block_parts(buf: &[u8]) -> Result<BlockParts> {
     let mut c = Cursor::new(buf);
-    let expected_digest = c.u64()?;
+    let expected = StreamDigests {
+        names: c.u64()?,
+        seq: c.u64()?,
+        qual: c.u64()?,
+    };
     let n_reads = c.u32()? as usize;
     // Slice out the three compressed streams (cheap, sequential), then decode
     // them concurrently — same rationale as the encode side.
@@ -375,20 +405,27 @@ pub(crate) fn decode_block_parts(buf: &[u8]) -> Result<BlockParts> {
     if names.len() != n_reads || seq_lens.len() != n_reads {
         return Err(Error::Malformed("block stream length disagreement"));
     }
-    // End-to-end check: the reconstructed content must digest to the value the
+    // End-to-end check: each reconstructed stream must digest to the value the
     // encoder stored. A mismatch here (with the frame CRC intact) means a codec
-    // decoded valid bytes into wrong output — the failure mode CRC cannot see.
-    let digest = content_digest(
+    // decoded valid bytes into wrong output — the failure mode CRC cannot see —
+    // and the per-stream digests name which stream regressed.
+    let got = stream_digests(
         n_reads,
         names.iter().map(Vec::as_slice),
         &seq_lens,
         &seq,
         &qual,
     );
-    if digest != expected_digest {
-        return Err(Error::Corrupt {
-            what: "block content digest".to_string(),
-        });
+    for (ok, what) in [
+        (got.names == expected.names, "block names digest"),
+        (got.seq == expected.seq, "block sequence digest"),
+        (got.qual == expected.qual, "block quality digest"),
+    ] {
+        if !ok {
+            return Err(Error::Corrupt {
+                what: what.to_string(),
+            });
+        }
     }
     Ok((n_reads, names, seq_lens, seq, qual))
 }

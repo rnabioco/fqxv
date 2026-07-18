@@ -1429,57 +1429,77 @@ fn decompress_detects_block_corruption() {
 }
 
 #[test]
-fn content_digest_distinguishes_streams_and_boundaries() {
+fn stream_digests_localize_and_pin_boundaries() {
     let d = |names: &[&[u8]], lens: &[u32], seq: &[u8], qual: &[u8]| {
-        content_digest(names.len(), names.iter().copied(), lens, seq, qual)
+        stream_digests(names.len(), names.iter().copied(), lens, seq, qual)
     };
     let base = d(&[b"r1", b"r2"], &[3, 3], b"ACGTTT", b"IIIFFF");
-    // Sensitive to each of the three decoded streams.
+
+    // Localization: a change in one stream perturbs ONLY that stream's digest,
+    // so a mismatch names the stream that regressed.
+    let name_changed = d(&[b"r1", b"rX"], &[3, 3], b"ACGTTT", b"IIIFFF");
     assert_ne!(
-        base,
-        d(&[b"r1", b"rX"], &[3, 3], b"ACGTTT", b"IIIFFF"),
-        "name"
+        base.names, name_changed.names,
+        "name change -> names digest"
     );
-    assert_ne!(
-        base,
-        d(&[b"r1", b"r2"], &[3, 3], b"ACGTTA", b"IIIFFF"),
-        "seq"
+    assert_eq!(base.seq, name_changed.seq, "name change leaves seq digest");
+    assert_eq!(
+        base.qual, name_changed.qual,
+        "name change leaves qual digest"
     );
-    assert_ne!(
-        base,
-        d(&[b"r1", b"r2"], &[3, 3], b"ACGTTT", b"IIIFF#"),
-        "qual"
+
+    let seq_changed = d(&[b"r1", b"r2"], &[3, 3], b"ACGTTA", b"IIIFFF");
+    assert_ne!(base.seq, seq_changed.seq, "seq change -> seq digest");
+    assert_eq!(
+        base.names, seq_changed.names,
+        "seq change leaves names digest"
     );
-    // Boundary pinning: the same concatenated bytes split differently between
-    // name and sequence must not collide (a byte "sliding" across a stream
-    // boundary is exactly the silent-corruption shape the length folds catch).
-    assert_ne!(
-        d(&[b"AB"], &[2], b"CD", b"II"),
-        d(&[b"ABC"], &[1], b"D", b"I"),
-        "boundary"
+    assert_eq!(base.qual, seq_changed.qual, "seq change leaves qual digest");
+
+    let qual_changed = d(&[b"r1", b"r2"], &[3, 3], b"ACGTTT", b"IIIFF#");
+    assert_ne!(base.qual, qual_changed.qual, "qual change -> qual digest");
+    assert_eq!(
+        base.names, qual_changed.names,
+        "qual change leaves names digest"
     );
+    assert_eq!(base.seq, qual_changed.seq, "qual change leaves seq digest");
+
+    // Boundary pinning per stream: the same concatenated bytes split differently
+    // between reads must not collide (a byte "sliding" across a read boundary is
+    // exactly the silent-corruption shape the length folds catch).
+    let a = d(&[b"AB", b"C"], &[1, 2], b"G", b"I");
+    let b = d(&[b"A", b"BC"], &[2, 1], b"G", b"I");
+    assert_ne!(a.names, b.names, "names boundary");
+    let c = d(&[b"n"], &[1, 2], b"ACG", b"III");
+    let e = d(&[b"n"], &[2, 1], b"ACG", b"III");
+    assert_ne!(c.seq, e.seq, "seq boundary");
+    assert_ne!(c.qual, e.qual, "qual boundary");
 }
 
 #[test]
-fn decompress_detects_content_digest_mismatch() {
-    // The failure mode CRC cannot see: frame CRC intact, but the decoded
-    // content does not match the stored digest (a codec round-trip bug).
-    // Simulate by flipping a byte in the payload's leading digest and repairing
-    // the frame CRC, so only the content-digest check can reject it.
-    let mut archive = multiblock_archive(20, 64); // block_reads > n => one block
-    let payload_start = HEADER_LEN + FRAME_HEAD_LEN;
-    archive[payload_start] ^= 0xFF; // first byte of the content digest
-    let len_at = HEADER_LEN + BLOCK_MAGIC.len();
-    let len = u64::from_le_bytes(archive[len_at..len_at + 8].try_into().unwrap()) as usize;
-    let repaired = crc32c(&archive[payload_start..payload_start + len]);
-    archive[len_at + 8..payload_start].copy_from_slice(&repaired.to_le_bytes());
+fn decompress_detects_and_localizes_content_digest_mismatch() {
+    // The failure mode CRC cannot see: frame CRC intact, but the decoded content
+    // does not match a stored digest (a codec round-trip bug). Simulate by
+    // flipping a byte inside one of the three per-stream digests and repairing the
+    // frame CRC, so only the content-digest check can reject it — and the reported
+    // stream must match the digest that was corrupted.
+    for (digest_idx, stream) in [(0usize, "names"), (1, "sequence"), (2, "quality")] {
+        let mut archive = multiblock_archive(20, 64); // block_reads > n => one block
+        let payload_start = HEADER_LEN + FRAME_HEAD_LEN;
+        archive[payload_start + digest_idx * DIGEST_LEN] ^= 0xFF; // that stream's digest
+        let len_at = HEADER_LEN + BLOCK_MAGIC.len();
+        let len = u64::from_le_bytes(archive[len_at..len_at + 8].try_into().unwrap()) as usize;
+        let repaired = crc32c(&archive[payload_start..payload_start + len]);
+        archive[len_at + 8..payload_start].copy_from_slice(&repaired.to_le_bytes());
 
-    let mut out = Vec::new();
-    let err = decompress(&archive[..], &mut out, 1).unwrap_err();
-    assert!(
-        matches!(&err, Error::Corrupt { what } if what.contains("content digest")),
-        "got {err:?}"
-    );
+        let mut out = Vec::new();
+        let err = decompress(&archive[..], &mut out, 1).unwrap_err();
+        let expected = format!("block {stream} digest");
+        assert!(
+            matches!(&err, Error::Corrupt { what } if *what == expected),
+            "flipping the {stream} digest should report {expected:?}, got {err:?}"
+        );
+    }
 }
 
 #[test]

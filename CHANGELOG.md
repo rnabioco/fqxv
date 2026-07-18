@@ -30,11 +30,18 @@ freely and archives are not guaranteed to be readable across releases until a
 - **`compress --block-reads N`** — set the reads-per-row-group directly,
   decoupling random-access granularity from the `--level` effort knob. Smaller
   groups give finer remote access and more parallelism at some ratio cost.
+- **Per-stream content digests** — the plain block payload now carries three
+  xxh3-64 digests (names, sequence, quality) in place of the single joint digest.
+  A post-decode mismatch (a codec round-tripping CRC-valid bytes into
+  wrong-but-in-bounds output) now names the offending stream instead of only the
+  block. Each digest still folds in `n_reads` and its stream's per-read lengths,
+  so boundary pinning is unchanged; cost is 16 extra bytes per block.
 
 ### Changed
 
-- **`FORMAT_VERSION` → 3** for the extended footer index above. As always in the
-  pre-1.0 format, a build reads only its own version.
+- **`FORMAT_VERSION` → 5** across the Unreleased changes (extended footer index,
+  long-read overlap sequence codec, and the per-stream block digests above). As
+  always in the pre-1.0 format, a build reads only its own version.
 - **`inspect`** now sums per-stream sizes straight from the footer index instead
   of seeking to each block header — one footer read is the whole metadata cost.
 

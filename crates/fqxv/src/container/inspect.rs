@@ -487,8 +487,8 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
     Ok(info)
 }
 
-/// Walk one block's header at the current position — the `[8] content_digest`
-/// prefix, `[4] n_reads`, an optional reorder preamble, and the three
+/// Walk one block's header at the current position — the `[24] per-stream content
+/// digests` prefix, `[4] n_reads`, an optional reorder preamble, and the three
 /// `[4 len][bytes]` stream frames — accumulating per-stream sizes into `info` and
 /// seeking past each payload. Returns the block's read count. Leaves the cursor at
 /// the end of the block's payload.
@@ -497,8 +497,8 @@ pub(crate) fn scan_block_header<R: Read + Seek>(
     reordered: bool,
     info: &mut Info,
 ) -> Result<u64> {
-    // Skip the payload's leading content digest (see the block-payload layout).
-    r.seek(SeekFrom::Current(DIGEST_LEN as i64))?;
+    // Skip the payload's leading content digests (see the block-payload layout).
+    r.seek(SeekFrom::Current(STREAM_DIGESTS_LEN as i64))?;
     let n = u64::from(read_u32(r)?);
     if reordered {
         r.seek(SeekFrom::Current(n.div_ceil(8) as i64))?; // flip bitmap

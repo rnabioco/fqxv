@@ -49,10 +49,11 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 ///   archive) with one range request, verifying it against the per-stream CRC;
 /// - carries a CRC-32C on every coded payload, so on-disk corruption is detected
 ///   and localized rather than silently decoded;
-/// - prepends an xxh3-64 digest of each block's *decoded* content (names,
-///   sequence, post-binning quality) to the block payload, verified after decode
-///   — so a codec bug that turns CRC-valid bytes into wrong-but-in-bounds output
-///   is caught at runtime, not just in tests;
+/// - prepends three xxh3-64 digests of each block's *decoded* content — one per
+///   stream (names, sequence, post-binning quality) — to the block payload (v5),
+///   verified after decode, so a codec bug that turns CRC-valid bytes into
+///   wrong-but-in-bounds output is caught at runtime and localized to the stream
+///   that regressed, not just to the block;
 /// - tags the `FLAG_GLOBAL_REFERENCE` frame with a leading method byte so the
 ///   shared reference can be coded by either the clean-room order-k model or an
 ///   xz pass (whichever is smaller), exploiting long-range repeat structure the
@@ -66,7 +67,7 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 ///   cross-read overlap-assembly codec (`fqxv-lroverlap`) for long reads.
 ///
 /// See `container.rs` for the full layout.
-pub const FORMAT_VERSION: u16 = 4;
+pub const FORMAT_VERSION: u16 = 5;
 
 /// Errors returned by the archiver.
 #[derive(Debug, Error)]

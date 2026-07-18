@@ -994,8 +994,9 @@ pub(crate) fn decode_reordered_split<R: Read, W: Write>(
 }
 
 /// Rolling xxh3-64 over reads in output order — the whole-file reorder layout's
-/// analog of the per-block [`content_digest`] (that layout splits reads across
-/// seq/name/quality partitions, so there is no single block to digest). Encode
+/// analog of the plain layout's per-block, per-stream [`stream_digests`] (that
+/// layout splits reads across seq/name/quality partitions, so there is no single
+/// block to digest). Encode
 /// folds the reads it *will* emit (original order for keep-order; clustered order,
 /// original orientation, with template-regenerated names otherwise); decode folds
 /// the reads it *actually* emits and compares. A mismatch means the reorder codec
