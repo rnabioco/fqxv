@@ -702,16 +702,30 @@ fn long_reads_skip_reorder() {
     assert_eq!(out, input, "long-read fallback must be byte-exact");
 }
 
+/// The leading sequence-stream method byte of the archive's first block
+/// (`SEQ_METHOD_ORDERK` or `SEQ_METHOD_OVERLAP`). Parses the plain-layout frame
+/// and block payload directly — the same offsets [`decode_block_parts`] uses — so
+/// a test can assert *which* sequence codec the container kept, rather than
+/// assuming it from the input shape.
+fn first_block_seq_method(archive: &[u8]) -> u8 {
+    let len_off = HEADER_LEN + BLOCK_MAGIC.len();
+    let plen = u64::from_le_bytes(archive[len_off..len_off + 8].try_into().unwrap()) as usize;
+    let payload = &archive[HEADER_LEN + FRAME_HEAD_LEN..HEADER_LEN + FRAME_HEAD_LEN + plen];
+    // payload: [24 stream digests][4 n_reads][4 names_len][names][4 seq_len][seq…]
+    let names_len = u32::from_le_bytes(payload[28..32].try_into().unwrap()) as usize;
+    payload[32 + names_len + 4] // first byte of the seq stream is the method tag
+}
+
 #[test]
-fn long_reads_use_overlap_codec_roundtrip_and_determinism() {
-    // Long reads tiling a small genome engage the overlap sequence codec
-    // (`fqxv-lroverlap`) through the real container. Assert the two invariants
-    // that matter: the archive round-trips byte-exact, and it is byte-identical
-    // regardless of thread count.
-    // Kept deliberately small: overlap assembly is quadratic in read count and
-    // this runs the full pipeline twice (one thread and many). ~24 reads of
-    // 600 bp tiling a 1500 bp genome is enough to engage the long-read path and
-    // form overlaps while staying off the suite's slow list.
+fn long_read_path_tries_overlap_but_keeps_order_k_roundtrip_and_determinism() {
+    // 600 bp reads clear the long-read gate (`is_long_read`, mean > 500), so the
+    // container *tries* the overlap codec and order-k and keeps the smaller — and
+    // at this scale order-k wins, so the block is stored order-k. (Overlap only
+    // beats order-k at realistic multi-kb reads and high depth; on a tiny genome
+    // the assembly/consensus overhead loses.) This test guards that long-read
+    // *selection* path: it round-trips byte-exact and is thread-count invariant.
+    // The overlap *decode* dispatch is covered separately by
+    // `container_decodes_overlap_tagged_sequence_stream`.
     let genome: Vec<u8> = (0..1500u32)
         .map(|i| b"ACGT"[((i.wrapping_mul(2_654_435_761) >> 13) & 3) as usize])
         .collect();
@@ -738,14 +752,53 @@ fn long_reads_use_overlap_codec_roundtrip_and_determinism() {
         archives.push(archive);
     }
     assert_eq!(
+        first_block_seq_method(&archives[0]),
+        SEQ_METHOD_ORDERK,
+        "order-k must win the size race at this scale; if overlap ever wins here, \
+         this test's premise (and name) is stale"
+    );
+    assert_eq!(
         archives[0], archives[1],
-        "long-read (overlap codec) output must not vary by thread count"
+        "long-read selection output must not vary by thread count"
     );
     let mut out = Vec::new();
     decompress(&archives[0][..], &mut out, 4).unwrap();
+    assert_eq!(out, input, "long-read archive must round-trip byte-exact");
+}
+
+#[test]
+fn container_decodes_overlap_tagged_sequence_stream() {
+    // The container's sequence path dispatches on a leading method byte; the
+    // overlap branch (`SEQ_METHOD_OVERLAP` -> `fqxv_lroverlap::decode`) is not
+    // reached by the compress path on synthetic data, because order-k wins the
+    // size race there. Cover that decode dispatch directly: build a genuine
+    // overlap-coded stream, tag it, and round-trip it through the container's
+    // `decode_sequence_stream`. Long reads tiling a genome so the codec forms
+    // real overlaps and does substantive assembly/consensus work.
+    let genome: Vec<u8> = (0..3000u32)
+        .map(|i| b"ACGT"[((i.wrapping_mul(2_654_435_761) >> 13) & 3) as usize])
+        .collect();
+    let (read_len, step) = (1000usize, 100usize);
+    let n = (genome.len() - read_len) / step;
+    let mut lens = Vec::with_capacity(n);
+    let mut seq = Vec::new();
+    for i in 0..n {
+        let mut s = genome[i * step..i * step + read_len].to_vec();
+        s[50] = b"ACGT"[(i + 1) & 3]; // a substitution the aligner must code
+        lens.push(s.len() as u32);
+        seq.extend_from_slice(&s);
+    }
+
+    let coded = fqxv_lroverlap::encode(&lens, &seq, &fqxv_lroverlap::EncodeOpts::default())
+        .expect("overlap encode");
+    let mut stream = vec![SEQ_METHOD_OVERLAP];
+    stream.extend_from_slice(&coded);
+
+    let (dlens, dseq) = decode_sequence_stream(&stream).expect("overlap dispatch decode");
+    assert_eq!(dlens, lens, "overlap decode must restore per-read lengths");
     assert_eq!(
-        out, input,
-        "long-read overlap archive must round-trip byte-exact"
+        dseq, seq,
+        "overlap decode must restore the bases byte-exact"
     );
 }
 
