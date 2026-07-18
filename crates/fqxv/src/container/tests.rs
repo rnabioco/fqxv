@@ -2078,6 +2078,35 @@ fn index_decodes_a_whole_fetched_block() {
     );
 }
 
+/// #142 F4: a block frame claiming the maximum payload but truncated must error
+/// as `Truncated` after reading only the bytes present — not zero-fill the full
+/// 2 GB claim before the short read is discovered.
+#[test]
+fn read_block_truncated_body_does_not_alloc_the_claim() {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&BLOCK_MAGIC);
+    frame.extend_from_slice(&MAX_BLOCK_PAYLOAD.to_le_bytes()); // len = the cap
+    frame.extend_from_slice(&0u32.to_le_bytes()); // crc
+    frame.extend_from_slice(b"short"); // body far below the claim
+    assert!(matches!(
+        read_block(&mut io::Cursor::new(&frame), 0),
+        Err(Error::Truncated)
+    ));
+}
+
+/// A frame length past `MAX_BLOCK_PAYLOAD` is rejected outright.
+#[test]
+fn read_block_rejects_over_cap_length() {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&BLOCK_MAGIC);
+    frame.extend_from_slice(&(MAX_BLOCK_PAYLOAD + 1).to_le_bytes());
+    frame.extend_from_slice(&0u32.to_le_bytes());
+    assert!(matches!(
+        read_block(&mut io::Cursor::new(&frame), 0),
+        Err(Error::Malformed(_))
+    ));
+}
+
 /// A bit flipped in a projected stream is caught by the index's per-stream CRC —
 /// the guarantee the joint block content digest can't provide on a column fetch.
 #[test]
