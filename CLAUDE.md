@@ -24,6 +24,18 @@ cargo run -p fqxv-cli -- compress reads.fastq.gz -o reads.fqxv
 cargo bench -p fqxv-rans               # criterion microbenchmarks
 ```
 
+**Run every compute command through Slurm — never bare, never in the small
+interactive session.** On the Bodhi cluster the login node and the default
+`sinteractive` session are tiny (~2 cores); `cargo build`/`check`/`nextest`/
+`clippy`/`bench` and any analysis must go to the `rna` partition (88+c/754G) via
+`srun`/`salloc`/`sbatch`. Prefer a longer-lived allocation you `srun --overlap`
+into over relaunching. Example:
+
+```bash
+salloc --no-shell -p rna -c 32 --mem 64G -J fqxv-build   # once
+srun --overlap --jobid=<JOBID> -- cargo nextest run -p fqxv   # per command
+```
+
 CI (`.github/workflows/ci.yml`) runs check, nextest, doctests, fmt, clippy, and
 an MSRV-1.95 check — all with `RUSTFLAGS=-Dwarnings`, so warnings fail the build.
 The `check`/`clippy` jobs pass `--features fqxv-rans/bench`; match that when
