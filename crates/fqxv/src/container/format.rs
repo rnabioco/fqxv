@@ -633,8 +633,16 @@ mod header_tests {
     #[test]
     fn roundtrips_current_version() {
         let mut buf = Vec::new();
-        write_header_prefix(&mut buf, 3, 0, FLAG_PLUS_NORMALIZED, 2, Platform::Illumina, 0)
-            .unwrap();
+        write_header_prefix(
+            &mut buf,
+            3,
+            0,
+            FLAG_PLUS_NORMALIZED,
+            2,
+            Platform::Illumina,
+            0,
+        )
+        .unwrap();
         assert_eq!(buf.len(), HEADER_LEN, "1.0 writes an ext-empty header");
         let h = read_header(&mut Cursor::new(&buf)).unwrap();
         assert_eq!((h.major, h.minor), (FORMAT_MAJOR, FORMAT_MINOR));
@@ -679,7 +687,10 @@ mod header_tests {
         let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, 0, &ext);
         let h = read_header(&mut Cursor::new(&buf)).unwrap();
         // Block region starts past the extension region, not at the const.
-        assert_eq!(h.header_len, (HEADER_PREFIX_LEN + ext.len() + CRC_LEN) as u64);
+        assert_eq!(
+            h.header_len,
+            (HEADER_PREFIX_LEN + ext.len() + CRC_LEN) as u64
+        );
     }
 
     #[test]

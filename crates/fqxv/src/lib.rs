@@ -106,7 +106,10 @@ pub enum Error {
     BadMagic,
     /// The container format major version differs from this build's
     /// [`FORMAT_MAJOR`] — the archive is wire-incompatible and cannot be read.
-    #[error("unsupported fqxv format version {major}.{minor} (this build reads {}.x)", FORMAT_MAJOR)]
+    #[error(
+        "unsupported fqxv format version {major}.{minor} (this build reads {}.x)",
+        FORMAT_MAJOR
+    )]
     UnsupportedVersion {
         /// On-disk major version (differs from [`FORMAT_MAJOR`]).
         major: u8,
@@ -119,7 +122,9 @@ pub enum Error {
     UnsupportedFeature(u64),
     /// The header carried a critical extension record with a tag this build
     /// doesn't recognize (see the header extension region). The payload is the tag.
-    #[error("fqxv archive has an unsupported critical header extension (tag {0:#x}); upgrade fqxv")]
+    #[error(
+        "fqxv archive has an unsupported critical header extension (tag {0:#x}); upgrade fqxv"
+    )]
     UnsupportedExtension(u8),
     /// A stream was tagged with a codec method byte this build can't decode (e.g.
     /// a sequence codec added in a newer minor). Localized to the stream and method.

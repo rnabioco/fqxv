@@ -534,7 +534,10 @@ fn reorder_with_lossy_binning_roundtrips() {
         };
         let mut archive = Vec::new();
         compress(&input[..], &mut archive, params).unwrap();
-        assert_eq!(archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+        assert_eq!(
+            archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
+            FLAG_GLOBAL_REORDER
+        );
         let mut out = Vec::new();
         decompress(&archive[..], &mut out, 1)
             .unwrap_or_else(|e| panic!("reorder + {bin:?} decode failed: {e:?}"));
@@ -1303,7 +1306,10 @@ fn verify_roundtrip_rejects_corrupt_reorder_read_count() {
         },
     )
     .unwrap();
-    assert_eq!(archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+    assert_eq!(
+        archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
+        FLAG_GLOBAL_REORDER
+    );
     // The read count is a little-endian u64 at `HEADER_LEN`; set its top byte to
     // blow the value past any real dataset.
     archive[HEADER_LEN + 7] ^= 0xFF;
@@ -1552,7 +1558,10 @@ fn reorder_header_is_crc_protected() {
         },
     )
     .unwrap();
-    assert_eq!(archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+    assert_eq!(
+        archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
+        FLAG_GLOBAL_REORDER
+    );
     archive[HDR_OFF_BINNING] ^= 0x02; // binning tag in the reorder layout's header
     let mut out = Vec::new();
     let err = decompress(&archive[..], &mut out, 1).unwrap_err();
@@ -1578,7 +1587,10 @@ fn decompress_detects_reorder_output_digest_mismatch() {
         },
     )
     .unwrap();
-    assert_eq!(archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+    assert_eq!(
+        archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
+        FLAG_GLOBAL_REORDER
+    );
     // Trailing frame is [4 len=8][4 crc][8 digest] at the very end (no footer).
     let len = archive.len();
     let dig_start = len - DIGEST_LEN;

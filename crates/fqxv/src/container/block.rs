@@ -479,8 +479,21 @@ pub(crate) fn read_slices<'a>(
 }
 
 /// Split a grouped block into `g` FASTQ buffers by local read index mod `g`.
+///
+/// De-interleaving is a block-local `i % g`, which is correct only because every
+/// block holds whole spots and starts on member 0 (enforced at encode by
+/// [`block_ranges`] and the streaming loop). That invariant is not otherwise
+/// recorded on disk, so a block whose read count is not a multiple of `g` — a
+/// regression in the block splitter, or a crafted archive — would silently
+/// misroute the trailing partial spot and shift every following block's members.
+/// Reject it here so the failure is loud and localized rather than wrong output.
 pub(crate) fn decode_block_group(buf: &[u8], g: usize) -> Result<(u64, Vec<Vec<u8>>)> {
     let (n_reads, names, lens, seq, qual) = decode_block_parts(buf)?;
+    if !n_reads.is_multiple_of(g) {
+        return Err(Error::Malformed(
+            "grouped block read count is not a multiple of the group size",
+        ));
+    }
     let mut outs = vec![Vec::new(); g];
     let mut off = 0usize;
     for i in 0..n_reads {
