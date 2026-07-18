@@ -11,6 +11,7 @@ tool is than plain `.fastq.gz` (higher is better).
 from __future__ import annotations
 
 import csv
+import math
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -83,6 +84,64 @@ def main() -> None:
                     f"{'':<13} └─ Δqual  mae {mae:.2f}  rmse {rmse:.2f}  "
                     f"changed {pct:.1f}% of bases"
                 )
+
+    # Optional section: fqxv vs the native .sra (from sra_compare.sh). Only shown
+    # when that harness has been run and its table is present.
+    sra_path = RESULTS_DIR / "sra_compare.tsv"
+    if sra_path.exists():
+        render_sra_compare(load_tsv(sra_path))
+
+
+def render_sra_compare(rows: list[dict[str, str]]) -> None:
+    """fqxv archive size vs the native .sra the run shipped in.
+
+    sra_compare.tsv is long-format: one row per (accession, fqxv point). We print
+    the shared .sra/.fastq sizes once per run, then each fqxv point's size and its
+    ratio to the .sra (< 1.00 = fqxv is smaller). A closing line geomeans the
+    lossless (`max`) fqxv/.sra across the panel — the headline "is it worth it".
+    """
+    by_acc: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for r in rows:
+        by_acc[r["accession"]].append(r)
+
+    print("\n\n## fqxv vs native .sra  (the archive the data actually shipped in)")
+    hdr = (
+        f"{'accession':<12} {'platform':<14} {'regime':<11} {'.sra':>9} "
+        f"{'.fastq':>9} {'point':<6} {'fqxv':>9} {'fqxv/.sra':>10} {'fqxv/.fastq':>12}"
+    )
+    print(hdr)
+    print("-" * len(hdr))
+
+    lossless_ratios: list[float] = []
+    for acc, prows in by_acc.items():
+        # Stable point order (lossless first, then increasingly lossy).
+        order = {"max": 0, "bin8": 1, "bin4": 2, "bin2": 3}
+        prows = sorted(prows, key=lambda r: order.get(r["point"], 9))
+        for i, r in enumerate(prows):
+            sra_b = int(r.get("sra_bytes", -1) or -1)
+            fq_b = int(r.get("fastq_bytes", 0) or 0)
+            fx_b = int(r.get("fqxv_bytes", 0) or 0)
+            over_sra = r.get("fqxv_over_sra", "NA")
+            over_fq = r.get("fqxv_over_fastq", "NA")
+            if r["point"] == "max" and over_sra not in ("NA", ""):
+                lossless_ratios.append(float(over_sra))
+            first = i == 0
+            print(
+                f"{(acc if first else ''):<12} {(r['platform'] if first else ''):<14} "
+                f"{(r['regime'] if first else ''):<11} "
+                f"{(fmt_bytes(sra_b) if first and sra_b >= 0 else ''):>9} "
+                f"{(fmt_bytes(fq_b) if first else ''):>9} "
+                f"{r['point']:<6} {fmt_bytes(fx_b):>9} {over_sra:>10} {over_fq:>12}"
+            )
+        print("-" * len(hdr))
+
+    if lossless_ratios:
+        geo = math.exp(sum(math.log(x) for x in lossless_ratios) / len(lossless_ratios))
+        verdict = "smaller than" if geo < 1 else "larger than"
+        print(
+            f"lossless fqxv (--max) is {geo:.2f}x the .sra size on average "
+            f"(geomean over {len(lossless_ratios)} runs) — {1/geo:.2f}x {verdict} .sra."
+        )
 
 
 def fmt_bytes(n: int) -> str:

@@ -1,0 +1,11 @@
+# Panel for sra_compare.sh — fqxv archive vs the native .sra a user would
+# otherwise store. Reuses the run accessions in datasets.tsv and adds long-read
+# platforms so the comparison spans regimes. Columns:
+#   accession  platform       regime       size_class
+# size_class=large rows (multi-Gbp full runs) are skipped unless
+# SRA_INCLUDE_LARGE=1 — the HiFi run is ~23 Gbp / ~17.6 GB .sra.
+SRR2627175	MiSeq	full-range	small
+DRR174812	NovaSeq6000	binned	medium
+SRR453566	GAIIx	full-range	small
+DRR205413	ONT-MinION	full-range	small
+SRR11434954	HiFi-SequelII	full-range	large

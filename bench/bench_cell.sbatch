@@ -5,9 +5,12 @@
 #SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16       # Memory is the real floor: the worst cell (xz9
-#SBATCH --mem=28G                # on NovaSeq) peaks ~22.5G, and amilan caps mem
-#SBATCH --time=02:00:00          # at 3840M/core, so 28G needs >=8 cores; 16 adds
+#SBATCH --cpus-per-task=16       # Memory is the real floor: short-read xz9 on
+#SBATCH --mem=48G                # NovaSeq peaks ~22.5G, and the long-read cells
+#SBATCH --time=02:00:00          # (HiFi fqxv ~11G, CoLoRd on 1.5 Gbp more) want
+                                 # headroom — 48G covers both. On Bodhi's rna
+                                 # partition (no per-core mem cap) override the
+                                 # amilan defaults via SBATCH_PARTITION=rna.
 #SBATCH --output=fqxv-cell-%A_%a.out    # throughput headroom while still packing.
 ## #SBATCH --account=amc-general
 # Walltime is gated by post-processing, not compression: the 2.1G-base NovaSeq

@@ -165,32 +165,32 @@ is_name_lossy() { [[ "$1" == *shuffle* ]]; }
 compress() {  # tool input out_prefix
   local tool="$1" in="$2" pfx="$3"
   case "$tool" in
-    fqxv)          COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --threads "$THREADS" ;;
-    fqxv9)         COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force -l 9 --threads "$THREADS" ;;
-    fqxv-reorder)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --order any --threads "$THREADS" ;;
+    fqxv)          COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force --threads "$THREADS" ;;
+    fqxv9)         COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force -l 9 --threads "$THREADS" ;;
+    fqxv-reorder)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force --order any --threads "$THREADS" ;;
     # fqxv-max: the advertised best-ratio preset (`--max` == `-l 9 --order any`):
     # deepest sequence context AND read reordering together.
-    fqxv-max)      COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --max --threads "$THREADS" ;;
+    fqxv-max)      COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force --max --threads "$THREADS" ;;
     # fqxv-shuffle: best-ratio RENUMBER preset (`-l 9 --order shuffle`) — the
     # apples-to-apples point vs SPRING, which also renumbers/reorders. Reads come
     # back as a seq+qual multiset with fresh names (name-lossy); verified below
     # with a `--no-names` digest, as SPRING's own reordering is verified by a
     # (order-independent) multiset digest.
-    fqxv-shuffle)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force -l 9 --order shuffle --threads "$THREADS" ;;
-    fqxv-bin8)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin bin8 --threads "$THREADS" ;;
-    fqxv-bin4)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin bin4 --threads "$THREADS" ;;
-    fqxv-bin2)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin bin2 --threads "$THREADS" ;;
+    fqxv-shuffle)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force -l 9 --order shuffle --threads "$THREADS" ;;
+    fqxv-bin8)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force --quality-bin bin8 --threads "$THREADS" ;;
+    fqxv-bin4)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force --quality-bin bin4 --threads "$THREADS" ;;
+    fqxv-bin2)     COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force --quality-bin bin2 --threads "$THREADS" ;;
     # Long-read lossy quality bins (CoLoRd-matched cutpoints). Like-for-like vs
     # colord-lossy below. bin_scheme -> none, so rt verifies names+bases only
     # plus quality-distortion metrics (as for spring-*), not the exact table.
-    fqxv-binont)   COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin ont --threads "$THREADS" ;;
-    fqxv-binhifi)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --quality-bin hifi --threads "$THREADS" ;;
+    fqxv-binont)   COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force --quality-bin ont --threads "$THREADS" ;;
+    fqxv-binhifi)  COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force --quality-bin hifi --threads "$THREADS" ;;
     # reorder + binning combined — the like-for-like rivals to SPRING's lossy
     # modes (spring-illbin vs fqxv-reorder-bin8, spring-binary vs -bin2), since
     # SPRING always reorders. The plain fqxv-bin* rows keep original order.
-    fqxv-reorder-bin8) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --order any --quality-bin bin8 --threads "$THREADS" ;;
-    fqxv-reorder-bin4) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --order any --quality-bin bin4 --threads "$THREADS" ;;
-    fqxv-reorder-bin2) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" -o "$COMP" --force --order any --quality-bin bin2 --threads "$THREADS" ;;
+    fqxv-reorder-bin8) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force --order any --quality-bin bin8 --threads "$THREADS" ;;
+    fqxv-reorder-bin4) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force --order any --quality-bin bin4 --threads "$THREADS" ;;
+    fqxv-reorder-bin2) COMP="$pfx.fqxv"; measure "$FQXV_BIN" compress "$in" $PLAT_FLAG -o "$COMP" --force --order any --quality-bin bin2 --threads "$THREADS" ;;
     gzip)     COMP="$pfx.gz";  measure bash -c "pigz -p $THREADS -6 -c '$in' > '$COMP'" ;;
     zstd19)   COMP="$pfx.zst"; measure bash -c "zstd -19 --long=27 -T$THREADS -q -f -o '$COMP' '$in'" ;;
     xz9)      COMP="$pfx.xz";  measure bash -c "xz -9 -T$THREADS -c '$in' > '$COMP'" ;;
@@ -237,6 +237,17 @@ mapfile -t rows < <(grep -v '^#' "$HERE/datasets.tsv" | awk 'NF')
 for row in "${rows[@]}"; do
   acc="$(awk '{print $1}' <<<"$row")"
   label="$(awk '{print $2}' <<<"$row")"
+  # Pass the KNOWN platform (datasets.tsv col 3) so the codec uses the right
+  # long-read sketch instead of guessing from headers — SRA-reformatted HiFi has
+  # generic `SRR` names that don't detect as PacBio, which would otherwise skip
+  # the HiFi WFA path. Short-read platforms are recorded but don't change coding.
+  plat_col="$(awk '{print $3}' <<<"$row")"
+  case "$plat_col" in
+    SequelII | Sequel* | Revio | *[Hh]iFi* | PacBio*) PLAT_FLAG="--platform pacbio" ;;
+    MinION | GridION | PromethION | *[Nn]anopore* | ONT) PLAT_FLAG="--platform nanopore" ;;
+    MiSeq | NovaSeq* | GAIIx | HiSeq* | NextSeq* | NovaSeq6000 | *[Ii]llumina*) PLAT_FLAG="--platform illumina" ;;
+    *) PLAT_FLAG="" ;;
+  esac
 
   # Array cells process a single dataset.
   [[ -n "${FQXV_ONLY_DATASET:-}" && "$label" != "$FQXV_ONLY_DATASET" ]] && continue
@@ -359,29 +370,11 @@ for row in "${rows[@]}"; do
       fi
     fi
 
-    # Determinism: fqxv must be byte-identical regardless of thread count
-    # (core invariant). Compare a 1-thread build of the same archive.
+    # Thread-count determinism is a code-level invariant (proptest round-trips +
+    # unit tests in the crates), so the benchmark does not re-prove it here — a
+    # full single-thread recompress per variant would only distort the wall-clock
+    # this harness exists to measure. Column kept for TSV/report.py stability.
     deterministic="n/a"
-    if is_fqxv "$tool"; then
-      det1="$WORK/${label}.${tool}.det1.fqxv"
-      case "$tool" in
-        fqxv)         "$FQXV_BIN" compress "$in" -o "$det1" --force --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv9)        "$FQXV_BIN" compress "$in" -o "$det1" --force -l 9 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-reorder) "$FQXV_BIN" compress "$in" -o "$det1" --force --order any --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-max)     "$FQXV_BIN" compress "$in" -o "$det1" --force --max --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-shuffle) "$FQXV_BIN" compress "$in" -o "$det1" --force -l 9 --order shuffle --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-bin8)    "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-bin4)    "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-bin2)    "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-binont)  "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin ont --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-binhifi) "$FQXV_BIN" compress "$in" -o "$det1" --force --quality-bin hifi --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-reorder-bin8) "$FQXV_BIN" compress "$in" -o "$det1" --force --order any --quality-bin bin8 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-reorder-bin4) "$FQXV_BIN" compress "$in" -o "$det1" --force --order any --quality-bin bin4 --threads 1 >/dev/null 2>&1 || true ;;
-        fqxv-reorder-bin2) "$FQXV_BIN" compress "$in" -o "$det1" --force --order any --quality-bin bin2 --threads 1 >/dev/null 2>&1 || true ;;
-      esac
-      if [[ -f "$det1" ]] && cmp -s "$det1" "$COMP"; then deterministic="yes"; else deterministic="no"; fi
-      rm -f "$det1"
-    fi
 
     ratio="$(awk -v o="$orig_bytes" -v c="$comp_bytes" 'BEGIN{printf "%.3f", (c>0)?o/c:0}')"
     if is_lossy "$tool"; then
