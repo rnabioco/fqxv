@@ -808,9 +808,15 @@ fn sketch_for_platform_picks_hifi_only_for_pacbio() {
     // (including a mis- or undetected one) falls back to the dense ONT sketch,
     // which also works on HiFi and never misses ONT overlaps.
     assert_eq!(sketch_for(Platform::PacBio), fqxv_lroverlap::Sketch::hifi());
-    assert_eq!(sketch_for(Platform::Nanopore), fqxv_lroverlap::Sketch::ont());
+    assert_eq!(
+        sketch_for(Platform::Nanopore),
+        fqxv_lroverlap::Sketch::ont()
+    );
     assert_eq!(sketch_for(Platform::Unknown), fqxv_lroverlap::Sketch::ont());
-    assert_eq!(sketch_for(Platform::Illumina), fqxv_lroverlap::Sketch::ont());
+    assert_eq!(
+        sketch_for(Platform::Illumina),
+        fqxv_lroverlap::Sketch::ont()
+    );
     assert_eq!(sketch_for(Platform::MgiBgi), fqxv_lroverlap::Sketch::ont());
 }
 
@@ -845,7 +851,10 @@ fn pacbio_long_reads_use_hifi_sketch_and_roundtrip() {
     );
     let mut out = Vec::new();
     decompress(&archive[..], &mut out, 4).unwrap();
-    assert_eq!(out, input, "HiFi-sketched long-read archive must round-trip byte-exact");
+    assert_eq!(
+        out, input,
+        "HiFi-sketched long-read archive must round-trip byte-exact"
+    );
 }
 
 #[test]
