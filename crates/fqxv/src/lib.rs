@@ -148,6 +148,17 @@ pub enum Error {
     /// A block referenced a codec parameter this build doesn't support.
     #[error("malformed fqxv block: {0}")]
     Malformed(&'static str),
+    /// A FASTQ record's sequence and quality lines differ in length. Valid FASTQ
+    /// requires them equal; caught per-record at parse time so a compensating
+    /// pair of mismatches (one read long on sequence, another long on quality)
+    /// can't net out at the block level and silently misalign the quality stream.
+    #[error("invalid FASTQ: sequence length {seq} but quality length {qual} (must be equal)")]
+    RecordLengthMismatch {
+        /// The record's sequence-line length.
+        seq: usize,
+        /// The record's quality-line length.
+        qual: usize,
+    },
     /// Read-name codec failure.
     #[error(transparent)]
     Tokenizer(#[from] fqxv_tokenizer::Error),

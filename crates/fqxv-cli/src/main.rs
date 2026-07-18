@@ -495,7 +495,9 @@ fn main() -> anyhow::Result<()> {
                 seq_hash_bits: level_to_hash(level).1,
                 // An explicit --block-reads overrides the level's block size,
                 // decoupling random-access granularity from effort. A zero is
-                // meaningless; treat it as "unset" and fall back to the level.
+                // meaningless; treat it as "unset" and fall back to the level. Tiny
+                // blocks no longer bomb: the sequence codec caps its per-block model
+                // to the block's own base count (see `fqxv_seq::encode`).
                 block_reads: block_reads
                     .filter(|&n| n > 0)
                     .unwrap_or(level_to_block(level)),

@@ -92,6 +92,35 @@ fn lo_order(k: usize) -> usize {
     (k / 2).max(1)
 }
 
+/// `floor(log2(n))` for `n >= 1` (0 for `n == 0`), via the leading-zero count.
+#[inline]
+fn log2_floor(n: usize) -> u32 {
+    (usize::BITS - 1).saturating_sub(n.leading_zeros())
+}
+
+/// Cap a requested context order to what the block's data can actually populate.
+/// The dense model is a `4^k`-entry table allocated **and zeroed per block**; a
+/// block of `bases` symbols visits at most `bases` distinct contexts, so a table
+/// far larger than that is not just wasted memory but a per-block denial-of-service
+/// lever — at 1 read/block the old fixed `4^11` (~4.2M-entry) table was memset once
+/// per read, turning a trivial file into minutes of work. Returns `k` in
+/// `1..=order` with `4^k <= max(bases, 4)`. Depends only on `bases`, so the archive
+/// stays byte-identical no matter how blocks were split across threads, and normal
+/// full-size blocks (millions of bases) keep the full requested order unchanged.
+#[inline]
+fn fit_order(order: usize, bases: usize) -> usize {
+    // 4^k = 2^(2k) <= bases  <=>  k <= floor(log2(bases)) / 2.
+    ((log2_floor(bases) / 2) as usize).clamp(1, order.clamp(1, MAX_ORDER))
+}
+
+/// Cap the hashed-tier table bits so `1 << hb` can't exceed the block's data —
+/// same per-block-allocation reasoning as [`fit_order`]. A block too small to hold
+/// even a one-slot table returns 0, which disables the tier.
+#[inline]
+fn fit_bits(bits: u32, bases: usize) -> u32 {
+    bits.min(log2_floor(bases))
+}
+
 /// The fifth model symbol: `N` (or any non-ACGT byte, restored via exceptions).
 /// [`BASE_LUT`] returns `fqxv_dna::NON_ACGT` (255) for these bytes; the model
 /// remaps that sentinel to `NSYM`.
@@ -240,15 +269,25 @@ fn encode_impl(
             seq: seq.len(),
         });
     }
-    let k = order.clamp(1, MAX_ORDER);
+    // Requested dense order, then the effective order capped to the block's data so
+    // a tiny block can't allocate (and zero) a table far larger than it can fill —
+    // see [`fit_order`]. `k` is what gets stored and what the decoder rebuilds from.
+    let k_req = order.clamp(1, MAX_ORDER);
+    let k = fit_order(k_req, total);
     let klo = lo_order(k);
     let ctx_mask = (1usize << (2 * k)) - 1;
     let lo_mask = (1usize << (2 * klo)) - 1;
-    // Optional hashed high-order tier. Only meaningful strictly above the dense
-    // order-k model; `hash_bits` is clamped so the table stays bounded.
+    // Optional hashed high-order tier. Whether it is *requested* is gated on the
+    // requested order (so the "hash_order <= order disables it" contract is stable
+    // regardless of the block-size cap); its table is then fitted to the block's
+    // data, and a block too small to hold any table disables the tier outright.
     let h = hash_order.min(MAX_HASH_ORDER);
-    let hb = hash_bits.min(MAX_HASH_BITS);
-    let use_hash = h > k && hb > 0;
+    let hb = if h > k_req && hash_bits > 0 {
+        fit_bits(hash_bits.min(MAX_HASH_BITS), total)
+    } else {
+        0
+    };
+    let use_hash = hb > 0;
     let h_mask: u64 = if use_hash { (1u64 << (2 * h)) - 1 } else { 0 };
     // The rolling context must retain the WIDEST tier's history (the hashed order
     // when enabled); each tier masks it down to its own order at lookup. Masking
@@ -527,6 +566,43 @@ impl ReaderError for Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_order_caps_to_block_data_but_spares_full_blocks() {
+        // A block can't populate more than `bases` contexts, so 4^k stays <= bases.
+        assert_eq!(fit_order(11, 0), 1); // empty block -> minimum order
+        assert_eq!(fit_order(11, 1), 1); // 1 base (the --block-reads 1 bomb) -> k=1, 4-entry table
+        assert_eq!(fit_order(11, 16), 2); // 4^2 == 16
+        assert_eq!(fit_order(11, 15), 1); // 4^2 > 15 -> stay at 1
+                                          // A block with >= 4^11 bases keeps the full requested order (normal blocks).
+        assert_eq!(fit_order(11, 1 << 22), 11);
+        assert_eq!(fit_order(8, 1 << 22), 8); // never exceeds what was asked for
+    }
+
+    #[test]
+    fn fit_order_never_shrinks_a_default_container_block() {
+        // The smallest default block (level 1: 128Ki reads) at 1bp/read already has
+        // far more than 4^11 bases, so real archives are unaffected by the cap.
+        assert_eq!(fit_order(11, (128 << 10) * 50), 11);
+    }
+
+    #[test]
+    fn fit_bits_caps_hash_table_to_block_data() {
+        assert_eq!(fit_bits(20, 0), 0); // empty -> table disabled
+        assert_eq!(fit_bits(20, 1), 0);
+        assert_eq!(fit_bits(20, 1 << 15), 15);
+        assert_eq!(fit_bits(12, 1 << 20), 12); // never grows past the request
+    }
+
+    #[test]
+    fn tiny_block_encode_is_cheap_and_roundtrips() {
+        // A 1-base "block" must not allocate a large model — it caps to order 1 —
+        // and must still round-trip. This is the per-block DoS the cap closes.
+        let enc = encode(&[1], b"A", 11).expect("encode");
+        assert_eq!(enc[1], 1, "order must be capped to 1 for a 1-base block");
+        let (lens, seq) = decode(&enc).expect("decode");
+        assert_eq!((lens.as_slice(), seq.as_slice()), (&[1u32][..], &b"A"[..]));
+    }
 
     fn roundtrip(lens: &[u32], seq: &[u8], order: usize) {
         let enc = encode(lens, seq, order).expect("encode");
