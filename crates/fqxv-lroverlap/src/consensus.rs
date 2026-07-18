@@ -50,7 +50,7 @@ use rayon::prelude::*;
 
 use crate::{
     align::{align_banded, Op},
-    place_against, ChainOpts, Contig, Sketch,
+    place_against, wfa_align_opt, ChainOpts, Contig, Sketch,
 };
 
 /// How much of the draft's end to index when placing the next tiling read.
@@ -466,7 +466,20 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Con
         if from >= to {
             return;
         }
-        let al = align_banded(&draft[from..to], s, opts.band);
+        // On low-divergence (HiFi-class) reads the read sits very close to the
+        // draft, so score-proportional WFA aligns it far faster than the banded
+        // DP — this vote runs once per read over a whole contig, so it is a large
+        // share of encode. WFA finds the true optimum (the DP is band-limited), so
+        // votes are as good or better; cap it and fall back to the DP on the rare
+        // read that turns out divergent. Noisy (ONT) platforms keep the DP, where
+        // WFA's O(s²) loses on both time and memory.
+        let al = if opts.sketch.is_low_divergence() {
+            let cap = ((to - from) as u32 / 8).max(64);
+            wfa_align_opt(&draft[from..to], s, cap)
+                .unwrap_or_else(|| align_banded(&draft[from..to], s, opts.band))
+        } else {
+            align_banded(&draft[from..to], s, opts.band)
+        };
         let mut d = from; // position in the draft
         let mut q = 0usize; // position in the read
         for op in &al.ops {

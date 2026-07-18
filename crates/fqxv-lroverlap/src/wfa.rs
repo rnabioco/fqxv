@@ -195,23 +195,38 @@ pub fn wfa_cells(refr: &[u8], query: &[u8], max_score: u32) -> usize {
 /// byte-identical to the DP.
 #[must_use]
 pub fn wfa_align(refr: &[u8], query: &[u8], max_score: u32) -> Alignment {
+    wfa_align_opt(refr, query, max_score).unwrap_or_else(|| Alignment {
+        // Capped: the same bounded, round-tripping rewrite the DP falls back to.
+        ops: vec![Op::Del(refr.len() as u32), Op::Ins(query.to_vec())],
+        dist: (refr.len() + query.len()) as u32,
+    })
+}
+
+/// Like [`wfa_align`], but returns `None` when the optimal edit distance would
+/// exceed `max_score`, so a caller can fall back to another aligner instead of
+/// taking the bounded `[Del, Ins]` rewrite. The empty-segment and successful
+/// cases always return `Some`. This is what a divergence-gated encoder uses: try
+/// WFA on a read expected to be similar, and on the rare miss (the read was more
+/// divergent than its band implied) drop to the banded DP for a real alignment.
+#[must_use]
+pub fn wfa_align_opt(refr: &[u8], query: &[u8], max_score: u32) -> Option<Alignment> {
     let (n_us, m_us) = (refr.len(), query.len());
     // Empty-segment fast paths, identical to `align_banded`.
     if n_us == 0 {
-        return Alignment {
+        return Some(Alignment {
             ops: if m_us == 0 {
                 Vec::new()
             } else {
                 vec![Op::Ins(query.to_vec())]
             },
             dist: m_us as u32,
-        };
+        });
     }
     if m_us == 0 {
-        return Alignment {
+        return Some(Alignment {
             ops: vec![Op::Del(n_us as u32)],
             dist: n_us as u32,
-        };
+        });
     }
 
     let (n, m) = (n_us as i32, m_us as i32);
@@ -219,13 +234,7 @@ pub fn wfa_align(refr: &[u8], query: &[u8], max_score: u32) -> Alignment {
     let max_score = i32::try_from(max_score).unwrap_or(i32::MAX);
 
     let (wavefronts, sf) = forward(refr, query, max_score, n, m, k_target);
-    let Some(sf) = sf else {
-        // Capped: the same bounded, round-tripping rewrite the DP falls back to.
-        return Alignment {
-            ops: vec![Op::Del(n_us as u32), Op::Ins(query.to_vec())],
-            dist: (n_us + m_us) as u32,
-        };
-    };
+    let sf = sf?;
 
     // Traceback from the corner. At each score the cell is the edit that reached
     // it followed by an extend run; walking down to score 0 and reversing yields
@@ -273,10 +282,10 @@ pub fn wfa_align(refr: &[u8], query: &[u8], max_score: u32) -> Alignment {
         }
     }
     ops.shrink_to_fit();
-    Alignment {
+    Some(Alignment {
         ops,
         dist: sf as u32,
-    }
+    })
 }
 
 #[cfg(test)]
