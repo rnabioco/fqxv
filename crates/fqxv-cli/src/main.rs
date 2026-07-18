@@ -1183,7 +1183,14 @@ fn print_info_human(fi: &FileInfo) {
         "plus line",
         bool_word(info.plus_normalized, "normalized", "verbatim"),
     );
-    meta_row("format", format!("v{}", info.format_version));
+    meta_row(
+        "format",
+        format!(
+            "v{}.{}",
+            info.format_version >> 8,
+            info.format_version & 0xff
+        ),
+    );
     meta_row(
         "whole-file crc",
         fi.crc_hex.clone().unwrap_or_else(|| "—".to_string()),

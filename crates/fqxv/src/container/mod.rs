@@ -3,7 +3,14 @@
 //!
 //! ```text
 //! [4] magic "FQXV"
-//! [2] format version (LE)
+//! [1] format version major (LE) -- a reader refuses any archive whose major
+//!     differs from its own FORMAT_MAJOR; the archive is wire-incompatible.
+//! [1] format version minor (LE) -- backward-compatible additions; a reader
+//!     tolerates any minor within its major (informational).
+//! [8] required_features (LE u64) -- coarse capability bits (fqxv::feature). A set
+//!     bit outside the reader's KNOWN_FEATURES is refused (UnsupportedFeature)
+//!     rather than mis-decoded. Per-block codec choices are NOT gated here — they
+//!     ride the sequence stream's method byte (UnsupportedMethod on decode).
 //! [1] sequence context order (k)
 //! [1] quality binning tag
 //! [1] flags (bit0: '+' normalized; bit1: reordered; bit2: order preserved;
@@ -15,9 +22,18 @@
 //!     Its own byte: it previously shared flags bits5-7, where Illumina's code
 //!     collided with the global-reference bit and made Illumina reorder archives
 //!     undecodable.
-//! [4] header_crc (LE) -- CRC-32C over the 11 header-field bytes above, verified
-//!     on read so a flipped version/flags/binning-tag/group-size/platform byte is
-//!     caught rather than silently changing decode. Present in both layouts.
+//! [2] ext_len (LE u16) -- bytes of the extension region that follows.
+//! [ext_len] extension records -- each [1 tag][2 len LE][len bytes]. Tag high bit
+//!     marks a *critical* record: a reader that doesn't know a critical tag refuses
+//!     the archive (UnsupportedExtension); an unknown non-critical tag is skipped.
+//!     Empty at 1.0 -- the region lets a later minor add skippable header fields
+//!     without a major bump. Covered by the header CRC.
+//! [4] header_crc (LE) -- CRC-32C over every header byte above (prefix + extension
+//!     region), verified on read so a flipped version/features/flags/binning-tag/
+//!     group-size/platform byte is caught rather than silently changing decode.
+//!     Present in both layouts. Blocks begin right after this; seek/scan start
+//!     offsets use the actual header length (prefix + ext_len + 4), which equals
+//!     the ext-empty HEADER_LEN for a 1.0-written archive.
 //! repeated until the terminator:
 //!   [4] BLOCK_MAGIC "FQXB" -- per-block sync marker; recovery scans for it to
 //!       resynchronize to a block boundary when the footer is lost or a length
@@ -96,7 +112,7 @@
 //! FASTQ (pipe to an aligner); [`decompress_split`] restores the `G` files.
 
 pub(crate) use crate::crc::{crc32c, crc32c_combine, CrcWriter};
-pub(crate) use crate::{Error, Result, FORMAT_VERSION, MAGIC};
+pub(crate) use crate::{Error, Result, FORMAT_MAJOR, FORMAT_MINOR, KNOWN_FEATURES, MAGIC};
 pub(crate) use fqxv_fqzcomp::QualityBinning;
 pub(crate) use std::borrow::Cow;
 pub(crate) use std::fs::File;

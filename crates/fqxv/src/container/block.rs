@@ -257,7 +257,10 @@ pub(crate) fn decode_sequence_stream(coded: &[u8]) -> Result<(Vec<u32>, Vec<u8>)
     match method {
         SEQ_METHOD_ORDERK => Ok(fqxv_seq::decode(rest)?),
         SEQ_METHOD_OVERLAP => Ok(fqxv_lroverlap::decode(rest)?),
-        _ => Err(Error::Malformed("unknown sequence codec method")),
+        method => Err(Error::UnsupportedMethod {
+            stream: "sequence",
+            method,
+        }),
     }
 }
 

@@ -277,7 +277,10 @@ fn content_stats_and_metadata() {
 
     // Metadata is read from the header + footer without decoding.
     let info = inspect(io::Cursor::new(&archive)).unwrap();
-    assert_eq!(info.format_version, FORMAT_VERSION);
+    assert_eq!(
+        info.format_version,
+        (u16::from(FORMAT_MAJOR) << 8) | u16::from(FORMAT_MINOR)
+    );
     assert!(info.whole_file_crc.is_some(), "plain layout stores the CRC");
     assert_eq!(info.reads, 2);
 
@@ -531,7 +534,7 @@ fn reorder_with_lossy_binning_roundtrips() {
         };
         let mut archive = Vec::new();
         compress(&input[..], &mut archive, params).unwrap();
-        assert_eq!(archive[8] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+        assert_eq!(archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
         let mut out = Vec::new();
         decompress(&archive[..], &mut out, 1)
             .unwrap_or_else(|e| panic!("reorder + {bin:?} decode failed: {e:?}"));
@@ -629,7 +632,7 @@ fn long_reads_skip_reorder() {
     let mut archive = Vec::new();
     compress(&input[..], &mut archive, params).unwrap();
     assert_eq!(
-        archive[8] & FLAG_GLOBAL_REORDER,
+        archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
         0,
         "reorder must be skipped (flag clear) for long-read data"
     );
@@ -1251,7 +1254,7 @@ fn verify_roundtrip_accepts_reorder_archive() {
     )
     .unwrap();
     assert_eq!(
-        archive[8] & FLAG_GLOBAL_REORDER,
+        archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
         FLAG_GLOBAL_REORDER,
         "test archive must use the reorder layout"
     );
@@ -1300,7 +1303,7 @@ fn verify_roundtrip_rejects_corrupt_reorder_read_count() {
         },
     )
     .unwrap();
-    assert_eq!(archive[8] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+    assert_eq!(archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
     // The read count is a little-endian u64 at `HEADER_LEN`; set its top byte to
     // blow the value past any real dataset.
     archive[HEADER_LEN + 7] ^= 0xFF;
@@ -1356,7 +1359,7 @@ fn verify_quick_falls_back_for_reorder_layout() {
     compress(&input[..], &mut archive, params).unwrap();
     // Header flags byte sits at offset 8 ([4]magic [2]ver [1]order [1]binning).
     assert_eq!(
-        archive[8] & FLAG_GLOBAL_REORDER,
+        archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
         FLAG_GLOBAL_REORDER,
         "test archive must use the reorder layout to exercise the fallback"
     );
@@ -1525,7 +1528,7 @@ fn decompress_rejects_header_bit_flip() {
     // The header CRC catches a flipped field byte (here the lossy binning tag)
     // that would otherwise silently change how the archive is interpreted.
     let mut archive = multiblock_archive(20, 64);
-    archive[7] ^= 0x02; // quality-binning tag, inside the CRC'd header fields
+    archive[HDR_OFF_BINNING] ^= 0x02; // quality-binning tag, inside the CRC'd header fields
     let mut out = Vec::new();
     let err = decompress(&archive[..], &mut out, 1).unwrap_err();
     assert!(
@@ -1549,8 +1552,8 @@ fn reorder_header_is_crc_protected() {
         },
     )
     .unwrap();
-    assert_eq!(archive[8] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
-    archive[7] ^= 0x02; // binning tag in the reorder layout's header
+    assert_eq!(archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+    archive[HDR_OFF_BINNING] ^= 0x02; // binning tag in the reorder layout's header
     let mut out = Vec::new();
     let err = decompress(&archive[..], &mut out, 1).unwrap_err();
     assert!(
@@ -1575,7 +1578,7 @@ fn decompress_detects_reorder_output_digest_mismatch() {
         },
     )
     .unwrap();
-    assert_eq!(archive[8] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
+    assert_eq!(archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER, FLAG_GLOBAL_REORDER);
     // Trailing frame is [4 len=8][4 crc][8 digest] at the very end (no footer).
     let len = archive.len();
     let dig_start = len - DIGEST_LEN;

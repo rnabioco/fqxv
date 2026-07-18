@@ -277,10 +277,18 @@ pub struct Info {
     /// Sequencing platform recorded at compress time (from read-name grammar or
     /// an explicit override); [`Platform::Unknown`] if none was recorded.
     pub platform: Platform,
-    /// On-disk container format version. Always equals [`crate::FORMAT_VERSION`]
-    /// for a readable archive (`read_header` rejects any other), but surfaced so
-    /// tooling can report it without re-parsing the header.
+    /// On-disk container format version, packed as `(major << 8) | minor`. The
+    /// major always equals [`crate::FORMAT_MAJOR`] for a readable archive
+    /// (`read_header` rejects any other); the minor may be newer than this build's
+    /// [`crate::FORMAT_MINOR`]. Surfaced so tooling can report it without
+    /// re-parsing the header — decode as `version >> 8` / `version & 0xff`.
     pub format_version: u16,
+    /// Coarse capability bits the archive's header declares as required
+    /// ([`crate::feature`]). Always a subset of [`crate::KNOWN_FEATURES`] for a
+    /// readable archive (unknown required bits are refused at read time). `0` for a
+    /// plain archive that needs nothing beyond the base format; surfaced so tooling
+    /// can report which optional capabilities an archive depends on.
+    pub required_features: u64,
     /// The archive's stored whole-file CRC-32C (footer field), a stable
     /// fingerprint of the on-disk bytes through the `total_reads` field. `None`
     /// for the footer-less whole-file-reorder layout and for truncated archives
@@ -393,7 +401,8 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
         regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
         platform: Platform::from_code(header.platform),
-        format_version: FORMAT_VERSION,
+        format_version: (u16::from(header.major) << 8) | u16::from(header.minor),
+        required_features: header.required_features,
         ..Info::default()
     })
 }
@@ -432,7 +441,8 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         keep_order: header.flags & FLAG_REORDERED == 0 || header.flags & FLAG_KEEP_ORDER != 0,
         regenerated_names: header.flags & FLAG_REGEN_NAMES != 0,
         platform: Platform::from_code(header.platform),
-        format_version: FORMAT_VERSION,
+        format_version: (u16::from(header.major) << 8) | u16::from(header.minor),
+        required_features: header.required_features,
         ..Info::default()
     };
     // Whole-file global-cluster layout: [u64 n][flip][perm][name template]
@@ -482,7 +492,7 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
                 info.qual_bytes += u64::from(streams[2].len);
             }
         }
-        Err(_) => scan_blocks_sequentially(&mut r, &mut info)?,
+        Err(_) => scan_blocks_sequentially(&mut r, header.header_len, &mut info)?,
     }
     Ok(info)
 }
@@ -521,8 +531,15 @@ pub(crate) fn scan_block_header<R: Read + Seek>(
 /// header until the terminator, a clean EOF, or the first structurally
 /// implausible frame (a truncated download's boundary). Best-effort — the block
 /// CRCs are not checked here, only the framing is followed.
-pub(crate) fn scan_blocks_sequentially<R: Read + Seek>(r: &mut R, info: &mut Info) -> Result<()> {
-    let mut off = HEADER_LEN as u64;
+pub(crate) fn scan_blocks_sequentially<R: Read + Seek>(
+    r: &mut R,
+    header_len: u64,
+    info: &mut Info,
+) -> Result<()> {
+    // Start at the archive's actual header length, not the ext-empty HEADER_LEN
+    // constant, so a header carrying extension records is scanned from the true
+    // block-region start.
+    let mut off = header_len;
     loop {
         r.seek(SeekFrom::Start(off))?;
         // Frame head: [4] marker, [8] length, [4] CRC.

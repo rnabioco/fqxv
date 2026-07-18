@@ -499,6 +499,15 @@ pub(crate) fn encode_reordered<W: Write>(
     if use_reference {
         flags |= FLAG_GLOBAL_REFERENCE;
     }
+    // A global reference frame is a whole-file capability a reader must have to
+    // reconstruct the referenced blocks, and it's known here before any block is
+    // written — so advertise it in the coarse feature word too (the flag bit stays
+    // for in-layout dispatch; the feature word is what an older reader checks).
+    let required_features = if use_reference {
+        crate::feature::GLOBAL_REFERENCE
+    } else {
+        0
+    };
     write_header_prefix(
         &mut w,
         params.seq_order,
@@ -506,6 +515,7 @@ pub(crate) fn encode_reordered<W: Write>(
         flags,
         g,
         platform,
+        required_features,
     )?;
     w.write_all(&(n as u64).to_le_bytes())?;
     write_framed(&mut w, &flip_bits)?;
