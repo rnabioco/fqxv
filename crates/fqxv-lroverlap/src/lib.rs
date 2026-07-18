@@ -75,7 +75,7 @@ pub use index::{Index, Occ, Repeat};
 pub use layout::{layout, Contig, LayoutOpts, Placement};
 pub use minimizer::{minimizers, Minimizer};
 pub use overlap::{find_overlaps, Overlap};
-pub use refine::{place_against, Anchored};
+pub use refine::{place_against, place_all, Anchored};
 pub use script::{chain_span, script_from_chain, ScriptOpts};
 
 /// Errors returned by this crate.

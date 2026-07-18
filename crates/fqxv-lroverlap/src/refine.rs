@@ -133,6 +133,78 @@ pub fn place_against(
         .collect()
 }
 
+/// Place every read against its best-scoring reference among **all** `consensi`
+/// at once, returning `(consensus index, placement)` per read.
+///
+/// This is [`place_against`] generalised from one reference to many, and it
+/// exists for cost, not just convenience. Calling `place_against` once per
+/// consensus rescans every read for every reference — `consensi × reads` overlap
+/// searches. On high-redundancy input (an amplicon block whose layout yields
+/// hundreds of near-identical consensi over ~150k reads) that product is tens of
+/// millions of searches and dominates encode time (#139). Indexing all consensi
+/// together and querying each read once makes it `reads` searches — the target of
+/// the winning overlap is the consensus index directly, since each consensus is
+/// one indexed sequence. It is also strictly better placement: a read is scored
+/// against all references simultaneously and takes the global best, rather than
+/// the best of independent per-reference passes.
+///
+/// Ties: [`find_overlaps`] already returns a total order (score desc, then
+/// target, then `q_start`), so `first()` is deterministic and the pick does not
+/// depend on consensus or read iteration order.
+#[must_use]
+pub fn place_all(
+    consensi: &[Vec<u8>],
+    reads: &[&[u8]],
+    sketch: Sketch,
+    opts: ChainOpts,
+) -> Vec<Option<(usize, Anchored)>> {
+    // Concatenate the consensi into one index; each is a single indexed
+    // sequence, so an overlap's `target` IS the consensus index. Repeat filtering
+    // is off for the same reason as `place_against`: a reference carries one copy
+    // of its locus, and dropping any minimizer would blind reads to that stretch.
+    let lens: Vec<u32> = consensi.iter().map(|c| c.len() as u32).collect();
+    let total: usize = consensi.iter().map(std::vec::Vec::len).sum();
+    let mut seq = Vec::with_capacity(total);
+    for c in consensi {
+        seq.extend_from_slice(c);
+    }
+    let Ok(idx) = Index::build(&lens, &seq, sketch, Repeat { drop_top_frac: 0.0 }) else {
+        return vec![None; reads.len()];
+    };
+
+    reads
+        .par_iter()
+        .enumerate()
+        .map(|(i, read)| {
+            // A query id past every consensus, so nothing is excluded as self.
+            let ov = find_overlaps(&idx, u32::MAX, read, opts);
+            let best = ov.first()?;
+            let ci = best.target as usize;
+            let reflen = i64::from(idx.read_len(best.target));
+            // Same one-hop offset/drift math as `place_against`, but `reflen` is
+            // the matched consensus's length rather than a single reference's.
+            let off = i64::from(best.t_start) - i64::from(best.q_start);
+            let offset = if best.strand {
+                (reflen - off - read.len() as i64).max(0) as u32
+            } else {
+                off.max(0) as u32
+            };
+            let d_end = i64::from(best.t_end) - i64::from(best.q_end);
+            let drift = (d_end - off).unsigned_abs() as u32;
+            Some((
+                ci,
+                Anchored {
+                    read: i as u32,
+                    offset,
+                    flip: best.strand,
+                    score: best.score,
+                    drift,
+                },
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +373,88 @@ mod tests {
         let a = place_against(&refseq, &refs, Sketch::ont(), ChainOpts::default());
         let b = place_against(&refseq, &refs, Sketch::ont(), ChainOpts::default());
         assert_eq!(a, b, "re-placement must be a pure function");
+    }
+
+    #[test]
+    fn place_all_routes_each_read_to_its_own_consensus() {
+        // The property `place_all` exists for: with several distinct references in
+        // one index, every read must be routed to the consensus it came from, at
+        // the right offset — not merely placed *somewhere*.
+        let a = rand_seq(20_000, 41);
+        let b = rand_seq(20_000, 42);
+        let c = rand_seq(20_000, 43);
+        let consensi = vec![a.clone(), b.clone(), c.clone()];
+        // Two reads per locus, at known offsets.
+        let reads: Vec<Vec<u8>> = vec![
+            mutate(&a[1_000..6_000], 0.03, 1),
+            mutate(&b[8_000..13_000], 0.03, 2),
+            mutate(&c[3_000..8_000], 0.03, 3),
+        ];
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+        let got = place_all(&consensi, &refs, Sketch::ont(), ChainOpts::default());
+        let want_ci = [0usize, 1, 2];
+        let want_off = [1_000u32, 8_000, 3_000];
+        for i in 0..3 {
+            let (ci, anch) = got[i].expect("read must place");
+            assert_eq!(ci, want_ci[i], "read {i} routed to the wrong consensus");
+            assert!(
+                anch.offset.abs_diff(want_off[i]) <= 32,
+                "read {i}: offset {} vs expected {}",
+                anch.offset,
+                want_off[i]
+            );
+        }
+    }
+
+    #[test]
+    fn place_all_matches_the_best_of_per_reference_passes() {
+        // `place_all` must agree with the reference behaviour it replaces: the
+        // per-read winner across a combined index equals the best-scoring pick
+        // from independent `place_against` passes.
+        let consensi: Vec<Vec<u8>> = (0..4).map(|i| rand_seq(15_000, 50 + i)).collect();
+        let reads: Vec<Vec<u8>> = (0..8)
+            .map(|i| {
+                let src = &consensi[i % 4];
+                let off = (i * 900) % 9_000;
+                mutate(&src[off..off + 4_000], 0.03, 200 + i as u32)
+            })
+            .collect();
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+
+        let all = place_all(&consensi, &refs, Sketch::ont(), ChainOpts::default());
+        // Reference: place against each consensus alone, keep the highest score.
+        let mut best: Vec<Option<(usize, Anchored)>> = vec![None; refs.len()];
+        for (ci, cs) in consensi.iter().enumerate() {
+            let pass = place_against(cs, &refs, Sketch::ont(), ChainOpts::default());
+            for (r, a) in pass.iter().enumerate() {
+                let Some(a) = a else { continue };
+                let take = match best[r] {
+                    None => true,
+                    Some((_, b)) => a.score > b.score,
+                };
+                if take {
+                    best[r] = Some((ci, *a));
+                }
+            }
+        }
+        for (r, (got, want)) in all.iter().zip(&best).enumerate() {
+            assert_eq!(
+                got.map(|(ci, _)| ci),
+                want.map(|(ci, _)| ci),
+                "read {r} routed to a different consensus than the best per-reference pass"
+            );
+        }
+    }
+
+    #[test]
+    fn place_all_is_deterministic() {
+        let consensi: Vec<Vec<u8>> = (0..3).map(|i| rand_seq(18_000, 70 + i)).collect();
+        let reads: Vec<Vec<u8>> = (0..6)
+            .map(|i| mutate(&consensi[i % 3][1_000..6_000], 0.04, 400 + i as u32))
+            .collect();
+        let refs: Vec<&[u8]> = reads.iter().map(|r| r.as_slice()).collect();
+        let a = place_all(&consensi, &refs, Sketch::ont(), ChainOpts::default());
+        let b = place_all(&consensi, &refs, Sketch::ont(), ChainOpts::default());
+        assert_eq!(a, b, "combined placement must be a pure function");
     }
 }
