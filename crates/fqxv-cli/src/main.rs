@@ -159,8 +159,14 @@ enum Command {
 
         /// Interleaving of a single input, in members per spot. Auto-detected
         /// from read names by default; pass to force (1 = single-end, 2 = paired
-        /// as from `sracha get -Z`). Ignored with multiple inputs.
-        #[arg(long, value_name = "N", help_heading = "Advanced")]
+        /// as from `sracha get -Z`). Ignored with multiple inputs. A group size of
+        /// 0 is meaningless and rejected.
+        #[arg(
+            long,
+            value_name = "N",
+            help_heading = "Advanced",
+            value_parser = clap::value_parser!(u8).range(1..)
+        )]
         interleaved: Option<u8>,
         /// Read-order guarantee. `preserve` (default) restores the original order
         /// on decompress. `any` allows read reordering to exploit depth redundancy

@@ -239,3 +239,43 @@ fn compress_verify_conflicts_with_estimate() {
         "--verify with --estimate must be rejected"
     );
 }
+
+#[test]
+fn interleaved_zero_is_rejected() {
+    // `--interleaved` is the number of reads per spot (1 = single-end, 2 = paired);
+    // 0 is meaningless and must be rejected at parse time, not silently treated as
+    // single-end.
+    let dir = tmp("interleaved_zero");
+    fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("reads.fastq");
+    fs::write(&src, fastq(5)).unwrap();
+
+    let out = Command::new(FQXV)
+        .args([
+            "compress",
+            src.to_str().unwrap(),
+            "-o",
+            dir.join("out.fqxv").to_str().unwrap(),
+            "--interleaved",
+            "0",
+        ])
+        .output()
+        .expect("spawn fqxv");
+    assert!(!out.status.success(), "--interleaved 0 must be rejected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--interleaved") && stderr.contains("0 is not in"),
+        "expected a clear range error, got: {stderr}"
+    );
+
+    // A valid group size is still accepted.
+    run(&[
+        "compress",
+        src.to_str().unwrap(),
+        "-o",
+        dir.join("ok.fqxv").to_str().unwrap(),
+        "--interleaved",
+        "1",
+        "--force",
+    ]);
+}
