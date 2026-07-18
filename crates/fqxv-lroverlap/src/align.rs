@@ -155,97 +155,16 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
         Some(i * stride + (j - lo))
     };
 
-    // Traceback pointers stay full — the traceback reads `from[i][j]` at every
-    // step of the walk back from the corner. The score matrix does NOT: the
-    // recurrence only ever reads row `i-1`, so keeping every row was ~4/5 of this
-    // call's memory (a `u32` per cell) written and never re-read. Roll it to two
-    // one-row windows, `prev` (row `i-1`) and `cur` (row `i`), each indexed by
-    // `j - lo_of(row)` exactly as a full row's slice was. This makes the hot
-    // loop's working set the `u8` `from` matrix plus two O(band) rows instead of
-    // an O(n·band) `u32` table.
-    // 2 bits/cell (0=diag 1=up(del) 2=left(ins)), four cells per byte.
+    // 2 bits/cell (0=diag 1=up(del) 2=left(ins)), four cells per byte. Packing
+    // four cells per byte quarters the only full-size allocation this call keeps
+    // once the score rows are rolled away by [`fill`].
     let mut from = vec![0u8; ((n + 1) * stride).div_ceil(4)];
-    let mut prev = vec![INF; stride];
-    let mut cur = vec![INF; stride];
 
-    // Row 0 (empty reference): dp[0][j] = j, all insertions. `lo_of(0) == 0`, so
-    // the window offset of column `j` is `j`.
-    if let Some(k) = at(0, 0) {
-        prev[k] = 0;
-    }
-    for j in 1..=m.min(band) {
-        if let Some(k) = at(0, j) {
-            prev[k] = j as u32;
-            tb_set(&mut from, k, 2);
-        }
-    }
-    // HOT LOOP. This is O(n * band) and, at 40x on ecoli_hifi, 63% of the entire
-    // encode — so it is written against the band's structure rather than through
-    // the `at`/`get` helpers, which recompute a row's bounds and build an
-    // `Option` for every one of the three neighbours of every cell. Everything
-    // those helpers derive is a per-ROW constant, hoisted here. The arithmetic is
-    // otherwise untouched: same predecessors, same tie-break, same values.
-    for i in 1..=n {
-        let lo = lo_of(i);
-        let hi = (i + band).min(m);
-        // The previous row's window and flat base, so a neighbour is an index,
-        // not a lookup.
-        let lo_p = lo_of(i - 1);
-        let hi_p = (i - 1 + band).min(m);
-        let base = i * stride;
-        let rb = refr[i - 1];
-
-        for j in lo..=hi {
-            // `j` is inside row `i`'s window by construction, so the old
-            // `at(i, j)` could never fail here. `off` is its offset in `cur`.
-            let off = j - lo;
-            if j == 0 {
-                cur[off] = i as u32;
-                tb_set(&mut from, base + off, 1);
-                continue;
-            }
-            // A neighbour outside the previous row's window has no cell and
-            // reads as INF, exactly as the full-matrix guard returned.
-            let diag = if j > lo_p && j - 1 <= hi_p {
-                prev[j - 1 - lo_p]
-            } else {
-                INF
-            };
-            let up = if j >= lo_p && j <= hi_p {
-                prev[j - lo_p]
-            } else {
-                INF
-            };
-            // (i, j-1) is this row, one cell back — in-window iff j > lo, and it
-            // was just written this row, so `cur[off - 1]` is live.
-            let left = if j > lo { cur[off - 1] } else { INF };
-
-            let cost = u32::from(rb != query[j - 1]);
-            let diag = diag.saturating_add(cost);
-            let up = up.saturating_add(1); // consume refr = del
-            let left = left.saturating_add(1); // consume query = ins
-
-            // Prefer diagonal, then deletion, then insertion — a fixed total
-            // order, so the traceback is deterministic for equal-cost paths.
-            let (best, f) = if diag <= up && diag <= left {
-                (diag, 0u8)
-            } else if up <= left {
-                (up, 1u8)
-            } else {
-                (left, 2u8)
-            };
-            cur[off] = best;
-            tb_set(&mut from, base + off, f);
-        }
-        // `cur` becomes row `i`; reuse the old `prev` buffer as next row's
-        // scratch. Stale cells in it are never read — every neighbour access is
-        // window-guarded or a same-row cell written earlier in the sweep.
-        std::mem::swap(&mut prev, &mut cur);
-    }
-
-    // Traceback from (n, m). After the final swap, `prev` holds row `n`; the
-    // corner cell is at offset `m - lo_of(n)` (in-window because `band >= |n-m|`).
-    let dist = at(n, m).map_or(INF, |_| prev[m - lo_of(n)]);
+    // Fill the traceback matrix and return the corner distance `dp[n][m]`. The
+    // recurrence, tie-break, and `from` layout are identical across every
+    // backend; only the fill *order* and its parallelism differ (row-major vs.
+    // the anti-diagonal wavefront vs. its AVX2 vectorization). See [`fill`].
+    let dist = fill(refr, query, band, stride, &mut from);
     let (mut i, mut j) = (n, m);
     let mut rev: Vec<Op> = Vec::new();
     while i > 0 || j > 0 {
@@ -302,6 +221,126 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
     Alignment { ops, dist }
 }
 
+/// Fill the traceback matrix `from` (row-major band layout, written via
+/// [`tb_set`]) and return the corner distance `dp[n][m]`.
+///
+/// Every backend here is byte-identical: it writes the same `from` pointers and
+/// returns the same distance for all inputs, differing only in fill order and
+/// SIMD width. The runtime picks the widest available; the anti-diagonal scalar
+/// [`fill_wavefront`] is the correctness reference and the universal fallback.
+fn fill(refr: &[u8], query: &[u8], band: usize, stride: usize, from: &mut [u8]) -> u32 {
+    fill_wavefront(refr, query, band, stride, from)
+}
+
+/// Anti-diagonal (wavefront) reformulation of the banded DP.
+///
+/// The row-major fill computes cell `(i, j)` from `(i-1, j-1)`, `(i-1, j)`, and
+/// `(i, j-1)`. On an anti-diagonal `d = i + j` those three neighbours all lie on
+/// `d-1` and `d-2`, so every cell of one anti-diagonal is independent of the
+/// others and they can be produced in any order — the property the AVX2 backend
+/// exploits. Three rolling score buffers indexed by row `i` hold anti-diagonals
+/// `d` (`ad0`), `d-1` (`ad1`), and `d-2` (`ad2`); with `j = d - i` the neighbour
+/// map is `diag = ad2[i-1]`, `up = ad1[i-1]`, `left = ad1[i]`.
+///
+/// The recurrence, the neighbour window guards, and the `diag <= up <= left`
+/// tie-break are copied verbatim from the row-major fill, so the `from` pointers
+/// — and thus the traceback and `ops` — are byte-identical. Only in-window
+/// neighbours are read, and an in-window neighbour is always a cell that was
+/// written this rotation, so no buffer clearing is needed: stale lanes are never
+/// consulted.
+fn fill_wavefront(refr: &[u8], query: &[u8], band: usize, stride: usize, from: &mut [u8]) -> u32 {
+    let (n, m) = (refr.len(), query.len());
+    // Score of anti-diagonals d / d-1 / d-2, indexed by row i in `0..=n`.
+    let mut ad0 = vec![INF; n + 1];
+    let mut ad1 = vec![INF; n + 1];
+    let mut ad2 = vec![INF; n + 1];
+    let mut dist = INF;
+
+    for d in 0..=(n + m) {
+        // Exactly the rows whose cell `(i, d - i)` is inside the band — the same
+        // set the row-major fill writes, as one contiguous interval so the inner
+        // loop touches only ~band cells, never the whole column. It is the
+        // intersection of `0 <= j <= m` with row `i`'s window `lo_of(i) <= j <=
+        // hi_of(i)` after substituting `j = d - i`:
+        //   i >= d - m,   i >= ceil((d - band) / 2)   [lower]
+        //   i <= d,       i <= floor((d + band) / 2)  [upper]
+        let ilo = d.saturating_sub(m).max(d.saturating_sub(band).div_ceil(2));
+        let ihi = n.min(d).min((d + band) / 2);
+        if ilo > ihi {
+            std::mem::swap(&mut ad0, &mut ad1);
+            std::mem::swap(&mut ad0, &mut ad2);
+            continue;
+        }
+        for i in ilo..=ihi {
+            let j = d - i;
+            let lo_i = i.saturating_sub(band);
+            let hi_i = (i + band).min(m);
+            // The interval above is exact; this guard is a cheap belt on the
+            // arithmetic and never fires for an in-band cell.
+            if j < lo_i || j > hi_i {
+                continue;
+            }
+
+            let (val, f) = if i == 0 {
+                // Row 0 (empty reference): dp[0][j] = j, all insertions. The
+                // corner (0,0) is 0 with an unused pointer.
+                if j == 0 {
+                    (0u32, 0u8)
+                } else {
+                    (j as u32, 2u8)
+                }
+            } else if j == 0 {
+                // Column 0 (empty query): dp[i][0] = i, all deletions.
+                (i as u32, 1u8)
+            } else {
+                // A neighbour outside the previous row's window has no cell and
+                // reads as INF, exactly as the row-major guards returned.
+                let lo_p = (i - 1).saturating_sub(band);
+                let hi_p = (i - 1 + band).min(m);
+                let diag = if j > lo_p && j - 1 <= hi_p {
+                    ad2[i - 1]
+                } else {
+                    INF
+                };
+                let up = if j >= lo_p && j <= hi_p {
+                    ad1[i - 1]
+                } else {
+                    INF
+                };
+                let left = if j > lo_i { ad1[i] } else { INF };
+
+                let cost = u32::from(refr[i - 1] != query[j - 1]);
+                let diag = diag.saturating_add(cost);
+                let up = up.saturating_add(1); // consume refr = del
+                let left = left.saturating_add(1); // consume query = ins
+
+                // Prefer diagonal, then deletion, then insertion — the same
+                // fixed total order the row-major fill uses.
+                if diag <= up && diag <= left {
+                    (diag, 0u8)
+                } else if up <= left {
+                    (up, 1u8)
+                } else {
+                    (left, 2u8)
+                }
+            };
+
+            ad0[i] = val;
+            tb_set(from, i * stride + (j - lo_i), f);
+            if i == n && j == m {
+                dist = val;
+            }
+        }
+
+        // Rotate: next iteration needs ad1 = D(d), ad2 = D(d-1); the old ad2
+        // buffer (D(d-2), now dead) becomes the scratch ad0.
+        std::mem::swap(&mut ad0, &mut ad1);
+        std::mem::swap(&mut ad0, &mut ad2);
+    }
+
+    dist
+}
+
 /// Apply an edit script to a reference segment, producing the query segment.
 ///
 /// The inverse of [`align_banded`], and the reason the codec can trust it: an
@@ -332,6 +371,93 @@ pub fn apply(refr: &[u8], ops: &[Op]) -> Vec<u8> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// The original row-major banded fill, kept verbatim as the correctness
+    /// oracle for the wavefront and AVX2 backends. Writes the same `from` layout
+    /// and returns the same corner distance `dp[n][m]`.
+    fn fill_rowmajor(
+        refr: &[u8],
+        query: &[u8],
+        band: usize,
+        stride: usize,
+        from: &mut [u8],
+    ) -> u32 {
+        let (n, m) = (refr.len(), query.len());
+        let lo_of = |i: usize| i.saturating_sub(band);
+        let at = |i: usize, j: usize| -> Option<usize> {
+            let lo = lo_of(i);
+            let hi = (i + band).min(m);
+            if j < lo || j > hi {
+                return None;
+            }
+            Some(i * stride + (j - lo))
+        };
+        let mut prev = vec![INF; stride];
+        let mut cur = vec![INF; stride];
+        if let Some(k) = at(0, 0) {
+            prev[k] = 0;
+        }
+        for j in 1..=m.min(band) {
+            if let Some(k) = at(0, j) {
+                prev[k] = j as u32;
+                tb_set(from, k, 2);
+            }
+        }
+        for i in 1..=n {
+            let lo = lo_of(i);
+            let hi = (i + band).min(m);
+            let lo_p = lo_of(i - 1);
+            let hi_p = (i - 1 + band).min(m);
+            let base = i * stride;
+            let rb = refr[i - 1];
+            for j in lo..=hi {
+                let off = j - lo;
+                if j == 0 {
+                    cur[off] = i as u32;
+                    tb_set(from, base + off, 1);
+                    continue;
+                }
+                let diag = if j > lo_p && j - 1 <= hi_p {
+                    prev[j - 1 - lo_p]
+                } else {
+                    INF
+                };
+                let up = if j >= lo_p && j <= hi_p {
+                    prev[j - lo_p]
+                } else {
+                    INF
+                };
+                let left = if j > lo { cur[off - 1] } else { INF };
+                let cost = u32::from(rb != query[j - 1]);
+                let diag = diag.saturating_add(cost);
+                let up = up.saturating_add(1);
+                let left = left.saturating_add(1);
+                let (best, f) = if diag <= up && diag <= left {
+                    (diag, 0u8)
+                } else if up <= left {
+                    (up, 1u8)
+                } else {
+                    (left, 2u8)
+                };
+                cur[off] = best;
+                tb_set(from, base + off, f);
+            }
+            std::mem::swap(&mut prev, &mut cur);
+        }
+        at(n, m).map_or(INF, |_| prev[m - lo_of(n)])
+    }
+
+    /// The `(band, stride, from-size)` the prep in [`align_banded`] derives for a
+    /// pair whose lengths are small enough that the `MAX_DP_CELLS` ceiling never
+    /// binds (true for every input in these proptests).
+    fn prep(n: usize, m: usize, raw_band: usize) -> (usize, usize, usize) {
+        let need = n.abs_diff(m);
+        let band = raw_band.max(need) + 1;
+        assert!(band <= max_band_for(n), "ceiling must not bind in tests");
+        let stride = (2 * band + 1).min(m + 1);
+        let size = ((n + 1) * stride).div_ceil(4);
+        (band, stride, size)
+    }
 
     #[test]
     fn identical_segments_are_one_match_run() {
@@ -470,6 +596,30 @@ mod tests {
     }
 
     proptest! {
+        /// The anti-diagonal wavefront fill must be BYTE-IDENTICAL to the
+        /// row-major fill: the same `from` traceback matrix and the same corner
+        /// distance for all inputs. This is the gate that makes the reorder of
+        /// the DP safe — identical `from` means identical traceback means
+        /// identical `ops`.
+        #[test]
+        fn wavefront_fill_matches_rowmajor(
+            refr in proptest::collection::vec(proptest::sample::select(&b"ACGT"[..]), 0..80),
+            query in proptest::collection::vec(proptest::sample::select(&b"ACGT"[..]), 0..80),
+            raw_band in 0usize..20,
+        ) {
+            let (n, m) = (refr.len(), query.len());
+            // `fill` is the production path only when both segments are
+            // non-empty; the empty cases are handled by early-outs upstream.
+            prop_assume!(n > 0 && m > 0);
+            let (band, stride, size) = prep(n, m, raw_band);
+            let mut fw = vec![0u8; size];
+            let mut fr = vec![0u8; size];
+            let dw = fill_wavefront(&refr, &query, band, stride, &mut fw);
+            let dr = fill_rowmajor(&refr, &query, band, stride, &mut fr);
+            prop_assert_eq!(dw, dr, "corner distance diverged");
+            prop_assert_eq!(fw, fr, "traceback matrix diverged");
+        }
+
         /// The property the codec depends on: replaying an alignment must
         /// reconstruct the query exactly. An alignment that does not round-trip
         /// is worse than useless — it silently corrupts the read.
