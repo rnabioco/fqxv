@@ -421,15 +421,6 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     let lens = read_lens(&mut r)?;
     let exceptions = read_exceptions(&mut r)?;
 
-    let mut hi = vec![NucModel::new(); ctx_mask + 1];
-    let mut lo = vec![NucModel::new(); lo_mask + 1];
-    let mut hh: Vec<HashSlot> = Vec::new();
-    if use_hash {
-        // Fallible: the (capped) table must error, not abort, if it won't allocate.
-        hh.try_reserve_exact(1usize << hb)
-            .map_err(|_| Error::Malformed("hashed-tier table too large to allocate"))?;
-        hh.resize(1usize << hb, HashSlot::empty());
-    }
     let payload_len = r.rest().len();
     // Checked sum: a malformed stream can declare lengths whose total wraps
     // `usize`, which would under-allocate `seq` and then over-push.
@@ -447,6 +438,32 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
         .saturating_add(MAX_BASES_PER_BYTE);
     if total > max_plausible {
         return Err(Error::Malformed("declared length exceeds payload capacity"));
+    }
+    // Refit guard (#142). The model tables are sized by the header's `k`/`hb`, but
+    // the encoder fits both to the block's base count — `fit_order` guarantees
+    // `4^k <= max(total, 4)` and `fit_bits` guarantees `1<<hb <= total`. A stream
+    // whose declared tables exceed what `total` can justify is malformed; reject
+    // it here, BEFORE the allocations below, so a tiny header cannot force a
+    // multi-hundred-MB memset (dense `4^k` ~42 MB at k=11, hashed `1<<hb` ~1 GB at
+    // hb=26). Without this the tables were allocated straight from unvalidated
+    // header bytes.
+    if ctx_mask as u64 + 1 > (total as u64).max(4) {
+        return Err(Error::Malformed("order-k table exceeds declared length"));
+    }
+    if use_hash && (1u64 << hb) > total as u64 {
+        return Err(Error::Malformed(
+            "hashed-tier table exceeds declared length",
+        ));
+    }
+
+    let mut hi = vec![NucModel::new(); ctx_mask + 1];
+    let mut lo = vec![NucModel::new(); lo_mask + 1];
+    let mut hh: Vec<HashSlot> = Vec::new();
+    if use_hash {
+        // Fallible: the (bounded) table must error, not abort, if it won't allocate.
+        hh.try_reserve_exact(1usize << hb)
+            .map_err(|_| Error::Malformed("hashed-tier table too large to allocate"))?;
+        hh.resize(1usize << hb, HashSlot::empty());
     }
     let mut dec = Decoder::new(r.rest());
     let mut seq = Vec::new();
@@ -822,5 +839,46 @@ mod tests {
         buf.push(1); // fixed = true
         push_varint(&mut buf, u32::MAX as u64); // each read u32::MAX long
         assert!(matches!(decode(&buf), Err(Error::Malformed(_))));
+    }
+
+    // #142: the model tables must be refit to the declared length on decode. A
+    // valid tiny stream with the hashed-tier bits (`hb`) or dense order (`k`)
+    // inflated past what `total` justifies is malformed — it must be rejected
+    // BEFORE allocating, not memset into a multi-hundred-MB table. These craft a
+    // legit 8-base stream (so framing/CRC-free path is valid) and patch the one
+    // header byte, exactly the reproducer the `seq` fuzz target now explores.
+    #[test]
+    fn rejects_oversized_hashed_table_for_tiny_block() {
+        let mut buf = encode_hashed(&[8], b"ACGTACGT", 1, 2, 6).unwrap();
+        buf[3] = MAX_HASH_BITS as u8; // hb -> 26: 1<<26 slots for 8 bases
+        assert!(matches!(decode(&buf), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn rejects_oversized_dense_table_for_tiny_block() {
+        let mut buf = encode(&[8], b"ACGTACGT", 1).unwrap();
+        buf[1] = MAX_ORDER as u8; // k -> 11: 4^11 contexts for 8 bases
+        assert!(matches!(decode(&buf), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn refit_bound_admits_every_legitimately_encoded_stream() {
+        // The bound must reject only malformed tables, never a stream the encoder
+        // actually produced: `fit_order`/`fit_bits` already keep the tables within
+        // `total`, so a real round-trip at assorted sizes and orders must decode.
+        for &n in &[1usize, 4, 64, 4096] {
+            let seq: Vec<u8> = (0..n).map(|i| b"ACGT"[i % 4]).collect();
+            for order in [1usize, 4, 8, 11] {
+                let enc = encode(&[n as u32], &seq, order).unwrap();
+                let (lens, out) = decode(&enc).expect("legit stream must decode");
+                assert_eq!(lens, vec![n as u32]);
+                assert_eq!(out, seq, "n={n} order={order}");
+            }
+            for hb in [4u32, 8, 12] {
+                let enc = encode_hashed(&[n as u32], &seq, 4, 6, hb).unwrap();
+                let (_, out) = decode(&enc).expect("legit hashed stream must decode");
+                assert_eq!(out, seq, "n={n} hb={hb}");
+            }
+        }
     }
 }

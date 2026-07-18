@@ -281,15 +281,27 @@ pub(crate) fn write_framed<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
 pub(crate) fn read_framed<R: Read>(r: &mut R, what: &str) -> Result<Vec<u8>> {
     let mut lb = [0u8; 4];
     r.read_exact(&mut lb)?;
-    let len = u32::from_le_bytes(lb) as usize;
+    let len = u32::from_le_bytes(lb) as u64;
+    // Cap the declared length like `read_block` does. `read_framed` drives every
+    // section of the reorder decode path (flip bitmap, permutation, template,
+    // global reference, per-block frames), all reached before any content check,
+    // so an uncapped u32 `len` let a ~30-byte archive claim ~4 GB (#142).
+    if len > MAX_BLOCK_PAYLOAD {
+        return Err(Error::Malformed("framed slice length exceeds the maximum"));
+    }
+    let len = len as usize;
     let mut cb = [0u8; CRC_LEN];
     r.read_exact(&mut cb)?;
     let expected = u32::from_le_bytes(cb);
+    // Read incrementally rather than `resize(len, 0)` + `read_exact`: a truncated
+    // stream that claims the maximum length then allocates only what is actually
+    // present, not the full claim zero-filled up front. `take` bounds the read so
+    // the CRC still guards the payload, and a short read surfaces as `Truncated`.
     let mut buf = Vec::new();
-    buf.try_reserve_exact(len)
-        .map_err(|_| Error::Malformed("framed slice too large to allocate"))?;
-    buf.resize(len, 0);
-    r.read_exact(&mut buf)?;
+    let got = r.by_ref().take(len as u64).read_to_end(&mut buf)?;
+    if got != len {
+        return Err(Error::Truncated);
+    }
     if crc32c(&buf) != expected {
         return Err(Error::Corrupt {
             what: what.to_string(),
@@ -721,5 +733,43 @@ mod header_tests {
             read_header(&mut Cursor::new(&buf)),
             Err(Error::Corrupt { .. })
         ));
+    }
+
+    // #142: a framed length is attacker-controlled and drives the whole reorder
+    // decode path. It must be capped and read incrementally, so a tiny truncated
+    // frame claiming a huge length errors without allocating the claim.
+    #[test]
+    fn read_framed_rejects_over_cap_length() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // len ~4 GB > MAX_BLOCK_PAYLOAD
+        buf.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
+                                                    // No payload. Must reject on the length cap, not resize(4 GB).
+        assert!(matches!(
+            read_framed(&mut Cursor::new(&buf), "frame"),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn read_framed_truncated_body_is_truncated_not_alloc() {
+        // Largest allowed length, but the body is short: `Truncated`, and only the
+        // bytes actually present are read (no full-claim zero-fill).
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(MAX_BLOCK_PAYLOAD as u32).to_le_bytes());
+        buf.extend_from_slice(&0u32.to_le_bytes());
+        buf.extend_from_slice(b"only a few bytes");
+        assert!(matches!(
+            read_framed(&mut Cursor::new(&buf), "frame"),
+            Err(Error::Truncated)
+        ));
+    }
+
+    #[test]
+    fn read_framed_roundtrips_a_valid_frame() {
+        let payload = b"a legitimate framed payload";
+        let mut buf = Vec::new();
+        write_framed(&mut buf, payload).unwrap();
+        let got = read_framed(&mut Cursor::new(&buf), "frame").unwrap();
+        assert_eq!(got, payload);
     }
 }
