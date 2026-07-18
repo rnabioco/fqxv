@@ -344,6 +344,64 @@ fn single_cell_four_way_roundtrip() {
 }
 
 #[test]
+fn paired_split_spans_multiple_blocks() {
+    // De-interleaving is a block-local `i % g`, correct only because every block
+    // starts on member 0. A single-block archive can't exercise that; force many
+    // blocks with a tiny target so the split must re-anchor per block.
+    let r1 = make_reads("a", 25);
+    let r2 = make_reads("b", 25);
+    let mut archive = Vec::new();
+    let readers: Vec<Box<dyn Read + Send>> =
+        vec![Box::new(&r1[..]) as Box<dyn Read + Send>, Box::new(&r2[..])];
+    compress_multi(
+        readers,
+        &mut archive,
+        Params {
+            block_reads: 4,
+            ..Params::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(peek(&archive[..]).unwrap().group_size, 2);
+    assert!(
+        inspect(io::Cursor::new(&archive[..])).unwrap().blocks > 1,
+        "test must span multiple blocks to cover per-block member re-anchoring"
+    );
+
+    let (mut o1, mut o2) = (Vec::new(), Vec::new());
+    {
+        let mut outs: Vec<&mut Vec<u8>> = vec![&mut o1, &mut o2];
+        decompress_split(&archive[..], &mut outs, 1).unwrap();
+    }
+    assert_eq!(o1, r1, "R1 must reassemble across block boundaries");
+    assert_eq!(o2, r2, "R2 must reassemble across block boundaries");
+}
+
+#[test]
+fn grouped_block_rejects_partial_spot() {
+    // The whole-spots invariant (a block's read count is a multiple of g) is
+    // enforced at encode but nowhere recorded on disk, so `decode_block_group`
+    // guards it: a block whose count is not a multiple of g would otherwise
+    // silently misroute the trailing partial spot. Build a valid 3-read block
+    // (a plain single-end archive) and feed it to the grouped splitter as g = 2.
+    let archive = compress_bytes(&make_reads("x", 3), Params::default());
+    let len_off = HEADER_LEN + BLOCK_MAGIC.len();
+    let payload_len =
+        u64::from_le_bytes(archive[len_off..len_off + 8].try_into().unwrap()) as usize;
+    let start = HEADER_LEN + FRAME_HEAD_LEN;
+    let payload = &archive[start..start + payload_len];
+
+    // g that divides the count still decodes; g = 2 does not divide 3 and errors.
+    assert!(decode_block_group(payload, 1).is_ok());
+    assert!(decode_block_group(payload, 3).is_ok());
+    let err = decode_block_group(payload, 2).unwrap_err();
+    assert!(
+        matches!(err, Error::Malformed(_)),
+        "partial-spot block must be rejected, got {err:?}"
+    );
+}
+
+#[test]
 fn grouped_archive_streams_interleaved() {
     let r1 = b"@r.1 a\nACGT\n+\nIIII\n";
     let r2 = b"@r.1 b\nGGGG\n+\n####\n";
