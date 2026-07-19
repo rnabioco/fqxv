@@ -244,12 +244,12 @@ impl Assembler {
         // still has clean k-mers to match on.
         let mut start = 0;
         while start + RESCUE_K <= cur.len() {
-            if let Some(code) = kmer_at(cur, start, RESCUE_K) {
-                if let Some(&(ci, cpos)) = self.index.get(&code) {
-                    let off = cpos as i64 - start as i64;
-                    if off >= 0 && off as usize <= self.contigs[ci as usize].len() {
-                        cands.push((ci as usize, off as usize));
-                    }
+            if let Some(code) = kmer_at(cur, start, RESCUE_K)
+                && let Some(&(ci, cpos)) = self.index.get(&code)
+            {
+                let off = cpos as i64 - start as i64;
+                if off >= 0 && off as usize <= self.contigs[ci as usize].len() {
+                    cands.push((ci as usize, off as usize));
                 }
             }
             start += RESCUE_K;

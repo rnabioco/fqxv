@@ -8,8 +8,8 @@
 //!
 //! Run on a compute node: `cargo bench -p fqxv-reorder`.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use fqxv_reorder::{plan, revcomp, DEFAULT_K};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use fqxv_reorder::{DEFAULT_K, plan, revcomp};
 
 /// Sample `n_reads` reads of `read_len` from a shared pseudo-random reference,
 /// reverse-complementing about half. Returns `(lens, concatenated seq)`.

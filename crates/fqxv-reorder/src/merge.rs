@@ -202,44 +202,44 @@ pub fn merge_reference_with(
             let mut best: Option<(u32, u32)> = None;
             let mut pos_a = lo;
             while pos_a + MERGE_K <= a.len() {
-                if let Some(code) = kmer_at(a, pos_a, MERGE_K) {
-                    if let Some(list) = index[merge_shard(code)].get(&code) {
-                        for &(bi_u, pos_b_u) in list {
-                            let bi = bi_u as usize;
-                            if bi == ai {
-                                continue;
-                            }
-                            let pos_b = pos_b_u as usize;
-                            if pos_a < pos_b {
-                                continue;
-                            }
-                            let s = pos_a - pos_b;
-                            if s == 0 || s >= a.len() {
-                                continue;
-                            }
-                            let ovl = a.len() - s;
-                            let b = contigs[bi];
-                            if ovl < cfg.min_ovl || ovl > b.len() {
-                                continue;
-                            }
-                            let budget = ovl / cfg.mism_div;
-                            let mut mism = 0usize;
-                            for t in 0..ovl {
-                                if a[s + t] != b[t] {
-                                    mism += 1;
-                                    if mism > budget {
-                                        break;
-                                    }
+                if let Some(code) = kmer_at(a, pos_a, MERGE_K)
+                    && let Some(list) = index[merge_shard(code)].get(&code)
+                {
+                    for &(bi_u, pos_b_u) in list {
+                        let bi = bi_u as usize;
+                        if bi == ai {
+                            continue;
+                        }
+                        let pos_b = pos_b_u as usize;
+                        if pos_a < pos_b {
+                            continue;
+                        }
+                        let s = pos_a - pos_b;
+                        if s == 0 || s >= a.len() {
+                            continue;
+                        }
+                        let ovl = a.len() - s;
+                        let b = contigs[bi];
+                        if ovl < cfg.min_ovl || ovl > b.len() {
+                            continue;
+                        }
+                        let budget = ovl / cfg.mism_div;
+                        let mut mism = 0usize;
+                        for t in 0..ovl {
+                            if a[s + t] != b[t] {
+                                mism += 1;
+                                if mism > budget {
+                                    break;
                                 }
                             }
-                            if mism > budget {
-                                continue;
-                            }
-                            let key = (usize::MAX - ovl, mism, bi, s);
-                            if key < best_key {
-                                best_key = key;
-                                best = Some((bi as u32, s as u32));
-                            }
+                        }
+                        if mism > budget {
+                            continue;
+                        }
+                        let key = (usize::MAX - ovl, mism, bi, s);
+                        if key < best_key {
+                            best_key = key;
+                            best = Some((bi as u32, s as u32));
                         }
                     }
                 }

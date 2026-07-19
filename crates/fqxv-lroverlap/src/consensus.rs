@@ -49,8 +49,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use rayon::prelude::*;
 
 use crate::{
-    align::{align_banded, Op},
-    place_against, wfa_align_opt, ChainOpts, Contig, Sketch,
+    ChainOpts, Contig, Sketch,
+    align::{Op, align_banded},
+    place_against, wfa_align_opt,
 };
 
 /// How much of the draft's end to index when placing the next tiling read.
@@ -486,20 +487,21 @@ pub fn consensus(contig: &Contig, reads: &[Vec<u8>], opts: ConsensusOpts) -> Con
             match op {
                 Op::Match(n) => {
                     for _ in 0..*n {
-                        if d < cols.len() && q < s.len() {
-                            if let Some(i) = base_idx(s[q]) {
-                                cols[d].acgt[i].fetch_add(1, Ordering::Relaxed);
-                            }
+                        if d < cols.len()
+                            && q < s.len()
+                            && let Some(i) = base_idx(s[q])
+                        {
+                            cols[d].acgt[i].fetch_add(1, Ordering::Relaxed);
                         }
                         d += 1;
                         q += 1;
                     }
                 }
                 Op::Sub(b) => {
-                    if d < cols.len() {
-                        if let Some(i) = base_idx(*b) {
-                            cols[d].acgt[i].fetch_add(1, Ordering::Relaxed);
-                        }
+                    if d < cols.len()
+                        && let Some(i) = base_idx(*b)
+                    {
+                        cols[d].acgt[i].fetch_add(1, Ordering::Relaxed);
                     }
                     d += 1;
                     q += 1;

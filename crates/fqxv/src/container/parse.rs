@@ -227,10 +227,10 @@ pub(crate) fn parse_chunks(
     bounds.push(0usize);
     for i in 1..n_chunks {
         let nominal = i * buf.len() / n_chunks;
-        if let Some(s) = find_record_start(buf, nominal) {
-            if *bounds.last().unwrap() < s {
-                bounds.push(s);
-            }
+        if let Some(s) = find_record_start(buf, nominal)
+            && *bounds.last().unwrap() < s
+        {
+            bounds.push(s);
         }
     }
     bounds.push(buf.len());

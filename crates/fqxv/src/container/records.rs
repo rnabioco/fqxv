@@ -17,7 +17,7 @@
 //!   thread feeding a bounded channel, so records stream out with bounded memory.
 
 use super::*;
-use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::{self, JoinHandle};
 
 /// One decoded FASTQ record.

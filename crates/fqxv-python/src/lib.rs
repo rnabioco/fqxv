@@ -18,8 +18,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use fqxv_core::{
-    decode_block_contents, decode_names, decode_quality, decode_quality_with_seq, decode_sequence,
-    quality_needs_sequence, Index, Stream,
+    Index, Stream, decode_block_contents, decode_names, decode_quality, decode_quality_with_seq,
+    decode_sequence, quality_needs_sequence,
 };
 
 create_exception!(

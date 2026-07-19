@@ -71,18 +71,18 @@ mod refine;
 mod script;
 mod wfa;
 
-pub use align::{align_banded, apply, Alignment, Op};
+pub use align::{Alignment, Op, align_banded, apply};
 pub use chain::{Anchor, Chain, ChainOpts, Chainer};
 pub use codec::{
-    build_reference, decode, decode_against, encode, encode_against, EncodeOpts, Reference,
+    EncodeOpts, Reference, build_reference, decode, decode_against, encode, encode_against,
 };
-pub use consensus::{consensus, Consensus, ConsensusOpts};
+pub use consensus::{Consensus, ConsensusOpts, consensus};
 pub use index::{Index, Occ, Repeat};
-pub use layout::{layout, Contig, LayoutOpts, Placement};
-pub use minimizer::{minimizers, syncmers, Minimizer};
-pub use overlap::{find_overlaps, Overlap};
-pub use refine::{place_against, place_all, Anchored};
-pub use script::{chain_span, script_from_chain, ScriptOpts};
+pub use layout::{Contig, LayoutOpts, Placement, layout};
+pub use minimizer::{Minimizer, minimizers, syncmers};
+pub use overlap::{Overlap, find_overlaps};
+pub use refine::{Anchored, place_against, place_all};
+pub use script::{ScriptOpts, chain_span, script_from_chain};
 pub use wfa::{wfa_align, wfa_align_opt, wfa_cells};
 
 /// Errors returned by this crate.

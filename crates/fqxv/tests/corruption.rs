@@ -12,10 +12,10 @@
 //! surface is fuzzed directly in each codec crate's own tests. This harness
 //! guards the container's own framing/index/header parsing.
 
-use std::io::{sink, Cursor};
+use std::io::{Cursor, sink};
 use std::sync::LazyLock;
 
-use fqxv::{compress, decompress, decompress_recover, expected_reads, inspect, verify, Params};
+use fqxv::{Params, compress, decompress, decompress_recover, expected_reads, inspect, verify};
 use proptest::prelude::*;
 
 /// Synthetic interleaved-ish FASTQ with a little duplication so the reorder
@@ -134,11 +134,10 @@ proptest! {
                 *b = 0xFF;
             }
         }
-        if let Some(t) = truncate {
-            if !bytes.is_empty() {
+        if let Some(t) = truncate
+            && !bytes.is_empty() {
                 bytes.truncate(t % bytes.len());
             }
-        }
         probe_structural(&bytes);
         probe_decode(&bytes);
     }

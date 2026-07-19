@@ -17,8 +17,8 @@
 //! so the error message isn't tangled with a half-drawn indicator.
 
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};

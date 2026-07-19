@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use fqxv_lroverlap::{find_overlaps, ChainOpts, Index, Repeat, SeedScheme, Sketch};
+use fqxv_lroverlap::{ChainOpts, Index, Repeat, SeedScheme, Sketch, find_overlaps};
 
 /// Minimal FASTQ reader: returns concatenated sequence plus per-read lengths.
 /// Non-ACGT is passed through — `minimizers` breaks k-mer runs on it.

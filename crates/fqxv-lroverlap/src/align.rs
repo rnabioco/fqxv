@@ -292,11 +292,7 @@ fn fill_wavefront(refr: &[u8], query: &[u8], band: usize, stride: usize, from: &
             let (val, f) = if i == 0 {
                 // Row 0 (empty reference): dp[0][j] = j, all insertions. The
                 // corner (0,0) is 0 with an unused pointer.
-                if j == 0 {
-                    (0u32, 0u8)
-                } else {
-                    (j as u32, 2u8)
-                }
+                if j == 0 { (0u32, 0u8) } else { (j as u32, 2u8) }
             } else if j == 0 {
                 // Column 0 (empty query): dp[i][0] = i, all deletions.
                 (i as u32, 1u8)

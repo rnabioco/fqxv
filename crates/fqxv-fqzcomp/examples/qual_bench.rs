@@ -11,7 +11,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::process::ExitCode;
 
-use fqxv_fqzcomp::{decode, encode, QualityBinning};
+use fqxv_fqzcomp::{QualityBinning, decode, encode};
 
 fn main() -> ExitCode {
     let path = match env::args().nth(1) {

@@ -768,7 +768,7 @@ mod header_tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&u32::MAX.to_le_bytes()); // len ~4 GB > MAX_BLOCK_PAYLOAD
         buf.extend_from_slice(&0u32.to_le_bytes()); // crc placeholder
-                                                    // No payload. Must reject on the length cap, not resize(4 GB).
+        // No payload. Must reject on the length cap, not resize(4 GB).
         assert!(matches!(
             read_framed(&mut Cursor::new(&buf), "frame"),
             Err(Error::Malformed(_))

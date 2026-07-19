@@ -626,8 +626,8 @@ pub(crate) struct ReorderStreams {
 const REF_METHOD_SEQ: u8 = 0; // whole-reference order-k `fqxv_seq` (single pass)
 const REF_METHOD_SEQPAR: u8 = 1; // block-parallel order-k `fqxv_seq`
 const REF_METHOD_PACK: u8 = 4; // SPRING-style 2-bit-pack + clean-room LZMA on packed
-                               // Method tags 2 (LZ77) and 3 (BWT) were prototypes that lost to the order-k model
-                               // on the raw bases and have been removed (see `refpack`'s module docs / issue #52).
+// Method tags 2 (LZ77) and 3 (BWT) were prototypes that lost to the order-k model
+// on the raw bases and have been removed (see `refpack`'s module docs / issue #52).
 
 /// Fixed number of contig blocks the reference is split into for parallel coding.
 /// Fixed (never derived from the thread count) so the coded bytes are identical

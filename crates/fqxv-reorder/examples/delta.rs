@@ -8,7 +8,7 @@
 //! entropy-coded with fqxv-rans. This is the SPRING-style mechanism — cheap
 //! per-read coding that leans on clustering to expose duplicate redundancy.
 
-use fqxv_rans::{encode as rans, Order};
+use fqxv_rans::{Order, encode as rans};
 use std::time::Instant;
 
 const MATCH: u8 = 0;

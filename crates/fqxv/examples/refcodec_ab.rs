@@ -131,7 +131,9 @@ fn main() {
         packed_s,
         d(packed.len()),
     );
-    println!("  (deltas == whole-archive seq delta; all round-trip OK. 2bit+xz(SPRING proxy) ~20.42 MB = -7.2%; raw xz ceiling ~19.87 = -9.7%.)");
+    println!(
+        "  (deltas == whole-archive seq delta; all round-trip OK. 2bit+xz(SPRING proxy) ~20.42 MB = -7.2%; raw xz ceiling ~19.87 = -9.7%.)"
+    );
 
     // Optional: dump the raw merged-reference bases so external reference
     // compressors (zstd --long, xz -9e) can re-measure the true LZ headroom vs

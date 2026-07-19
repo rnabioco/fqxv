@@ -32,7 +32,7 @@
 
 use std::borrow::Cow;
 
-use fqxv_bytes::{unzigzag, write_varint, zigzag, ReaderError};
+use fqxv_bytes::{ReaderError, unzigzag, write_varint, zigzag};
 use fqxv_rans::Order;
 use thiserror::Error;
 
@@ -922,10 +922,10 @@ mod tests {
                 *b = 0xFF;
             }
         }
-        if let Some(t) = trunc {
-            if !data.is_empty() {
-                data.truncate(t % data.len());
-            }
+        if let Some(t) = trunc
+            && !data.is_empty()
+        {
+            data.truncate(t % data.len());
         }
         data
     }

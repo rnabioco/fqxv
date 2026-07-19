@@ -21,9 +21,9 @@
 //! container.
 
 use fqxv_bytes::{read_varint, write_varint};
-use fqxv_dna::{code_strict, SYM2BASE};
+use fqxv_dna::{SYM2BASE, code_strict};
 
-use crate::{reflzma, Error, Result};
+use crate::{Error, Result, reflzma};
 
 /// 2-bit-pack `seq` (4 bases/byte, little-endian within a byte). Non-ACGT bytes
 /// are packed as `A` (code 0) and recorded as `(index, byte)` exceptions for

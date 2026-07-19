@@ -75,7 +75,7 @@ build_tool() {  # src bin
   command -v rustc >/dev/null || { echo "rustc not on PATH (need the rust toolchain)" >&2; exit 1; }
   mkdir -p "$(dirname "$2")"
   echo "==> building $(basename "$2") -> $2"
-  rustc -O --edition 2021 "$1" -o "$2"
+  rustc -O --edition 2024 "$1" -o "$2"
 }
 build_tool "$HERE/../tools/bamcmp.rs" "$BAMCMP"
 build_tool "$HERE/../tools/fqdigest.rs" "$FQDIGEST"

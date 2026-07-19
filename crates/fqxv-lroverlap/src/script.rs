@@ -11,8 +11,8 @@
 //! only ever runs over tens of bases.
 
 use crate::{
-    align::{align_banded, Op},
     Anchor,
+    align::{Op, align_banded},
 };
 
 /// How to turn a chain into a script.

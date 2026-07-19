@@ -3,8 +3,8 @@
 //! Run on a compute node: `cargo bench -p fqxv-rans --features bench`.
 //! (The `bench` feature exposes the internal scalar/AVX2 decoders.)
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use fqxv_rans::{bench_api, encode, Order};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use fqxv_rans::{Order, bench_api, encode};
 
 /// Deterministic quality-like bytes: a skewed ~40-symbol alphabet with runs,
 /// so the model is realistic (not uniform) without any RNG dependency.

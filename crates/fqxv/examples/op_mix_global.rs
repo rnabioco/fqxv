@@ -35,7 +35,7 @@ const SEQ_ORDER: usize = 11;
 /// reorder block payload, so the per-stream breakdown can be reported.
 fn stream_sizes(payload: &[u8]) -> Vec<usize> {
     let mut pos = 1usize; // skip version byte
-                          // read varint n (reads)
+    // read varint n (reads)
     read_varint(payload, &mut pos);
     let mut sizes = Vec::new();
     while pos < payload.len() {

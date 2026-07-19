@@ -6,7 +6,7 @@
 //!
 //! Run on a compute node: `cargo bench -p fqxv-tokenizer`.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fqxv_tokenizer::{decode, encode};
 
 /// Deterministic Illumina-like names: fixed instrument/run/flowcell prefix, then

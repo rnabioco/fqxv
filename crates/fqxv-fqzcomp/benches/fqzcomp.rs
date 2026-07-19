@@ -7,8 +7,8 @@
 //!
 //! Run on a compute node: `cargo bench -p fqxv-fqzcomp`.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use fqxv_fqzcomp::{decode, encode, QualityBinning};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use fqxv_fqzcomp::{QualityBinning, decode, encode};
 
 /// Deterministic quality-like bytes: a skewed alphabet with short runs.
 fn quality_like(n: usize) -> Vec<u8> {

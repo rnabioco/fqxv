@@ -2,7 +2,7 @@
 name = "fqxv-fuzz"
 version = "0.0.0"
 publish = false
-edition = "2021"
+edition = "2024"
 
 # Standalone from the parent workspace: fuzzing needs a nightly toolchain and
 # sanitizer instrumentation, so it must not be pulled into the stable
