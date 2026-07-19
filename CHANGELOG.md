@@ -13,6 +13,30 @@ freely and archives are not guaranteed to be readable across releases until a
 
 ### Added
 
+- **Long-read (ONT / PacBio) support** — platform-aware compression for
+  Nanopore and PacBio reads: `--platform illumina|nanopore|pacbio` (with header
+  auto-detection), long-read quality binning (`--quality-bin ont|hifi`, matching
+  CoLoRd's cutpoints), and a dedicated long-read overlap sequence codec that
+  drives its minimizer sketch from the detected platform.
+- **Long-read overlap sequence codec (`fqxv-lroverlap`)** — a new cross-read
+  overlap codec (minimizers → overlaps → layout → consensus → per-read banded
+  edit script → rANS) wired into the container as the sequence path for long-read
+  blocks, auto-selected and kept only when it beats order-k. It reaches CoLoRd
+  parity on ONT/HiFi (e.g. ~0.653 → ~0.067 bits/base at depth) and codes its edit
+  streams (substitutions, ops, insertions) with per-stream context models. A WFA
+  aligner (HiFi) and an AVX2 anti-diagonal aligner accelerate encoding, both
+  byte-identical to the scalar reference.
+- **Python bindings (`fqxv` via PyO3 / maturin)** — read-only access from
+  Python: a streaming record iterator and column projection (fetch just names,
+  sequence, or quality) over an existing archive.
+- **`compress --verify`** — an opt-in read-after-write check that round-trips the
+  freshly written archive back to the original records before exiting, backed by a
+  public `verify_roundtrip` in the library.
+- **Block sync markers + footer-independent recovery** — each block carries a
+  sync marker so a reader can resynchronize and recover blocks even when the
+  footer index is missing or truncated.
+- **`compress -f`/`--force`** — compression now refuses to overwrite an existing
+  output unless `--force` is given.
 - **Remote / parallel column projection** — the footer row-group index now
   records, per group, a `(offset, len, crc32c)` triple for each of the three
   coded streams (names, sequence, quality). A client can fetch the archive tail,
@@ -39,11 +63,56 @@ freely and archives are not guaranteed to be readable across releases until a
 
 ### Changed
 
-- **`FORMAT_VERSION` → 5** across the Unreleased changes (extended footer index,
-  long-read overlap sequence codec, and the per-stream block digests above). As
-  always in the pre-1.0 format, a build reads only its own version.
+- **On-disk format versioning is now `FORMAT_MAJOR.FORMAT_MINOR` (currently
+  `1.0`)**, replacing the single monotonic `FORMAT_VERSION` integer. A reader
+  refuses a differing major and tolerates a newer minor (backward-compatible
+  additions), a documented forward-compatibility contract for the pre-stable
+  format. This release's format carries the long-read overlap codec, the extended
+  per-stream footer index, and the per-stream block digests below.
+- **`platform` has its own header byte** — the platform tag no longer shares bits
+  with the flags byte (a prior collision made Illumina `--order any` archives
+  undecodable).
 - **`inspect`** now sums per-stream sizes straight from the footer index instead
   of seeking to each block header — one footer read is the whole metadata cost.
+- **`fqxv-dna` primitives crate** — the 2-bit ACGT lookup and reverse-complement
+  helpers are extracted into a shared leaf crate, and the `fqxv-reorder` monolith
+  is split into focused modules.
+
+### Performance
+
+- **Single-end compress** now streams through a block pipeline instead of
+  buffering the whole input.
+- **Reorder read storage** flattens `cl_reads` into an arena, cutting ~168 MB of
+  peak memory with byte-identical output.
+- **Quality models** are sized to the alphabet actually present in the file
+  (~17% faster quality coding, ~45 MB less memory).
+
+### Fixed
+
+- **Silent quality corruption** on certain inputs and a `--block-reads`
+  compression-bomb path, both surfaced by CLI stress testing.
+- **fqzcomp** no longer rejects legitimately compressible quality (which could
+  drop data).
+- **Read-name headers** are preserved byte-exactly.
+- **Long-read memory** — the overlap codec's overlap/layout/placement and the
+  banded aligner's DP matrix are now bounded, fixing OOMs on high-error ONT and
+  large amplicon inputs (with O(n) placement).
+- Assorted CLI fixes: `--order any` no longer aborts on a truncated FASTQ that
+  `preserve` rejects, `--estimate` handles empty input, `--interleaved 0` is
+  rejected, and `--verify` honors `--threads`.
+
+### Security
+
+- **Decode-path hardening** — a fuzzing-driven pass (cargo-fuzz targets over the
+  public decode entries, plus a weekly fuzz schedule) closed multiple
+  decompression bombs across the rANS, quality, sequence, name, reorder, and
+  container decoders: untrusted length/size headers can no longer trigger
+  unbounded allocation.
+
+### Documentation
+
+- Long-read benchmark tables, a format-comparison page, a Python API reference,
+  and `--quality-bin ont|hifi` documentation.
 
 ## [0.2.0] - 2026-07-15
 
