@@ -53,7 +53,7 @@ pub fn find_overlaps(
 ) -> Vec<Overlap> {
     let sketch = idx.sketch();
     let k = sketch.k as u32;
-    let mins = sketch.minimizers(query_seq);
+    let mins = sketch.seeds(query_seq);
 
     // The chainer's `k` MUST be the sketch's. An anchor is an exact match of
     // exactly `sketch.k` bases, and `chain` uses `k` to weight anchors, scale the

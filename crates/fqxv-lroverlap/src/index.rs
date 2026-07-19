@@ -12,7 +12,7 @@
 
 use rayon::prelude::*;
 
-use crate::{minimizer::minimizers, Error, Result, Sketch};
+use crate::{Error, Result, Sketch};
 
 /// One minimizer occurrence within the read set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -105,7 +105,8 @@ impl Index {
             .into_par_iter()
             .map(|r| {
                 let s = &seq[offs[r]..offs[r + 1]];
-                minimizers(s, sketch.w, sketch.k)
+                sketch
+                    .seeds(s)
                     .into_iter()
                     .map(|m| Occ {
                         hash: m.hash,
@@ -214,6 +215,7 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SeedScheme;
 
     /// Deterministic pseudo-random bases.
     fn rand_seq(n: usize, seed: u32) -> Vec<u8> {
@@ -278,7 +280,7 @@ mod tests {
             Repeat { drop_top_frac: 0.0 },
         )
         .unwrap();
-        let single = minimizers(&r, 10, 15);
+        let single = Sketch::ont().seeds(&r);
         for m in &single {
             let occ = idx.query(m.hash);
             let reads: Vec<u32> = occ.iter().map(|o| o.read).collect();
@@ -318,10 +320,19 @@ mod tests {
         for _ in 0..200 {
             seq.extend_from_slice(b"ACGTACGTACGTACGTACGTACGTACGTACGT");
         }
+        // Same-hash-dedup collapse of a tandem repeat is a *window-minimizer*
+        // property: consecutive windows re-select the run's single minimum. A
+        // syncmer is chosen per-k-mer, so a repeat's phases don't collapse the
+        // same way (the repeat *filter* bounds them there instead). ONT now
+        // defaults to syncmers, so pin the minimizer scheme explicitly here.
         let idx = Index::build(
             &[seq.len() as u32],
             &seq,
-            Sketch::ont(),
+            Sketch {
+                w: 10,
+                k: 15,
+                scheme: SeedScheme::Minimizer,
+            },
             Repeat { drop_top_frac: 0.0 },
         )
         .unwrap();
@@ -405,6 +416,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(idx.dropped(), 0);
-        assert_eq!(idx.len(), minimizers(&s, 10, 15).len());
+        assert_eq!(idx.len(), Sketch::ont().seeds(&s).len());
     }
 }

@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use rayon::prelude::*;
 
-use fqxv_lroverlap::{find_overlaps, ChainOpts, Index, Repeat, Sketch};
+use fqxv_lroverlap::{find_overlaps, ChainOpts, Index, Repeat, SeedScheme, Sketch};
 
 /// Minimal FASTQ reader: returns concatenated sequence plus per-read lengths.
 /// Non-ACGT is passed through — `minimizers` breaks k-mer runs on it.
@@ -39,8 +39,16 @@ fn main() {
         eprintln!("usage: overlaps <reads.fastq> [ont|hifi]");
         std::process::exit(2);
     }
+    // `ont-mini` forces the legacy minimizer sketch at the ONT operating point so
+    // syncmer (default `ont`) vs minimizer recall can be compared head-to-head on
+    // the same reads.
     let sketch = match args.get(2).map(String::as_str) {
         Some("hifi") => Sketch::hifi(),
+        Some("ont-mini") => Sketch {
+            w: 10,
+            k: 15,
+            scheme: SeedScheme::Minimizer,
+        },
         _ => Sketch::ont(),
     };
 
@@ -54,7 +62,10 @@ fn main() {
         total / lens.len().max(1) as u64,
         t0.elapsed().as_secs_f64()
     );
-    println!("sketch: w={} k={}", sketch.w, sketch.k);
+    println!(
+        "sketch: w={} k={} scheme={:?}",
+        sketch.w, sketch.k, sketch.scheme
+    );
 
     let t1 = Instant::now();
     let idx = Index::build(&lens, &seq, sketch, Repeat::default()).expect("build index");

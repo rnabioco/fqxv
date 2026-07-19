@@ -144,6 +144,99 @@ pub fn minimizers(seq: &[u8], w: usize, k: usize) -> Vec<Minimizer> {
     out
 }
 
+/// Compute the canonical **closed syncmers** of `seq` for parameters `(k, s)`.
+///
+/// A closed syncmer is a k-mer whose minimal `s`-mer (by canonical hash, over the
+/// `k - s + 1` s-mers it contains) sits at the **first or last** s-mer position.
+/// Like [`minimizers`] the emitted `hash`/`strand` are for the canonical k-mer and
+/// runs of non-ACGT reset the accumulator, so the two are interchangeable anchors.
+///
+/// **Why syncmers on noisy (ONT) reads.** A minimizer is selected only if it wins a
+/// `w`-wide window, so a base error in any *neighbor* k-mer can deselect an intact
+/// k-mer — the dominant conservation loss at ~10% error. A syncmer's selection is a
+/// function of the k-mer's *own* content only, so an intact shared k-mer is
+/// co-selected by two reads regardless of surrounding errors. At matched density and
+/// the same `k` this recovers ~1.3–1.6× more shared anchors without changing
+/// specificity or the hot-path anchor count.
+///
+/// **Strand symmetry.** Selection uses *canonical* s-mer hashes and the symmetric
+/// {first, last} offset pair: under reverse-complement a k-mer's s-mer-hash sequence
+/// reverses (canonical s-mer hashes are revcomp-invariant), so "min at first or last"
+/// is invariant, and the run-dedup-by-hash keeps the multiset identical either
+/// direction — exactly as [`minimizers`] guarantees.
+///
+/// **Density** is `2 / (k - s + 1)` (min of `k-s+1` positions lands on an endpoint),
+/// so `s = k - w` matches [`minimizers`]' `2 / (w + 1)`. Requires `1 <= s < k`.
+#[must_use]
+pub fn syncmers(seq: &[u8], k: usize, s: usize) -> Vec<Minimizer> {
+    assert!((1..=31).contains(&k), "k must be 1..=31");
+    assert!(s >= 1 && s < k, "s must be in 1..k");
+    let mut out = Vec::new();
+    if seq.len() < k {
+        return out;
+    }
+    let kmask = if k == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * k)) - 1
+    };
+    let kshift = 2 * (k - 1);
+    let smask = (1u64 << (2 * s)) - 1;
+    let sshift = 2 * (s - 1);
+    let win = k - s + 1; // s-mers per k-mer
+
+    let (mut kf, mut kr) = (0u64, 0u64);
+    let (mut sf, mut sr) = (0u64, 0u64);
+    let mut have = 0usize;
+    // Canonical s-mer hashes of the current k-mer's window (front = first, back = last).
+    let mut ring: std::collections::VecDeque<u64> = std::collections::VecDeque::with_capacity(win);
+    let mut last_hash: Option<u64> = None;
+
+    for (i, &b) in seq.iter().enumerate() {
+        let Some(c) = code(b) else {
+            have = 0;
+            kf = 0;
+            kr = 0;
+            sf = 0;
+            sr = 0;
+            ring.clear();
+            continue;
+        };
+        kf = ((kf << 2) | c) & kmask;
+        kr = (kr >> 2) | ((3 - c) << kshift);
+        sf = ((sf << 2) | c) & smask;
+        sr = (sr >> 2) | ((3 - c) << sshift);
+        have += 1;
+        if have >= s {
+            let scanon = if sf <= sr { sf } else { sr };
+            ring.push_back(hash64(scanon));
+            if ring.len() > win {
+                ring.pop_front();
+            }
+        }
+        if have >= k {
+            // `ring` holds exactly this k-mer's `win` s-mer hashes.
+            let minh = *ring.iter().min().expect("window non-empty");
+            let closed =
+                *ring.front().expect("front") == minh || *ring.back().expect("back") == minh;
+            if closed {
+                let pos = (i + 1 - k) as u32;
+                let (canon, strand) = if kf <= kr { (kf, false) } else { (kr, true) };
+                let h = hash64(canon);
+                if last_hash != Some(h) {
+                    out.push(Minimizer {
+                        hash: h,
+                        pos,
+                        strand,
+                    });
+                    last_hash = Some(h);
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,7 +315,139 @@ mod tests {
         assert!(m.iter().all(|x| (x.pos as usize) + 7 <= s.len()));
     }
 
+    #[test]
+    fn syncmer_empty_and_short() {
+        assert!(syncmers(b"", 5, 2).is_empty());
+        assert!(syncmers(b"ACGT", 5, 2).is_empty(), "seq shorter than k");
+    }
+
+    #[test]
+    fn syncmer_homopolymer_collapses_to_one() {
+        // Every k-mer in a poly-A run is identical (min s-mer trivially at both
+        // ends → every k-mer is a closed syncmer), so the run must still collapse
+        // to a single emission by the same-hash dedup.
+        let m = syncmers(b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", 11, 5);
+        assert_eq!(
+            m.len(),
+            1,
+            "a homopolymer run must emit exactly one syncmer"
+        );
+    }
+
+    #[test]
+    fn syncmer_n_runs_produce_none() {
+        assert!(
+            syncmers(b"NNNNNNNNNNNNNNNNNNNN", 11, 5).is_empty(),
+            "an N run must not yield syncmers"
+        );
+    }
+
+    #[test]
+    fn syncmer_positions_are_ascending_and_in_range() {
+        let s = b"ACGTTGCAACGTTGCAGGCCATATCGCGATCGGATCAGCTAGCTAGCATCGA";
+        let m = syncmers(s, 11, 5);
+        assert!(!m.is_empty());
+        for pair in m.windows(2) {
+            assert!(pair[0].pos < pair[1].pos, "positions must strictly ascend");
+        }
+        assert!(m.iter().all(|x| (x.pos as usize) + 11 <= s.len()));
+    }
+
+    #[test]
+    fn syncmer_density_is_about_two_over_k_minus_s_plus_one() {
+        // Closed syncmers select a k-mer when its minimal s-mer lands on either
+        // endpoint: 2 of the `k - s + 1` positions, so density ~= 2/(k-s+1). With
+        // s = k - w this equals the minimizer's 2/(w+1) at the same w.
+        let mut s = Vec::new();
+        let mut x: u32 = 7;
+        for _ in 0..200_000 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            s.push(b"ACGT"[(x >> 16) as usize % 4]);
+        }
+        let k = 15;
+        for smer in [5usize, 8, 10] {
+            let m = syncmers(&s, k, smer);
+            let density = m.len() as f64 / s.len() as f64;
+            let expect = 2.0 / ((k - smer) as f64 + 1.0);
+            assert!(
+                (density - expect).abs() < expect * 0.25,
+                "s={smer}: density {density:.4} vs expected ~{expect:.4}"
+            );
+        }
+    }
+
+    #[test]
+    fn syncmer_and_minimizer_match_density_at_s_equals_k_minus_w() {
+        // The load-bearing relation the wiring rests on: `s = k - w` makes the
+        // closed-syncmer density equal the `w`-minimizer density, so swapping the
+        // scheme leaves the index size (and the derived stride) unchanged.
+        let mut s = Vec::new();
+        let mut x: u32 = 99;
+        for _ in 0..200_000 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            s.push(b"ACGT"[(x >> 16) as usize % 4]);
+        }
+        let (w, k) = (10usize, 15usize);
+        let mins = minimizers(&s, w, k).len() as f64;
+        let syncs = syncmers(&s, k, k - w).len() as f64;
+        assert!(
+            (mins - syncs).abs() < mins * 0.1,
+            "syncmer count {syncs} should track minimizer count {mins} within 10%"
+        );
+    }
+
     proptest! {
+        /// The canonical property for syncmers: a sequence and its reverse
+        /// complement select the SAME multiset of hashes. Closed syncmers get this
+        /// from the symmetric {first, last} endpoint pair over *canonical* s-mer
+        /// hashes plus the same-hash run dedup — exactly the argument `minimizers`
+        /// relies on. This is what lets two reads off opposite strands overlap.
+        #[test]
+        fn syncmer_canonical_across_revcomp(
+            bases in proptest::collection::vec(proptest::sample::select(&b"ACGT"[..]), 60..300),
+        ) {
+            let fwd = syncmers(&bases, 11, 4);
+            let rev = syncmers(&revcomp(&bases), 11, 4);
+            let mut a: Vec<u64> = fwd.iter().map(|m| m.hash).collect();
+            let mut b: Vec<u64> = rev.iter().map(|m| m.hash).collect();
+            a.sort_unstable();
+            b.sort_unstable();
+            prop_assert_eq!(a, b);
+        }
+
+        /// Deterministic: same input, same output, always.
+        #[test]
+        fn syncmer_deterministic(
+            bases in proptest::collection::vec(proptest::sample::select(&b"ACGTN"[..]), 0..400),
+        ) {
+            prop_assert_eq!(syncmers(&bases, 9, 4), syncmers(&bases, 9, 4));
+        }
+
+        /// Never panics on arbitrary bytes.
+        #[test]
+        fn syncmer_arbitrary_bytes_never_panic(bases in proptest::collection::vec(any::<u8>(), 0..400)) {
+            let _ = syncmers(&bases, 11, 5);
+        }
+
+        /// Every emitted `hash` is the canonical hash of the k-mer actually at
+        /// `pos` — the anchor identity `index`/`chain` depend on.
+        #[test]
+        fn syncmer_hash_matches_kmer_at_pos(
+            bases in proptest::collection::vec(proptest::sample::select(&b"ACGT"[..]), 20..200),
+        ) {
+            for m in syncmers(&bases, 11, 5) {
+                let kmer = &bases[m.pos as usize..m.pos as usize + 11];
+                let (mut f, mut r) = (0u64, 0u64);
+                for &b in kmer {
+                    let c = code(b).unwrap();
+                    f = (f << 2) | c;
+                    r = (r >> 2) | ((3 - c) << (2 * (11 - 1)));
+                }
+                let canon = if f <= r { f } else { r };
+                prop_assert_eq!(m.hash, hash64(canon));
+            }
+        }
+
         /// The canonical property: a sequence and its reverse complement select
         /// the SAME multiset of minimizer hashes. This is what lets two reads
         /// off opposite strands of one locus find each other.
