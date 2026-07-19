@@ -224,10 +224,9 @@ const MODE_SEQ: u8 = 1;
 const MODE_SEQ_MIX: u8 = 2;
 /// Long-read **binary-decomposition** logistic-mixing quality model ([`binmix`]):
 /// codes each quality as `ceil(log2 k)` bit-tree decisions with binary logistic
-/// mixing instead of one k-way softmax — the same sub-CoLoRd ratio at a fraction of
-/// the per-symbol work. Like the other sequence modes it needs the decoded bases.
-/// Currently selected by [`encode_seq`] when `FQXV_BINMIX` is set (A/B vs the k-way
-/// [`MODE_SEQ_MIX`]); both are decodable.
+/// mixing instead of one k-way softmax — better ratio than [`MODE_SEQ_MIX`] on HiFi
+/// and ~2x faster on both HiFi and ONT, at a fraction of the per-symbol work. The
+/// **default** long-read quality mode; needs the decoded bases like the others.
 const MODE_SEQ_BINMIX: u8 = 3;
 
 /// Mean read length (bases) above which [`encode_seq`] selects [`MODE_SEQ`]. Long
@@ -523,10 +522,13 @@ pub fn encode_seq(
     // position context (`MODE_POS`). The retired single-context `MODE_SEQ` stays
     // decodable but is no longer emitted.
     let (payload, mode) = if seq_mode {
-        if std::env::var_os("FQXV_BINMIX").is_some() {
-            (binmix::encode(lens, &binned, seq, &dense, qmin, k), MODE_SEQ_BINMIX)
-        } else {
+        // Binary-decomposition mixing ([`binmix`]) is the default long-read quality
+        // coder: better ratio than the k-way softmax mix on HiFi and ~2x faster on
+        // both HiFi and ONT. `FQXV_KWAY` forces the k-way mixer for comparison.
+        if std::env::var_os("FQXV_KWAY").is_some() {
             (mix::encode(lens, &binned, seq, &dense, qmin, k), MODE_SEQ_MIX)
+        } else {
+            (binmix::encode(lens, &binned, seq, &dense, qmin, k), MODE_SEQ_BINMIX)
         }
     } else {
         (dispatch_encode(lens, &binned, None, &dense, qmin, k), MODE_POS)
