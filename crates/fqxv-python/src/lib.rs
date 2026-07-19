@@ -217,11 +217,14 @@ impl PyInfo {
         self.inner.whole_file_crc
     }
     fn __repr__(&self) -> String {
+        // `format_version` is packed `(major << 8) | minor`; show it as `major.minor`.
+        let v = self.inner.format_version;
         format!(
-            "Info(reads={}, blocks={}, format_version={}, platform={:?})",
+            "Info(reads={}, blocks={}, format={}.{}, platform={:?})",
             self.inner.reads,
             self.inner.blocks,
-            self.inner.format_version,
+            v >> 8,
+            v & 0xff,
             self.inner.platform.label(),
         )
     }
