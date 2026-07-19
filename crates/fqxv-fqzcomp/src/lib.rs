@@ -50,6 +50,8 @@ use fqxv_bytes::{read_lens, write_lens, ReaderError};
 use fqxv_range::{Decoder, Encoder, SimpleModel};
 use thiserror::Error;
 
+mod mix;
+
 /// Optional lossy quantization applied to quality scores before modeling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QualityBinning {
@@ -211,6 +213,14 @@ const FORMAT_VERSION: u8 = 2;
 ///   Requires the decoded sequence, so the container serializes seq → qual.
 const MODE_POS: u8 = 0;
 const MODE_SEQ: u8 = 1;
+/// Long-read logistic context-**mixing** quality model ([`mix`]): mixes several
+/// context tiers with adaptive weights instead of a single packed context. Beats
+/// the single-context [`MODE_SEQ`] on real bytes (a per-block adaptive model can't
+/// exploit a richer single context, but *can* mix a coarse and a rich one). Like
+/// [`MODE_SEQ`] it conditions on the sequence, so decode needs the decoded bases.
+/// Selected by [`encode_seq`] for long reads; [`MODE_SEQ`] is retained so older
+/// archives still decode.
+const MODE_SEQ_MIX: u8 = 2;
 
 /// Mean read length (bases) above which [`encode_seq`] selects [`MODE_SEQ`]. Long
 /// reads (HiFi ~15 kb, ONT ~10 kb) clear this comfortably; Illumina (≤250 bp)
@@ -499,12 +509,21 @@ pub fn encode_seq(
     // capacity — see `SimpleModel::with_active`. Context features stay on the
     // original Phred scale (`cv = b - qmin`); only the coded symbol is the dense
     // index (`dv`).
-    let payload = dispatch_encode(lens, &binned, seq_mode.then_some(seq), &dense, qmin, k);
+    //
+    // Long reads take the logistic mixing model ([`mix`], `MODE_SEQ_MIX`), which
+    // beats the single packed context on real bytes; short reads keep the
+    // position context (`MODE_POS`). The retired single-context `MODE_SEQ` stays
+    // decodable but is no longer emitted.
+    let (payload, mode) = if seq_mode {
+        (mix::encode(lens, &binned, seq, &dense, qmin, k), MODE_SEQ_MIX)
+    } else {
+        (dispatch_encode(lens, &binned, None, &dense, qmin, k), MODE_POS)
+    };
 
     let mut out = Vec::with_capacity(16 + k + lens.len() + payload.len());
     out.push(FORMAT_VERSION);
     out.push(binning.tag());
-    out.push(if seq_mode { MODE_SEQ } else { MODE_POS });
+    out.push(mode);
     out.push(k as u8);
     out.extend_from_slice(&syms);
     write_lens(&mut out, lens);
@@ -519,7 +538,8 @@ pub fn encode_seq(
 /// foreign stream reads as `false`; [`decode`]/[`decode_seq`] then reject it.
 pub fn needs_sequence(src: &[u8]) -> bool {
     // Header layout: version(0), binning tag(1), mode(2), ...
-    src.first() == Some(&FORMAT_VERSION) && src.get(2) == Some(&MODE_SEQ)
+    src.first() == Some(&FORMAT_VERSION)
+        && matches!(src.get(2), Some(&MODE_SEQ) | Some(&MODE_SEQ_MIX))
 }
 
 /// Decode a sequence-blind stream produced by [`encode`], returning
@@ -541,9 +561,11 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
         return Err(Error::Malformed("unsupported version"));
     }
     let _binning = QualityBinning::from_tag(r.u8()?)?;
-    let seq_mode = match r.u8()? {
+    let mode = r.u8()?;
+    // Both sequence modes need the decoded bases; `MODE_POS` does not.
+    let seq_mode = match mode {
         MODE_POS => false,
-        MODE_SEQ => true,
+        MODE_SEQ | MODE_SEQ_MIX => true,
         _ => return Err(Error::Malformed("unknown quality context mode")),
     };
     let k = r.u8()? as usize;
@@ -560,7 +582,7 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
         .iter()
         .try_fold(0usize, |acc, &l| acc.checked_add(l as usize))
         .ok_or(Error::Malformed("total length overflows usize"))?;
-    let mut dec = Decoder::new(r.rest());
+    let payload = r.rest();
     // Decompression-bomb guard: bound the *allocation*, not the ratio. A single
     // repeated quality symbol codes to almost nothing (a 1-symbol alphabet costs
     // ~0 bits/symbol), so there is no finite "symbols per compressed byte" bound —
@@ -590,15 +612,20 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     quals
         .try_reserve(total)
         .map_err(|_| Error::Malformed("declared total length too large to allocate"))?;
-    dispatch_decode(
-        &lens,
-        &syms,
-        seq_mode.then_some(seq),
-        qmin,
-        k,
-        &mut dec,
-        &mut quals,
-    )?;
+    if mode == MODE_SEQ_MIX {
+        mix::decode(&lens, payload, seq, &syms, qmin, k, &mut quals)?;
+    } else {
+        let mut dec = Decoder::new(payload);
+        dispatch_decode(
+            &lens,
+            &syms,
+            seq_mode.then_some(seq),
+            qmin,
+            k,
+            &mut dec,
+            &mut quals,
+        )?;
+    }
     Ok((lens, quals))
 }
 
