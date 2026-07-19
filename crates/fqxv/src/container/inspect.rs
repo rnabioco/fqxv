@@ -91,6 +91,86 @@ pub(crate) fn detect_platform(headers: &[&[u8]]) -> Platform {
     best
 }
 
+/// Mean read length above which content classification treats a run as
+/// long-read. Matches the layout gate ([`REORDER_MAX_MEAN_LEN`]) so detection and
+/// codec routing agree on what "long" means.
+const LONG_READ_MIN_MEAN_LEN: f64 = 500.0;
+/// Minimum mean Phred to call a long-read run PacBio. PacBio's circular-consensus
+/// output is a high-fidelity product, so its per-base quality sits far above ONT's.
+/// Calibrated on the robustness corpus: the 12 `PACBIO_SMRT` accessions span mean
+/// Phred **36.9–84.5**, so this threshold clears the lowest by ~5.
+const PACBIO_MIN_MEAN_Q: f64 = 32.0;
+/// Maximum mean Phred to call a long-read run Oxford Nanopore. Calibrated on the
+/// robustness corpus: the 12 `OXFORD_NANOPORE` accessions span mean Phred
+/// **6.9–23.5**, so this threshold clears the highest by ~4.5.
+///
+/// The gap between this and [`PACBIO_MIN_MEAN_Q`] is deliberate: no corpus
+/// accession lands inside it, and anything that does is genuinely ambiguous and
+/// stays `Unknown` rather than being forced a label.
+const ONT_MAX_MEAN_Q: f64 = 28.0;
+
+/// Classify a run from read **content** when the read names carry no platform
+/// grammar — the SRA-reformatted case, where a genuine PacBio run arrives with
+/// bare `SRR…` headers and [`classify_header`] can only say `Unknown`.
+///
+/// Each long-read platform is identified by its **own** positive evidence, not as a
+/// fallthrough for "not the other": mean per-base quality separates them cleanly,
+/// because PacBio's circular consensus is a high-fidelity product while ONT reads
+/// carry raw basecall error. Measured across the robustness corpus (24 long-read
+/// accessions with ENA platform ground truth):
+///
+/// | platform | mean Phred |
+/// |---|---|
+/// | `OXFORD_NANOPORE` (n=12) | 6.9 – 23.5 |
+/// | `PACBIO_SMRT` (n=12) | 36.9 – 84.5 |
+///
+/// Anything landing between the two thresholds is genuinely ambiguous and stays
+/// `Unknown` — which is also behaviourally safe, since `Unknown` already routes to
+/// `Sketch::ont()`, the right handling for any high-error long read. That preserves
+/// the "a wrong platform is never recorded" guarantee of [`detect_platform`].
+///
+/// **Read length is deliberately not a criterion beyond the long/short gate.** A
+/// tight length spread looks like a CCS signature on a single dataset, but across
+/// the corpus it does not hold: 3 of 12 PacBio accessions have a length CV of
+/// 0.32–0.58 (as broad as ONT), and 2 ONT accessions are as tight as 0.21. Quality
+/// is the signal that generalizes.
+///
+/// **Short reads are not classifiable this way.** Illumina and MGI/BGI overlap on
+/// every content signal measured — read length, mean quality, and quality-alphabet
+/// size all interleave across the 24 short-read corpus accessions — so only the
+/// name grammar distinguishes them, and short runs stay `Unknown` here. This costs
+/// nothing: `sketch_for` is only consulted for long-read blocks.
+///
+/// Getting this right matters beyond the label: `sketch_for` sends every
+/// non-PacBio long read to `Sketch::ont()`, which is `k = 15` closed syncmers
+/// tuned for ~10% error. On PacBio that both misses the low-divergence WFA aligner
+/// (gated on `k >= 17`) and applies error-tolerant seeding to data that does not
+/// need it — measured at ~31% slower encode on a real HiFi run.
+pub(crate) fn classify_content(lens: &[u32], quals: &[u8]) -> Platform {
+    if lens.is_empty() || quals.is_empty() {
+        return Platform::Unknown;
+    }
+    let n = lens.len() as f64;
+    let mean_len = lens.iter().map(|&l| f64::from(l)).sum::<f64>() / n;
+    // Short reads: the name grammar is the only signal that separates the vendors,
+    // and the sketch this would feed is unused there (short blocks take order-k).
+    if mean_len <= LONG_READ_MIN_MEAN_LEN {
+        return Platform::Unknown;
+    }
+    let mean_q = quals
+        .iter()
+        .map(|&q| f64::from(q.saturating_sub(33)))
+        .sum::<f64>()
+        / quals.len() as f64;
+    if mean_q >= PACBIO_MIN_MEAN_Q {
+        Platform::PacBio
+    } else if mean_q <= ONT_MAX_MEAN_Q {
+        Platform::Nanopore
+    } else {
+        Platform::Unknown
+    }
+}
+
 /// Classify one read header by its name grammar. The header is the first
 /// whitespace-delimited token (the name) plus an optional description tail; both
 /// carry platform signal (Illumina packs everything in the name; Nanopore's
@@ -212,14 +292,24 @@ pub(crate) fn resolve_platform_buf(forced: Option<Platform>, buf: &[u8]) -> Plat
     let mut fq = noodles_fastq::io::Reader::new(buf);
     let mut rec = noodles_fastq::Record::default();
     let mut headers: Vec<Vec<u8>> = Vec::with_capacity(PLATFORM_PEEK);
+    let mut lens: Vec<u32> = Vec::with_capacity(PLATFORM_PEEK);
+    let mut quals: Vec<u8> = Vec::new();
     for _ in 0..PLATFORM_PEEK {
         match fq.read_record(&mut rec) {
             Ok(0) | Err(_) => break,
-            Ok(_) => headers.push(join_header(rec.name(), rec.description())),
+            Ok(_) => {
+                headers.push(join_header(rec.name(), rec.description()));
+                lens.push(rec.sequence().len() as u32);
+                quals.extend_from_slice(rec.quality_scores());
+            }
         }
     }
     let refs: Vec<&[u8]> = headers.iter().map(Vec::as_slice).collect();
-    detect_platform(&refs)
+    match detect_platform(&refs) {
+        // Names carry no platform grammar (SRA-reformatted): fall back to content.
+        Platform::Unknown => classify_content(&lens, &quals),
+        p => p,
+    }
 }
 
 /// Resolve the platform from the leading headers of an already-buffered block
@@ -230,7 +320,17 @@ pub(crate) fn resolve_platform_block(forced: Option<Platform>, all: &RawBlock) -
     }
     let n = all.n_reads().min(PLATFORM_PEEK);
     let refs: Vec<&[u8]> = (0..n).map(|i| all.header(i)).collect();
-    detect_platform(&refs)
+    match detect_platform(&refs) {
+        // Names carry no platform grammar (SRA-reformatted): fall back to content.
+        // Quality runs parallel to sequence, so the first `n` reads' quality is the
+        // matching prefix of the block's quality stream.
+        Platform::Unknown => {
+            let lens: Vec<u32> = all.lens.iter().take(n).copied().collect();
+            let qual_len: usize = lens.iter().map(|&l| l as usize).sum();
+            classify_content(&lens, &all.qual[..qual_len.min(all.qual.len())])
+        }
+        p => p,
+    }
 }
 
 /// Join a read `name` and optional `description` the way a [`RawBlock`] stores a
@@ -564,4 +664,111 @@ pub(crate) fn scan_blocks_sequentially<R: Read + Seek>(
         off += FRAME_HEAD_LEN as u64 + plen;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod content_tests {
+    use super::*;
+
+    /// A quality buffer of `total` bytes, every base at Phred `q`.
+    fn quals(total: usize, q: u8) -> Vec<u8> {
+        vec![33 + q; total]
+    }
+
+    fn total_of(lens: &[u32]) -> usize {
+        lens.iter().map(|&l| l as usize).sum()
+    }
+
+    /// Tightly size-distributed long reads.
+    fn tight_lens() -> Vec<u32> {
+        (0..16).map(|i| 12_000 + i * 20).collect()
+    }
+
+    /// A broad, long-tailed length distribution.
+    fn broad_lens() -> Vec<u32> {
+        vec![
+            2_000, 40_000, 9_000, 30_000, 5_000, 22_000, 14_000, 3_500, 18_000, 7_000, 26_000,
+            11_000, 4_000, 33_000, 16_000, 6_000,
+        ]
+    }
+
+    #[test]
+    fn pacbio_is_identified_by_consensus_grade_quality() {
+        // The SRA-reformatted case: bare headers, but consensus-grade quality names
+        // the platform on its own evidence.
+        let lens = tight_lens();
+        assert_eq!(
+            classify_content(&lens, &quals(total_of(&lens), 38)),
+            Platform::PacBio
+        );
+    }
+
+    #[test]
+    fn nanopore_is_identified_by_raw_basecall_quality() {
+        let lens = broad_lens();
+        assert_eq!(
+            classify_content(&lens, &quals(total_of(&lens), 20)),
+            Platform::Nanopore
+        );
+    }
+
+    /// The corpus calibration boundaries: the lowest-quality `PACBIO_SMRT`
+    /// accession (mean Phred 36.9) and the highest-quality `OXFORD_NANOPORE` one
+    /// (23.5) must each land on the correct side of the thresholds.
+    #[test]
+    fn corpus_quality_extremes_classify_correctly() {
+        let lens = tight_lens();
+        let t = total_of(&lens);
+        assert_eq!(classify_content(&lens, &quals(t, 37)), Platform::PacBio);
+        assert_eq!(classify_content(&lens, &quals(t, 23)), Platform::Nanopore);
+    }
+
+    /// Length spread must NOT sway the verdict. The corpus has PacBio runs as broad
+    /// as CV 0.58 and ONT runs as tight as CV 0.21, so a length-shape rule
+    /// misclassifies real data; only quality generalizes.
+    #[test]
+    fn length_spread_does_not_sway_the_verdict() {
+        let broad = broad_lens();
+        let tight = tight_lens();
+        assert_eq!(
+            classify_content(&broad, &quals(total_of(&broad), 38)),
+            Platform::PacBio,
+            "broad-length PacBio must still be PacBio"
+        );
+        assert_eq!(
+            classify_content(&tight, &quals(total_of(&tight), 20)),
+            Platform::Nanopore,
+            "tight-length ONT must still be ONT"
+        );
+    }
+
+    #[test]
+    fn quality_between_the_bands_stays_unknown() {
+        // Phred 30 sits in the deliberate gap (28..32) that no corpus run occupies;
+        // Unknown already routes to the ONT sketch, so abstaining is safe.
+        let lens = tight_lens();
+        assert_eq!(
+            classify_content(&lens, &quals(total_of(&lens), 30)),
+            Platform::Unknown
+        );
+    }
+
+    #[test]
+    fn short_reads_are_never_classified() {
+        // Illumina and MGI/BGI overlap on every content signal measured, so short
+        // runs must abstain no matter how clean they look.
+        let lens = vec![150u32; 16];
+        assert_eq!(
+            classify_content(&lens, &quals(total_of(&lens), 37)),
+            Platform::Unknown
+        );
+    }
+
+    #[test]
+    fn missing_input_is_unknown() {
+        let none: [u32; 0] = [];
+        assert_eq!(classify_content(&none, &[]), Platform::Unknown);
+        // Lengths without quality carry no fidelity signal.
+        assert_eq!(classify_content(&[12_000], &[]), Platform::Unknown);
+    }
 }
