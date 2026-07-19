@@ -113,8 +113,8 @@ Two facts hold on both platforms:
 - **Quality now beats CoLoRd on both platforms.** fqxv's binary-decomposition
   context-mixing quality coder codes the HiFi quality stream to **641.8M vs
   CoLoRd's 684.3M** (~6% smaller) and ONT to **163.7M vs 166.5M** (~2% smaller).
-  This quality win carries the **HiFi lossless total ahead of CoLoRd** (see
-  [`RESULTS.md`](../bench/RESULTS.md); fqxv 4.68× vs CoLoRd 4.44× on the full file);
+  This quality win carries the **HiFi lossless total ahead of CoLoRd** (see the
+  repository's `bench/RESULTS.md`; fqxv 4.68× vs CoLoRd 4.44× on the full file);
   on ONT the much larger sequence deficit below keeps CoLoRd ahead on total.
 - **The remaining lossless gap is the sequence stream**, and it widens with
   coverage: on HiFi it is now the *only* deficit (quality is a credit), so closing
