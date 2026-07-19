@@ -29,6 +29,10 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
             has_reference,
         );
     }
+    // Whole-file shared reference frame (plain layout, issue #168): read it once,
+    // right after the header, and thread it into every block's sequence decode.
+    let reference = read_reference_frame(&mut r, header.flags)?;
+    let reference = reference.as_ref();
     let mut w = BufWriter::new(writer);
 
     debug!(
@@ -40,8 +44,12 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
     let mut stats = Stats::default();
     for_each_block_batch(&mut r, batch, |raw_blocks| {
         debug!(blocks = raw_blocks.len(), "decoding batch");
-        let decoded: Vec<Result<(u64, Vec<u8>)>> =
-            pool.install(|| raw_blocks.par_iter().map(|b| decode_block(b)).collect());
+        let decoded: Vec<Result<(u64, Vec<u8>)>> = pool.install(|| {
+            raw_blocks
+                .par_iter()
+                .map(|b| decode_block(b, reference))
+                .collect()
+        });
         for d in decoded {
             let (reads, fastq) = d?;
             w.write_all(&fastq)?;
@@ -186,6 +194,8 @@ pub fn decompress_split<R: Read, W: Write>(
         ));
     }
 
+    let reference = read_reference_frame(&mut r, header.flags)?;
+    let reference = reference.as_ref();
     debug!(
         threads = pool.current_num_threads(),
         batch,
@@ -199,7 +209,7 @@ pub fn decompress_split<R: Read, W: Write>(
         let decoded: Vec<Result<(u64, Vec<Vec<u8>>)>> = pool.install(|| {
             raw_blocks
                 .par_iter()
-                .map(|b| decode_block_group(b, g))
+                .map(|b| decode_block_group(b, g, reference))
                 .collect()
         });
         for d in decoded {
@@ -261,16 +271,21 @@ pub fn decompress_recover<R: Read + Seek, W: Write>(
             "recover supports only the plain layout; reordered archives decode all-or-nothing",
         ));
     }
+    // Read the whole-file shared reference frame (if any) before seeking around, so
+    // reference-coded blocks can be recovered. A corrupt frame fails closed here —
+    // its blocks then simply won't decode and are skipped like any other bad block.
+    let reference = read_reference_frame(&mut r, header.flags)?;
+    let reference = reference.as_ref();
     // Prefer the footer's row-group index — it carries per-group read counts, so
     // losses can be tallied exactly. If the footer is unreadable (the common
     // truncated-tail case, which also loses the trailing blocks), fall back to
     // scanning for block sync markers: that needs no index and resynchronizes past
     // a corrupt length prefix or a bad block.
     let rec = match read_footer(&mut r) {
-        Ok(footer) => recover_via_footer(&mut r, &pool, &footer, writer)?,
+        Ok(footer) => recover_via_footer(&mut r, &pool, &footer, writer, reference)?,
         Err(footer_err) => {
             debug!(error = %footer_err, "footer unreadable; scanning for block markers");
-            recover_via_scan(&mut r, &pool, writer)?
+            recover_via_scan(&mut r, &pool, writer, reference)?
         }
     };
     info!(
@@ -289,6 +304,7 @@ fn recover_via_footer<R: Read + Seek, W: Write>(
     pool: &rayon::ThreadPool,
     footer: &Footer,
     writer: W,
+    reference: Option<&fqxv_lroverlap::Reference>,
 ) -> Result<Recovery> {
     let mut rec = Recovery::default();
     let mut w = BufWriter::new(writer);
@@ -298,7 +314,7 @@ fn recover_via_footer<R: Read + Seek, W: Write>(
         // any failure — bad marker/CRC, truncation, or a decode error — drops just
         // this group.
         let outcome = match read_block(r, i as u64) {
-            Ok(Some(payload)) => pool.install(|| decode_block(&payload)),
+            Ok(Some(payload)) => pool.install(|| decode_block(&payload, reference)),
             Ok(None) => Err(Error::Malformed(
                 "row-group offset points at the terminator",
             )),
@@ -337,6 +353,7 @@ fn recover_via_scan<R: Read + Seek, W: Write>(
     r: &mut BufReader<R>,
     pool: &rayon::ThreadPool,
     writer: W,
+    reference: Option<&fqxv_lroverlap::Reference>,
 ) -> Result<Recovery> {
     r.seek(SeekFrom::Start(HEADER_LEN as u64))?;
     let mut region = Vec::new();
@@ -353,7 +370,7 @@ fn recover_via_scan<R: Read + Seek, W: Write>(
         let m = pos + rel;
         match read_frame_at(&region, m) {
             Some((len, payload)) => {
-                match pool.install(|| decode_block(payload)) {
+                match pool.install(|| decode_block(payload, reference)) {
                     Ok((reads, fastq)) => {
                         w.write_all(&fastq)?;
                         rec.stats.reads += reads;

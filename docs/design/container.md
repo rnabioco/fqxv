@@ -154,6 +154,18 @@ compressed length. Byte cuts still land on whole-spot boundaries. Boundaries
 depend only on the read lengths and the two limits, never on thread scheduling,
 so determinism holds.
 
+Capping a block at the byte budget also caps how much coverage a long-read block's
+overlap codec sees, and each block otherwise self-assembles (and re-stores) its own
+consensus reference. For long-read input the container hoists that reference out:
+it assembles one consensus over the whole file and stores it **once** in a framed
+region between the header and the first block (gated by the `GLOBAL_REFERENCE`
+feature bit and flag bit5), then codes every block's reads against that frozen
+frame (sequence method byte 2). Placement is per-read against an immutable frame,
+so blocks stay byte-budgeted, parallel, and independently decodable given the
+frame, while the genome is stored once rather than once per block. A whole-file
+never-worse gate adopts the layout only when it beats the plain order-k total. See
+[long reads](longread.md#wiring-and-the-per-block-coverage-cap).
+
 ## Grouping (paired-end and single-cell)
 
 When `G > 1`, per-spot reads are interleaved (`m0₀, m1₀, …, m0₁, m1₁, …`). Blocks
