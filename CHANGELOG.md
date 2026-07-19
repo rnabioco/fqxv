@@ -60,6 +60,18 @@ freely and archives are not guaranteed to be readable across releases until a
   wrong-but-in-bounds output) now names the offending stream instead of only the
   block. Each digest still folds in `n_reads` and its stream's per-read lengths,
   so boundary pinning is unchanged; cost is 16 extra bytes per block.
+- **Crash-safe compress output** — compression writes to a sibling temp file and
+  atomically renames it into place only once the whole archive (header, blocks,
+  *and* footer trailer) is on disk. Interrupting a stream mid-run (Ctrl-C on
+  `sracha get -Z | fqxv compress -`, say) or hitting any error no longer leaves a
+  corrupt, footer-less `.fqxv` at the destination: the partial temp is removed on
+  a `?` bail and by a SIGINT/SIGTERM/SIGHUP handler, and the destination path only
+  ever holds a complete archive.
+- **Live compress progress** — the compress indicator now reports how much data
+  has been processed and the rate. With a known input size (a file) it renders a
+  percentage bar; for a stdin stream of unknown length it shows a bytes + rate
+  readout, so a pause waiting on an upstream producer reads as `0 B` rather than a
+  hang.
 
 ### Changed
 
@@ -77,6 +89,13 @@ freely and archives are not guaranteed to be readable across releases until a
 - **`fqxv-dna` primitives crate** — the 2-bit ACGT lookup and reverse-complement
   helpers are extracted into a shared leaf crate, and the `fqxv-reorder` monolith
   is split into focused modules.
+- **Default log verbosity is `warn`** — routine per-run `info` diagnostics now
+  require `-v`, so they no longer interleave with and smear the live compress
+  indicator on a shared stderr (`-vv` = debug, `-vvv` = trace with targets).
+- **`--verify` verifies before publishing** — the read-after-write check now runs
+  against the temp file, so a failed verification leaves the unverified output off
+  the destination path (kept aside for inspection) and exits non-zero, rather than
+  leaving a suspect archive in place.
 
 ### Performance
 
