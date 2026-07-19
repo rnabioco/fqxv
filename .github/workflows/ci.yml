@@ -33,6 +33,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      # `.cargo/config.toml` links with lld (proc-macros/build scripts link
+      # even under `cargo check`); install it.
+      - run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets --features fqxv-rans/bench
@@ -43,6 +46,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      # `.cargo/config.toml` links with lld; install it for the build step.
+      - run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -62,6 +67,8 @@ jobs:
     # nextest does not run doctests; keep them alive on a separate job.
     steps:
       - uses: actions/checkout@v7
+      # `.cargo/config.toml` links with lld; install it for the build step.
+      - run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --doc --workspace
@@ -83,6 +90,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      # `.cargo/config.toml` links with lld (proc-macros/build scripts link
+      # even under `cargo clippy`); install it.
+      - run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -95,6 +105,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
+      # `.cargo/config.toml` links with lld (proc-macros/build scripts link
+      # even under `cargo check`); install it.
+      - run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95"

@@ -2,11 +2,19 @@
 # published crates — this only affects builds inside this workspace).
 #
 # Baseline: `x86-64-v3` = SSE4.2 + AVX + AVX2 + FMA + BMI1/BMI2 + POPCNT + F16C.
-# The Alpine `amilan`/`acpu` partition (AMD EPYC 7713P, Zen 3) supports all of
-# v3. Features above v3 (AVX-512, etc.) are NOT pinned — the EPYC 7713P has no
-# AVX-512 anyway, and portable hot kernels use `#[target_feature]` + runtime
-# `is_x86_feature_detected!` dispatch (see fqxv-rans) rather than a global bump.
+# The Bodhi `rna` partition (all-Intel) supports all of v3. Features above v3
+# (AVX-512, etc.) are NOT pinned — portable hot kernels use `#[target_feature]`
+# + runtime `is_x86_feature_detected!` dispatch (see fqxv-rans) rather than a
+# global bump.
+#
+# Linker: `lld` in place of the default GNU `ld.bfd`. This only matters for the
+# link step, so it's a no-op on fat-LTO release/bench/dist builds (all the work
+# is in the compiler) but a real win on the `cargo nextest run` edit-test loop,
+# which links ~10 per-crate test binaries. The toolchain already ships lld as
+# `rust-lld`; symlink its gcc-ld shim onto PATH so `cc` can find it:
+#   ln -sf "$(rustc --print sysroot)"/lib/rustlib/*/bin/gcc-ld/ld.lld ~/.local/bin/
+# CI installs the system `lld` package in the jobs that link (see ci.yml).
 #
 # Only applies to the x86_64 GNU target used for local builds and benchmarking.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "link-arg=-fuse-ld=lld"]

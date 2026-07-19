@@ -131,5 +131,13 @@ comment at the top of `container.rs` — read it before touching the format.
 - `.cargo/config.toml` pins `target-cpu=x86-64-v3` for local/bench builds only
   (not for published crates). Do not raise the global baseline for SIMD; use
   `#[target_feature]` + runtime detection like `fqxv-rans`.
+- `.cargo/config.toml` also links with `lld` (`-C link-arg=-fuse-ld=lld`). This
+  is a no-op on fat-LTO release/bench builds (all the cost is in the compiler)
+  but speeds the `cargo nextest run` edit-test loop, which links ~10 per-crate
+  test binaries. The toolchain ships lld as `rust-lld`; make `cc` find it once
+  with `ln -sf "$(rustc --print sysroot)"/lib/rustlib/*/bin/gcc-ld/ld.lld
+  ~/.local/bin/`. CI `apt-get install`s the system `lld` in every compiling job
+  — the flag also applies to proc-macro/build-script links, so all of them (not
+  just the test jobs) need it.
 - Release profile is fat-LTO, single codegen unit, `panic = "abort"`. Use the
   `profiling` profile for samply/perf (keeps symbols, no LTO).
