@@ -35,3 +35,4 @@ flamegraph.svg
 
 # claude
 /.claude
+.fqxv-build.lock
