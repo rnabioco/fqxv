@@ -22,10 +22,11 @@ const PONE: u32 = 1 << PBITS; // 4096
 const NMODELS: usize = 3;
 /// Rich context hashed into this many slots (see [`crate::mix`]).
 const RICH_BITS: u32 = 20;
-/// Mixer weight scale (Q16) and learning-rate shift (`lr ≈ 2^-? `, tuned to the sim
-/// optimum lr≈0.01). Weight update: `w += (err·stretch) >> LR_SHIFT`.
+/// Mixer weight scale (Q16) and learning-rate shift. Weight update:
+/// `w += (err·stretch) >> LR_SHIFT`. 11 is the joint HiFi/ONT optimum from a real-
+/// byte sweep (overridable via `FQXV_LR` for re-tuning).
 const W_ONE: i32 = 1 << 16;
-const LR_SHIFT: u32 = 10;
+const LR_SHIFT: u32 = 11;
 /// Per-tier bit-probability adaptation rate: `p += ((bit<<12) - p) >> PRATE_SHIFT`
 /// (1/32, the sim optimum).
 const PRATE_SHIFT: u32 = 5;
@@ -108,6 +109,13 @@ struct BinMixer {
     logistic: Logistic,
     weights: Vec<[i32; NMODELS]>, // per bit-position gate
     d: u32,
+    lr_shift: u32,
+    prate_shift: u32,
+}
+
+/// Read a `u32` tuning knob from the environment (for A/B sweeps), else the default.
+fn env_shift(name: &str, default: u32) -> u32 {
+    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
 impl BinMixer {
@@ -124,20 +132,29 @@ impl BinMixer {
             logistic: Logistic::build(),
             weights: vec![[W_ONE / NMODELS as i32; NMODELS]; d as usize],
             d,
+            lr_shift: env_shift("FQXV_LR", LR_SHIFT),
+            prate_shift: env_shift("FQXV_PRATE", PRATE_SHIFT),
         }
     }
 
     /// Predict P(bit=1) as a 12-bit prob for tree `node` under `keys`, and the
     /// per-tier stretched inputs (needed for the weight update). Returns
     /// `(p, [stretch_t], gate)`.
+    /// The three tier base offsets for a context (constant across a symbol's bits;
+    /// only the tree `node` changes), computed once per symbol.
     #[inline]
-    fn predict(&self, keys: &[u32; NMODELS], node: usize, bpos: u32) -> (u16, [i32; NMODELS], usize) {
+    fn bases(&self, keys: &[u32; NMODELS]) -> [usize; NMODELS] {
+        core::array::from_fn(|t| self.tiers[t].base(keys[t]))
+    }
+
+    #[inline]
+    fn predict(&self, bases: &[usize; NMODELS], node: usize, bpos: u32) -> (u16, [i32; NMODELS], usize) {
         let gate = bpos as usize;
         let mut st = [0i32; NMODELS];
         let mut x = 0i64;
         let w = &self.weights[gate];
         for t in 0..NMODELS {
-            let p = self.tiers[t].probs[self.tiers[t].base(keys[t]) + node];
+            let p = self.tiers[t].probs[bases[t] + node];
             let s = self.logistic.stretch(p);
             st[t] = s;
             x += i64::from(w[t]) * i64::from(s);
@@ -148,34 +165,36 @@ impl BinMixer {
 
     /// Adapt the mixer weights and each tier's node probability after coding `bit`.
     #[inline]
-    fn update(&mut self, keys: &[u32; NMODELS], node: usize, bit: u32, p: u16, st: &[i32; NMODELS], gate: usize) {
+    fn update(&mut self, bases: &[usize; NMODELS], node: usize, bit: u32, p: u16, st: &[i32; NMODELS], gate: usize) {
         let err = (bit << PBITS) as i32 - i32::from(p); // [-4095, 4095]
+        let (lr_shift, prate_shift) = (self.lr_shift, self.prate_shift);
         let w = &mut self.weights[gate];
         for t in 0..NMODELS {
-            w[t] += (err * st[t]) >> LR_SHIFT;
+            w[t] += (err * st[t]) >> lr_shift;
         }
         let target = (bit << PBITS) as i32;
         for t in 0..NMODELS {
-            let idx = self.tiers[t].base(keys[t]) + node;
+            let idx = bases[t] + node;
             let cur = i32::from(self.tiers[t].probs[idx]);
-            self.tiers[t].probs[idx] = (cur + ((target - cur) >> PRATE_SHIFT)) as u16;
+            self.tiers[t].probs[idx] = (cur + ((target - cur) >> prate_shift)) as u16;
         }
     }
 
     /// Code one symbol (`dv`, the dense index) as `d` bits, MSB first.
     #[inline]
     fn encode_sym(&mut self, enc: &mut Encoder, keys: &[u32; NMODELS], dv: usize) {
+        let bases = self.bases(keys);
         let mut node = 1usize;
         for bpos in 0..self.d {
             let bit = (dv as u32 >> (self.d - 1 - bpos)) & 1;
-            let (p, st, gate) = self.predict(keys, node, bpos);
+            let (p, st, gate) = self.predict(&bases, node, bpos);
             // bit==1 occupies [0, p); bit==0 occupies [p, PONE).
             if bit == 1 {
                 enc.encode(0, u32::from(p), PONE);
             } else {
                 enc.encode(u32::from(p), PONE - u32::from(p), PONE);
             }
-            self.update(keys, node, bit, p, &st, gate);
+            self.update(&bases, node, bit, p, &st, gate);
             node = 2 * node + bit as usize;
         }
     }
@@ -183,10 +202,11 @@ impl BinMixer {
     /// Decode one symbol, returning its dense index.
     #[inline]
     fn decode_sym(&mut self, dec: &mut Decoder<'_>, keys: &[u32; NMODELS]) -> usize {
+        let bases = self.bases(keys);
         let mut node = 1usize;
         let mut dv = 0u32;
         for bpos in 0..self.d {
-            let (p, st, gate) = self.predict(keys, node, bpos);
+            let (p, st, gate) = self.predict(&bases, node, bpos);
             let target = dec.freq(PONE);
             let bit = if target < u32::from(p) { 1u32 } else { 0 };
             if bit == 1 {
@@ -194,7 +214,7 @@ impl BinMixer {
             } else {
                 dec.decode(u32::from(p), PONE - u32::from(p));
             }
-            self.update(keys, node, bit, p, &st, gate);
+            self.update(&bases, node, bit, p, &st, gate);
             node = 2 * node + bit as usize;
             dv = (dv << 1) | bit;
         }
