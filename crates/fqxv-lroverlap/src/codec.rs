@@ -150,6 +150,47 @@ fn put_stream(out: &mut Vec<u8>, raw: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Substitution alphabet: ACGT (codes 0-3) plus a non-ACGT placeholder (4).
+const SUB_SYMS: usize = 5;
+
+/// Range-code the substituted bases conditioned on the reference base each replaced.
+/// ONT substitutions are strongly reference-base-dependent, so a per-ref-base
+/// adaptive model beats the flat order-0/1 rANS (CoLoRd conditions substitutions on
+/// the reference base similarly). The models start uniform and adapt in stream order;
+/// [`decode`] rebuilds the same models with the same contexts (the consensus base at
+/// each position), so it round-trips exactly.
+fn encode_subs(subs: &[u8], sub_ctx: &[u8]) -> Vec<u8> {
+    let mut enc = fqxv_range::Encoder::new();
+    let mut models: [fqxv_range::SimpleModel<SUB_SYMS>; SUB_SYMS] =
+        std::array::from_fn(|_| fqxv_range::SimpleModel::new());
+    for (&v, &c) in subs.iter().zip(sub_ctx) {
+        let ctx = (c as usize).min(SUB_SYMS - 1);
+        models[ctx].encode(&mut enc, (v as usize).min(SUB_SYMS - 1));
+    }
+    enc.finish()
+}
+
+/// Number of order-3 op-history contexts (last 3 ops × 2 bits).
+const OP_CTXS: usize = 64;
+
+/// Range-code the op-type stream (Match/Sub/Ins/Del = 0..3) with an order-3 context
+/// over the three preceding op types. Op sequences are strongly self-correlated
+/// (Match follows Match; homopolymer indels cluster), so this beats the flat rANS.
+/// The rolling context is derived from the ops themselves, so decode rebuilds it
+/// identically as it decodes each op during reconstruction.
+fn encode_ops(ops: &[u8]) -> Vec<u8> {
+    let mut enc = fqxv_range::Encoder::new();
+    let mut models: [fqxv_range::SimpleModel<4>; OP_CTXS] =
+        std::array::from_fn(|_| fqxv_range::SimpleModel::new());
+    let mut ctx = 0usize;
+    for &o in ops {
+        let sym = (o as usize).min(3);
+        models[ctx].encode(&mut enc, sym);
+        ctx = ((ctx << 2) | sym) & (OP_CTXS - 1);
+    }
+    enc.finish()
+}
+
 fn get_stream(src: &[u8], pos: &mut usize) -> Result<Vec<u8>, Error> {
     let raw_len = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
     if raw_len == 0 {
@@ -173,7 +214,13 @@ struct Streams {
     ops: Vec<u8>,
     runs: Vec<u8>,
     subs: Vec<u8>,
+    /// Parallel to `subs`: the reference (consensus) base code at each substitution,
+    /// used as the entropy-coding context (ONT substitutions are ref-base-dependent).
+    sub_ctx: Vec<u8>,
     ins_bases: Vec<u8>,
+    /// Parallel to `ins_bases`: the preceding read base at each inserted base, the
+    /// entropy context (ONT insertions are mostly homopolymer extensions).
+    ins_ctx: Vec<u8>,
     indel_lens: Vec<u8>,
     placements: Vec<u8>,
     flips: Vec<u8>,
@@ -189,7 +236,9 @@ impl Streams {
         self.ops.extend_from_slice(&o.ops);
         self.runs.extend_from_slice(&o.runs);
         self.subs.extend_from_slice(&o.subs);
+        self.sub_ctx.extend_from_slice(&o.sub_ctx);
         self.ins_bases.extend_from_slice(&o.ins_bases);
+        self.ins_ctx.extend_from_slice(&o.ins_ctx);
         self.indel_lens.extend_from_slice(&o.indel_lens);
         self.placements.extend_from_slice(&o.placements);
         self.flips.extend_from_slice(&o.flips);
@@ -378,24 +427,46 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
                 let d = start as i64 - prev_start;
                 prev_start = start as i64;
                 write_varint(&mut s.placements, fqxv_bytes::zigzag(d));
+                // Track the reference position (for the substitution's ref base) and
+                // the preceding read base (for the insertion's homopolymer context).
+                let mut ref_pos = 0usize;
+                let mut last: u8 = 4; // 4 = no preceding base (read start)
                 for op in &ops {
                     match op {
                         Op::Match(m) => {
                             s.ops.push(0);
                             write_varint(&mut s.runs, u64::from(*m));
+                            let mm = *m as usize;
+                            if mm > 0 {
+                                last = cs
+                                    .get(start + ref_pos + mm - 1)
+                                    .map_or(4, |&x| base_code(x));
+                            }
+                            ref_pos += mm;
                         }
                         Op::Sub(b) => {
                             s.ops.push(1);
-                            s.subs.push(base_code(*b));
+                            let bc = base_code(*b);
+                            s.subs.push(bc);
+                            s.sub_ctx
+                                .push(cs.get(start + ref_pos).map_or(4, |&x| base_code(x)));
+                            last = bc;
+                            ref_pos += 1;
                         }
                         Op::Ins(bs) => {
                             s.ops.push(2);
                             write_varint(&mut s.indel_lens, bs.len() as u64);
-                            s.ins_bases.extend(bs.iter().map(|&b| base_code(b)));
+                            for &b in bs {
+                                let bc = base_code(b);
+                                s.ins_ctx.push(last);
+                                s.ins_bases.push(bc);
+                                last = bc;
+                            }
                         }
                         Op::Del(m) => {
                             s.ops.push(3);
                             write_varint(&mut s.indel_lens, u64::from(*m));
+                            ref_pos += *m as usize;
                         }
                     }
                 }
@@ -474,10 +545,29 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
     put_stream(&mut out, &all.kinds)?;
     put_stream(&mut out, &all.flips)?;
     put_stream(&mut out, &all.placements)?;
-    put_stream(&mut out, &all.ops)?;
+    // ops: range-coded with an order-3 op-history context (see `encode_ops`).
+    {
+        let blob = encode_ops(&all.ops);
+        write_varint(&mut out, all.ops.len() as u64);
+        write_varint(&mut out, blob.len() as u64);
+        out.extend_from_slice(&blob);
+    }
     put_stream(&mut out, &all.runs)?;
-    put_stream(&mut out, &all.subs)?;
-    put_stream(&mut out, &all.ins_bases)?;
+    // subs: range-coded conditioned on the reference base (see `encode_subs`).
+    {
+        let blob = encode_subs(&all.subs, &all.sub_ctx);
+        write_varint(&mut out, all.subs.len() as u64);
+        write_varint(&mut out, blob.len() as u64);
+        out.extend_from_slice(&blob);
+    }
+    // ins_bases: range-coded conditioned on the preceding read base (homopolymer
+    // context). Same 5-context base coder as subs, keyed on `ins_ctx`.
+    {
+        let blob = encode_subs(&all.ins_bases, &all.ins_ctx);
+        write_varint(&mut out, all.ins_bases.len() as u64);
+        write_varint(&mut out, blob.len() as u64);
+        out.extend_from_slice(&blob);
+    }
     put_stream(&mut out, &all.indel_lens)?;
     put_stream(&mut out, &all.literals)?;
     put_stream(&mut out, &exc_pos)?;
@@ -547,10 +637,43 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
     let kinds = get_stream(src, &mut pos)?;
     let flips = get_stream(src, &mut pos)?;
     let placements = get_stream(src, &mut pos)?;
-    let ops = get_stream(src, &mut pos)?;
+    // ops: range-coded with an order-3 op-history context (see `encode_ops`).
+    // Decoded inline during reconstruction; the rolling context is rebuilt from the
+    // decoded ops exactly as on encode.
+    let ops_count = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let ops_blob_len = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let ops_end = pos.checked_add(ops_blob_len).ok_or(Error::Corrupt)?;
+    let ops_blob = src.get(pos..ops_end).ok_or(Error::Corrupt)?;
+    pos = ops_end;
+    let mut op_dec = fqxv_range::Decoder::new(ops_blob);
+    let mut op_models: [fqxv_range::SimpleModel<4>; OP_CTXS] =
+        std::array::from_fn(|_| fqxv_range::SimpleModel::new());
+    let mut op_ctx = 0usize;
+    let mut ops_seen = 0usize;
     let runs = get_stream(src, &mut pos)?;
-    let subs = get_stream(src, &mut pos)?;
-    let ins_bases = get_stream(src, &mut pos)?;
+    // subs: range-coded, conditioned on the reference base (see `encode_subs`).
+    // Decoded inline during reconstruction — the consensus base at each substitution
+    // selects the model, exactly as on encode.
+    let subs_count = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let subs_blob_len = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let subs_end = pos.checked_add(subs_blob_len).ok_or(Error::Corrupt)?;
+    let subs_blob = src.get(pos..subs_end).ok_or(Error::Corrupt)?;
+    pos = subs_end;
+    let mut sub_dec = fqxv_range::Decoder::new(subs_blob);
+    let mut sub_models: [fqxv_range::SimpleModel<SUB_SYMS>; SUB_SYMS] =
+        std::array::from_fn(|_| fqxv_range::SimpleModel::new());
+    let mut subs_seen = 0usize;
+    // ins_bases: range-coded, conditioned on the preceding read base. Decoded
+    // inline during reconstruction with the same rolling context.
+    let ins_count = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let ins_blob_len = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let ins_end = pos.checked_add(ins_blob_len).ok_or(Error::Corrupt)?;
+    let ins_blob = src.get(pos..ins_end).ok_or(Error::Corrupt)?;
+    pos = ins_end;
+    let mut ins_dec = fqxv_range::Decoder::new(ins_blob);
+    let mut ins_models: [fqxv_range::SimpleModel<SUB_SYMS>; SUB_SYMS] =
+        std::array::from_fn(|_| fqxv_range::SimpleModel::new());
+    let mut ins_seen = 0usize;
     let indel_lens = get_stream(src, &mut pos)?;
     let literals = get_stream(src, &mut pos)?;
     let exc_pos = get_stream(src, &mut pos)?;
@@ -562,10 +685,7 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
     let mut kp = 0usize; // kinds
     let mut fp = 0usize; // flips
     let mut pp = 0usize; // placements
-    let mut op = 0usize; // ops
     let mut rp = 0usize; // runs
-    let mut sp = 0usize; // subs
-    let mut ip = 0usize; // ins_bases
     let mut dp = 0usize; // indel_lens
     let mut litp = 0usize; // literals
 
@@ -612,39 +732,53 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
             let cs = *refs.get(ci).ok_or(Error::Corrupt)?;
             let cs = cs.get(start..).ok_or(Error::Corrupt)?;
 
-            // Rebuild this read's ops until it has produced `lens[r]` bases.
+            // Rebuild this read's ops until it has produced `lens[r]` bases. Track
+            // the reference position so each substitution is decoded with the same
+            // reference-base context the encoder used.
             let want = lens[r] as usize;
             let mut produced = 0usize;
+            let mut ref_pos = 0usize;
+            let mut last: u8 = 4; // preceding read base, for the insertion context
             let mut read_ops: Vec<Op> = Vec::new();
             while produced < want {
-                let code = *ops.get(op).ok_or(Error::Corrupt)?;
-                op += 1;
+                let code = op_models[op_ctx].decode(&mut op_dec) as u8;
+                op_ctx = ((op_ctx << 2) | code as usize) & (OP_CTXS - 1);
+                ops_seen += 1;
                 match code {
                     0 => {
                         let m = read_varint(&runs, &mut rp).ok_or(Error::Corrupt)? as usize;
+                        if m > 0 {
+                            last = cs.get(ref_pos + m - 1).map_or(4, |&x| base_code(x));
+                        }
                         produced += m;
+                        ref_pos += m;
                         read_ops.push(Op::Match(m as u32));
                     }
                     1 => {
-                        let b = base_of_sym(*subs.get(sp).ok_or(Error::Corrupt)?);
-                        sp += 1;
+                        let rc = cs.get(ref_pos).map_or(4, |&x| base_code(x)) as usize;
+                        let vc = sub_models[rc.min(SUB_SYMS - 1)].decode(&mut sub_dec);
+                        subs_seen += 1;
                         produced += 1;
-                        read_ops.push(Op::Sub(b));
+                        ref_pos += 1;
+                        last = vc as u8;
+                        read_ops.push(Op::Sub(base_of_sym(vc as u8)));
                     }
                     2 => {
                         let k = read_varint(&indel_lens, &mut dp).ok_or(Error::Corrupt)? as usize;
-                        let bs: Vec<u8> = ins_bases
-                            .get(ip..ip + k)
-                            .ok_or(Error::Corrupt)?
-                            .iter()
-                            .map(|&c| base_of_sym(c))
-                            .collect();
-                        ip += k;
+                        let mut bs: Vec<u8> = Vec::with_capacity(k);
+                        for _ in 0..k {
+                            let vc =
+                                ins_models[(last as usize).min(SUB_SYMS - 1)].decode(&mut ins_dec);
+                            last = vc as u8;
+                            bs.push(base_of_sym(vc as u8));
+                        }
+                        ins_seen += k;
                         produced += k;
                         read_ops.push(Op::Ins(bs));
                     }
                     3 => {
                         let m = read_varint(&indel_lens, &mut dp).ok_or(Error::Corrupt)? as u32;
+                        ref_pos += m as usize;
                         read_ops.push(Op::Del(m));
                     }
                     _ => return Err(Error::Corrupt),
@@ -664,6 +798,10 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
             };
             write_read(&mut seq, r, &read)?;
         }
+    }
+    // The decoded op / substitution / insertion counts must match what was framed.
+    if subs_seen != subs_count || ops_seen != ops_count || ins_seen != ins_count {
+        return Err(Error::Corrupt);
     }
 
     // Apply non-ACGT exceptions last.
