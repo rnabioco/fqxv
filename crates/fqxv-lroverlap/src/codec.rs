@@ -28,7 +28,7 @@
 //! **re-store the same reference**. [`build_reference`] + [`encode_against`] hoist
 //! it out: assemble one [`Reference`] over the whole file, store it **once** (the
 //! container writes it as a shared frame), and code every block's reads against
-//! that frozen frame with [`encode_against`] (bitstream [`VERSION_SHARED`]), which
+//! that frozen frame with [`encode_against`] (a distinct bitstream version), which
 //! is byte-for-byte the standalone block *minus* the reference streams.
 //! [`decode_against`] inverts it given the same reference. Placement is per-read
 //! against a frozen frame, so a read codes identically regardless of which block
@@ -183,8 +183,8 @@ impl Reference {
     /// Serialise the reference to a self-contained, entropy-coded frame: contig
     /// count, per-contig lengths, and the concatenated consensus bases. The
     /// container stores this once per file (see issue #168); [`Reference::decode`]
-    /// inverts it. This is byte-for-byte the reference portion a [`VERSION`] block
-    /// stores inline, just lifted out with its own magic/version.
+    /// inverts it. This is byte-for-byte the reference portion a self-contained
+    /// block stores inline, just lifted out with its own magic/version.
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         out.extend_from_slice(&REF_MAGIC);
@@ -429,9 +429,9 @@ fn compute_offs(lens: &[u32], seq_len: usize) -> Result<Vec<usize>, Error> {
     Ok(offs)
 }
 
-/// Assemble a [`Reference`] from long reads: subsample the layout to
-/// [`TARGET_LAYOUT_COVERAGE`], find overlaps, lay out contigs, and vote a
-/// consensus per multi-read contig. This is the assembly half of [`encode`],
+/// Assemble a [`Reference`] from long reads: subsample the layout to a target
+/// coverage, find overlaps, lay out contigs, and vote a consensus per multi-read
+/// contig. This is the assembly half of [`encode`],
 /// hoisted so the container can build one reference over the whole file and share
 /// it across blocks (issue #168). Pure function of the input (and thread-count
 /// invariant), so the shared reference is deterministic.

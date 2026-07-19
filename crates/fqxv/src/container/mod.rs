@@ -31,9 +31,20 @@
 //! [4] header_crc (LE) -- CRC-32C over every header byte above (prefix + extension
 //!     region), verified on read so a flipped version/features/flags/binning-tag/
 //!     group-size/platform byte is caught rather than silently changing decode.
-//!     Present in both layouts. Blocks begin right after this; seek/scan start
-//!     offsets use the actual header length (prefix + ext_len + 4), which equals
-//!     the ext-empty HEADER_LEN for a 1.0-written archive.
+//!     Present in both layouts. The block region (or the reference frame below, if
+//!     present) begins right after this; seek/scan start offsets use the actual
+//!     header length (prefix + ext_len + 4), which equals the ext-empty HEADER_LEN
+//!     for a 1.0-written archive.
+//! optional whole-file reference frame (plain layout only, present iff the flags
+//!   bit5 FLAG_GLOBAL_REFERENCE and the GLOBAL_REFERENCE feature bit are set):
+//!   [4] len (LE)  [4] CRC-32C  [len] reference bytes -- a single framed
+//!       `fqxv_lroverlap::Reference` (consensus contigs, entropy-coded), assembled
+//!       once over the whole file. Long-read sequence blocks then code against it
+//!       (sequence method byte 2) instead of re-storing a reference per block, so
+//!       the genome is stored once, not once per 256 MiB block. The footer's block
+//!       offsets start past this frame. A reader without the GLOBAL_REFERENCE
+//!       feature refuses the archive (upgrade signal); a block referencing a
+//!       missing frame fails closed.
 //! repeated until the terminator:
 //!   [4] BLOCK_MAGIC "FQXB" -- per-block sync marker; recovery scans for it to
 //!       resynchronize to a block boundary when the footer is lost or a length
