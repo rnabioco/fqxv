@@ -327,11 +327,17 @@ the field reaches 0.35 bits/base and fqxv's within-read model cannot.
    the file. Still needs a downstream-fidelity check (`concordance.sh`) to set
    cutpoints honestly; the current cutpoints are CoLoRd's, not ones fqxv
    validated.
-2. **Overlap sequence codec** (Lever 2) — the algorithm is built and measured at
-   parity (`fqxv-lroverlap`); **wiring it into the container is the open work**
-   — a sequence-method tag, `is_long_read` gating, and the decode path.
-3. Quality base-context (rest of Lever 1) — lowest priority; measured headroom
-   vs CoLoRd is ~nil on this data, revisit only if HiFi shows otherwise.
+2. **Overlap sequence codec** (Lever 2) — **shipped.** The algorithm
+   (`fqxv-lroverlap`) is wired into the container behind a sequence-method tag
+   with `is_long_read` gating and a full decode path, auto-selected and kept only
+   when it beats order-k. Two follow-ups have since landed on top: the consensus
+   reference is assembled once for the whole file and stored once rather than
+   per block, and ONT seeds with closed syncmers instead of window minimizers.
+   What remains is consensus *quality* — the draft consensus still sits above a
+   raw read's error rate, which bounds the ONT edit cost.
+3. Quality base-context (rest of Lever 1) — **shipped**, and it overshot the
+   estimate: the sequence-conditioned, context-mixed coder took HiFi quality
+   below CoLoRd rather than the ~nil headroom predicted from this ONT data.
 
 ## Benchmark
 

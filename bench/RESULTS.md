@@ -20,12 +20,20 @@ dataset; `fqxv-max` is the order-preserving lossless point.
 
 ## Long-read, lossless
 
+> **Stale — re-run pending.** The table below was measured before the shared
+> whole-file overlap reference and ONT closed-syncmer seeding landed, both of
+> which are long-read *sequence* wins. Both fqxv figures should improve; treat
+> these as a floor until the matrix is re-run on current `main`.
+
 **fqxv now leads on HiFi.** Its quality coder (binary-decomposition context
 mixing) beats CoLoRd's lossless quality, and that win outweighs fqxv's remaining
 cross-read *sequence* deficit, so fqxv is smaller overall. **CoLoRd still leads on
-ONT**, where fqxv trails on both streams — quality by a few percent, and the noisier
-sequence more (exact seed anchors don't survive ONT error, so the overlap codec
-falls back to the within-read model). All rows round-trip losslessly.
+ONT** — but not on quality: fqxv's ONT quality stream is also smaller than
+CoLoRd's. The deficit is entirely in the sequence stream, and it is no longer a
+seeding problem: closed syncmers select on a k-mer's own bases, so the overlap
+codec beats the within-read order-k baseline on ONT rather than falling back to
+it. What bounds it now is the quality of the assembled consensus the reads are
+coded against. All rows round-trip losslessly.
 
 | dataset    |      fqxv | fqxv9 |   colord | zstd19 | xz9 | gzip |
 |------------|----------:|------:|---------:|-------:|----:|-----:|
@@ -55,5 +63,6 @@ read-reordering on top of binning.
 | DRR205413  | ONT-MinION  |       0.825 |
 
 NovaSeq wins most (its quality is pre-binned, so the lossless point is already
-compact); ONT wins least, since the long-read sequence stream — the CoLoRd gap
-above — dominates that archive.
+compact); ONT wins least, since the long-read sequence stream dominates that
+archive. The ONT row predates the edit-stream context coding, the shared
+whole-file reference, and syncmer seeding, so it should improve on a re-run.

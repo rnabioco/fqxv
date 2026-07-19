@@ -102,8 +102,11 @@ other, not against the lossless rows.
 - **Smallest lossless short-read archive** → `fqxv --order shuffle` or `SPRING`;
   `fqxv --order shuffle` is smaller on both benchmark sets under the same
   reorder+renumber rules.
-- **Long reads** → `fqxv` (overlap codec) or `CoLoRd`. `fqxv`'s quality is at
-  near-parity with CoLoRd; the remaining sequence gap is per-block coverage — see
+- **Long reads** → `fqxv` (overlap codec) or `CoLoRd`. `fqxv`'s quality now
+  *leads* CoLoRd on both platforms since the sequence-conditioned, context-mixed
+  quality coder, and the sequence stream no longer pays a per-block coverage
+  penalty — the consensus reference is assembled once per file and stored once.
+  What remains on ONT is consensus quality, not coverage — see
   [Long-read support](design/longread.md).
 - **Aligned reads with a reference on hand** → `CRAM` is purpose-built for that and
   reference-based; `fqxv` is for the raw, reference-free FASTQ.

@@ -116,12 +116,17 @@ Two facts hold on both platforms:
   This quality win carries the **HiFi lossless total ahead of CoLoRd** (see the
   repository's `bench/RESULTS.md`; fqxv 4.68× vs CoLoRd 4.44× on the full file);
   on ONT the much larger sequence deficit below keeps CoLoRd ahead on total.
-- **The remaining lossless gap is the sequence stream**, and it widens with
-  coverage: on HiFi it is now the *only* deficit (quality is a credit), so closing
-  it widens fqxv's lead; on ONT it is the larger of the two. At ~300× the same locus
-  is read hundreds of times — CoLoRd codes each read against a similar earlier read,
-  while fqxv's per-block overlap reference is re-stored every block (HiFi) or the
-  exact seed anchors don't survive the error rate (ONT).
+- **The remaining lossless gap is the sequence stream.** On HiFi it is now the
+  *only* deficit (quality is a credit), so closing it widens fqxv's lead; on ONT it
+  is the larger of the two. At ~300× the same locus is read hundreds of times, and
+  CoLoRd codes each read against a similar earlier read. Both of fqxv's original
+  handicaps here have since been addressed: the overlap reference is no longer
+  re-stored per block (it is assembled once over the whole file and stored once),
+  and ONT no longer depends on exact window-minimizer anchors surviving the error
+  rate (closed syncmers select on a k-mer's own bases, so an intact shared k-mer is
+  co-selected regardless of neighbouring errors). What remains on ONT is the
+  quality of the assembled consensus the reads are coded against, not the coverage
+  available to it.
 
 ### Lossy quality
 
