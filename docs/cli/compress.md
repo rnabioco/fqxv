@@ -36,7 +36,7 @@ preserved for the split.
 
 | Option | Description |
 | --- | --- |
-| `-l, --level <N>` | Effort 1–9; higher raises the sequence context order and block size. Default: 5. |
+| `-l, --level <N>` | Effort 1–9; higher raises the sequence context order (up to order 11, reached at level 5) and the block size, and enables a hashed high-order tier at level 8+. Default: 5. |
 | `--block-reads <N>` | Reads per row group, overriding the size `--level` would pick. Decouples random-access granularity from effort: smaller groups give finer remote/parallel access and more parallelism at some ratio cost; larger groups the reverse. Sequence order still follows `--level`. Ignored by the reorder path (`--order any`/`--max`). See [Row-group sizing](#row-group-sizing). |
 | `--order <MODE>` | Read-order guarantee: `preserve` (default, restores original order), `any` (allows reordering for a better ratio; single-end order may change), or `shuffle` (like `any`, but discards order and regenerates purely positional names — reorder-lossy, single-end only). |
 | `--interleaved <N>` | Interleaving of a *single* input, in members per spot (1 = single-end, 2 = paired as from `sracha get -Z`). Auto-detected from read names by default. Ignored with multiple inputs. |

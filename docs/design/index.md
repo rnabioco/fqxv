@@ -22,10 +22,25 @@ graph TD
     C --> TOK[fqxv-tokenizer]
     C --> SEQ[fqxv-seq]
     C --> FQZ[fqxv-fqzcomp]
+    C --> REO[fqxv-reorder]
+    C --> LRO[fqxv-lroverlap]
     TOK --> RANS[fqxv-rans]
     SEQ --> RANGE[fqxv-range]
+    SEQ --> DNA[fqxv-dna]
     FQZ --> RANGE
+    REO --> RANS
+    REO --> SEQ
+    REO --> DNA
+    LRO --> SEQ
+    LRO --> RANS
+    LRO --> DNA
 ```
+
+Two leaf crates sit below the codecs and are shared by several of them:
+`fqxv-dna` (nucleotide primitives — the 2-bit ACGT lookup and reverse
+complement) and `fqxv-bytes` (on-disk byte primitives — LEB128 varints, zig-zag,
+the bounds-checked reader). They are omitted from some edges above to keep the
+graph legible.
 
 - **`fqxv-rans`** — rANS Nx16 entropy coder (32 interleaved states, 16-bit
   renormalization), with scalar, AVX2, and AVX-512 backends selected at runtime
@@ -44,15 +59,19 @@ graph TD
   / literal), rANS-coding the op and payload streams.
 - **`fqxv-reorder`** — canonical-minimizer read clustering (see
   [Read Reordering](reordering.md)).
-- **`fqxv-lroverlap`** — cross-read overlap detection for long reads
-  (minimizers → chaining → layout → consensus → edit scripts). **Not wired into
-  the container**: nothing imports it yet, so it is not reachable from the CLI.
-  It exists to measure the long-read sequence lever — see
-  [Long-read support](longread.md).
+- **`fqxv-lroverlap`** — cross-read overlap coding for long reads
+  (minimizers → overlaps → layout → consensus → per-read banded edit script →
+  rANS). **Wired into the container**: it is the sequence path for long-read
+  blocks, auto-selected per block via the sequence stream's method byte and kept
+  only when it beats the order-k model — see [Long-read support](longread.md).
+- **`fqxv-dna`** — a leaf crate of shared nucleotide primitives (the 2-bit ACGT
+  lookup and reverse complement) that `fqxv-seq`, `fqxv-reorder`, and
+  `fqxv-lroverlap` build on; the single source of truth so those variants can't
+  drift.
 - **`fqxv-bytes`** — a leaf crate of shared byte-serialization primitives
-  (LEB128 varints, zig-zag) that `fqxv-seq`, `fqxv-reorder`, `fqxv-fqzcomp`, and
-  `fqxv-tokenizer` all read/write on disk; the single source of truth for those
-  encodings.
+  (LEB128 varints, zig-zag, the bounds-checked reader) that `fqxv-seq`,
+  `fqxv-reorder`, `fqxv-fqzcomp`, and `fqxv-tokenizer` all read/write on disk; the
+  single source of truth for those encodings.
 
 ## Clean-room provenance
 
@@ -68,10 +87,11 @@ in-tree order-k `fqxv-seq` model.
 
 ## Design principles
 
-- **Measure, don't assume.** Backends and parameters are chosen on measured
-  numbers. The AVX2 rANS path, for instance, is *not* the default on AMD Zen 3,
-  where its gather instructions measured slower than the autovectorized scalar
-  path.
+- **Measure, don't assume.** Codec choices are made on measured bytes, per input.
+  The long-read overlap codec, for instance, is adopted for a block only when it
+  actually beats the order-k model, and the whole-file global reference frame is
+  written only when it nets a size win over the block-local codecs — so a codec
+  can never enlarge the archive.
 - **Parallelism is a first-class concern.** Everything blocks and fans out with
   `rayon`; output is deterministic across thread counts.
 

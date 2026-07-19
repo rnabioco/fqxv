@@ -1,5 +1,6 @@
 //! `fqxv` command-line interface — a thin front-end over the [`fqxv`] library.
 
+mod output;
 mod progress;
 mod report;
 
@@ -67,16 +68,26 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
-    /// Number of worker threads, capped at available cores (0 = all cores).
+    /// Number of worker threads (0 = all cores).
+    ///
+    /// Capped at the number of cores that physically exist, so an explicit
+    /// value never oversubscribes. Governs both compression and the parallel
+    /// BGZF decode path.
     #[arg(long, global = true, default_value_t = 16)]
     threads: usize,
 
-    /// Increase log verbosity: -v debug, -vv trace, -vvv trace with targets,
-    /// thread ids, and span timing. Overridden by RUST_LOG if set.
+    /// Increase log verbosity (repeatable: -v, -vv, -vvv).
+    ///
+    /// -v adds info, -vv adds debug, -vvv adds trace with targets, thread ids,
+    /// and span timing. All logs go to stderr, so piped FASTQ stays clean.
+    /// Overridden by RUST_LOG if set.
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Silence all output except warnings and errors (suppresses the summary).
+    /// Silence all output except warnings and errors.
+    ///
+    /// Suppresses the progress indicator and the end-of-run summary; only
+    /// warnings and errors reach stderr.
     #[arg(short, long, global = true, conflicts_with = "verbose")]
     quiet: bool,
 }
@@ -84,13 +95,19 @@ struct Cli {
 /// Install the `tracing` subscriber. Verbosity comes from `-v/-vv/-vvv` and
 /// `--quiet`; a set `RUST_LOG` overrides the computed level entirely. All output
 /// goes to **stderr** so decompressed FASTQ on stdout stays uncontaminated.
+///
+/// The default (no `-v`) is `warn`: the user-facing surface is the progress
+/// indicator plus the end-of-run summary, so routine `info` diagnostics — which
+/// otherwise interleave with and smear the live spinner/bar — are held back to
+/// `-v`. `-vv` adds `debug`, `-vvv` adds `trace` with targets and timing.
 fn init_tracing(verbose: u8, quiet: bool) {
     let level = if quiet {
-        "warn"
+        "error"
     } else {
         match verbose {
-            0 => "info",
-            1 => "debug",
+            0 => "warn",
+            1 => "info",
+            2 => "debug",
             _ => "trace",
         }
     };
@@ -116,51 +133,120 @@ fn init_tracing(verbose: u8, quiet: bool) {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Compress FASTQ to `.fqxv`. Give multiple inputs to interleave per-spot
-    /// files (paired mates, or single-cell R1/R2/I1/I2) into one archive.
+    /// Compress FASTQ to `.fqxv`.
+    ///
+    /// Give multiple inputs to interleave per-spot files (paired mates, or
+    /// single-cell R1/R2/I1/I2) into one archive.
     Compress {
-        /// Input FASTQ file(s), plain or gzipped; `-` reads one stream from
-        /// stdin. One file = single-end, 2 = paired, 3-4 = single-cell; multiple
-        /// files are interleaved per spot. Order is preserved for `--split`.
+        /// Input FASTQ file(s), or `-` for stdin.
+        ///
+        /// Plain or gzipped; `-` reads one stream from stdin. One file =
+        /// single-end, 2 = paired, 3-4 = single-cell; multiple files are
+        /// interleaved per spot. Order is preserved for `--split`.
         #[arg(num_args = 1..)]
         inputs: Vec<PathBuf>,
-        /// Output `.fqxv` path. Defaults to the first input's name with the
-        /// FASTQ/gzip extension replaced by `.fqxv` (`reads.fastq.gz` ->
-        /// `reads.fqxv`), written alongside the input. Required when the input is
-        /// stdin (`-`).
+        /// Output `.fqxv` path (default: alongside the input).
+        ///
+        /// Defaults to the first input's name with the FASTQ/gzip extension
+        /// replaced by `.fqxv` (`reads.fastq.gz` -> `reads.fqxv`), written
+        /// alongside the input. Required when the input is stdin (`-`).
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Overwrite the output archive if it already exists. Without this, an
-        /// existing output path is left untouched and the command errors, so a
-        /// stray `compress` can't silently clobber an archive.
+        /// Overwrite the output archive if it already exists.
+        ///
+        /// Without this, an existing output path is left untouched and the
+        /// command errors, so a stray `compress` can't silently clobber an
+        /// archive.
         #[arg(short = 'f', long)]
         force: bool,
-        /// Maximum-compression preset: the deepest sequence context plus read
-        /// reordering *where it helps*. Overrides `--level`/`--order`. Reordering
-        /// is applied to short-read data and automatically skipped for long reads
-        /// (nanopore/PacBio), where it costs ~10x the time and memory for no ratio
-        /// gain — so `--max` adapts to the input rather than forcing one fixed
-        /// setting. Single-end short reads may come back reordered; names,
-        /// sequence, and quality are preserved exactly (still lossless).
+        /// Maximum-compression preset (overrides `--level`/`--order`).
+        ///
+        /// The deepest sequence context plus read reordering *where it helps*.
+        /// Reordering is applied to short-read data and automatically skipped
+        /// for long reads (nanopore/PacBio), where it costs ~10x the time and
+        /// memory for no ratio gain — so `--max` adapts to the input rather than
+        /// forcing one fixed setting. Single-end short reads may come back
+        /// reordered; names, sequence, and quality are preserved exactly (still
+        /// lossless).
         #[arg(long)]
         max: bool,
+        /// Re-decode the archive after writing to confirm it round-trips.
+        ///
+        /// Recommended before deleting the source FASTQ. Catches a codec or
+        /// memory error that produced a CRC-valid-but-wrong archive. Roughly
+        /// doubles wall time (adds a decode pass; the reorder/`--max` path is
+        /// the heaviest). On failure the archive is left in place and the
+        /// command exits non-zero.
+        #[arg(long, conflicts_with = "estimate")]
+        verify: bool,
+        /// Estimate the ratio and archive size from a sample, then exit.
+        ///
+        /// Writes nothing. Codes the leading reads with the real codecs at the
+        /// chosen `--level`/`--quality-bin` and projects the whole-file archive.
+        /// Reordering (`--order any`/`--max`) is not modeled, so with it the
+        /// estimate is a conservative lower bound — the real archive comes out
+        /// this size or smaller. Pass `tsv` for a two-line machine-readable
+        /// table (`file`, `input_bytes`, `est_fqxv_bytes`, `ratio`) instead of
+        /// the human report.
+        #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "human", value_name = "FORMAT")]
+        estimate: Option<EstimateFormat>,
         /// Compression effort level (1-9); higher raises the sequence order.
+        ///
+        /// The primary effort knob when you aren't using `--max`. Higher levels
+        /// raise the sequence context order (and, at the top levels, enable a
+        /// hashed high-order model) for a better ratio at more time and memory.
         #[arg(short, long, default_value_t = 5, help_heading = "Advanced")]
         level: u8,
-        /// Reads per row group (block). Overrides the block size `--level` would
-        /// pick, decoupling granularity from effort: smaller groups give finer
-        /// random access and more parallelism at some ratio cost (the order-k
-        /// sequence model trains on fewer reads), larger groups the reverse. Useful
-        /// when archiving to object storage where you want to fetch small ranges.
-        /// Sequence order still follows `--level`. Ignored by the reorder path
-        /// (`--order any`/`--max`), which clusters globally.
+        /// Opt-in lossy quality binning (default: lossless).
+        ///
+        /// Changes the data. Quantizes quality scores to a fixed set of levels
+        /// (Illumina 8/4/2-bin, or the Nanopore/HiFi CoLoRd cutpoints) for a
+        /// smaller quality stream at the cost of exact fidelity.
+        #[arg(long, value_enum, default_value_t = QualityBin::Lossless, help_heading = "Advanced")]
+        quality_bin: QualityBin,
+        /// Read-order guarantee: `preserve` (default) or `any`.
+        ///
+        /// `preserve` restores the original order on decompress. `any` allows
+        /// read reordering to exploit depth redundancy for a better ratio —
+        /// single-end reads may come back in a different order; paired/grouped
+        /// input still round-trips in order (the mate interleaving requires it),
+        /// it just costs a stored permutation.
+        #[arg(long, value_enum, default_value_t = ReadOrder::Preserve, help_heading = "Advanced")]
+        order: ReadOrder,
+        /// With `--order any`, force original read order to be restored.
+        ///
+        /// Stores a permutation and codes names/quality in original order. By
+        /// default single-end reorder picks this automatically when it makes the
+        /// archive smaller — counter-style names (e.g. an incrementing `.N N`)
+        /// delta-code to almost nothing in original order, so the permutation
+        /// beats a scrambled-name stream. Pass this to force it on.
+        #[arg(long, help_heading = "Advanced")]
+        keep_order: bool,
+        /// With `--order any`, disable the adaptive assembly codecs.
+        ///
+        /// Uses the faster single-contig sequence codec only. By default reorder
+        /// codes each block with every codec and keeps the smaller — plus, when
+        /// a shared global reference nets a whole-file win, stores it once and
+        /// codes reads as positions on it (never worse than block-local) —
+        /// recovering reads the single-contig codec would strand as literals at
+        /// a higher encode cost. No effect without `--order any`.
+        #[arg(long = "no-rescue", help_heading = "Advanced")]
+        no_rescue: bool,
+        /// Reads per row group (block); overrides the level's block size.
+        ///
+        /// Decouples random-access granularity from effort: smaller groups give
+        /// finer random access and more parallelism at some ratio cost (the
+        /// order-k sequence model trains on fewer reads), larger groups the
+        /// reverse. Useful when archiving to object storage where you want to
+        /// fetch small ranges. Sequence order still follows `--level`. Ignored by
+        /// the reorder path (`--order any`/`--max`), which clusters globally.
         #[arg(long, value_name = "N", help_heading = "Advanced")]
         block_reads: Option<usize>,
-
-        /// Interleaving of a single input, in members per spot. Auto-detected
-        /// from read names by default; pass to force (1 = single-end, 2 = paired
-        /// as from `sracha get -Z`). Ignored with multiple inputs. A group size of
-        /// 0 is meaningless and rejected.
+        /// Force single-input interleaving, in members per spot.
+        ///
+        /// Auto-detected from read names by default; pass to force (1 =
+        /// single-end, 2 = paired as from `sracha get -Z`). Ignored with
+        /// multiple inputs. A group size of 0 is meaningless and rejected.
         #[arg(
             long,
             value_name = "N",
@@ -168,134 +254,112 @@ enum Command {
             value_parser = clap::value_parser!(u8).range(1..)
         )]
         interleaved: Option<u8>,
-        /// Read-order guarantee. `preserve` (default) restores the original order
-        /// on decompress. `any` allows read reordering to exploit depth redundancy
-        /// for a better ratio — single-end reads may come back in a different
-        /// order; paired/grouped input still round-trips in order (the mate
-        /// interleaving requires it), it just costs a stored permutation.
-        #[arg(long, value_enum, default_value_t = ReadOrder::Preserve, help_heading = "Advanced")]
-        order: ReadOrder,
-        /// With `--order any`, disable the adaptive assembly codecs (block-local
-        /// literal-rescue and the whole-file global reference) and use the faster
-        /// single-contig sequence codec only. By default reorder codes each block
-        /// with every codec and keeps the smaller — plus, when a shared global
-        /// reference nets a whole-file win, stores it once and codes reads as
-        /// positions on it (never worse than block-local) — recovering reads the
-        /// single-contig codec would strand as literals at a higher encode cost.
-        /// No effect without `--order any`.
-        #[arg(long = "no-rescue", help_heading = "Advanced")]
-        no_rescue: bool,
-        /// With `--order any`, force original read order to be restored on
-        /// decompress (store a permutation, code names/quality in original order).
-        /// By default single-end reorder picks this automatically when it makes
-        /// the archive smaller — counter-style names (e.g. an incrementing
-        /// `.N N`) delta-code to almost nothing in original order, so the
-        /// permutation beats a scrambled-name stream. Pass this to force it on.
-        #[arg(long, help_heading = "Advanced")]
-        keep_order: bool,
-        /// Opt-in lossy quality binning (changes the data; default is lossless).
-        #[arg(long, value_enum, default_value_t = QualityBin::Lossless, help_heading = "Advanced")]
-        quality_bin: QualityBin,
-        /// Sequencing platform to record in the archive. Auto-detected from the
-        /// read names by default; pass to force it (e.g. for unusual name
-        /// conventions the detector doesn't recognize).
+        /// Sequencing platform to record (default: auto-detect).
+        ///
+        /// Auto-detected from the read names by default; pass to force it (e.g.
+        /// for unusual name conventions the detector doesn't recognize).
         #[arg(long, value_enum, help_heading = "Advanced")]
         platform: Option<Platform>,
-        /// Estimate the compression ratio and archive size from a sample of the
-        /// input, then exit without writing anything. Codes the leading reads
-        /// with the real codecs at the chosen `--level`/`--quality-bin` and
-        /// projects the whole-file archive. Reordering (`--order any`/`--max`) is
-        /// not modeled, so with it the estimate is a conservative lower bound —
-        /// the real archive comes out this size or smaller. Pass `tsv` for a
-        /// two-line machine-readable table (`file`, `input_bytes`,
-        /// `est_fqxv_bytes`, `ratio`) instead of the human report.
-        #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "human", value_name = "FORMAT")]
-        estimate: Option<EstimateFormat>,
-        /// After writing the archive, re-read and fully decode it to confirm it
-        /// round-trips before reporting success — recommended before deleting the
-        /// source FASTQ. Catches a codec or memory error that produced a
-        /// CRC-valid-but-wrong archive. Roughly doubles wall time (adds a decode
-        /// pass; the reorder/`--max` path is the heaviest). On failure the archive
-        /// is left in place and the command exits non-zero.
-        #[arg(long, conflicts_with = "estimate")]
-        verify: bool,
     },
     /// Decompress a `.fqxv` file to FASTQ.
+    ///
+    /// Writes interleaved FASTQ by default; `--split` restores separate
+    /// per-spot mate files and `-Z` streams to stdout.
     Decompress {
         /// Input `.fqxv` file.
         input: PathBuf,
-        /// Interleaved FASTQ output file. A `.gz` extension writes block-gzip
-        /// (BGZF); any other extension writes plain FASTQ. Use `-Z/--stdout` (or
-        /// `-o -`) to stream to stdout instead.
+        /// Interleaved FASTQ output file (`.gz` => BGZF).
+        ///
+        /// A `.gz` extension writes block-gzip (BGZF); any other extension
+        /// writes plain FASTQ. Use `-Z/--stdout` (or `-o -`) to stream to stdout
+        /// instead.
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// Stream interleaved FASTQ (always raw) to stdout, e.g. to pipe into an
-        /// aligner: `fqxv decompress x.fqxv -Z | bwa mem -p ref -`. Required to
-        /// write to stdout — a bare `decompress` with no `-o`/`--split`/`-Z` errors
-        /// rather than flooding the terminal with reads.
+        /// Stream interleaved FASTQ (always raw) to stdout.
+        ///
+        /// E.g. to pipe into an aligner:
+        /// `fqxv decompress x.fqxv -Z | bwa mem -p ref -`. Required to write to
+        /// stdout — a bare `decompress` with no `-o`/`--split`/`-Z` errors rather
+        /// than flooding the terminal with reads.
         #[arg(short = 'Z', long, conflicts_with_all = ["output", "split"])]
         stdout: bool,
-        /// Restore separate per-spot files as `<prefix>_R1.fastq.gz …
-        /// _R<G>.fastq.gz` (block-gzip by default; see `--mate-style`/`--no-gzip`).
+        /// Restore separate per-spot mate files under `<prefix>`.
+        ///
+        /// Writes `<prefix>_R1.fastq.gz … _R<G>.fastq.gz` (block-gzip by default;
+        /// see `--mate-style`/`--no-gzip`).
         #[arg(long, conflicts_with = "output")]
         split: Option<PathBuf>,
-        /// Labeling for `--split` outputs: `r` gives `_R1`,`_R2`,… (Illumina
-        /// convention, the default); `num` gives `_1`,`_2`,….
-        #[arg(long, value_enum, default_value_t = MateStyle::R, requires = "split")]
-        mate_style: MateStyle,
-        /// Write plain `.fastq` for `--split` instead of the default block-gzip
-        /// `.fastq.gz`. (For `-o FILE`, compression follows the file extension.)
-        #[arg(long, requires = "split")]
-        no_gzip: bool,
-        /// Best-effort recovery of a corrupted archive: skip blocks that fail
-        /// their CRC and decode the rest, reporting what was lost. Interleaved
-        /// output only (plain, non-reordered archives).
-        #[arg(long, conflicts_with = "split")]
-        recover: bool,
-        /// Overwrite output FASTQ file(s) if they already exist. Without this, an
-        /// existing output (`-o FILE` or any `--split` mate file) is left
-        /// untouched and the command errors before decoding. Ignored when writing
-        /// to stdout (`-Z`/`-o -`).
+        /// Overwrite output FASTQ file(s) if they already exist.
+        ///
+        /// Without this, an existing output (`-o FILE` or any `--split` mate
+        /// file) is left untouched and the command errors before decoding.
+        /// Ignored when writing to stdout (`-Z`/`-o -`).
         #[arg(short = 'f', long)]
         force: bool,
+        /// Labeling for `--split` outputs: `r` (`_R1`) or `num` (`_1`).
+        ///
+        /// `r` gives `_R1`,`_R2`,… (Illumina convention, the default); `num`
+        /// gives `_1`,`_2`,….
+        #[arg(long, value_enum, default_value_t = MateStyle::R, requires = "split", help_heading = "Advanced")]
+        mate_style: MateStyle,
+        /// Write plain `.fastq` for `--split` (default is `.fastq.gz`).
+        ///
+        /// For `-o FILE`, compression follows the file extension instead.
+        #[arg(long, requires = "split", help_heading = "Advanced")]
+        no_gzip: bool,
+        /// Best-effort recovery of a corrupted archive.
+        ///
+        /// Skip blocks that fail their CRC and decode the rest, reporting what
+        /// was lost. Interleaved output only (plain, non-reordered archives).
+        #[arg(long, conflicts_with = "split", help_heading = "Advanced")]
+        recover: bool,
     },
-    /// Print `.fqxv` container metadata and per-stream sizes. Give several files
-    /// or a directory (scanned recursively for `*.fqxv`) to report a batch — one
-    /// TSV/JSON entry per archive, keyed by filename.
+    /// Print `.fqxv` container metadata and per-stream sizes.
+    ///
+    /// Give several files or a directory (scanned recursively for `*.fqxv`) to
+    /// report a batch — one TSV/JSON entry per archive, keyed by filename.
     Info {
-        /// Input `.fqxv` file(s), or a directory scanned recursively for `*.fqxv`.
+        /// Input `.fqxv` file(s), or a directory scanned for `*.fqxv`.
         #[arg(num_args = 1..)]
         inputs: Vec<PathBuf>,
-        /// Emit machine-readable TSV instead of the human report. A single file
-        /// keeps the stable one-row columns (benchmark harness / scripts); a batch
-        /// prepends a `file` column and prints one row per archive.
+        /// Also report content statistics (decodes the whole archive).
+        ///
+        /// Read-length spread, base composition, GC%, and the quality
+        /// distribution. Unlike the default metadata-only report (which just
+        /// reads the header and footer index), this costs a full decompress.
+        #[arg(long, short = 's')]
+        stats: bool,
+        /// Emit machine-readable TSV instead of the human report.
+        ///
+        /// A single file keeps the stable one-row columns (benchmark harness /
+        /// scripts); a batch prepends a `file` column and prints one row per
+        /// archive.
         #[arg(long, conflicts_with = "json")]
         tsv: bool,
         /// Emit a JSON object instead of the human report.
         #[arg(long)]
         json: bool,
-        /// Also report content statistics — read-length spread, base
-        /// composition, GC%, and the quality distribution. This decodes the whole
-        /// archive (unlike the default metadata-only report, which just reads the
-        /// header and footer index), so it costs a full decompress.
-        #[arg(long, short = 's')]
-        stats: bool,
     },
-    /// Verify archive integrity (CRC checks) without writing any output.
+    /// Verify archive integrity (CRC checks) without writing output.
+    ///
     /// Prints a table of per-check results; exits non-zero if any archive is
     /// corrupt. Give several files or a directory (scanned recursively for
     /// `*.fqxv`) to verify a batch.
     Verify {
-        /// Input `.fqxv` file(s), or a directory scanned recursively for `*.fqxv`.
+        /// Input `.fqxv` file(s), or a directory scanned for `*.fqxv`.
         #[arg(num_args = 1..)]
         inputs: Vec<PathBuf>,
-        /// Faster, weaker check: verify each block's stored CRC via the footer
-        /// index (parallel positioned reads) instead of the whole-file digest.
-        /// Skips the header, footer, and inter-block framing bytes.
+        /// Faster, weaker check: per-block CRC via the footer index.
+        ///
+        /// Verifies each block's stored CRC through the footer index (parallel
+        /// positioned reads) instead of the whole-file digest. Skips the header,
+        /// footer, and inter-block framing bytes.
         #[arg(long)]
         quick: bool,
-        /// Emit tab-separated per-check rows instead of the human table. A batch
-        /// prepends a `file` column so rows from different archives stay distinct.
+        /// Emit tab-separated per-check rows instead of the human table.
+        ///
+        /// A batch prepends a `file` column so rows from different archives stay
+        /// distinct.
         #[arg(long, conflicts_with = "json")]
         tsv: bool,
         /// Emit a JSON object instead of the human table.
@@ -461,6 +525,10 @@ fn main() -> anyhow::Result<()> {
         !cli.quiet && io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
     );
     configure_global_pool(cli.threads).context("configuring the global thread pool")?;
+    // Clean up an in-progress temp archive if the user Ctrl-C's mid-compress, so
+    // an interrupted stream never orphans a partial file (the atomic rename
+    // already guarantees no corrupt archive lands at the destination path).
+    output::install_interrupt_handler();
     match cli.command {
         Command::Compress {
             inputs,
@@ -531,60 +599,92 @@ fn main() -> anyhow::Result<()> {
                 .filter_map(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len())
                 .sum();
-            let out = create_output(&output, force)?;
+            // Write to a sibling temp file and rename into place only once the
+            // whole archive is on disk. An interrupted or failed run then never
+            // leaves a footer-less, corrupt `.fqxv` at the destination path.
+            let (archive, out) = output::AtomicOutput::create(&output, force)?;
 
-            // The reorder path opens with a long single-threaded prelude, so name
-            // the spinner after the slow work to set expectations. On a `?` bail
-            // the spinner's Drop clears the line before the error prints.
+            // The reorder path reads the whole input up front before its
+            // single-threaded compute begins, so input-byte progress would stall
+            // at 100% mid-run — give it an indeterminate readout and name it after
+            // the slow work. The streaming path tracks input consumption, so it
+            // gets a live bar (a percentage when the input size is known, a
+            // bytes + rate readout for a stdin stream of unknown length).
             let spin_msg = if params.reorder {
                 "compressing (reorder — this can take a while)…"
             } else {
                 "compressing…"
             };
-            let sp = progress::Spinner::start(spin_msg, cli.quiet);
 
             let t0 = Instant::now();
             let stats = if inputs.len() == 1 {
-                match interleaved {
-                    None => fqxv::compress_auto(open_input(&inputs[0])?, out, params)?,
-                    Some(g) if g > 1 => {
-                        fqxv::compress_interleaved(open_input(&inputs[0])?, out, params, g)?
-                    }
-                    Some(_) => fqxv::compress(open_input(&inputs[0])?, out, params)?,
-                }
+                // Create the byte counter before opening the reader so the
+                // gzip-sniffing read — which blocks on a not-yet-ready stdin — is
+                // already counted and the indicator is live while we wait on the
+                // upstream producer (a pause reads as `0 B`, not a hang).
+                let counter = Arc::new(AtomicU64::new(0));
+                let total = single_input_len(&inputs[0], params.reorder);
+                let reader = open_input_with_counter(&inputs[0], Arc::clone(&counter))?;
+                let bar = progress::Bar::start(spin_msg, cli.quiet, counter, total);
+                let stats = match interleaved {
+                    None => fqxv::compress_auto(reader, out, params)?,
+                    Some(g) if g > 1 => fqxv::compress_interleaved(reader, out, params, g)?,
+                    Some(_) => fqxv::compress(reader, out, params)?,
+                };
+                bar.abandon();
+                stats
             } else {
+                let sp = progress::Spinner::start(spin_msg, cli.quiet);
                 let readers: Vec<Box<dyn Read + Send>> = inputs
                     .iter()
                     .map(|p| open_input(p))
                     .collect::<anyhow::Result<_>>()?;
-                fqxv::compress_multi(readers, out, params)?
+                let stats = fqxv::compress_multi(readers, out, params)?;
+                sp.abandon();
+                stats
             };
             let secs = t0.elapsed().as_secs_f64();
-            sp.abandon();
 
             // Optional read-after-write verification: fully decode the archive we
-            // just wrote and confirm it round-trips before reporting success. The
-            // output handle was flushed and dropped by the compress call above, so
-            // reopen the path. On any failure the archive is left in place (for
-            // inspection) and we bail non-zero via `?` — a bad archive is never
-            // reported as done. The spinner's Drop clears its line on that bail.
+            // just wrote and confirm it round-trips *before* publishing it. We
+            // verify the temp file and only commit (atomically rename into place)
+            // on success, so `--verify` never leaves a bad archive at the
+            // destination. On a mismatch or decode error the temp is kept off the
+            // final path for inspection and we bail non-zero. On a `?` bail
+            // elsewhere the spinner's Drop clears its line before the error prints.
             if verify {
                 let sp = progress::Spinner::start("verifying…", cli.quiet);
-                let decoded = File::open(&output)
-                    .with_context(|| format!("reopening {} to verify", output.display()))
+                let verified = File::open(archive.temp_path())
+                    .with_context(|| {
+                        format!("reopening {} to verify", archive.temp_path().display())
+                    })
                     .and_then(|f| {
-                        fqxv::verify_roundtrip(f, cli.threads)
-                            .with_context(|| format!("verifying {}", output.display()))
-                    })?;
-                if decoded != stats.reads {
-                    anyhow::bail!(
-                        "verification of {} decoded {decoded} reads but {} were written",
-                        output.display(),
-                        stats.reads
-                    );
+                        fqxv::verify_roundtrip(f, cli.threads).context("verifying the archive")
+                    });
+                match verified {
+                    Ok(decoded) if decoded == stats.reads => sp.abandon(),
+                    Ok(decoded) => {
+                        let kept = archive.keep_for_inspection();
+                        anyhow::bail!(
+                            "verification decoded {decoded} reads but {} were written; \
+                             unverified output kept at {} (not published to {})",
+                            stats.reads,
+                            kept.display(),
+                            output.display()
+                        );
+                    }
+                    Err(e) => {
+                        let kept = archive.keep_for_inspection();
+                        return Err(e.context(format!(
+                            "unverified output kept at {} (not published to {})",
+                            kept.display(),
+                            output.display()
+                        )));
+                    }
                 }
-                sp.abandon();
             }
+            // Publish: atomically move the finished, verified archive into place.
+            archive.commit()?;
 
             // User-facing summary: printed to stderr, gated only on `--quiet` and
             // deliberately independent of the tracing log level. The structured
@@ -1680,16 +1780,40 @@ fn decode_input(mut src: Box<dyn Read + Send>) -> anyhow::Result<Box<dyn Read + 
 }
 
 /// Like [`open_input`], but tallies bytes pulled from the *raw* (pre-decode)
-/// source into the returned counter. `--estimate` uses this to learn how much
-/// on-disk input a sample consumed, so it can project the whole-file archive
-/// size — for a gzip input the count is on-disk (compressed) bytes.
-fn open_input_counted(path: &Path) -> anyhow::Result<(Box<dyn Read + Send>, Arc<AtomicU64>)> {
-    let count = Arc::new(AtomicU64::new(0));
+/// source into `count`. The compress progress bar drives a live readout from
+/// this counter; passing the counter in (rather than getting it back) lets the
+/// caller start the indicator *before* the reader's gzip-sniffing first read,
+/// which blocks on a not-yet-ready stdin. For a gzip input the count is on-disk
+/// (compressed) bytes, matching the file length the bar measures against.
+fn open_input_with_counter(
+    path: &Path,
+    count: Arc<AtomicU64>,
+) -> anyhow::Result<Box<dyn Read + Send>> {
     let counted: Box<dyn Read + Send> = Box::new(CountingReader {
         inner: raw_input(path)?,
-        count: Arc::clone(&count),
+        count,
     });
-    Ok((decode_input(counted)?, count))
+    decode_input(counted)
+}
+
+/// [`open_input_with_counter`] with a fresh counter returned alongside. `--estimate`
+/// uses this to learn how much on-disk input a sample consumed, so it can project
+/// the whole-file archive size.
+fn open_input_counted(path: &Path) -> anyhow::Result<(Box<dyn Read + Send>, Arc<AtomicU64>)> {
+    let count = Arc::new(AtomicU64::new(0));
+    let reader = open_input_with_counter(path, Arc::clone(&count))?;
+    Ok((reader, count))
+}
+
+/// The on-disk byte length to drive a compress progress bar, or `None` for an
+/// indeterminate readout. `None` when the input is stdin (`-`, no length) or
+/// when `reorder` is set — the reorder codec reads the whole input up front, so
+/// an input-byte bar would misleadingly stall at 100% during its compute.
+fn single_input_len(path: &Path, reorder: bool) -> Option<u64> {
+    if reorder || path.as_os_str() == "-" {
+        return None;
+    }
+    std::fs::metadata(path).ok().map(|m| m.len())
 }
 
 /// A pass-through reader that adds every byte it yields to a shared counter.

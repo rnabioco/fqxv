@@ -48,6 +48,7 @@ automake = "*"
 libtool = "*"
 zlib = "*"
 bzip2 = "*"
+minimap2 = ">=2.31,<3"
 
 [tasks]
 # Clone + build the from-source baselines (PgRC, fqzcomp5) into $SCRATCH tools.

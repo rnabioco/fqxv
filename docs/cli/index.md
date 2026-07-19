@@ -16,6 +16,8 @@ The `fqxv` binary has four subcommands:
 | Option | Description |
 | --- | --- |
 | `--threads <N>` | Worker threads (0 = all available cores). Default: 16, capped at available cores. |
+| `-v, --verbose` | Increase log verbosity (`-v` debug, `-vv`/`-vvv` trace); overridden by `RUST_LOG`. |
+| `-q, --quiet` | Silence all output except warnings and errors (also suppresses the summary). |
 | `-h, --help` | Print help. |
 | `-V, --version` | Print version. |
 

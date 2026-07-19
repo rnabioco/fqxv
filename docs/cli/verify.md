@@ -24,6 +24,7 @@ fqxv verify [--quick] [--tsv | --json] <INPUT>
 | `--quick` | Faster, weaker check: validate each block's stored CRC via the footer index (parallel positioned reads) instead of the whole-file digest. |
 | `--tsv` | Emit tab-separated per-check rows instead of the table. |
 | `--json` | Emit a JSON object instead of the table. |
+| `--threads <N>` | Worker threads (0 = all cores) for the parallelized CRC pass. |
 
 ## Output and exit status
 
@@ -33,14 +34,14 @@ every output format, so it drops cleanly into scripts and CI.
 
 ```text
 sample.fqxv
-╭────────────────┬────────┬─────────────────────────╮
-│ check          │ result │ detail                  │
-├────────────────┼────────┼─────────────────────────┤
-│ header         │ ok     │ format v1, plain layout │
-│ footer         │ ok     │ 128 blocks, 33200000 …  │
-│ block CRCs     │ ok     │ 128/128 intact          │
-│ whole-file CRC │ ok     │                         │
-╰────────────────┴────────┴─────────────────────────╯
+╭────────────────┬────────┬───────────────────────────╮
+│ check          │ result │ detail                    │
+├────────────────┼────────┼───────────────────────────┤
+│ header         │ ok     │ format v1.0, plain layout │
+│ footer         │ ok     │ 128 blocks, 33200000 …    │
+│ block CRCs     │ ok     │ 128/128 intact            │
+│ whole-file CRC │ ok     │                           │
+╰────────────────┴────────┴───────────────────────────╯
 sample.fqxv: OK
 ```
 
@@ -67,7 +68,7 @@ fqxv verify sample.fqxv --tsv
 
 ```text
 check	result	detail
-header	ok	format v1, plain layout
+header	ok	format v1.0, plain layout
 footer	ok	128 blocks, 33200000 reads
 block CRCs	ok	128/128 intact
 whole-file CRC	ok	
@@ -81,7 +82,7 @@ and any `failed_blocks` (`--tsv` and `--json` are mutually exclusive):
   "file": "sample.fqxv",
   "passed": true,
   "checks": [
-    { "name": "header", "ok": true, "detail": "format v1, plain layout" },
+    { "name": "header", "ok": true, "detail": "format v1.0, plain layout" },
     { "name": "footer", "ok": true, "detail": "128 blocks, 33200000 reads" },
     { "name": "block CRCs", "ok": true, "detail": "128/128 intact" },
     { "name": "whole-file CRC", "ok": true, "detail": "" }

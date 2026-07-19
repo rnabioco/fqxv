@@ -76,8 +76,8 @@ print(info.reads, info.blocks, info.format_version, info.platform)
 
 ## Column projection & random access
 
-Since format v3, an `.fqxv` archive carries a footer index with per-stream byte
-offsets and CRCs. That makes it **Parquet-shaped**: you can fetch and decode a
+An `.fqxv` archive carries a footer index with per-stream byte offsets and CRCs.
+That makes it **Parquet-shaped**: you can fetch and decode a
 single column, or a single row group, without touching the rest. Read names are
 typically under 1% of the archive, so an ID-only pass reads ~100× less.
 

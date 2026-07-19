@@ -21,7 +21,8 @@ degenerate distributions, and cross-tool edge cases.
 ## 1. Decoder robustness on untrusted input (highest priority)
 
 htscodecs fuzzes every one of these codecs via OSS-Fuzz, feeding arbitrary bytes
-straight to the *decompressor*. We have no equivalent yet. A local probe (30k
+straight to the *decompressor*. We now have an equivalent — coverage-guided
+`cargo-fuzz` targets over every decode entry point (see below). A local probe (30k
 random inputs per codec) found no panics, but **targeted adversarial headers did
 crash the process**:
 
@@ -37,11 +38,18 @@ crash the process**:
   `rejects_huge_length_count`, `rejects_huge_total_length`,
   `decode_never_aborts_on_garbage` in both `fqxv-fqzcomp` and `fqxv-seq`.
   Mirrors the htscodecs fqzcomp 1-bp buffer-overrun fix (NEWS 1.5.2).
-- ▶ **Extend `decode_never_aborts_on_garbage` to every codec** (rans,
-  tokenizer, reorder, and the `fqxv` container). Cheap, high-value.
-- ▶ **Adopt `cargo-fuzz`** with one target per decoder (`*_fuzz`) plus
-  round-trip targets (`*_fuzzrt`), matching htscodecs' split. No fuzz harness
-  exists today.
+- ✅ **`cargo-fuzz` harness over every decoder.** `fuzz/fuzz_targets/` has six
+  coverage-guided targets — `container`, `rans`, `tokenizer`, `seq`, `fqzcomp`,
+  `reorder` — each feeding arbitrary bytes straight to a decode entry point, the
+  invariant being that a decoder returns `Ok`/`Err` on *any* input and never
+  panics/aborts (release is `panic = "abort"`). This complements the in-tree
+  proptest corruption harness (`crates/fqxv/tests/corruption.rs`), which mutates
+  valid encodings in normal CI. See `fuzz/README.md`.
+- ▶ **Extend the inline `decode_never_aborts_on_garbage` test to every codec.**
+  The fuzz targets already exercise `rans`/`tokenizer`/`reorder`/`container`, but
+  the cheap inline regression test still lives only in `fqxv-fqzcomp` and
+  `fqxv-seq`; mirror it in the others so a random-garbage smoke check runs without
+  the nightly fuzz toolchain.
 - ○ **tokenizer/reorder speculative allocations** cap at `1<<20`/`1<<22`, so the
   worst case is ~96 MB rather than an abort — lower risk, but converting them to
   `try_reserve` would remove the last alloc-abort paths for consistency.

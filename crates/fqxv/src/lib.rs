@@ -30,13 +30,14 @@ use thiserror::Error;
 /// The four-byte magic at the head of every `.fqxv` file.
 pub const MAGIC: [u8; 4] = *b"FQXV";
 
-/// The container format version this build writes.
+/// The container format **major** version this build writes.
 ///
-/// **Nothing on disk is stable yet (alpha): this build reads only its own
-/// version.** Because of that, the format has not accreted numbered revisions —
-/// every change lands in v1 until a first stable release freezes it. (The
-/// "v2/v3/v4" you see elsewhere are the per-block *sequence codec* versions,
-/// which are independent of this container version.)
+/// **Nothing on disk is stable yet (alpha):** the format may change incompatibly
+/// before a first stable release freezes it. A reader refuses an archive whose
+/// major differs from its own (wire-incompatible) but tolerates a newer
+/// [`FORMAT_MINOR`] within its major — minor bumps only add backward-compatible
+/// things. (The "v2/v3/v4" you see elsewhere are the per-block *sequence codec*
+/// versions, independent of this container version.)
 ///
 /// The v1 container:
 /// - appends a footer index (`[u32 n_row_groups]`, per-group

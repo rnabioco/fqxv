@@ -29,6 +29,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tabled.workspace = true
 indicatif.workspace = true
+ctrlc.workspace = true
 owo-colors.workspace = true
 serde.workspace = true
 serde_json.workspace = true

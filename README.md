@@ -11,11 +11,12 @@ one-crate-per-algorithm codecs plus a container format and CLI.
 > [benchmarked against the field](docs/benchmarks.md), but **do not use `fqxv` as
 > the only copy of data you care about.**
 >
-> - **The on-disk `.fqxv` format (`FORMAT_VERSION` 2) is not frozen and changes
->   without notice.** Each build reads only its own version, so an archive
->   written today may be unreadable by tomorrow's build. Pin an exact version if
->   you need archives to survive an upgrade — and prefer re-compressing from the
->   original FASTQ.
+> - **The on-disk `.fqxv` format (version 1.0) is not frozen and may change
+>   incompatibly before a stability guarantee.** A reader accepts any archive with
+>   its own major version (newer minors are tolerated) but refuses a different
+>   major, so a future major bump can make today's archives unreadable. Pin an
+>   exact version if you need archives to survive an upgrade — and prefer
+>   re-compressing from the original FASTQ.
 > - **Bugs are still being found.** Correctness work is ongoing, including
 >   defects that produced archives which could not be decompressed. Archives are
 >   checksummed and `compress --verify` reads one back to confirm, but **keep
