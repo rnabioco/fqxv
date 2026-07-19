@@ -13,8 +13,9 @@ input's name with the FASTQ/gzip extension replaced by `.fqxv`:
 fqxv compress reads.fastq.gz            # writes reads.fqxv
 ```
 
-Tune effort with `--level` (1–9; higher raises the sequence context order) and
-threads with `--threads` (default 16, capped at available cores; 0 = all cores):
+Tune effort with `--level` (1–9; higher raises the sequence context order up to
+level 5, then the block size) and threads with `--threads` (default 16, capped at
+available cores; 0 = all cores):
 
 ```bash
 fqxv compress reads.fastq.gz -o reads.fqxv --level 7 --threads 16

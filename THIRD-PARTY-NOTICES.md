@@ -38,6 +38,11 @@ reference implementations we cross-checked against for correctness.
   Reimplemented from the paper; no source translated.
 - miniasm (Heng Li, *Bioinformatics* 2016, MIT) — overlap–layout–consensus
   reference used to check the long-read assembly's collapse.
+- NanoSpring (Meng, Chandak et al.) — approximate-assembly long-read sequence
+  compression; field context for the same lever (overlap index → align →
+  consensus graph). Referenced for context only; not reimplemented from, and no
+  source used.
 
-None of the above impose obligations beyond attribution; all are permissive
-(BSD 3-Clause / MIT) or public domain. This project is licensed MIT OR Apache-2.0.
+None of the implemented-from references above impose obligations beyond
+attribution; all are permissive (BSD 3-Clause / MIT) or public domain. This
+project is licensed MIT OR Apache-2.0.

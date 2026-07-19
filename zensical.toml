@@ -26,6 +26,7 @@ nav = [
     { "Container Format" = "design/container.md" },
     { "Read Reordering" = "design/reordering.md" },
     { "Long-read Support" = "design/longread.md" },
+    { "Testing & Robustness" = "design/testing.md" },
   ] },
   { "Benchmarks" = "benchmarks.md" },
   { "Format comparison" = "format-comparison.md" },
