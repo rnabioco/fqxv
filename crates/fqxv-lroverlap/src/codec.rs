@@ -170,6 +170,27 @@ fn encode_subs(subs: &[u8], sub_ctx: &[u8]) -> Vec<u8> {
     enc.finish()
 }
 
+/// Number of order-3 op-history contexts (last 3 ops × 2 bits).
+const OP_CTXS: usize = 64;
+
+/// Range-code the op-type stream (Match/Sub/Ins/Del = 0..3) with an order-3 context
+/// over the three preceding op types. Op sequences are strongly self-correlated
+/// (Match follows Match; homopolymer indels cluster), so this beats the flat rANS.
+/// The rolling context is derived from the ops themselves, so decode rebuilds it
+/// identically as it decodes each op during reconstruction.
+fn encode_ops(ops: &[u8]) -> Vec<u8> {
+    let mut enc = fqxv_range::Encoder::new();
+    let mut models: [fqxv_range::SimpleModel<4>; OP_CTXS] =
+        std::array::from_fn(|_| fqxv_range::SimpleModel::new());
+    let mut ctx = 0usize;
+    for &o in ops {
+        let sym = (o as usize).min(3);
+        models[ctx].encode(&mut enc, sym);
+        ctx = ((ctx << 2) | sym) & (OP_CTXS - 1);
+    }
+    enc.finish()
+}
+
 fn get_stream(src: &[u8], pos: &mut usize) -> Result<Vec<u8>, Error> {
     let raw_len = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
     if raw_len == 0 {
@@ -506,7 +527,13 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
     put_stream(&mut out, &all.kinds)?;
     put_stream(&mut out, &all.flips)?;
     put_stream(&mut out, &all.placements)?;
-    put_stream(&mut out, &all.ops)?;
+    // ops: range-coded with an order-3 op-history context (see `encode_ops`).
+    {
+        let blob = encode_ops(&all.ops);
+        write_varint(&mut out, all.ops.len() as u64);
+        write_varint(&mut out, blob.len() as u64);
+        out.extend_from_slice(&blob);
+    }
     put_stream(&mut out, &all.runs)?;
     // subs: range-coded conditioned on the reference base (see `encode_subs`).
     {
@@ -585,7 +612,19 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
     let kinds = get_stream(src, &mut pos)?;
     let flips = get_stream(src, &mut pos)?;
     let placements = get_stream(src, &mut pos)?;
-    let ops = get_stream(src, &mut pos)?;
+    // ops: range-coded with an order-3 op-history context (see `encode_ops`).
+    // Decoded inline during reconstruction; the rolling context is rebuilt from the
+    // decoded ops exactly as on encode.
+    let ops_count = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let ops_blob_len = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let ops_end = pos.checked_add(ops_blob_len).ok_or(Error::Corrupt)?;
+    let ops_blob = src.get(pos..ops_end).ok_or(Error::Corrupt)?;
+    pos = ops_end;
+    let mut op_dec = fqxv_range::Decoder::new(ops_blob);
+    let mut op_models: [fqxv_range::SimpleModel<4>; OP_CTXS] =
+        std::array::from_fn(|_| fqxv_range::SimpleModel::new());
+    let mut op_ctx = 0usize;
+    let mut ops_seen = 0usize;
     let runs = get_stream(src, &mut pos)?;
     // subs: range-coded, conditioned on the reference base (see `encode_subs`).
     // Decoded inline during reconstruction — the consensus base at each substitution
@@ -611,7 +650,6 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
     let mut kp = 0usize; // kinds
     let mut fp = 0usize; // flips
     let mut pp = 0usize; // placements
-    let mut op = 0usize; // ops
     let mut rp = 0usize; // runs
     let mut ip = 0usize; // ins_bases
     let mut dp = 0usize; // indel_lens
@@ -668,8 +706,9 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
             let mut ref_pos = 0usize;
             let mut read_ops: Vec<Op> = Vec::new();
             while produced < want {
-                let code = *ops.get(op).ok_or(Error::Corrupt)?;
-                op += 1;
+                let code = op_models[op_ctx].decode(&mut op_dec) as u8;
+                op_ctx = ((op_ctx << 2) | code as usize) & (OP_CTXS - 1);
+                ops_seen += 1;
                 match code {
                     0 => {
                         let m = read_varint(&runs, &mut rp).ok_or(Error::Corrupt)? as usize;
@@ -720,8 +759,8 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
             write_read(&mut seq, r, &read)?;
         }
     }
-    // The decoded substitution count must match what the encoder framed.
-    if subs_seen != subs_count {
+    // The decoded op and substitution counts must match what the encoder framed.
+    if subs_seen != subs_count || ops_seen != ops_count {
         return Err(Error::Corrupt);
     }
 
