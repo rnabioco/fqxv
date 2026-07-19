@@ -1,11 +1,19 @@
 //! fqzcomp-style quality-score context model.
 //!
-//! Each quality symbol is range-coded ([`fqxv_range`]) under a context built
-//! from the previous three quality values (`q3` coarsely quantized), a running
-//! "how noisy has this read been so far" delta counter, and the position within
-//! the read — the dominant signals in Illumina quality streams (the same
-//! features fqz_comp conditions on). One adaptive model per context. Context
-//! resets at every read boundary, so [`encode`] takes per-read lengths.
+//! Each quality symbol is range-coded ([`fqxv_range`]) under a per-context
+//! adaptive model; the context resets at every read boundary, so [`encode`] takes
+//! per-read lengths. Two context modes are chosen automatically by mean read
+//! length (a self-describing byte in the stream header records which):
+//!
+//! - **Position context** (short reads): the previous three quality values (`q3`
+//!   coarsely quantized), a running "how noisy has this read been so far" delta
+//!   counter, and the position within the read — the dominant signals in Illumina
+//!   quality streams (the same features fqz_comp conditions on).
+//! - **Sequence context** (long reads, via [`encode_seq`]): the two previous
+//!   qualities plus the current base, the next base, and the homopolymer
+//!   run-length — where HiFi/ONT quality actually lives. This drops the
+//!   position/delta features (useless on long reads) and requires the decoded
+//!   sequence at decode time (see [`decode_seq`]/[`needs_sequence`]).
 //!
 //! Lossy quality binning ([`QualityBinning`]) is applied before modeling; the
 //! default is lossless. Three quantization tables are offered (exact ranges in
@@ -175,15 +183,40 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// is accepted rather than rejected. `context` masks its fields (below) so a
 /// symbol beyond the old 64-cap can never index past `N_CTX`.
 const QMAX: usize = 94;
-/// Number of contexts: q1(6) | q2>>2(4) | delta(2) | q3>>4(2) | pos-bucket(4) =
-/// 18 bits. `q3` (the third-previous quality, coarse) captures more of the local
-/// quality trajectory. Keeping `q2` at 4 bits and growing to 18 bits beat the
-/// 16-bit rebalance (coarsening `q2` to 2 bits lost more than `q3` added on
-/// full-range data), at 4x the quality-model memory (~34 MB/block).
+/// Number of contexts, sized to the wider of the two modes. Position context:
+/// q1(6) | q2>>2(4) | delta(2) | q3>>4(2) | pos-bucket(4) = 18 bits. `q3` (the
+/// third-previous quality, coarse) captures more of the local quality trajectory;
+/// keeping `q2` at 4 bits and growing to 18 bits beat the 16-bit rebalance
+/// (coarsening `q2` to 2 bits lost more than `q3` added on full-range data), at 4x
+/// the quality-model memory (~34 MB/block). Sequence context ([`context_lr`]) packs
+/// into 16 bits, well inside the same table.
 const N_CTX: usize = 1 << 18;
 /// Saturating cap on the running delta counter (2 bits).
 const DELTA_MAX: u8 = 3;
-const FORMAT_VERSION: u8 = 1;
+/// Stream format version. Bumped to 2 when the header gained its context-mode byte
+/// (see [`MODE_POS`]/[`MODE_SEQ`]); a v1 stream has no such byte, so rejecting it
+/// here is cleaner than silently misreading the old layout.
+const FORMAT_VERSION: u8 = 2;
+
+/// Context-model selector, stored as a byte in the stream header (after the
+/// binning tag). The decoder reads it to know which context to reconstruct — and,
+/// for [`MODE_SEQ`], that it must be handed the block's decoded sequence.
+///
+/// - [`MODE_POS`]: the original sequence-blind context (q1, q2, q3, delta, pos).
+///   Tuned for short reads, whose quality tracks position; needs no sequence, so
+///   the container decodes it in parallel with the sequence stream.
+/// - [`MODE_SEQ`]: a long-read context (q1, q2, current base, next base,
+///   homopolymer run-length) that drops the position/delta features — useless on
+///   long reads — for the base identity that HiFi/ONT quality actually follows.
+///   Requires the decoded sequence, so the container serializes seq → qual.
+const MODE_POS: u8 = 0;
+const MODE_SEQ: u8 = 1;
+
+/// Mean read length (bases) above which [`encode_seq`] selects [`MODE_SEQ`]. Long
+/// reads (HiFi ~15 kb, ONT ~10 kb) clear this comfortably; Illumina (≤250 bp)
+/// never does, so short-read archives keep the position context and the parallel
+/// decode. A middle ground here would only ever misclassify synthetic data.
+const SEQ_MODE_MIN_MEAN_LEN: usize = 500;
 /// Absolute ceiling on a single decode's total quality bytes, guarding the
 /// [`decode`] allocation/loop against a corrupt length header on memory-overcommit
 /// systems (where `try_reserve` can't). Sized far above any real decode — quality
@@ -219,6 +252,37 @@ fn context(q1: u8, q2: u8, q3: u8, delta: u8, pos: usize) -> usize {
         | ((pos_bucket(pos) & 0xF) << 14) // bits 14..17
 }
 
+/// 2-bit code for a base (A/C/G/T → 0/1/2/3; anything else, including `N` and the
+/// end-of-read sentinel, folds to 0). Only feeds the quality context, so the fold
+/// is harmless — encode and decode compute it identically.
+#[inline]
+fn base_code(b: u8) -> usize {
+    match b {
+        b'A' | b'a' => 0,
+        b'C' | b'c' => 1,
+        b'G' | b'g' => 2,
+        b'T' | b't' => 3,
+        _ => 0,
+    }
+}
+
+/// Long-read ([`MODE_SEQ`]) context: condition each quality byte on the two
+/// previous qualities, the current and next base, and the homopolymer run-length
+/// ending at this position. This is where HiFi/ONT quality lives — base identity
+/// and homopolymer runs, not read position — so we spend the 18 bits there and
+/// drop the position/delta features [`context`] uses for short reads.
+///
+/// Packs into 16 bits (`< N_CTX`): q1 (coarse /2, 6 bits) | q2 (coarse /8, 3) |
+/// base (2) | next base (2) | run-length capped at 7 (3).
+#[inline]
+fn context_lr(q1: u8, q2: u8, base: usize, next: usize, hp_run: usize) -> usize {
+    ((q1 as usize >> 1) & 0x3F)              // bits 0..5   previous quality (coarse)
+        | (((q2 as usize >> 3) & 0x7) << 6)  // bits 6..8   second-previous quality (coarse)
+        | ((base & 0x3) << 9)                // bits 9..10  current base
+        | ((next & 0x3) << 11)               // bits 11..12 next base
+        | ((hp_run.min(7)) << 13) // bits 13..15 homopolymer run-length
+}
+
 /// Size-class dispatch for the per-context quality models.
 ///
 /// `SimpleModel<N>` is `[u16; N] + u32`, so the `N_CTX`-entry table costs
@@ -244,6 +308,7 @@ macro_rules! by_size_class {
 fn encode_payload<const NM: usize>(
     lens: &[u32],
     binned: &[u8],
+    seq: Option<&[u8]>,
     dense: &[u8; 256],
     qmin: u8,
     k: usize,
@@ -251,17 +316,38 @@ fn encode_payload<const NM: usize>(
     let mut models = vec![SimpleModel::<NM>::with_active(k); N_CTX];
     let mut enc = Encoder::new();
     let mut rest: &[u8] = binned;
+    let seq_mode = seq.is_some();
+    let mut srest: &[u8] = seq.unwrap_or(&[]);
     for &l in lens {
         let (read, tail) = rest.split_at(l as usize);
         rest = tail;
+        // In `MODE_SEQ` the bases run in lockstep with the qualities; slice this
+        // read's bases off the parallel stream. `MODE_POS` never touches `sread`.
+        let sread: &[u8] = if seq_mode {
+            let (sr, st) = srest.split_at(l as usize);
+            srest = st;
+            sr
+        } else {
+            &[]
+        };
         let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
         let mut delta = 0u8;
+        let mut prev_base = u8::MAX;
+        let mut run = 0usize;
         for (pos, &b) in read.iter().enumerate() {
             let cv = b - qmin;
             let dv = dense[b as usize];
-            let c = context(q1, q2, q3, delta, pos);
+            let c = if seq_mode {
+                let base = sread[pos];
+                let next = sread.get(pos + 1).copied().unwrap_or(u8::MAX);
+                run = if base == prev_base { run + 1 } else { 1 };
+                prev_base = base;
+                context_lr(q1, q2, base_code(base), base_code(next), run)
+            } else {
+                context(q1, q2, q3, delta, pos)
+            };
             debug_assert!(c < N_CTX);
-            // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
+            // SAFETY: both contexts pack into ≤18 bits, so `c < N_CTX == models.len()`.
             unsafe { models.get_unchecked_mut(c) }.encode(&mut enc, dv as usize);
             if pos > 0 && cv != q1 {
                 delta = (delta + 1).min(DELTA_MAX);
@@ -274,26 +360,58 @@ fn encode_payload<const NM: usize>(
     enc.finish()
 }
 
-fn dispatch_encode(lens: &[u32], binned: &[u8], dense: &[u8; 256], qmin: u8, k: usize) -> Vec<u8> {
-    by_size_class!(k, encode_payload, lens, binned, dense, qmin, k)
+fn dispatch_encode(
+    lens: &[u32],
+    binned: &[u8],
+    seq: Option<&[u8]>,
+    dense: &[u8; 256],
+    qmin: u8,
+    k: usize,
+) -> Vec<u8> {
+    by_size_class!(k, encode_payload, lens, binned, seq, dense, qmin, k)
 }
 
 fn decode_payload<const NM: usize>(
     lens: &[u32],
     syms: &[u8],
+    seq: Option<&[u8]>,
     qmin: u8,
     k: usize,
     dec: &mut Decoder<'_>,
     quals: &mut Vec<u8>,
 ) -> Result<()> {
     let mut models = vec![SimpleModel::<NM>::with_active(k); N_CTX];
+    let seq_mode = seq.is_some();
+    let mut srest: &[u8] = seq.unwrap_or(&[]);
     for &l in lens {
+        // `MODE_SEQ` reconstructs the same base/next/run features the encoder
+        // used, from the already-decoded sequence handed in by the caller.
+        let sread: &[u8] = if seq_mode {
+            if srest.len() < l as usize {
+                return Err(Error::Malformed("sequence shorter than quality lengths"));
+            }
+            let (sr, st) = srest.split_at(l as usize);
+            srest = st;
+            sr
+        } else {
+            &[]
+        };
         let (mut q1, mut q2, mut q3) = (0u8, 0u8, 0u8);
         let mut delta = 0u8;
+        let mut prev_base = u8::MAX;
+        let mut run = 0usize;
         for pos in 0..l as usize {
-            let c = context(q1, q2, q3, delta, pos);
+            let c = if seq_mode {
+                let base = sread[pos];
+                let next = sread.get(pos + 1).copied().unwrap_or(u8::MAX);
+                run = if base == prev_base { run + 1 } else { 1 };
+                prev_base = base;
+                context_lr(q1, q2, base_code(base), base_code(next), run)
+            } else {
+                context(q1, q2, q3, delta, pos)
+            };
             debug_assert!(c < N_CTX);
-            // SAFETY: `context` packs into 18 bits, so `c < N_CTX == models.len()`.
+            // SAFETY: both contexts pack into ≤18 bits, so `c < N_CTX == models.len()`.
             let dv = unsafe { models.get_unchecked_mut(c) }.decode(dec);
             let b = *syms
                 .get(dv)
@@ -314,19 +432,41 @@ fn decode_payload<const NM: usize>(
 fn dispatch_decode(
     lens: &[u32],
     syms: &[u8],
+    seq: Option<&[u8]>,
     qmin: u8,
     k: usize,
     dec: &mut Decoder<'_>,
     quals: &mut Vec<u8>,
 ) -> Result<()> {
-    by_size_class!(k, decode_payload, lens, syms, qmin, k, dec, quals)
+    by_size_class!(k, decode_payload, lens, syms, seq, qmin, k, dec, quals)
 }
 
-/// Encode per-read quality strings.
+/// Encode per-read quality strings (sequence-blind).
 ///
 /// `lens` gives each read's quality length; `quals` is their concatenation.
-/// `binning` optionally quantizes qualities before modeling (lossy).
+/// `binning` optionally quantizes qualities before modeling (lossy). Always
+/// selects the position context ([`MODE_POS`]); see [`encode_seq`] to let long
+/// reads condition quality on their bases.
 pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec<u8>> {
+    encode_seq(lens, quals, &[], binning)
+}
+
+/// Encode per-read quality strings, optionally conditioning long reads on their
+/// bases.
+///
+/// `seq` is the reads' concatenated bases in the same order and per-read lengths
+/// as `quals`. When it is present, non-empty, and the mean read length exceeds
+/// [`SEQ_MODE_MIN_MEAN_LEN`], the stream is coded in [`MODE_SEQ`] (base + next
+/// base + homopolymer run-length context); otherwise it falls back to the
+/// sequence-blind [`MODE_POS`] and `seq` is ignored. Pass `&[]` for `seq` to
+/// force [`MODE_POS`] — that is exactly what [`encode`] does. A `MODE_SEQ` stream
+/// requires the decoded sequence at [`decode_seq`] time.
+pub fn encode_seq(
+    lens: &[u32],
+    quals: &[u8],
+    seq: &[u8],
+    binning: QualityBinning,
+) -> Result<Vec<u8>> {
     let total: usize = lens.iter().map(|&l| l as usize).sum();
     if total != quals.len() {
         return Err(Error::LengthMismatch {
@@ -334,6 +474,14 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
             quals: quals.len(),
         });
     }
+
+    // Sequence context needs the bases to run in exact lockstep with the
+    // qualities, and only pays off on long reads. If either fails, code
+    // sequence-blind — never a correctness risk, just the old behaviour.
+    let seq_mode = !seq.is_empty()
+        && seq.len() == total
+        && !lens.is_empty()
+        && total / lens.len() >= SEQ_MODE_MIN_MEAN_LEN;
 
     // Apply (optional) lossy binning, then map to a dense 0-based alphabet. On
     // the lossless default `apply` is the identity, so borrow `quals` directly
@@ -351,11 +499,12 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
     // capacity — see `SimpleModel::with_active`. Context features stay on the
     // original Phred scale (`cv = b - qmin`); only the coded symbol is the dense
     // index (`dv`).
-    let payload = dispatch_encode(lens, &binned, &dense, qmin, k);
+    let payload = dispatch_encode(lens, &binned, seq_mode.then_some(seq), &dense, qmin, k);
 
     let mut out = Vec::with_capacity(16 + k + lens.len() + payload.len());
     out.push(FORMAT_VERSION);
     out.push(binning.tag());
+    out.push(if seq_mode { MODE_SEQ } else { MODE_POS });
     out.push(k as u8);
     out.extend_from_slice(&syms);
     write_lens(&mut out, lens);
@@ -363,14 +512,40 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
     Ok(out)
 }
 
-/// Decode a stream produced by [`encode`], returning `(lengths, qualities)`.
-/// In lossy modes the qualities are the binned values, not the originals.
+/// Whether a stream was coded in [`MODE_SEQ`] and so needs the block's decoded
+/// sequence at [`decode_seq`] time. Lets the container peek the header cheaply and
+/// decide whether to serialize seq → qual or keep decoding them in parallel,
+/// without paying that serialization on the short-read common case. A truncated or
+/// foreign stream reads as `false`; [`decode`]/[`decode_seq`] then reject it.
+pub fn needs_sequence(src: &[u8]) -> bool {
+    // Header layout: version(0), binning tag(1), mode(2), ...
+    src.first() == Some(&FORMAT_VERSION) && src.get(2) == Some(&MODE_SEQ)
+}
+
+/// Decode a sequence-blind stream produced by [`encode`], returning
+/// `(lengths, qualities)`. A [`MODE_SEQ`] stream (from [`encode_seq`] on long
+/// reads) is rejected here — use [`decode_seq`] with its decoded sequence.
 pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
+    decode_seq(src, &[])
+}
+
+/// Decode a stream produced by [`encode_seq`], returning `(lengths, qualities)`.
+/// In lossy modes the qualities are the binned values, not the originals.
+///
+/// For a [`MODE_SEQ`] stream, `seq` must be the block's decoded sequence (same
+/// order and per-read lengths as the qualities) — see [`needs_sequence`]. For a
+/// [`MODE_POS`] stream `seq` is ignored and may be `&[]`.
+pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     let mut r = ByteReader::new(src);
     if r.u8()? != FORMAT_VERSION {
         return Err(Error::Malformed("unsupported version"));
     }
     let _binning = QualityBinning::from_tag(r.u8()?)?;
+    let seq_mode = match r.u8()? {
+        MODE_POS => false,
+        MODE_SEQ => true,
+        _ => return Err(Error::Malformed("unknown quality context mode")),
+    };
     let k = r.u8()? as usize;
     if k == 0 || k > QMAX {
         return Err(Error::AlphabetTooLarge(k));
@@ -403,11 +578,27 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     if total > MAX_DECODED_QUALS {
         return Err(Error::Malformed("declared total length exceeds maximum"));
     }
+    // A `MODE_SEQ` stream conditions each quality on its base, so the caller must
+    // hand back exactly the decoded sequence — same total length as the qualities.
+    // Reject a mismatch up front rather than panicking on a short slice mid-decode.
+    if seq_mode && seq.len() != total {
+        return Err(Error::Malformed(
+            "sequence context requires the decoded sequence",
+        ));
+    }
     let mut quals = Vec::new();
     quals
         .try_reserve(total)
         .map_err(|_| Error::Malformed("declared total length too large to allocate"))?;
-    dispatch_decode(&lens, &syms, qmin, k, &mut dec, &mut quals)?;
+    dispatch_decode(
+        &lens,
+        &syms,
+        seq_mode.then_some(seq),
+        qmin,
+        k,
+        &mut dec,
+        &mut quals,
+    )?;
     Ok((lens, quals))
 }
 
@@ -490,13 +681,13 @@ mod tests {
         let (qmin, k) = (syms[0], syms.len());
         assert_eq!(k, 3, "fixture must land in the smallest size class");
 
-        let want = encode_payload::<QMAX>(&lens, &quals, &dense, qmin, k);
+        let want = encode_payload::<QMAX>(&lens, &quals, None, &dense, qmin, k);
         for got in [
-            encode_payload::<4>(&lens, &quals, &dense, qmin, k),
-            encode_payload::<8>(&lens, &quals, &dense, qmin, k),
-            encode_payload::<16>(&lens, &quals, &dense, qmin, k),
-            encode_payload::<32>(&lens, &quals, &dense, qmin, k),
-            encode_payload::<64>(&lens, &quals, &dense, qmin, k),
+            encode_payload::<4>(&lens, &quals, None, &dense, qmin, k),
+            encode_payload::<8>(&lens, &quals, None, &dense, qmin, k),
+            encode_payload::<16>(&lens, &quals, None, &dense, qmin, k),
+            encode_payload::<32>(&lens, &quals, None, &dense, qmin, k),
+            encode_payload::<64>(&lens, &quals, None, &dense, qmin, k),
         ] {
             assert_eq!(
                 got, want,
@@ -536,6 +727,96 @@ mod tests {
         );
     }
 
+    /// Deterministic pseudo-random long-read fixture: `n` reads of `len` bases,
+    /// each quality correlated with its base so `MODE_SEQ` has real signal to fit.
+    fn longread_fixture(n: usize, len: usize) -> (Vec<u32>, Vec<u8>, Vec<u8>) {
+        let bases = b"ACGT";
+        let mut x: u32 = 0x1234_5678;
+        let mut rng = move || {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x
+        };
+        let (mut seq, mut qual) = (Vec::new(), Vec::new());
+        for _ in 0..n {
+            for _ in 0..len {
+                let base = bases[(rng() % 4) as usize];
+                seq.push(base);
+                // Quality leans on base identity plus a little noise — exactly the
+                // structure the sequence context is meant to exploit.
+                let bias = match base {
+                    b'A' => 40,
+                    b'C' => 35,
+                    b'G' => 30,
+                    _ => 25,
+                };
+                let noise = (rng() % 8) as u8;
+                qual.push(33 + bias + noise);
+            }
+        }
+        (vec![len as u32; n], seq, qual)
+    }
+
+    #[test]
+    fn roundtrip_seq_context_long_reads() {
+        let (lens, seq, quals) = longread_fixture(40, 2000);
+        // Long reads: encode_seq must pick MODE_SEQ and round-trip through decode_seq.
+        let enc = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("encode");
+        assert!(needs_sequence(&enc), "long reads must select MODE_SEQ");
+        let (out_lens, out_quals) = decode_seq(&enc, &seq).expect("decode");
+        assert_eq!(out_lens, lens);
+        assert_eq!(out_quals, quals);
+    }
+
+    #[test]
+    fn seq_context_beats_blind_on_correlated_quality() {
+        // The whole point: when quality tracks the base, conditioning on sequence
+        // must code smaller than the sequence-blind position context.
+        let (lens, seq, quals) = longread_fixture(40, 2000);
+        let with_seq = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("seq");
+        let blind = encode(&lens, &quals, QualityBinning::Lossless).expect("blind");
+        assert!(
+            with_seq.len() < blind.len(),
+            "sequence context ({} B) should beat blind ({} B) on base-correlated quality",
+            with_seq.len(),
+            blind.len()
+        );
+    }
+
+    #[test]
+    fn seq_context_decode_requires_sequence() {
+        // A MODE_SEQ stream cannot be decoded blind: the plain `decode` (empty
+        // sequence) must reject it cleanly rather than produce wrong output.
+        let (lens, seq, quals) = longread_fixture(20, 1000);
+        let enc = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("encode");
+        assert!(matches!(decode(&enc), Err(Error::Malformed(_))));
+        // A wrong-length sequence is rejected too.
+        assert!(matches!(
+            decode_seq(&enc, &seq[..seq.len() - 1]),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn short_reads_stay_sequence_blind() {
+        // Below the mean-length gate, encode_seq must fall back to MODE_POS and
+        // produce byte-identical output to the sequence-blind encode.
+        let lens = vec![100u32; 50];
+        let mut quals = Vec::new();
+        let mut seq = Vec::new();
+        let mut x: u32 = 99;
+        for _ in 0..5000 {
+            x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            quals.push(b'#' + ((x >> 16) % 4) as u8);
+            seq.push(b"ACGT"[((x >> 20) % 4) as usize]);
+        }
+        let with_seq = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("seq");
+        let blind = encode(&lens, &quals, QualityBinning::Lossless).expect("blind");
+        assert!(!needs_sequence(&with_seq), "short reads must stay MODE_POS");
+        assert_eq!(with_seq, blind, "short-read output must be byte-identical");
+    }
+
     #[test]
     fn roundtrip_large_constant_quality() {
         // Constant quality compresses to almost nothing, so total / payload_len
@@ -562,7 +843,7 @@ mod tests {
         // A tiny stream declaring an enormous fixed-length total must fail the
         // fallible reserve, not abort (the removed ratio guard used to catch this;
         // `try_reserve` on `total` still does).
-        let mut src = vec![FORMAT_VERSION, 0, 1, b'I']; // version, lossless, k=1, symbol
+        let mut src = vec![FORMAT_VERSION, 0, MODE_POS, 1, b'I']; // version, lossless, mode, k=1, symbol
         write_varint(&mut src, 1000); // n = 1000 reads
         src.push(1); // fixed-length flag
         write_varint(&mut src, u64::from(u32::MAX)); // f -> total ~4.3e12 bytes
@@ -738,7 +1019,7 @@ mod tests {
     // ~13-byte stream requested hundreds of petabytes via `Vec::with_capacity`.
     #[test]
     fn rejects_huge_length_count() {
-        let mut buf = vec![FORMAT_VERSION, 0, 1, 0]; // version, binning, k=1, syms=[0]
+        let mut buf = vec![FORMAT_VERSION, 0, MODE_POS, 1, 0]; // version, binning, mode, k=1, syms=[0]
         push_varint(&mut buf, u64::MAX >> 8); // n: absurd length count
         buf.push(1); // fixed = true -> resize(n, f) path
         push_varint(&mut buf, 100); // f
@@ -747,7 +1028,7 @@ mod tests {
 
     #[test]
     fn rejects_huge_total_length() {
-        let mut buf = vec![FORMAT_VERSION, 0, 1, 0]; // version, binning, k=1, syms=[0]
+        let mut buf = vec![FORMAT_VERSION, 0, MODE_POS, 1, 0]; // version, binning, mode, k=1, syms=[0]
         push_varint(&mut buf, 1000); // n reads
         buf.push(1); // fixed = true
         push_varint(&mut buf, u32::MAX as u64); // each read u32::MAX long

@@ -13,6 +13,18 @@ freely and archives are not guaranteed to be readable across releases until a
 
 ### Added
 
+- **Sequence-conditioned quality for long reads** — the quality coder can now
+  condition each score on the read's bases (current base, next base, and the
+  homopolymer run-length) instead of the read position, which carries no signal
+  on long reads. The mode is chosen automatically by mean read length and recorded
+  in a self-describing header byte, so short-read archives are byte-identical to
+  before and keep decoding sequence and quality in parallel; long-read archives
+  decode the sequence first and feed it to the quality decoder. On PacBio HiFi
+  this cuts the quality stream ~10% (lossless), the dominant share of a HiFi
+  archive. New `fqzcomp` API: `encode_seq`/`decode_seq`/`needs_sequence`; new
+  random-access projection helpers `decode_quality_with_seq`/
+  `quality_needs_sequence`. Bumps the `fqzcomp` stream version to 2.
+
 - **Remote / parallel column projection** — the footer row-group index now
   records, per group, a `(offset, len, crc32c)` triple for each of the three
   coded streams (names, sequence, quality). A client can fetch the archive tail,

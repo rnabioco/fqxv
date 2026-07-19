@@ -150,8 +150,8 @@ pub use decompress::{content_stats, decompress, decompress_recover, decompress_s
 pub use estimate::{estimate, Estimate};
 pub use inspect::{inspect, peek, ContentStats, Info, Platform, QUAL_MAX};
 pub use random_access::{
-    decode_block_contents, decode_names, decode_quality, decode_sequence, BlockContents, GroupLoc,
-    Index, Stream, SuffixParse,
+    decode_block_contents, decode_names, decode_quality, decode_quality_with_seq, decode_sequence,
+    quality_needs_sequence, BlockContents, GroupLoc, Index, Stream, SuffixParse,
 };
 pub use records::{decompress_records, Record, RecordReader};
 pub use verify::{
