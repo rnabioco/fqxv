@@ -7,8 +7,26 @@ use super::*;
 /// (nanopore-style) data does not collapse into one enormous row group that
 /// destroys parallelism and random-access granularity and could overflow the
 /// `u32` per-stream compressed length. For fixed short reads the read count is
-/// the binding limit and this never triggers.
+/// the binding limit and this never triggers. Long-read platforms use the larger
+/// [`LONGREAD_BLOCK_SEQ_BYTES`] instead (see [`max_block_seq_bytes`]); this value
+/// is the short-read/default budget and the base for the [`MAX_BLOCK_PAYLOAD`]
+/// decode bound.
 pub(crate) const MAX_BLOCK_SEQ_BYTES: usize = 256 << 20;
+/// Raw-sequence byte budget per block for long-read platforms (nanopore/PacBio).
+///
+/// Larger than [`MAX_BLOCK_SEQ_BYTES`] on purpose: the cross-read overlap codec's
+/// gains are *coverage-dependent* (its closed-syncmer seeding only reliably beats
+/// order-k once a block holds enough reads of the same locus), and a bigger block
+/// also amortizes the per-block assembled reference over more reads. Short reads
+/// gain nothing from this (the read count binds first, and their order-k codec has
+/// no per-block reference), so only the long-read path is widened.
+///
+/// Kept at 512 MiB so a block's three streams — even stored raw at their absolute
+/// worst (≈512 MiB sequence + ≈512 MiB quality + a small name stream) — still fit
+/// under [`MAX_BLOCK_PAYLOAD`] and within the `u32` per-stream length. The on-disk
+/// framing and every decode bound are therefore unchanged: this is a pure
+/// encode-time sizing choice with no format-version impact.
+pub(crate) const LONGREAD_BLOCK_SEQ_BYTES: usize = 512 << 20;
 /// Fixed header prefix, byte offsets within it, up to and including the 2-byte
 /// extension-length field. Layout:
 ///
@@ -68,12 +86,22 @@ pub(crate) const DIGEST_LEN: usize = 8;
 /// covers stored/compressed bytes). See [`stream_digests`].
 pub(crate) const STREAM_DIGESTS_LEN: usize = 3 * DIGEST_LEN;
 /// Upper bound on a single block payload's declared length. A block holds at most
-/// `block_reads` reads and `MAX_BLOCK_SEQ_BYTES` of raw sequence, and the three
-/// compressed streams are each smaller than their raw input in the common case,
-/// so a real payload is comfortably under this. It exists only so a corrupted
-/// length field can't drive a multi-exabyte allocation before the CRC is even
-/// checked; anything larger is rejected as malformed.
+/// `block_reads` reads and, in raw sequence, `MAX_BLOCK_SEQ_BYTES` (short reads)
+/// or `LONGREAD_BLOCK_SEQ_BYTES` (long reads); the three compressed streams are
+/// each no larger than their raw input, so even a worst-case long-read block
+/// (≈512 MiB sequence + ≈512 MiB quality + names ≈ 1 GiB) stays comfortably under
+/// this 2 GiB ceiling. It exists only so a corrupted length field can't drive a
+/// multi-exabyte allocation before the CRC is even checked; anything larger is
+/// rejected as malformed. Independent of the encode budgets above, so widening the
+/// long-read block never changes this decode bound.
 pub(crate) const MAX_BLOCK_PAYLOAD: u64 = (MAX_BLOCK_SEQ_BYTES as u64) * 8;
+// Compile-time guard: a worst-case wide block — two raw-sized streams (sequence +
+// quality) plus a small name stream — must fit under MAX_BLOCK_PAYLOAD, else raising
+// LONGREAD_BLOCK_SEQ_BYTES would silently make wide blocks undecodable. Expressed as
+// an array length so a violation is a hard compile error, not a lintable `assert!`.
+const _WIDE_BLOCK_FITS_PAYLOAD_BOUND: [(); 1] = [(); (2 * LONGREAD_BLOCK_SEQ_BYTES as u64
+    + LONGREAD_BLOCK_SEQ_BYTES as u64 / 8
+    < MAX_BLOCK_PAYLOAD) as usize];
 /// Magic at the very end of a v1 archive, just after the `[8] footer_offset`
 /// back-pointer, so a reader can confirm it found a real footer.
 pub(crate) const FOOTER_MAGIC: [u8; 4] = *b"FQXF";
@@ -598,6 +626,131 @@ pub(crate) fn build_pool(threads: usize) -> Result<rayon::ThreadPool> {
         .map_err(|e| Error::Io(io::Error::other(e.to_string())))
 }
 
+/// Raw-sequence byte budget for one block. Long-read inputs get the wider
+/// [`LONGREAD_BLOCK_SEQ_BYTES`], everything else the default
+/// [`MAX_BLOCK_SEQ_BYTES`]. See those constants for the rationale.
+///
+/// Keyed on read *length* (`long_read`, i.e. [`is_long_read`](super::reorder::is_long_read)),
+/// not the recorded platform: the platform tag is name-vote based and can be
+/// `Unknown` for a genuine long-read file, whereas the wider block only pays off —
+/// and the [`block_concurrency`] memory cap only *matters* — exactly when the
+/// length-gated overlap codec runs. Tying both to the same length signal keeps
+/// them consistent with the codec.
+pub(crate) fn max_block_seq_bytes(long_read: bool) -> usize {
+    if long_read {
+        LONGREAD_BLOCK_SEQ_BYTES
+    } else {
+        MAX_BLOCK_SEQ_BYTES
+    }
+}
+
+/// Peak resident bytes the long-read overlap codec holds per block, as a multiple
+/// of the block's raw sequence: its index + overlaps + layout + consensus DP +
+/// per-read edit scripts peak well above the input (measured ≈15× on noisy ONT).
+/// Rounded up to 16 for headroom. Short-read/order-k blocks are far cheaper and
+/// are not memory-capped.
+const OVERLAP_PEAK_BYTES_PER_SEQ_BYTE: u64 = 16;
+
+/// How many blocks may compress concurrently without risking OOM.
+///
+/// Short-read platforms keep full `nworkers` parallelism — the order-k sequence
+/// codec is cheap. Long-read platforms encode through the overlap codec, whose
+/// per-block peak is ≈[`OVERLAP_PEAK_BYTES_PER_SEQ_BYTE`]× the block's raw
+/// sequence; with the wider [`LONGREAD_BLOCK_SEQ_BYTES`] budget that is several GiB
+/// per in-flight block, so concurrency is bounded to a fraction of currently
+/// available RAM. Clamped to `[1, nworkers]`: one block always makes progress, and
+/// a large-memory node still never exceeds its core count. Determinism is
+/// unaffected — this bounds *how many* blocks run at once, never their contents or
+/// boundaries, so output stays byte-identical across thread counts.
+pub(crate) fn block_concurrency(long_read: bool, block_seq_bytes: usize, nworkers: usize) -> usize {
+    block_concurrency_within(long_read, block_seq_bytes, nworkers, memory_budget_bytes())
+}
+
+/// Pure core of [`block_concurrency`] (budget injected, so it's testable): short
+/// reads keep full parallelism, long reads are bounded by `budget / per-block-peak`
+/// and clamped to `[1, nworkers]`. Keyed on read length for the same reason as
+/// [`max_block_seq_bytes`].
+fn block_concurrency_within(
+    long_read: bool,
+    block_seq_bytes: usize,
+    nworkers: usize,
+    budget: u64,
+) -> usize {
+    let nworkers = nworkers.max(1);
+    if !long_read {
+        return nworkers;
+    }
+    let per_block = (block_seq_bytes as u64)
+        .saturating_mul(OVERLAP_PEAK_BYTES_PER_SEQ_BYTE)
+        .max(1);
+    let by_mem = (budget / per_block).max(1) as usize;
+    by_mem.clamp(1, nworkers)
+}
+
+/// Memory budget for [`block_concurrency`]: ~60% of currently-available RAM, with
+/// a conservative fallback when it can't be read. The 60% leaves room for the
+/// input buffer, OS page cache, and the estimate's own slack.
+fn memory_budget_bytes() -> u64 {
+    // Fallback: budget for exactly one wide long-read block, so an unknown system
+    // serializes long-read blocks rather than risking OOM.
+    const FALLBACK: u64 = LONGREAD_BLOCK_SEQ_BYTES as u64 * OVERLAP_PEAK_BYTES_PER_SEQ_BYTE;
+    let avail = available_memory_bytes().unwrap_or(FALLBACK);
+    (avail / 5 * 3).max(1 << 30)
+}
+
+/// Currently-available RAM in bytes: the minimum of node-level `MemAvailable` and
+/// the free space within this process's cgroup memory limit. The cgroup term is
+/// what makes the cap correct under a Slurm/container `--mem` allocation — that
+/// limit is invisible to `/proc/meminfo`, so without it the cap would size to the
+/// whole node and the job would be OOM-killed. `None` only if neither is readable.
+fn available_memory_bytes() -> Option<u64> {
+    [node_mem_available(), cgroup_mem_available()]
+        .into_iter()
+        .flatten()
+        .min()
+}
+
+/// Node-wide available RAM from Linux `/proc/meminfo` `MemAvailable`.
+fn node_mem_available() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = meminfo
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    Some(kb * 1024)
+}
+
+/// Free bytes within this process's cgroup-v2 memory limit
+/// (`memory.max − memory.current`), walking up to the nearest ancestor that sets a
+/// real limit (Slurm sets it at the job/step level, not always the leaf). `None`
+/// when unlimited or not cgroup v2, so the node figure governs on bare metal.
+fn cgroup_mem_available() -> Option<u64> {
+    let cg = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    // cgroup v2 is the single unified line `0::<path>`.
+    let rel = cg.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let mut dir = std::path::PathBuf::from("/sys/fs/cgroup");
+    dir.push(rel.trim_start_matches('/'));
+    for _ in 0..16 {
+        if let Ok(raw) = std::fs::read_to_string(dir.join("memory.max")) {
+            if let Ok(max) = raw.trim().parse::<u64>() {
+                let cur = std::fs::read_to_string(dir.join("memory.current"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                return Some(max.saturating_sub(cur));
+            }
+            // "max" here (no limit at this level) — check the parent.
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
 pub(crate) fn binning_tag(b: QualityBinning) -> u8 {
     match b {
         QualityBinning::Lossless => 0,
@@ -624,6 +777,41 @@ impl fqxv_bytes::ReaderError for Error {
     }
     fn oversized() -> Self {
         Error::Truncated
+    }
+}
+
+#[cfg(test)]
+mod block_sizing_tests {
+    use super::*;
+
+    #[test]
+    fn long_reads_get_the_wider_block_budget() {
+        assert_eq!(max_block_seq_bytes(true), LONGREAD_BLOCK_SEQ_BYTES);
+        assert_eq!(max_block_seq_bytes(false), MAX_BLOCK_SEQ_BYTES);
+        // The whole point — long reads get a strictly wider budget.
+        assert!(max_block_seq_bytes(true) > max_block_seq_bytes(false));
+    }
+
+    #[test]
+    fn short_reads_are_never_concurrency_capped() {
+        // The order-k codec is cheap, so short-read blocks always get every worker
+        // regardless of the memory budget.
+        assert_eq!(
+            block_concurrency_within(false, MAX_BLOCK_SEQ_BYTES, 32, 1 << 20),
+            32
+        );
+    }
+
+    #[test]
+    fn long_reads_bound_concurrency_by_the_memory_budget() {
+        let blk = LONGREAD_BLOCK_SEQ_BYTES;
+        let per_block = blk as u64 * OVERLAP_PEAK_BYTES_PER_SEQ_BYTE;
+        // A budget for exactly four blocks binds concurrency at four, below workers.
+        assert_eq!(block_concurrency_within(true, blk, 32, per_block * 4), 4);
+        // A tiny budget still lets one block make progress.
+        assert_eq!(block_concurrency_within(true, blk, 32, 1), 1);
+        // A huge budget is capped by the worker count, never exceeding it.
+        assert_eq!(block_concurrency_within(true, blk, 8, per_block * 1000), 8);
     }
 }
 

@@ -77,7 +77,7 @@ pub use codec::{decode, encode, EncodeOpts};
 pub use consensus::{consensus, Consensus, ConsensusOpts};
 pub use index::{Index, Occ, Repeat};
 pub use layout::{layout, Contig, LayoutOpts, Placement};
-pub use minimizer::{minimizers, Minimizer};
+pub use minimizer::{minimizers, syncmers, Minimizer};
 pub use overlap::{find_overlaps, Overlap};
 pub use refine::{place_against, place_all, Anchored};
 pub use script::{chain_span, script_from_chain, ScriptOpts};
@@ -103,39 +103,83 @@ pub enum Error {
 /// The result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// How read positions are selected as anchors under a [`Sketch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeedScheme {
+    /// Window minimizers: the minimum-hash k-mer of every `w`-wide window. Cheap
+    /// and robust where nearly every k-mer survives (HiFi). Its weakness on noisy
+    /// reads is that a base error in *any* k-mer of a window can displace an
+    /// otherwise-intact k-mer, so an error-free shared k-mer is not always
+    /// co-selected by two overlapping reads.
+    Minimizer,
+    /// Closed syncmers with `s = k - w`: a k-mer is an anchor when its minimal
+    /// `s`-mer lies at its first or last position. Selection is a function of the
+    /// k-mer's own bases alone, so an intact shared k-mer is co-selected
+    /// regardless of neighbour errors — ~1.3–1.6× more surviving anchors at ~10%
+    /// error (ONT). Density is `2/(k - s + 1) = 2/(w + 1)`, identical to the
+    /// minimizer at the same `w`, so `k`, anchor count, and specificity are
+    /// unchanged; only *conservation* improves. Seeding is encode-only, so this
+    /// never affects an on-disk block's decodability.
+    Syncmer,
+}
+
 /// Minimizer sketching parameters.
 ///
 /// Presets follow minimap2's, which are the field-tested operating points for
-/// each error regime; `(w, k)` is recorded in the stream so decode never
-/// re-derives it from data.
+/// each error regime. Seeding is encode-only — the decoder replays stored edit
+/// scripts against stored consensi and never re-sketches — so `(w, k, scheme)`
+/// affects ratio and speed only, never correctness, and is not written to the
+/// stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sketch {
-    /// Window: one minimizer is selected per `w` consecutive k-mers.
+    /// Window: one anchor per `w` consecutive k-mers (density `2/(w + 1)`). For
+    /// [`SeedScheme::Syncmer`] this sets the s-mer length as `s = k - w`.
     pub w: usize,
     /// K-mer length (`1..=31`).
     pub k: usize,
+    /// Which positions become anchors (see [`SeedScheme`]).
+    pub scheme: SeedScheme,
 }
 
 impl Sketch {
-    /// Oxford Nanopore (`w = 10, k = 15`) — minimap2's `map-ont`. Dense, because
-    /// at ~10% error only a fifth of any given 15-mer's occurrences survive.
+    /// Oxford Nanopore (`w = 10, k = 15`) — minimap2's `map-ont` operating point,
+    /// but seeded with **closed syncmers** (`s = k - w = 5`) instead of
+    /// minimizers. At ~10% error a minimizer is often deselected by an error in a
+    /// window *neighbour*; a syncmer survives whenever its own k-mer does, so more
+    /// genuine overlaps are found at the same density and `k`. See
+    /// [`SeedScheme::Syncmer`].
     #[must_use]
     pub const fn ont() -> Self {
-        Self { w: 10, k: 15 }
+        Self {
+            w: 10,
+            k: 15,
+            scheme: SeedScheme::Syncmer,
+        }
     }
 
     /// PacBio HiFi (`w = 19, k = 19`) — minimap2's `map-hifi`. Sparser and
-    /// longer: at <1% error nearly every k-mer survives, so a smaller sketch
-    /// suffices and the index stays cheap.
+    /// longer: at <1% error nearly every k-mer survives, so window minimizers are
+    /// already near-optimal and a smaller sketch keeps the index cheap.
     #[must_use]
     pub const fn hifi() -> Self {
-        Self { w: 19, k: 19 }
+        Self {
+            w: 19,
+            k: 19,
+            scheme: SeedScheme::Minimizer,
+        }
     }
 
-    /// Minimizers of one sequence under these parameters.
+    /// Anchors of one sequence under these parameters — [`minimizers`] or
+    /// [`syncmers`] per [`self.scheme`](SeedScheme). Both return the same
+    /// [`Minimizer`] shape, so the rest of the pipeline is scheme-agnostic.
     #[must_use]
-    pub fn minimizers(&self, seq: &[u8]) -> Vec<Minimizer> {
-        minimizers(seq, self.w, self.k)
+    pub fn seeds(&self, seq: &[u8]) -> Vec<Minimizer> {
+        match self.scheme {
+            SeedScheme::Minimizer => minimizers(seq, self.w, self.k),
+            // s = k - w makes closed-syncmer density 2/(k-s+1) equal the
+            // minimizer's 2/(w+1) at the same w.
+            SeedScheme::Syncmer => syncmers(seq, self.k, self.k - self.w),
+        }
     }
 
     /// Whether this sketch's platform is low-divergence (HiFi-class, <~1% error)
@@ -163,8 +207,22 @@ mod tests {
 
     #[test]
     fn presets_match_minimap2_operating_points() {
-        assert_eq!(Sketch::ont(), Sketch { w: 10, k: 15 });
-        assert_eq!(Sketch::hifi(), Sketch { w: 19, k: 19 });
+        assert_eq!(
+            Sketch::ont(),
+            Sketch {
+                w: 10,
+                k: 15,
+                scheme: SeedScheme::Syncmer
+            }
+        );
+        assert_eq!(
+            Sketch::hifi(),
+            Sketch {
+                w: 19,
+                k: 19,
+                scheme: SeedScheme::Minimizer
+            }
+        );
         assert_eq!(Sketch::default(), Sketch::ont());
     }
 
@@ -176,8 +234,8 @@ mod tests {
             x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
             s.push(b"ACGT"[(x >> 16) as usize % 4]);
         }
-        let ont = Sketch::ont().minimizers(&s).len();
-        let hifi = Sketch::hifi().minimizers(&s).len();
+        let ont = Sketch::ont().seeds(&s).len();
+        let hifi = Sketch::hifi().seeds(&s).len();
         assert!(
             hifi < ont,
             "hifi sketch ({hifi}) must be sparser than ont ({ont})"

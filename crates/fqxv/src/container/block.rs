@@ -270,6 +270,27 @@ pub(crate) fn encode_sequence_stream(
         || order_k_stream(lens, seq, params),
     );
     let (overlap, order_k) = (overlap?, order_k?);
+    // `FQXV_DIAG_SEQ` reports the overlap-vs-order-k contest per long-read block
+    // (bytes and bits/base) so seeding/consensus changes can be judged against the
+    // real keep-the-smaller outcome, not a proxy. Off by default, zero-cost.
+    if std::env::var_os("FQXV_DIAG_SEQ").is_some() {
+        let bases: u64 = lens.iter().map(|&l| u64::from(l)).sum::<u64>().max(1);
+        let bpb = |n: usize| (n as f64 * 8.0) / bases as f64;
+        eprintln!(
+            "[diag seq] {} reads, {} bases | overlap {} B ({:.3} b/base) | order-k {} B ({:.3} b/base) | kept {}",
+            lens.len(),
+            bases,
+            overlap.len(),
+            bpb(overlap.len()),
+            order_k.len(),
+            bpb(order_k.len()),
+            if overlap.len() < order_k.len() {
+                "OVERLAP"
+            } else {
+                "order-k"
+            },
+        );
+    }
     Ok(if overlap.len() < order_k.len() {
         overlap
     } else {

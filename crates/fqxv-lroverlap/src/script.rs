@@ -154,7 +154,7 @@ pub fn chain_span(anchors: &[Anchor], k: u32) -> (u32, u32, u32, u32) {
 mod tests {
     use super::*;
     use crate::align::apply;
-    use crate::{ChainOpts, Chainer, Index, Repeat, Sketch};
+    use crate::{ChainOpts, Chainer, Index, Repeat, SeedScheme, Sketch};
     use proptest::prelude::*;
 
     fn rand_seq(n: usize, seed: u32) -> Vec<u8> {
@@ -213,9 +213,17 @@ mod tests {
         let lens = [refr.len() as u32, query.len() as u32];
         let mut seq = refr.to_vec();
         seq.extend_from_slice(query);
-        let idx = Index::build(&lens, &seq, Sketch::ont(), Repeat { drop_top_frac: 0.0 }).unwrap();
+        // The script/chain machinery under test is seeding-scheme-independent, so
+        // pin an explicit minimizer sketch: the fixture's anchor set stays stable
+        // regardless of the platform default (ONT now defaults to syncmers).
+        let sk = Sketch {
+            w: 10,
+            k: 15,
+            scheme: SeedScheme::Minimizer,
+        };
+        let idx = Index::build(&lens, &seq, sk, Repeat { drop_top_frac: 0.0 }).unwrap();
         let mut anchors: Vec<Anchor> = Vec::new();
-        for m in Sketch::ont().minimizers(query) {
+        for m in sk.seeds(query) {
             for o in idx.query(m.hash) {
                 if o.read == 0 && o.strand == m.strand {
                     anchors.push(Anchor {

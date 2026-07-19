@@ -263,7 +263,7 @@ fn derive_stride(sketch: Sketch, reads: &[&[u8]], total_bases: u64) -> usize {
     let distinct = reads
         .par_iter()
         .fold(HashSet::<u64>::new, |mut s, r| {
-            for m in sketch.minimizers(r) {
+            for m in sketch.seeds(r) {
                 s.insert(m.hash);
             }
             s
