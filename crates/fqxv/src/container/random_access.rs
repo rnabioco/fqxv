@@ -237,8 +237,27 @@ pub fn decode_sequence(coded: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
 
 /// Decode a projected **quality** stream into `(per-read lengths, concatenated
 /// quality)`. The lengths match the sequence stream's.
+///
+/// Long-read archives condition quality on the sequence, so their quality streams
+/// cannot be projected alone — [`quality_needs_sequence`] reports this and
+/// [`decode_quality_with_seq`] decodes them given the block's decoded bases. This
+/// function errors cleanly (never panics) on such a stream.
 pub fn decode_quality(coded: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     Ok(fqxv_fqzcomp::decode(coded)?)
+}
+
+/// Whether a projected quality stream was coded against its sequence and so must
+/// be decoded with [`decode_quality_with_seq`] rather than [`decode_quality`].
+pub fn quality_needs_sequence(coded: &[u8]) -> bool {
+    fqxv_fqzcomp::needs_sequence(coded)
+}
+
+/// Decode a projected **quality** stream that was coded against its sequence
+/// (see [`quality_needs_sequence`]), given the block's decoded bases (from
+/// [`decode_sequence`], same order and per-read lengths). For a sequence-blind
+/// stream `seq` is ignored, so this is always safe to call.
+pub fn decode_quality_with_seq(coded: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
+    Ok(fqxv_fqzcomp::decode_seq(coded, seq)?)
 }
 
 /// Decoded contents of one block: parallel per-read names and lengths, plus the

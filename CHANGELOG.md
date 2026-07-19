@@ -13,6 +13,21 @@ freely and archives are not guaranteed to be readable across releases until a
 
 ### Added
 
+- **Sequence-conditioned, context-mixed quality for long reads** — the quality
+  coder now conditions each score on the read's bases and recent qualities instead
+  of read position (which carries no signal on long reads). It mixes several
+  context models of increasing richness (coarse/mid/rich) with adaptive,
+  confidence-gated weights — a logistic mixer — because a per-block adaptive model
+  can't exploit a richer *single* context but *can* blend a well-trained coarse one
+  with a sparse rich one. On PacBio HiFi this takes the quality stream (the dominant
+  share of a HiFi archive) below CoLoRd, lossless. The mode is chosen automatically
+  by mean read length and recorded in a self-describing header byte, so short-read
+  archives are byte-identical to before; long-read archives decode the sequence
+  first and feed it to the quality decoder. The mixer is fixed-point/integer
+  throughout, so archives are bit-identical across platforms. New `fqzcomp` API:
+  `encode_seq`/`decode_seq`/`needs_sequence`; new random-access projection helpers
+  `decode_quality_with_seq`/`quality_needs_sequence`.
+
 - **Long-read (ONT / PacBio) support** — platform-aware compression for
   Nanopore and PacBio reads: `--platform illumina|nanopore|pacbio` (with header
   auto-detection), long-read quality binning (`--quality-bin ont|hifi`, matching

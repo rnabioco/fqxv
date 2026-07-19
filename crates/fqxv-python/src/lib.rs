@@ -18,7 +18,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use fqxv_core::{
-    decode_block_contents, decode_names, decode_quality, decode_sequence, Index, Stream,
+    decode_block_contents, decode_names, decode_quality, decode_quality_with_seq, decode_sequence,
+    quality_needs_sequence, Index, Stream,
 };
 
 create_exception!(
@@ -317,7 +318,24 @@ fn project(
                 slice_reads(&lens, &bases, &mut out);
             }
             Stream::Quality => {
-                let (lens, qual) = decode_quality(&buf)?;
+                // Long-read quality is coded against the sequence, so its stream
+                // can't be projected alone — fetch and decode this group's
+                // sequence first, then hand it to the quality decoder.
+                let (lens, qual) = if quality_needs_sequence(&buf) {
+                    let srange = index.byte_ranges(&[g], Stream::Sequence)?;
+                    let srange = srange
+                        .into_iter()
+                        .next()
+                        .ok_or(fqxv_core::Error::Malformed("row-group index out of range"))?;
+                    r.seek(SeekFrom::Start(srange.start))?;
+                    let mut sbuf = vec![0u8; (srange.end - srange.start) as usize];
+                    r.read_exact(&mut sbuf)?;
+                    index.verify_stream(g, Stream::Sequence, &sbuf)?;
+                    let (_slens, bases) = decode_sequence(&sbuf)?;
+                    decode_quality_with_seq(&buf, &bases)?
+                } else {
+                    decode_quality(&buf)?
+                };
                 slice_reads(&lens, &qual, &mut out);
             }
         }

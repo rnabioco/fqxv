@@ -307,7 +307,10 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params, platform: Platform) 
         || {
             rayon::join(
                 || encode_sequence_stream(&b.lens, &b.seq, params, platform),
-                || fqxv_fqzcomp::encode(&b.lens, &b.qual, params.quality_binning),
+                // Hand the bases to the quality coder: on long reads it conditions
+                // quality on sequence (base + next + homopolymer run); on short
+                // reads it ignores them and codes the position context as before.
+                || fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning),
             )
         },
     );
@@ -421,13 +424,29 @@ pub(crate) fn decode_block_parts(buf: &[u8]) -> Result<BlockParts> {
     // Slice out the three compressed streams (cheap, sequential), then decode
     // them concurrently — same rationale as the encode side.
     let (names_s, seq_s, qual_s) = (c.slice_u32()?, c.slice_u32()?, c.slice_u32()?);
+    // A sequence-conditioned quality stream (long reads) must see the decoded
+    // bases, so decode the sequence first and feed it in. Short-read quality is
+    // sequence-blind, so keep decoding the two streams in parallel — the common
+    // case pays nothing for this. Peek the quality header to tell them apart.
+    let seq_first = fqxv_fqzcomp::needs_sequence(qual_s);
     let (names, (seq_r, qual_r)) = rayon::join(
         || fqxv_tokenizer::decode(names_s),
         || {
-            rayon::join(
-                || decode_sequence_stream(seq_s),
-                || fqxv_fqzcomp::decode(qual_s),
-            )
+            if seq_first {
+                let seq_r = decode_sequence_stream(seq_s);
+                let qual_r = match &seq_r {
+                    Ok((_, seq)) => fqxv_fqzcomp::decode_seq(qual_s, seq),
+                    // Sequence decode failed; the block errors on `seq_r?` below.
+                    // Decode quality with no sequence so the type lines up.
+                    Err(_) => fqxv_fqzcomp::decode_seq(qual_s, &[]),
+                };
+                (seq_r, qual_r)
+            } else {
+                rayon::join(
+                    || decode_sequence_stream(seq_s),
+                    || fqxv_fqzcomp::decode_seq(qual_s, &[]),
+                )
+            }
         },
     );
     let names = names?;
