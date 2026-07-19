@@ -162,11 +162,144 @@ struct Mixer {
     logit: Vec<i32>,
     e: Vec<u32>,
     freq_rc: Vec<u32>,
+    backend: Backend,
 }
 
 /// Number of mixed model tiers. Simulation: gated 3-tier {coarse16b, mid18b,
 /// rich22b} at lr≈0.003 already beats CoLoRd; a 4th tier adds little.
 const NMODELS: usize = 3;
+
+/// Which per-symbol kernel implementation the mixer runs. Chosen once from the CPU
+/// at construction; both produce **byte-identical** output (the crate's `SIMD ≡
+/// scalar` invariant — enforced by `mix::tests::backends_agree`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Backend {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Avx2,
+}
+
+fn detect_backend() -> Backend {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") {
+        return Backend::Avx2;
+    }
+    Backend::Scalar
+}
+
+/// Fill `logit[s] = (Σ_t w[t]·feat[t*k+s]) >> 16` and return `max(logit)`.
+///
+/// `feat` is tier-major (`feat[t*k+s]`); `w[t]` fits `i32` (clamped to `W_MAX`) and
+/// `feat` fits `i32`, so each term is an exact `i32×i32→i64` product. This is the
+/// scalar reference; [`logit_avx2`] reproduces it bit-for-bit.
+fn logit_scalar(feat: &[i32], w: &[i64; NMODELS], k: usize, logit: &mut [i32]) -> i32 {
+    let mut max_logit = i32::MIN;
+    for s in 0..k {
+        let mut l = 0i64;
+        for t in 0..NMODELS {
+            l += w[t] * i64::from(feat[t * k + s]);
+        }
+        let lg = (l >> 16) as i32;
+        logit[s] = lg;
+        if lg > max_logit {
+            max_logit = lg;
+        }
+    }
+    max_logit
+}
+
+/// AVX2 form of [`logit_scalar`], processing four symbols per iteration. Uses
+/// `i32×i32→i64` products (`_mm256_mul_epi32` on sign-extended features) and an
+/// exact floor `>>16` via a bias (AVX2 has no arithmetic 64-bit shift): for
+/// `v ∈ (-2^44, 0]`, `((v + 2^44) >>u 16) - 2^28 == v >> 16` (arithmetic).
+///
+/// # Safety
+/// Requires AVX2. `feat` must have length `NMODELS*k` and `logit` length `k`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn logit_avx2(feat: &[i32], w: &[i64; NMODELS], k: usize, logit: &mut [i32]) -> i32 {
+    use core::arch::x86_64::*;
+    // SAFETY: caller guarantees AVX2 and the slice lengths; all loads/stores below
+    // stay within `feat[..NMODELS*k]` and `logit[..k]` (blocks of 4, scalar tail).
+    unsafe {
+        let (w0, w1, w2) = (
+            _mm256_set1_epi32(w[0] as i32),
+            _mm256_set1_epi32(w[1] as i32),
+            _mm256_set1_epi32(w[2] as i32),
+        );
+        let bias = _mm256_set1_epi64x(1i64 << 44);
+        let debias = _mm256_set1_epi64x(1i64 << 28);
+        let pick_lo = _mm256_setr_epi32(0, 2, 4, 6, 0, 0, 0, 0);
+        let fp = feat.as_ptr();
+        let mut s = 0usize;
+        while s + 4 <= k {
+            let a0 = _mm256_cvtepi32_epi64(_mm_loadu_si128(fp.add(s) as *const __m128i));
+            let a1 = _mm256_cvtepi32_epi64(_mm_loadu_si128(fp.add(k + s) as *const __m128i));
+            let a2 = _mm256_cvtepi32_epi64(_mm_loadu_si128(fp.add(2 * k + s) as *const __m128i));
+            let acc = _mm256_add_epi64(
+                _mm256_add_epi64(_mm256_mul_epi32(a0, w0), _mm256_mul_epi32(a1, w1)),
+                _mm256_mul_epi32(a2, w2),
+            );
+            let shifted =
+                _mm256_sub_epi64(_mm256_srli_epi64(_mm256_add_epi64(acc, bias), 16), debias);
+            // pack the four i64 (each fits i32) into the low 128 bits as i32.
+            let lo = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(shifted, pick_lo));
+            _mm_storeu_si128(logit.as_mut_ptr().add(s) as *mut __m128i, lo);
+            s += 4;
+        }
+        // scalar tail (k is not a multiple of 4)
+        while s < k {
+            let l = w[0] * i64::from(*feat.get_unchecked(s))
+                + w[1] * i64::from(*feat.get_unchecked(k + s))
+                + w[2] * i64::from(*feat.get_unchecked(2 * k + s));
+            *logit.get_unchecked_mut(s) = (l >> 16) as i32;
+            s += 1;
+        }
+    }
+    // max over the filled logits (exact regardless of order)
+    logit.iter().copied().max().unwrap_or(i32::MIN)
+}
+
+/// `Σ_s e[s]·f[s]` (the un-normalized `E_P[f]` numerator in the weight gradient).
+/// `e` is non-negative and fits `i32`; `f` is signed and fits `i32`. Scalar
+/// reference for [`dot_avx2`].
+fn dot_scalar(e: &[u32], f: &[i32], k: usize) -> i64 {
+    let mut acc = 0i64;
+    for s in 0..k {
+        acc += i64::from(e[s]) * i64::from(f[s]);
+    }
+    acc
+}
+
+/// AVX2 form of [`dot_scalar`] (four terms per iteration, `i32×i32→i64`). Integer
+/// addition is associative, so the reordered reduction is bit-identical.
+///
+/// # Safety
+/// Requires AVX2; `e` and `f` must have length ≥ `k`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2(e: &[u32], f: &[i32], k: usize) -> i64 {
+    use core::arch::x86_64::*;
+    // SAFETY: caller guarantees AVX2 and lengths; loads stay within `e`/`f[..k]`.
+    unsafe {
+        let mut acc = _mm256_setzero_si256();
+        let mut s = 0usize;
+        while s + 4 <= k {
+            let ev = _mm256_cvtepu32_epi64(_mm_loadu_si128(e.as_ptr().add(s) as *const __m128i));
+            let fv = _mm256_cvtepi32_epi64(_mm_loadu_si128(f.as_ptr().add(s) as *const __m128i));
+            acc = _mm256_add_epi64(acc, _mm256_mul_epi32(ev, fv));
+            s += 4;
+        }
+        let mut lanes = [0i64; 4];
+        _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc);
+        let mut total = lanes[0] + lanes[1] + lanes[2] + lanes[3];
+        while s < k {
+            total += i64::from(*e.get_unchecked(s)) * i64::from(*f.get_unchecked(s));
+            s += 1;
+        }
+        total
+    }
+}
 
 impl Mixer {
     fn new(k: usize) -> Self {
@@ -185,6 +318,7 @@ impl Mixer {
             logit: vec![0i32; k],
             e: vec![0u32; k],
             freq_rc: vec![0u32; k],
+            backend: detect_backend(),
         }
     }
 
@@ -215,18 +349,13 @@ impl Mixer {
         }
         let w = &self.weights[gate];
         // logit[s] = (Σ_t w[t]·feat[t*k+s]) >> 16 (back to Q16 nat-log units).
-        let mut max_logit = i32::MIN;
-        for s in 0..k {
-            let mut l = 0i64;
-            for t in 0..NMODELS {
-                l += w[t] * i64::from(self.feat[t * k + s]);
-            }
-            let lg = (l >> 16) as i32;
-            self.logit[s] = lg;
-            if lg > max_logit {
-                max_logit = lg;
-            }
-        }
+        let max_logit = match self.backend {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: `Backend::Avx2` is only set when AVX2 is present; `feat` is
+            // `NMODELS*k` and `logit` is `k` by construction.
+            Backend::Avx2 => unsafe { logit_avx2(&self.feat, w, k, &mut self.logit) },
+            Backend::Scalar => logit_scalar(&self.feat, w, k, &mut self.logit),
+        };
         // softmax weights via the exp table
         let mut z = 0u64;
         for s in 0..k {
@@ -266,13 +395,18 @@ impl Mixer {
         let k = self.k;
         // E_P[f_i] = Σ_s P(s)·f_i[s] = (Σ_s e[s]·f_i[s]) / Z
         let z: u64 = self.e.iter().map(|&e| u64::from(e)).sum::<u64>().max(1);
+        let backend = self.backend;
+        let e = &self.e;
+        let feat = &self.feat;
         let w = &mut self.weights[gate];
         for t in 0..NMODELS {
-            let mut acc = 0i64;
-            let ft = &self.feat[t * k..t * k + k];
-            for s in 0..k {
-                acc += i64::from(self.e[s]) * i64::from(ft[s]);
-            }
+            let ft = &feat[t * k..t * k + k];
+            let acc = match backend {
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: `Backend::Avx2` implies AVX2; `e`/`ft` have length `k`.
+                Backend::Avx2 => unsafe { dot_avx2(e, ft, k) },
+                Backend::Scalar => dot_scalar(e, ft, k),
+            };
             let ep = acc / z as i64; // E_P[f_t], Q16
             let grad = i64::from(ft[sym]) - ep; // Q16
             let nw = w[t] + ((grad * LR_NUM) >> LR_SHIFT);
@@ -465,5 +599,46 @@ mod tests {
         let mut out = Vec::new();
         decode(&lens, &payload, &seq, &syms, qmin, k, &mut out).unwrap();
         assert_eq!(out, quals);
+    }
+
+    /// The AVX2 kernels must be byte-identical to scalar (the `SIMD ≡ scalar`
+    /// invariant) or archives would decode differently on different CPUs.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn backends_agree_logit() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // deterministic LCG over the real value ranges: feat ∈ [-590558, 0]
+        // (ln(freq)-ln(tot) ≤ 0), weights ∈ [0, W_MAX].
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rng = || {
+            st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (st >> 33) as u32
+        };
+        for &k in &[1usize, 3, 4, 5, 7, 8, 15, 16, 31, 63, 93] {
+            for _ in 0..64 {
+                let feat: Vec<i32> = (0..NMODELS * k).map(|_| -((rng() % 590_559) as i32)).collect();
+                let w: [i64; NMODELS] =
+                    core::array::from_fn(|_| i64::from(rng() % (W_MAX as u32 + 1)));
+                let mut ls = vec![0i32; k];
+                let mut la = vec![0i32; k];
+                let ms = logit_scalar(&feat, &w, k, &mut ls);
+                // SAFETY: guarded by the avx2 feature check above.
+                let ma = unsafe { logit_avx2(&feat, &w, k, &mut la) };
+                assert_eq!(ls, la, "logit vectors differ (k={k})");
+                assert_eq!(ms, ma, "max_logit differs (k={k})");
+
+                // dot: e ∈ [0, EXP_ONE], f is a feature row.
+                let ev: Vec<u32> = (0..k).map(|_| rng() % (EXP_ONE + 1)).collect();
+                let fv = &feat[..k];
+                // SAFETY: guarded by the avx2 feature check above.
+                assert_eq!(
+                    dot_scalar(&ev, fv, k),
+                    unsafe { dot_avx2(&ev, fv, k) },
+                    "dot differs (k={k})"
+                );
+            }
+        }
     }
 }
