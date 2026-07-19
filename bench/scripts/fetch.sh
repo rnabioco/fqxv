@@ -22,7 +22,7 @@ mkdir -p "$DATA_DIR"
 if [[ $# -gt 0 ]]; then
   accessions=("$@")
 else
-  mapfile -t accessions < <(grep -v '^#' "$HERE/datasets.tsv" | awk 'NF{print $1}')
+  mapfile -t accessions < <(grep -v '^#' "$HERE/../panels/datasets.tsv" | awk 'NF{print $1}')
 fi
 
 echo "==> fetching ${#accessions[@]} accession(s) to $DATA_DIR"

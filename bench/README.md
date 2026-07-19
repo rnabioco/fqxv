@@ -3,18 +3,39 @@
 Baseline the field so every `fqxv` release can be measured against it. All tools
 live in a pixi env; data and results live on `$SCRATCH` (never in the repo).
 
+## Layout
+
+```
+bench/
+  scripts/   the drivers        run_bench.sh, corpus.sh, edgecases.sh, sra_compare.sh,
+                               bam_identity.sh, concordance.sh, fetch.sh, report.py, …
+  slurm/     batch job files    bench.sbatch, bench_cell.sbatch, prep.sbatch, merge.sbatch, …
+  panels/    input tables       datasets.tsv (ratio matrix), sra_panel.tsv (vs .sra)
+  tools/     rustc helpers      fqdigest.rs (round-trip digest), bamcmp.rs (BAM digests)
+  RESULTS.md headline numbers
+```
+
+Scripts locate their siblings relative to their own path, so they can be invoked
+from anywhere. The batch files resolve the harness root from `SLURM_SUBMIT_DIR`
+(Slurm runs a spool copy, so `$0` is not the original path) and tolerate
+submission from the repo root, `bench/`, or `bench/slurm/`.
+
 ## Environment
 
+The repo has a **single** pixi manifest at the root with two environments:
+`default` (docs toolchain) and `bench` (this harness). Everything below runs
+under `-e bench`; `pixi` finds the manifest by searching upward, so the commands
+work from the repo root or from `bench/`.
+
 ```bash
-cd bench
-pixi install        # solves conda-forge + bioconda: sracha, spring, fqz_comp, zstd, xz, pigz, seqkit, samtools
+pixi install -e bench   # conda-forge + bioconda: sracha, spring, fqz_comp, colord, zstd, xz, pigz, seqkit, samtools, bwa, bcftools
 ```
 
 ## 1. Fetch data (login node is fine — it's I/O bound)
 
 ```bash
-pixi run bash fetch.sh              # all accessions in datasets.tsv, raw .fastq to $SCRATCH/fqxv/data
-pixi run bash fetch.sh SRR453566    # just one
+pixi run -e bench bash scripts/fetch.sh              # all accessions in datasets.tsv, raw .fastq to $SCRATCH/fqxv/data
+pixi run -e bench bash scripts/fetch.sh SRR453566    # just one
 ```
 
 Datasets span both quality regimes (the thing a quality codec cares about):
@@ -26,12 +47,12 @@ Datasets span both quality regimes (the thing a quality codec cares about):
 | DRR174812 | rnaseq_novaseq | NovaSeq 6000 | binned |
 | SRR453566 | rnaseq_fullrange | GAIIx | full-range |
 
-Check the quality alphabet of any file with `pixi run qstats <file.fastq>`.
+Check the quality alphabet of any file with `pixi run -e bench qstats <file.fastq>`.
 
 ## 2. Run the benchmark (compute node via Slurm — NOT the login node)
 
 ```bash
-sbatch bench.sbatch                 # one exclusive amilan node, 64 threads
+sbatch slurm/bench.sbatch                 # one exclusive amilan node, 64 threads
 ```
 
 Or interactively:
@@ -39,7 +60,7 @@ Or interactively:
 ```bash
 srun --partition=amilan --qos=normal --nodes=1 --ntasks=1 --cpus-per-task=64 \
      --exclusive --mem=0 --time=02:00:00 --pty bash
-pixi run bash run_bench.sh
+pixi run -e bench bash scripts/run_bench.sh
 ```
 
 Knobs (env vars): `FQXV_THREADS`, `FQXV_INPUT=r1|cat` (R1 only vs R1+R2
@@ -49,7 +70,7 @@ concatenated), `FQXV_TOOLS="gzip zstd19 fqz_comp"` (subset), `FQXV_DATA_DIR`,
 ## 3. Read the table
 
 ```bash
-pixi run python report.py
+pixi run -e bench python scripts/report.py
 ```
 
 `vs_gzip` is how many times smaller than plain `.fastq.gz` a tool is — the number
@@ -102,7 +123,7 @@ binning; `fqz_comp`/`fqzcomp5` have no such mode, so they run lossless only and
 `fqzcomp5` and `PgRC` aren't in bioconda; build them with:
 
 ```bash
-pixi run build-tools        # clones + compiles into $SCRATCH/fqxv/tools/bin
+pixi run -e bench build-tools        # clones + compiles into $SCRATCH/fqxv/tools/bin
 ```
 
 `fqzcomp5` is a full lossless FASTQ compressor and is in the default tool set.
@@ -120,48 +141,76 @@ PgRC -d -t 8 arch                        # -> arch_out (sequences, one per line)
 
 Once `fqxv` produces output, it joins the comparable table as another tool.
 
-## Downstream fidelity — variant-call concordance (`concordance.sh`)
+## fqxv vs the archive the data shipped in (`scripts/sra_compare.sh`)
 
-`run_bench.sh` reports the *rate* of lossy quality binning (ratio) and its raw
-*distortion* (`Δqual`). `concordance.sh` answers the question that actually
+`.sra` is the format most public data actually ships in, and it is itself a
+compressed columnar store (2-bit-packed bases, a quality model, spot/name
+columns). For anyone pulling from SRA/ENA the honest question is "is an `.fqxv`
+worth keeping instead of the `.sra` I'd otherwise store?" — not just "how does it
+compare to gzip". This records, per run, the `.sra` size and the fqxv size at
+several operating points, and reports **fqxv/.sra** (< 1.0 = fqxv is smaller).
+
+The `.sra` size comes from `sracha info --format tsv` — **metadata only**, so the
+multi-GB archive is never downloaded. That splits the run in two, because the
+lookup needs the network and the compression needs a compute node:
+
+```bash
+pixi run -e bench bash scripts/sra_compare.sh sizes   # login node: cache .sra sizes
+# then inside an srun/sbatch allocation:
+pixi run -e bench bash scripts/sra_compare.sh run     # compute: compress + join
+# results -> $FQXV_RESULTS_DIR/sra_compare.tsv, rendered by scripts/report.py
+```
+
+The panel is `panels/sra_panel.tsv`; `SRA_POINTS` selects the fqxv points
+(default `max bin8 bin4 bin2`) and `SRA_INCLUDE_LARGE=1` opts into the big rows.
+Compare **lossless fqxv vs `.sra` first** — `.sra` bundles both mates, read names
+and spot metadata, and its quality handling is platform-adaptive (binned Illumina
+vs full-range), so match the fqxv point to the `.sra`'s own quality regime before
+reading anything into the lossy rows. Reference-compressed cSRA runs aren't
+reconstructable to raw FASTQ and are flagged/excluded.
+
+## Downstream fidelity — variant-call concordance (`scripts/concordance.sh`)
+
+`scripts/run_bench.sh` reports the *rate* of lossy quality binning (ratio) and its raw
+*distortion* (`Δqual`). `scripts/concordance.sh` answers the question that actually
 matters for lossy quality: **does binning change variant calls?**
 
-For each dataset with a `reference` genome (the last column of `datasets.tsv`),
+For each dataset with a `reference` genome (the last column of `panels/datasets.tsv`),
 it aligns the lossless reads and each `fqxv --quality-bin` output to the
 reference, calls variants (`bwa mem` → `bcftools mpileup`/`call`), and reports
 SNP and indel **recall** and **precision** of the binned calls against the
 lossless baseline. The binned FASTQ is produced by the real codec (compress
 `--quality-bin` then decompress), so the concordance is exactly what fqxv would
-store. It is **heavy** (alignment + calling) and is *not* part of `run_bench.sh`.
+store. It is **heavy** (alignment + calling) and is *not* part of `scripts/run_bench.sh`.
 
 ```bash
 # inside an srun/sbatch allocation:
-pixi run bash concordance.sh              # every dataset with a reference
-pixi run bash concordance.sh ecoli_miseq  # just one
-pixi run python -c 'pass'  # results land in $FQXV_RESULTS_DIR/concordance.tsv
+pixi run -e bench bash scripts/concordance.sh              # every dataset with a reference
+pixi run -e bench bash scripts/concordance.sh ecoli_miseq  # just one
+# results land in $FQXV_RESULTS_DIR/concordance.tsv
 ```
 
 Read the concordance next to the ratio — a bin that compresses well but drops
 SNP precision (coarser binning tends to inflate false-positive calls) is not
 free. Only DNA-resequencing datasets carry a reference; RNA-seq needs
-splice-aware calling and is left out (`-` in `datasets.tsv`). Extra pixi deps:
+splice-aware calling and is left out (`-` in `panels/datasets.tsv`). Extra pixi deps:
 `bwa`, `bcftools` (`samtools` was already present).
 
-## Downstream fidelity — BAM round-trip (`bam_identity.sh`)
+## Downstream fidelity — BAM round-trip (`scripts/bam_identity.sh`)
 
-Where `concordance.sh` asks "do variant calls change?", `bam_identity.sh` asks
+Where `scripts/concordance.sh` asks "do variant calls change?", `scripts/bam_identity.sh` asks
 the sharper question: **is the aligned BAM itself identical before vs after
 fqxv?** It aligns the original reads and each fqxv round-trip (`bwa mem`) and
 compares the alignments with `bamcmp` — an `rustc -O` streaming tool (sibling of
-`fqdigest.rs`) that emits order-independent multiset digests of `samtools view`
+`tools/fqdigest.rs`) that emits order-independent multiset digests of `samtools view`
 in one pass (no `samtools sort`, no `sort | md5sum`), plus a fast `qualdelta`.
 Three digests per BAM: `content` (whole record), `body` (drop QNAME — survives
 renaming), `place` (FLAG..SEQ — survives renaming *and* quality binning).
 
 ```bash
 # inside an srun/sbatch allocation:
-sbatch bam_identity.sbatch              # default dataset (ecoli_miseq)
-sbatch bam_identity.sbatch ecoli_miseq  # any datasets.tsv row with a reference
+sbatch slurm/bam_identity.sbatch              # default dataset (ecoli_miseq)
+sbatch slurm/bam_identity.sbatch ecoli_miseq  # any datasets.tsv row with a reference
 # results -> $FQXV_RESULTS_DIR/bam_identity.tsv
 ```
 
@@ -175,10 +224,10 @@ order-sensitive** (~1.2% of reads realign differently — deterministic, not
 threading, unaffected by `-K`), which is why preserving read order is what makes
 a BAM reproducible. Tools: `bwa`, `samtools`, `rustc`.
 
-## Robustness corpus (`corpus.sh`) — correctness, not ratio
+## Robustness corpus (`scripts/corpus.sh`) — correctness, not ratio
 
-`run_bench.sh` is a curated *ratio* comparison against the field.
-`corpus.sh` is the opposite: a *correctness net* that throws a random pile of
+`scripts/run_bench.sh` is a curated *ratio* comparison against the field.
+`scripts/corpus.sh` is the opposite: a *correctness net* that throws a random pile of
 real SRA runs at fqxv and asserts every archive round-trips and builds
 identically regardless of thread count. It's how we shake out the messy long
 tail (odd read lengths, wide/narrow quality alphabets, Ns, empty reads, long
@@ -199,11 +248,11 @@ Modes: `default` (`-l5` lossless), `max` (`-l9 --order any`), and `bin8`
 `FAIL_COMPRESS` / `FAIL_DECOMPRESS` / `ERROR_FETCH`.
 
 ```bash
-pixi run bash corpus.sh sample -n 20 -s 42   # random ENA accessions -> $CORPUS_DIR/accessions.txt
-pixi run bash corpus.sh build-digest         # compile fqdigest (fast round-trip hash; optional)
-pixi run bash corpus.sh fetch                # sracha get every accession (login node — I/O bound)
-pixi run bash corpus.sh sbatch               # fan out as a slurm array (COMPUTE) — one accession/task
-pixi run bash corpus.sh summary              # pass/fail tally + failing accessions
+pixi run -e bench bash scripts/corpus.sh sample -n 20 -s 42   # random ENA accessions -> $CORPUS_DIR/accessions.txt
+pixi run -e bench bash scripts/corpus.sh build-digest         # compile fqdigest (fast round-trip hash; optional)
+pixi run -e bench bash scripts/corpus.sh fetch                # sracha get every accession (login node — I/O bound)
+pixi run -e bench bash scripts/corpus.sh sbatch               # fan out as a slurm array (COMPUTE) — one accession/task
+pixi run -e bench bash scripts/corpus.sh summary              # pass/fail tally + failing accessions
 ```
 
 `sample` draws random Illumina runs by default (`-p all` for every platform);
@@ -212,10 +261,10 @@ seed the shuffle for a reproducible corpus. Everything lands under
 `logs/`, and `results.tsv`. On a **`FAIL_*`** the offending archive is kept in
 `work/<acc>/` for post-mortem (`fqxv info`, re-decompress with `-v`).
 
-`fqdigest.rs` is the round-trip hash: an order-independent multiset digest
+`tools/fqdigest.rs` is the round-trip hash: an order-independent multiset digest
 (sum of per-record hashes — commutative, so read order doesn't matter) in one
 O(n) streaming pass with bounded memory, replacing a slow `awk | sort | md5sum`
 (~4× faster, and it sidesteps awk's per-byte quality-binning loop entirely).
-`corpus.sh` uses it when built and falls back to the awk pipeline otherwise, so
+`scripts/corpus.sh` uses it when built and falls back to the awk pipeline otherwise, so
 results are identical either way. Build it once with `corpus.sh build-digest`
 (needs `rustc` on PATH; the harness never builds on the login node otherwise).

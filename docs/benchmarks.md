@@ -89,7 +89,7 @@ no such split, so its columns are taken by difference — `-q none` discards
 quality, and quality is `org - none` — which makes the rows additive by
 construction. `-q none` still carries names and container overhead, so CoLoRd's
 non-quality column is an upper bound on its sequence stream. See
-[Long-read support](design/longread.md) for the method and `bench/colord_split.sh`
+[Long-read support](design/longread.md) for the method and `bench/scripts/colord_split.sh`
 to re-run it.
 
 All sizes are `MiB` (base-1024, matching `fqxv info` and the harness `report.py`).
@@ -166,10 +166,10 @@ See [Long-read support](design/longread.md) for the full analysis.
 ## Round-trip fidelity (alignment level)
 
 A compression ratio only counts if the reads survive intact. Beyond `fqxv`'s
-internal round-trip digest, the `bench/bam_identity.sh` harness proves fidelity
+internal round-trip digest, the `bench/scripts/bam_identity.sh` harness proves fidelity
 *through a real analysis*: it aligns the original reads and the `fqxv`
 round-tripped reads with `bwa mem` and compares the BAMs with an order-independent
-multiset digest (`bench/bamcmp.rs`).
+multiset digest (`bench/tools/bamcmp.rs`).
 
 On E. coli MiSeq (SRR2627175, 2.19 M reads, GCF_000005845.2):
 

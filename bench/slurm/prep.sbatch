@@ -18,8 +18,12 @@
 set -euo pipefail
 
 export PATH="$HOME/.pixi/bin:$HOME/.cargo/bin:$PATH"
-HERE="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
-ROOT="$(cd "$HERE/.." && pwd)"
+BENCH="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Tolerate submission from the repo root, bench/, or bench/slurm/.
+for _c in "$BENCH" "$BENCH/.." "$BENCH/bench"; do
+  [ -d "$_c/scripts" ] && [ -d "$_c/panels" ] && { BENCH="$(cd "$_c" && pwd)"; break; }
+done
+ROOT="$(cd "$BENCH/.." && pwd)"
 export FQXV_THREADS="${SLURM_CPUS_PER_TASK:-$(nproc)}"
 
 echo "==> prep on $(hostname), $FQXV_THREADS threads, $(date)"
@@ -35,10 +39,10 @@ HIFI_SUB="$DATA_DIR/ecoli_hifi.fastq"
 N_READS="${HIFI_SUBSAMPLE_READS:-120000}"
 if [[ ! -s "$HIFI_SUB" && -s "$HIFI_SRC" ]]; then
   echo "==> subsample HiFi $HIFI_SRC -> $HIFI_SUB (first $N_READS reads)"
-  pixi run --manifest-path "$HERE/pixi.toml" seqkit head -n "$N_READS" "$HIFI_SRC" -o "$HIFI_SUB"
+  pixi run -e bench --manifest-path "$ROOT/pixi.toml" seqkit head -n "$N_READS" "$HIFI_SRC" -o "$HIFI_SUB"
 fi
 
 echo "==> computing per-dataset meta + input digests"
 export FQXV_PREP_ONLY=1
-pixi run --manifest-path "$HERE/pixi.toml" bash "$HERE/run_bench.sh"
+pixi run -e bench --manifest-path "$ROOT/pixi.toml" bash "$BENCH/scripts/run_bench.sh"
 echo "==> prep done $(date)"

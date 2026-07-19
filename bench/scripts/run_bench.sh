@@ -47,7 +47,7 @@ export LD_LIBRARY_PATH="$TOOLS_DIR/lib:${LD_LIBRARY_PATH:-}"
 # Rust content-digest tool (single O(n) streaming pass, bounded memory, no sort) —
 # the record-multiset round-trip check. Built on demand from bench/fqdigest.rs.
 FQDIGEST="${FQDIGEST:-$TOOLS_DIR/bin/fqdigest}"
-FQDIGEST_SRC="$HERE/fqdigest.rs"
+FQDIGEST_SRC="$HERE/../tools/fqdigest.rs"
 ensure_fqdigest() {
   if [[ ! -x "$FQDIGEST" || "$FQDIGEST_SRC" -nt "$FQDIGEST" ]]; then
     mkdir -p "$(dirname "$FQDIGEST")"
@@ -226,7 +226,7 @@ if [[ -z "$PART_TAG" ]]; then
   [[ "$PREP_ONLY" == 1 ]] || echo -e "dataset\ttool\torig_bytes\tcomp_bytes\tratio\tc_secs\td_secs\tc_rss_kb\td_rss_kb\tnames_bytes\tseq_bytes\tqual_bytes\trt_ok\tdeterministic\tqual_mae\tqual_rmse\tqual_pct_changed" > "$RESULTS"
 fi
 
-mapfile -t rows < <(grep -v '^#' "$HERE/datasets.tsv" | awk 'NF')
+mapfile -t rows < <(grep -v '^#' "$HERE/../panels/datasets.tsv" | awk 'NF')
 for row in "${rows[@]}"; do
   acc="$(awk '{print $1}' <<<"$row")"
   label="$(awk '{print $2}' <<<"$row")"

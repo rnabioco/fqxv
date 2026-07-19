@@ -1,6 +1,12 @@
-# Root pixi environment for the docs toolchain (VHS tape rendering + the
-# zensical site). NOT the build path for the crates — that stays pure cargo
-# (see CLAUDE.md). The separate `bench/pixi.toml` is the benchmarking harness.
+# The single pixi manifest for the repo. Two environments:
+#
+#   default  docs toolchain (VHS tape rendering + the zensical site)
+#   bench    the benchmarking harness (baseline compressors, test-data fetch,
+#            fidelity tooling) — `pixi run -e bench …`, scripts in bench/
+#
+# NOT the build path for the crates — that stays pure cargo (see CLAUDE.md).
+# The bench environment declares its own channels (bioconda) and is linux-only,
+# so the default docs environment is unaffected by it and still solves for macOS.
 
 [workspace]
 name = "fqxv"
@@ -28,3 +34,68 @@ release = "cargo build --profile release"
 tapes = { cmd = "docs/tapes/generate.sh", depends-on = ["release"] }
 docs-serve = "zensical serve"
 docs-build = "zensical build"
+
+# ── bench environment ────────────────────────────────────────────────────────
+# Was bench/pixi.toml. Declared as a feature so its bioconda channel and
+# linux-only platform stay off the default docs environment. Run with:
+#   pixi run -e bench bash bench/scripts/run_bench.sh
+[feature.bench]
+channels = ["conda-forge", "bioconda"]
+platforms = ["linux-64"]
+
+[feature.bench.dependencies]
+# Test-data fetch
+sracha = "*"
+
+# General-purpose baselines (compression floor)
+zstd = "*"
+xz = "*"
+pigz = "*"
+
+# FASTQ-specific baseline compressors
+spring = "*"
+fqzcomp = "*"
+# Long-read (Nanopore/PacBio) SOTA reference — compresses sequence *and* quality
+# via approximate assembly; the meaningful bar for our ONT sequence stream.
+colord = "*"
+
+# FASTQ utilities (quality histograms, subsampling, stats)
+seqkit = "*"
+samtools = "*"
+
+# Downstream-concordance fidelity check (concordance.sh): align lossless vs
+# binned reads and compare variant calls. Not used by run_bench.sh.
+bwa = "*"
+# Pin a modern bcftools: the unconstrained solve pulls the ancient 1.6, which
+# links a long-gone libcrypto.so.1.0.0 and fails to load.
+bcftools = ">=1.20"
+
+# Harness scripting
+python = ">=3.11"
+
+# Build toolchain for from-source baselines (PgRC, fqzcomp5 + its htscodecs).
+cxx-compiler = "*"
+c-compiler = "*"
+cmake = "*"
+make = "*"
+git = "*"
+pkg-config = "*"
+autoconf = "*"
+automake = "*"
+libtool = "*"
+zlib = "*"
+bzip2 = "*"
+minimap2 = ">=2.31,<3"
+
+[feature.bench.tasks]
+# Clone + build the from-source baselines (PgRC, fqzcomp5) into $SCRATCH tools.
+build-tools = { cmd = "bash bench/scripts/build_tools.sh", description = "Build PgRC and fqzcomp5 from source" }
+# Print quality-score alphabet + basic stats for a FASTQ (binned vs full-range check)
+qstats = { cmd = "seqkit stats -a", description = "Quality/length stats for a FASTQ" }
+# Downstream fidelity: variant-call concordance of lossy binning vs lossless.
+concordance = { cmd = "bash bench/scripts/concordance.sh", description = "Variant-call concordance: lossy quality binning vs lossless" }
+
+[environments]
+# no-default-feature: the harness must not drag in the docs toolchain (vhs,
+# zensical, fonts) — it is a separate, much heavier solve.
+bench = { features = ["bench"], no-default-feature = true }

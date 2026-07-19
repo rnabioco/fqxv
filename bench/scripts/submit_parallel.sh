@@ -48,16 +48,16 @@ while read -r acc label platform layout quality approx _; do
   for t in $sel; do
     printf '%s\t%s\n' "$label" "$t" >> "$CELLS"
   done
-done < <(grep -v '^#' "$HERE/datasets.tsv")
+done < <(grep -v '^#' "$HERE/../panels/datasets.tsv")
 
 N="$(wc -l < "$CELLS")"
 [[ "$N" -gt 0 ]] || { echo "no cells generated (no datasets present?)"; exit 1; }
-echo "==> $N cells ($(wc -l < <(grep -v '^#' "$HERE/datasets.tsv" | awk 'NF')) datasets x tools) -> $CELLS"
+echo "==> $N cells ($(wc -l < <(grep -v '^#' "$HERE/../panels/datasets.tsv" | awk 'NF')) datasets x tools) -> $CELLS"
 
 # Fresh run: clear previous parts so the merge only sees this submission.
 rm -f "$RESULTS_DIR/parts"/results.*.tsv "$RESULTS_DIR/parts"/meta.*.tsv 2>/dev/null || true
 
-jid_prep=$(sbatch --parsable "$HERE/prep.sbatch")
+jid_prep=$(sbatch --parsable "$HERE/../slurm/prep.sbatch")
 echo "prep   -> job $jid_prep"
 # Default: no concurrency cap — let the scheduler decide how many cells run at
 # once (each cell is one exclusive-ish node, so Slurm's partition limits already
@@ -65,9 +65,9 @@ echo "prep   -> job $jid_prep"
 array="1-${N}"
 [[ -n "$MAXPAR" ]] && array="${array}%${MAXPAR}"
 jid_arr=$(sbatch --parsable --dependency=afterok:"$jid_prep" \
-                 --array="$array" "$HERE/bench_cell.sbatch")
+                 --array="$array" "$HERE/../slurm/bench_cell.sbatch")
 echo "cells  -> job $jid_arr  (array $array)"
-jid_merge=$(sbatch --parsable --dependency=afterany:"$jid_arr" "$HERE/merge.sbatch")
+jid_merge=$(sbatch --parsable --dependency=afterany:"$jid_arr" "$HERE/../slurm/merge.sbatch")
 echo "merge  -> job $jid_merge"
 echo
 echo "watch:   squeue -u $USER"

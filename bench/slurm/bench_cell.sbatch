@@ -35,7 +35,12 @@
 set -euo pipefail
 
 export PATH="$HOME/.pixi/bin:$HOME/.cargo/bin:$PATH"
-HERE="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+BENCH="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Tolerate submission from the repo root, bench/, or bench/slurm/.
+for _c in "$BENCH" "$BENCH/.." "$BENCH/bench"; do
+  [ -d "$_c/scripts" ] && [ -d "$_c/panels" ] && { BENCH="$(cd "$_c" && pwd)"; break; }
+done
+ROOT="$(cd "$BENCH/.." && pwd)"
 RESULTS_DIR="${FQXV_RESULTS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/results}"
 CELLS="$RESULTS_DIR/cells.tsv"
 
@@ -51,5 +56,5 @@ export FQXV_TOOLS="$tool"
 export FQXV_PART_TAG="${label}.${tool}"
 
 echo "==> cell ${SLURM_ARRAY_TASK_ID}: ${label} / ${tool} on $(hostname), ${FQXV_THREADS} threads, $(date)"
-pixi run --manifest-path "$HERE/pixi.toml" bash "$HERE/run_bench.sh"
+pixi run -e bench --manifest-path "$ROOT/pixi.toml" bash "$BENCH/scripts/run_bench.sh"
 echo "==> cell done $(date)"

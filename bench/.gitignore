@@ -1,6 +1,3 @@
-# pixi environments
-.pixi/*
-!.pixi/config.toml
-
-# Slurm job logs (%x-%j.out / fqxv-cell-%A_%a.out)
+# Slurm job logs (%x-%j.out / fqxv-cell-%A_%a.out) — written next to the submit dir
 *.out
+slurm/*.out

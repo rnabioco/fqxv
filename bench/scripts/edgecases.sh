@@ -28,7 +28,7 @@ RESULTS="$EDGE_DIR/results.tsv"
 
 FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$HERE/.." && pwd)/target}/release/fqxv}"
 FQDIGEST="${FQDIGEST:-${SCRATCH:-$HOME/scratch}/fqxv/tools/bin/fqdigest}"
-FQDIGEST_SRC="$HERE/fqdigest.rs"
+FQDIGEST_SRC="$HERE/../tools/fqdigest.rs"
 THREADS="${FQXV_THREADS:-8}"
 MODES="${FQXV_MODES:-default max maxkeep bin8 bin4 bin2}"
 
