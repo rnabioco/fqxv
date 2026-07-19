@@ -206,13 +206,13 @@ pub(crate) fn detect_group_size(peeked: &[noodles_fastq::Record]) -> u8 {
 }
 
 /// Compress a single FASTQ stream, auto-detecting whether it is interleaved
-/// paired data from the leading read names (see [`detect_group_size`]). This is
+/// paired data from the leading read names (see `detect_group_size`). This is
 /// what the CLI uses by default for a lone input so `sracha get -Z … | fqxv
 /// compress -` archives paired downloads with the right spot grouping and no
 /// flag. Detection only ever promotes to paired on unambiguous mate names;
 /// otherwise it behaves exactly like [`compress`]. `reorder` mode honours the
 /// detected grouping too: paired input is globally clustered and a permutation
-/// restores the mate interleaving (see [`encode_reordered`]).
+/// restores the mate interleaving (see `encode_reordered`).
 #[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, reorder = params.reorder, threads = params.threads))]
 pub fn compress_auto<'a, R: Read + Send + 'a, W: Write>(
     mut reader: R,

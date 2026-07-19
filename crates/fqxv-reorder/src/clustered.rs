@@ -32,7 +32,7 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
             continue;
         }
         // Place `cur` on the contig (shared-minimizer anchor, small indel-rescue
-        // window). See [`place_on_contig`].
+        // window). See `place_on_contig`.
         let placed = place_on_contig(&contig, cur, anchors[i], ref_anchor);
         match placed {
             Some((off, overlap, mism)) => {
@@ -97,7 +97,7 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
 
 /// Op-mix tally from the clustered contig-assembly codec — a diagnostic that
 /// replays [`encode_clustered`]'s classification and consensus updates exactly
-/// (via the shared [`place_on_contig`]) but skips entropy coding, so the counts
+/// (via the shared `place_on_contig`) but skips entropy coding, so the counts
 /// reflect what the real encoder does. A high `literals` / `literal_bases` share
 /// is the signal that clustering is leaving cross-read redundancy uncaptured.
 ///

@@ -530,7 +530,7 @@ pub fn decode_clustered_auto(src: &[u8]) -> Result<Vec<Vec<u8>>> {
 }
 
 /// Op-mix tally for the literal-rescue codec — the [`op_stats`] analogue for
-/// [`encode_clustered_rescue`], driving the same [`Assembler`] so the counts
+/// [`encode_clustered_rescue`], driving the same `Assembler` so the counts
 /// match the encoder. Lets the diagnostic measure how many literals the rescue
 /// pass recovers.
 pub fn op_stats_rescue(reads: &[&[u8]], anchors: &[u32]) -> OpStats {

@@ -107,7 +107,7 @@ pub(crate) const FLAG_GLOBAL_REFERENCE: u8 = 0x20;
 /// Write the fixed header prefix (see [`HEADER_PREFIX_LEN`]), then the extension
 /// region (empty at 1.0), then a CRC-32C over prefix+extension — so a flipped
 /// header byte is caught on read instead of silently altering decode. Shared by
-/// the plain ([`write_header`]) and reorder ([`encode_reordered`]) layouts, which
+/// the plain ([`write_header`]) and reorder (`encode_reordered`) layouts, which
 /// differ only in their `flags`.
 ///
 /// `required_features` is the coarse, intent-level capability word: set a bit
@@ -500,7 +500,7 @@ pub(crate) fn read_footer<R: Read + Seek>(r: &mut R) -> Result<Footer> {
 /// Parse and CRC-check a footer body already in memory. `body` is the bytes from
 /// `footer_offset` up to (not including) the EOF trailer — the `[4 n_groups] …
 /// [8 total_reads] [4 whole_file_crc] [4 footer_crc]` region. Shared by
-/// [`read_footer`] (seek-based) and the IO-free suffix parser in `random_access`,
+/// `read_footer` (seek-based) and the IO-free suffix parser in `random_access`,
 /// so both apply exactly the same validation before any offset is trusted.
 pub(crate) fn parse_footer_body(body: &[u8], footer_offset: u64) -> Result<Footer> {
     let body_len = body.len();

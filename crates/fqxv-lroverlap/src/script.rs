@@ -4,7 +4,7 @@
 //! consensus, or another read) becomes a short script instead of thousands of
 //! bases — the entire point of the crate.
 //!
-//! Anchors from [`chain`](crate::chain) are exact k-mer matches, so the spans
+//! Anchors from `chain` are exact k-mer matches, so the spans
 //! they cover are free: they emit as [`Op::Match`] with no alignment at all.
 //! Only the gaps *between* consecutive anchors are aligned, and those are short.
 //! That is what keeps a 14 kb read at 18% error affordable — the quadratic DP
@@ -34,7 +34,7 @@ impl Default for ScriptOpts {
 /// Rewrite `query` as edits against `refr`, guided by chained anchors.
 ///
 /// `anchors` must be colinear and ascending in both coordinates — i.e. one
-/// chain, as produced by [`chain`](crate::chain). `refr` is the reference in the
+/// chain, as produced by `chain`. `refr` is the reference in the
 /// same orientation as `query` (callers reverse-complement first if the overlap
 /// says so).
 ///

@@ -2,11 +2,11 @@
 
 use super::*;
 
-/// Leading reads sampled to guess the platform (see [`detect_platform`]).
+/// Leading reads sampled to guess the platform (see `detect_platform`).
 pub(crate) const PLATFORM_PEEK: usize = 16;
 
 /// Sequencing platform recorded in the archive metadata. Detected from read-name
-/// grammar at compress time (see [`detect_platform`]) and overridable via
+/// grammar at compress time (see `detect_platform`) and overridable via
 /// [`Params::platform`]; stored once in the container header, since it is a
 /// per-archive fact, not a per-read one.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

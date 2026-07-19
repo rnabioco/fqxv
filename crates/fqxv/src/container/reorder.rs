@@ -75,7 +75,7 @@ pub(crate) fn serialize_block(all: &RawBlock) -> Vec<u8> {
     buf
 }
 
-/// Buffer a single reader and hand off to [`encode_reordered`] (single-end when
+/// Buffer a single reader and hand off to `encode_reordered` (single-end when
 /// `group_size == 1`, or an already-interleaved stream for `group_size > 1`).
 pub(crate) fn compress_reordered_whole<R: Read + Send, W: Write>(
     reader: R,
@@ -602,7 +602,7 @@ pub(crate) fn encode_reordered<W: Write>(
 
 /// The decoded whole-file reorder streams, before any un-permutation. `cl_reads`
 /// is in clustered order; `names`/`lens`/`quals` are in clustered order without
-/// `keep_order` and in original order with it (see [`encode_reordered`]).
+/// `keep_order` and in original order with it (see `encode_reordered`).
 pub(crate) struct ReorderStreams {
     n: usize,
     n_blocks: usize,

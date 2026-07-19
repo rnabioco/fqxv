@@ -119,7 +119,7 @@ fn gap_cost(gap: u32, k: u32) -> i32 {
 ///
 /// ## Why the table exists
 ///
-/// The DP evaluates [`gap_cost`] once per (anchor, predecessor) pair — about
+/// The DP evaluates `gap_cost` once per (anchor, predecessor) pair — about
 /// 2.2e12 times on a 300x HiFi dataset, where `overlaps` is 83% of runtime — and
 /// its log term was an `f64::log2`, a libm call in the innermost loop. Both of
 /// that function's inputs are bounded before it is ever called: the DP skips any

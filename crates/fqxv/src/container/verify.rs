@@ -81,7 +81,7 @@ pub fn verify_roundtrip<R: Read + Seek>(mut reader: R, threads: usize) -> Result
 ///
 /// For the plain and per-block-reorder layouts this reads the footer's
 /// `total_reads` field **with no forward-scan fallback**: a file that lost its
-/// trailing blocks also lost the footer/EOF trailer, so [`read_footer`] fails and
+/// trailing blocks also lost the footer/EOF trailer, so `read_footer` fails and
 /// the truncation surfaces as an error rather than a short, silent success.
 /// (Contrast [`inspect`], which deliberately falls back to counting the surviving
 /// blocks so a partial file still reports what it holds — the wrong tool for a

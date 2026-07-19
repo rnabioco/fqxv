@@ -205,7 +205,7 @@ impl GlobalReference {
     /// the redundancy that separates xz (~1.79 b/base here) from the context model
     /// (~1.98). Coded over one whole-reference window (a serial decode, fine since
     /// the reference is coded once per file); deterministic, so thread-count
-    /// independent. See the [`reflzma`] module. Gated never-worse by the caller.
+    /// independent. See the `reflzma` module. Gated never-worse by the caller.
     pub fn encode_lzma(&self) -> Result<Vec<u8>> {
         reflzma::encode(&self.contig_lens(), &self.seq)
     }
@@ -222,7 +222,7 @@ impl GlobalReference {
     /// floor and a byte-domain LZ then captures the long-range near-duplicate
     /// repeats; on real references this beats the order-k model on raw bases by
     /// ~7%. Non-ACGT bytes (rare in a plurality consensus) are exception-coded so
-    /// it stays byte-exact. See the [`refpack`] module. Gated never-worse.
+    /// it stays byte-exact. See the `refpack` module. Gated never-worse.
     pub fn encode_packed(&self) -> Result<Vec<u8>> {
         refpack::encode(&self.contig_lens(), &self.seq)
     }
@@ -246,7 +246,7 @@ pub struct Place4 {
 }
 
 /// Pass 1 of the v4 codec: assemble ALL clustered reads into one global set of
-/// contigs (the multi-contig [`Assembler`], never reset), freeze the final
+/// contigs (the multi-contig `Assembler`, never reset), freeze the final
 /// consensus into a [`GlobalReference`], and record each read's placement.
 ///
 /// Exact duplicates of the previous read are not re-folded (they inherit the
@@ -307,7 +307,7 @@ pub(crate) fn assemble_window(reads: &[&[u8]], anchors: &[u32]) -> (GlobalRefere
 /// Parallel windowed assembly: split the clustered reads into `n_windows`
 /// contiguous windows (by read index — fixed, so the result is byte-identical
 /// regardless of thread count), assemble each **in parallel** with the serial
-/// [`assemble_window`], then concatenate their frozen references (remapping each
+/// `assemble_window`, then concatenate their frozen references (remapping each
 /// window's local contig ids by a running offset). Windowing costs cross-window
 /// deduplication, but a following [`merge_reference`] recovers most of it by
 /// chaining duplicate contigs — so this is a near-ratio-neutral speedup of the

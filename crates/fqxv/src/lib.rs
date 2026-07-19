@@ -73,7 +73,7 @@ pub const FORMAT_MAJOR: u8 = 1;
 /// On-disk format minor version. Bumped for backward-compatible additions — a new
 /// skippable header extension record, or a new optional codec/mode gated by a
 /// [`feature`] bit. A reader tolerates any minor within its [`FORMAT_MAJOR`]; the
-/// value is informational (surfaced by [`inspect`](container::inspect)).
+/// value is informational (surfaced by `inspect`).
 pub const FORMAT_MINOR: u8 = 0;
 
 /// Coarse capability bits an archive can require in its header `required_features`
@@ -92,7 +92,7 @@ pub mod feature {
 
 /// The union of every [`feature`] bit this build understands. A `required_features`
 /// word with any bit outside this mask is rejected by
-/// [`read_header`](container::format::read_header).
+/// `read_header`.
 pub const KNOWN_FEATURES: u64 = feature::GLOBAL_REFERENCE;
 
 /// Errors returned by the archiver.
