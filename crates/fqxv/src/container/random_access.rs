@@ -232,7 +232,11 @@ pub fn decode_names(coded: &[u8]) -> Result<Vec<Vec<u8>>> {
 /// bases)`. Slice read `i` out with the lengths' running sum. The stream carries
 /// a leading codec-method byte (order-k or long-read overlap).
 pub fn decode_sequence(coded: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
-    super::block::decode_sequence_stream(coded)
+    // Projection has no access to the archive's whole-file reference frame, so a
+    // shared-reference sequence stream (issue #168) cannot be decoded stand-alone
+    // and fails closed here (`Error::Malformed`). Order-k and self-contained
+    // overlap streams project as before.
+    super::block::decode_sequence_stream(coded, None)
 }
 
 /// Decode a projected **quality** stream into `(per-read lengths, concatenated
@@ -280,7 +284,10 @@ pub struct BlockContents {
 /// digest check as streaming decompression, for a client that fetched an entire
 /// block rather than one stream.
 pub fn decode_block_contents(payload: &[u8]) -> Result<BlockContents> {
-    let (_n, names, lengths, sequence, quality) = decode_block_parts(payload)?;
+    // As with [`decode_sequence`], a shared-reference block (issue #168) needs the
+    // archive's reference frame, which a projected block payload does not carry, so
+    // it fails closed. Order-k / self-contained overlap blocks decode as before.
+    let (_n, names, lengths, sequence, quality) = decode_block_parts(payload, None)?;
     Ok(BlockContents {
         names,
         lengths,

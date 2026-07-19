@@ -206,10 +206,18 @@ pub(crate) struct FooterIndex {
 impl FooterIndex {
     pub(crate) fn new() -> Self {
         // Blocks begin right after the fixed header.
+        Self::new_at(HEADER_LEN as u64)
+    }
+
+    /// Like [`FooterIndex::new`] but with the first block at an explicit offset —
+    /// used by the shared-reference plain layout (issue #168), where a whole-file
+    /// reference frame sits between the header and the first block, so block
+    /// offsets recorded in the footer must start past it.
+    pub(crate) fn new_at(offset: u64) -> Self {
         FooterIndex {
             entries: Vec::new(),
             streams: Vec::new(),
-            offset: HEADER_LEN as u64,
+            offset,
         }
     }
 }
@@ -274,6 +282,23 @@ pub(crate) fn write_framed<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
     w.write_all(&crc32c(bytes).to_le_bytes())?;
     w.write_all(bytes)?;
     Ok(())
+}
+
+/// Read the plain layout's whole-file reference frame if the header's
+/// `FLAG_GLOBAL_REFERENCE` bit is set (issue #168). The frame is a single
+/// [`write_framed`] slice immediately after the header, before the first block; a
+/// reader positioned just past the header consumes it here and threads the decoded
+/// [`fqxv_lroverlap::Reference`] into every block's sequence decode. Returns `None`
+/// when the bit is clear (no frame is present). A corrupt frame fails closed.
+pub(crate) fn read_reference_frame<R: Read>(
+    r: &mut R,
+    flags: u8,
+) -> Result<Option<fqxv_lroverlap::Reference>> {
+    if flags & FLAG_GLOBAL_REFERENCE == 0 {
+        return Ok(None);
+    }
+    let bytes = read_framed(r, "plain-layout global reference")?;
+    Ok(Some(fqxv_lroverlap::Reference::decode(&bytes)?))
 }
 
 /// Read a `[u32 len][u32 crc32c][bytes]` frame, guarding the length allocation and

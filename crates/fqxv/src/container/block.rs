@@ -200,6 +200,12 @@ pub(crate) fn stream_digests<'a>(
 pub(crate) const SEQ_METHOD_ORDERK: u8 = 0;
 /// See [`SEQ_METHOD_ORDERK`].
 pub(crate) const SEQ_METHOD_OVERLAP: u8 = 1;
+/// Long-read overlap codec coded against a **shared, whole-file reference**
+/// (`fqxv_lroverlap::encode_against`): the block stores only its edit streams; the
+/// consensus reference lives once in the archive's `FLAG_GLOBAL_REFERENCE` frame
+/// (issue #168). Decoding requires that frame — [`decode_sequence_stream`] fails
+/// closed if it is absent.
+pub(crate) const SEQ_METHOD_OVERLAP_REF: u8 = 2;
 
 /// Minimizer sketch for the long-read overlap codec, chosen by the detected
 /// platform. PacBio's <1% error rate leaves nearly every k-mer intact, so its
@@ -277,14 +283,71 @@ pub(crate) fn encode_sequence_stream(
     })
 }
 
+/// Code a long-read block's sequence against a shared, whole-file
+/// [`fqxv_lroverlap::Reference`], returning the chosen method-tagged stream (the
+/// smaller of the reference-coded [`SEQ_METHOD_OVERLAP_REF`] and order-k) and the
+/// order-k stream's length. The length is the whole-file never-worse baseline the
+/// shared-reference compress path (issue #168) sums across blocks: it adopts the
+/// reference layout only when `reference frame + Σ chosen` beats `Σ order-k`, so
+/// the archive is never larger than the plain order-k layout.
+///
+/// Unlike [`encode_sequence_stream`], the reference is not re-assembled or stored
+/// per block — it is built once by the caller and coded against here, which is the
+/// whole point of the shared frame.
+pub(crate) fn encode_sequence_stream_shared(
+    lens: &[u32],
+    seq: &[u8],
+    params: &Params,
+    platform: Platform,
+    reference: &fqxv_lroverlap::Reference,
+) -> Result<(Vec<u8>, usize)> {
+    let opts = fqxv_lroverlap::EncodeOpts {
+        sketch: sketch_for(platform),
+        ..Default::default()
+    };
+    let (against, order_k) = rayon::join(
+        || {
+            fqxv_lroverlap::encode_against(reference, lens, seq, &opts).map(|coded| {
+                let mut out = Vec::with_capacity(coded.len() + 1);
+                out.push(SEQ_METHOD_OVERLAP_REF);
+                out.extend_from_slice(&coded);
+                out
+            })
+        },
+        || order_k_stream(lens, seq, params),
+    );
+    let (against, order_k) = (against?, order_k?);
+    let orderk_len = order_k.len();
+    let chosen = if against.len() < order_k.len() {
+        against
+    } else {
+        order_k
+    };
+    Ok((chosen, orderk_len))
+}
+
 /// Decode a method-tagged sequence stream back to `(per-read lengths, bases)`.
-pub(crate) fn decode_sequence_stream(coded: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
+///
+/// `shared_ref` is the archive's whole-file reference frame (present only when the
+/// header's `FLAG_GLOBAL_REFERENCE` bit is set). A [`SEQ_METHOD_OVERLAP_REF`] block
+/// is coded against it and cannot be decoded without it, so this **fails closed**
+/// (`Error::Malformed`) when the method needs the reference but none was supplied.
+pub(crate) fn decode_sequence_stream(
+    coded: &[u8],
+    shared_ref: Option<&fqxv_lroverlap::Reference>,
+) -> Result<(Vec<u32>, Vec<u8>)> {
     let (&method, rest) = coded
         .split_first()
         .ok_or(Error::Malformed("empty sequence stream"))?;
     match method {
         SEQ_METHOD_ORDERK => Ok(fqxv_seq::decode(rest)?),
         SEQ_METHOD_OVERLAP => Ok(fqxv_lroverlap::decode(rest)?),
+        SEQ_METHOD_OVERLAP_REF => {
+            let reference = shared_ref.ok_or(Error::Malformed(
+                "shared-reference sequence block but no reference frame in the archive",
+            ))?;
+            Ok(fqxv_lroverlap::decode_against(reference, rest)?)
+        }
         method => Err(Error::UnsupportedMethod {
             stream: "sequence",
             method,
@@ -315,7 +378,41 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params, platform: Platform) 
         },
     );
     let (names_c, seq_c, qual_c) = (names_c?, seq_c?, qual_c?);
+    assemble_block_payload(b, &names_c, &seq_c, &qual_c, params)
+}
 
+/// Code one non-reorder block reusing an already-coded sequence stream: names
+/// (tokenizer) and quality (fqzcomp) are coded here, and `precoded_seq` (a
+/// method-tagged stream from [`encode_sequence_stream_shared`]) is bundled in
+/// as-is. The shared-reference compress path (issue #168) codes the expensive
+/// reference-aligned sequence in a first pass and reuses it here, so the sequence
+/// is never coded twice.
+pub(crate) fn compress_block_with_seq(
+    b: &RawBlock,
+    params: &Params,
+    precoded_seq: &[u8],
+) -> Result<Vec<u8>> {
+    let header_refs = b.header_refs();
+    let (names_c, qual_c) = rayon::join(
+        || fqxv_tokenizer::encode(&header_refs),
+        || fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning),
+    );
+    let (names_c, qual_c) = (names_c?, qual_c?);
+    assemble_block_payload(b, &names_c, precoded_seq, &qual_c, params)
+}
+
+/// Assemble a block payload from its three already-coded streams: prepend the
+/// per-stream decoded-content digests and `n_reads`, then each length-prefixed
+/// stream. Shared by the plain ([`compress_block`]) and shared-reference
+/// ([`compress_block_shared`]) block builders, which differ only in how they code
+/// the sequence stream.
+fn assemble_block_payload(
+    b: &RawBlock,
+    names_c: &[u8],
+    seq_c: &[u8],
+    qual_c: &[u8],
+    params: &Params,
+) -> Result<Vec<u8>> {
     // End-to-end round-trip check: digest the block's decoded content (post-binning
     // quality, so lossy archives verify against what they emit) and store it at the
     // head of the payload. Lossless is the common case and borrows without a copy.
@@ -337,7 +434,7 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params, platform: Platform) 
     out.extend_from_slice(&digests.seq.to_le_bytes());
     out.extend_from_slice(&digests.qual.to_le_bytes());
     out.extend_from_slice(&(b.n_reads() as u32).to_le_bytes());
-    for stream in [&names_c, &seq_c, &qual_c] {
+    for stream in [names_c, seq_c, qual_c] {
         // Stream lengths are stored as u32. The MAX_BLOCK_SEQ_BYTES row-group
         // budget keeps every compressed stream well under this, but guard the
         // cast so a future budget change can never silently truncate a length
@@ -413,7 +510,14 @@ pub(crate) fn payload_stream_locs(payload: &[u8], block_offset: u64) -> Result<[
 pub(crate) type BlockParts = (usize, Vec<Vec<u8>>, Vec<u32>, Vec<u8>, Vec<u8>);
 
 /// Decode a block's streams and slice out each read's (name, seq, qual).
-pub(crate) fn decode_block_parts(buf: &[u8]) -> Result<BlockParts> {
+///
+/// `shared_ref` is the archive's whole-file reference frame, threaded through to
+/// the sequence decoder for [`SEQ_METHOD_OVERLAP_REF`] blocks (issue #168); `None`
+/// for archives without a reference frame, which never contain such blocks.
+pub(crate) fn decode_block_parts(
+    buf: &[u8],
+    shared_ref: Option<&fqxv_lroverlap::Reference>,
+) -> Result<BlockParts> {
     let mut c = Cursor::new(buf);
     let expected = StreamDigests {
         names: c.u64()?,
@@ -433,7 +537,7 @@ pub(crate) fn decode_block_parts(buf: &[u8]) -> Result<BlockParts> {
         || fqxv_tokenizer::decode(names_s),
         || {
             if seq_first {
-                let seq_r = decode_sequence_stream(seq_s);
+                let seq_r = decode_sequence_stream(seq_s, shared_ref);
                 let qual_r = match &seq_r {
                     Ok((_, seq)) => fqxv_fqzcomp::decode_seq(qual_s, seq),
                     // Sequence decode failed; the block errors on `seq_r?` below.
@@ -443,7 +547,7 @@ pub(crate) fn decode_block_parts(buf: &[u8]) -> Result<BlockParts> {
                 (seq_r, qual_r)
             } else {
                 rayon::join(
-                    || decode_sequence_stream(seq_s),
+                    || decode_sequence_stream(seq_s, shared_ref),
                     || fqxv_fqzcomp::decode_seq(qual_s, &[]),
                 )
             }
@@ -490,8 +594,11 @@ pub(crate) fn write_record(out: &mut Vec<u8>, name: &[u8], seq: &[u8], qual: &[u
     out.push(b'\n');
 }
 
-pub(crate) fn decode_block(buf: &[u8]) -> Result<(u64, Vec<u8>)> {
-    let (n_reads, names, lens, seq, qual) = decode_block_parts(buf)?;
+pub(crate) fn decode_block(
+    buf: &[u8],
+    shared_ref: Option<&fqxv_lroverlap::Reference>,
+) -> Result<(u64, Vec<u8>)> {
+    let (n_reads, names, lens, seq, qual) = decode_block_parts(buf, shared_ref)?;
     let mut out = Vec::with_capacity(seq.len() * 2 + qual.len());
     let mut off = 0usize;
     for i in 0..n_reads {
@@ -534,8 +641,12 @@ pub(crate) fn read_slices<'a>(
 /// regression in the block splitter, or a crafted archive — would silently
 /// misroute the trailing partial spot and shift every following block's members.
 /// Reject it here so the failure is loud and localized rather than wrong output.
-pub(crate) fn decode_block_group(buf: &[u8], g: usize) -> Result<(u64, Vec<Vec<u8>>)> {
-    let (n_reads, names, lens, seq, qual) = decode_block_parts(buf)?;
+pub(crate) fn decode_block_group(
+    buf: &[u8],
+    g: usize,
+    shared_ref: Option<&fqxv_lroverlap::Reference>,
+) -> Result<(u64, Vec<Vec<u8>>)> {
+    let (n_reads, names, lens, seq, qual) = decode_block_parts(buf, shared_ref)?;
     if !n_reads.is_multiple_of(g) {
         return Err(Error::Malformed(
             "grouped block read count is not a multiple of the group size",

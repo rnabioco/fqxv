@@ -20,6 +20,19 @@
 //! Read lengths terminate each read's op run on decode (ops are consumed until
 //! the produced length equals `lens[r]`), so the format self-describes lengths
 //! the same way [`fqxv_seq`] does.
+//!
+//! ## Shared reference (whole-file)
+//!
+//! The reference above is by far the largest single stream, and at high coverage
+//! the container splits a file into several blocks that each self-assemble and
+//! **re-store the same reference**. [`build_reference`] + [`encode_against`] hoist
+//! it out: assemble one [`Reference`] over the whole file, store it **once** (the
+//! container writes it as a shared frame), and code every block's reads against
+//! that frozen frame with [`encode_against`] (bitstream [`VERSION_SHARED`]), which
+//! is byte-for-byte the standalone block *minus* the reference streams.
+//! [`decode_against`] inverts it given the same reference. Placement is per-read
+//! against a frozen frame, so a read codes identically regardless of which block
+//! it lands in — no block-boundary penalty.
 
 use std::collections::HashSet;
 
@@ -64,8 +77,20 @@ fn align_for_coding(refr: &[u8], query: &[u8], band: usize) -> Alignment {
 
 /// Format tag for a `fqxv-lroverlap` sequence block.
 const MAGIC: [u8; 3] = *b"LRO";
-/// Bitstream version. Bump on any layout change (nothing on disk is stable yet).
+/// Bitstream version for a self-contained block ([`encode`]/[`decode`]): the
+/// reference consensi are stored inline. Bump on any layout change (nothing on
+/// disk is stable yet).
 const VERSION: u8 = 1;
+/// Bitstream version for a block coded against a shared [`Reference`]
+/// ([`encode_against`]/[`decode_against`]): identical to [`VERSION`] except the
+/// reference consensi are NOT stored — the caller supplies them.
+const VERSION_SHARED: u8 = 2;
+
+/// Format tag for a standalone shared [`Reference`] frame (see
+/// [`Reference::encode`]).
+const REF_MAGIC: [u8; 3] = *b"LRR";
+/// Bitstream version of a [`Reference`] frame.
+const REF_VERSION: u8 = 1;
 
 /// Coverage the layout is fed after subsampling. The layout is excellent at
 /// ~40× and starves past it (see `layout.rs`); every read is then placed against
@@ -116,6 +141,99 @@ impl Default for EncodeOpts {
             band_margin: 32,
             band_cap: 2048,
         }
+    }
+}
+
+/// A frozen cross-read reference: the per-contig consensus sequences reads are
+/// coded against. Built once by [`build_reference`] (over a block, or the whole
+/// file) and shared immutably — it is `Send + Sync` — across [`encode_against`] /
+/// [`decode_against`] calls. Storing it once and coding every block against it is
+/// what removes the redundant per-block reference copies (issue #168).
+#[derive(Debug, Clone, Default)]
+pub struct Reference {
+    /// Consensus contigs in index order (the order [`place_all`] assigns targets).
+    consensi: Vec<Vec<u8>>,
+}
+
+impl Reference {
+    /// The consensus contigs, in index order.
+    #[must_use]
+    pub fn consensi(&self) -> &[Vec<u8>] {
+        &self.consensi
+    }
+
+    /// Number of consensus contigs.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.consensi.len()
+    }
+
+    /// Whether the reference has no contigs (assembly found no shared locus).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.consensi.is_empty()
+    }
+
+    /// Total consensus bases across all contigs.
+    #[must_use]
+    pub fn total_bases(&self) -> usize {
+        self.consensi.iter().map(Vec::len).sum()
+    }
+
+    /// Serialise the reference to a self-contained, entropy-coded frame: contig
+    /// count, per-contig lengths, and the concatenated consensus bases. The
+    /// container stores this once per file (see issue #168); [`Reference::decode`]
+    /// inverts it. This is byte-for-byte the reference portion a [`VERSION`] block
+    /// stores inline, just lifted out with its own magic/version.
+    pub fn encode(&self) -> Result<Vec<u8>, Error> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&REF_MAGIC);
+        out.push(REF_VERSION);
+        write_varint(&mut out, self.consensi.len() as u64);
+        let mut ref_lens_raw = Vec::new();
+        let mut ref_bytes = Vec::new();
+        for cs in &self.consensi {
+            write_varint(&mut ref_lens_raw, cs.len() as u64);
+            ref_bytes.extend_from_slice(cs);
+        }
+        put_stream(&mut out, &ref_lens_raw)?;
+        put_stream(&mut out, &ref_bytes)?;
+        Ok(out)
+    }
+
+    /// Decode a frame produced by [`Reference::encode`].
+    pub fn decode(src: &[u8]) -> Result<Self, Error> {
+        let mut pos = 0usize;
+        if src.get(..REF_MAGIC.len()) != Some(&REF_MAGIC) {
+            return Err(Error::Corrupt);
+        }
+        pos += REF_MAGIC.len();
+        let version = *src.get(pos).ok_or(Error::Corrupt)?;
+        pos += 1;
+        if version != REF_VERSION {
+            return Err(Error::Corrupt);
+        }
+        let n_contigs = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+        let ref_lens_raw = get_stream(src, &mut pos)?;
+        let ref_bytes = get_stream(src, &mut pos)?;
+        // `n_contigs` is untrusted, so do NOT pre-reserve it (a crafted count is an
+        // allocation bomb); each contig length costs at least one varint byte, so
+        // the loop errors out of `ref_lens_raw` long before an absurd count is
+        // reached. See the reorder decode path's `reserve_checked` for the same
+        // rule.
+        let mut consensi: Vec<Vec<u8>> = Vec::new();
+        let mut rlp = 0usize;
+        let mut roff = 0usize;
+        for _ in 0..n_contigs {
+            let rl = read_varint(&ref_lens_raw, &mut rlp).ok_or(Error::Corrupt)? as usize;
+            let end = roff.checked_add(rl).ok_or(Error::Corrupt)?;
+            consensi.push(ref_bytes.get(roff..end).ok_or(Error::Corrupt)?.to_vec());
+            roff = end;
+        }
+        if roff != ref_bytes.len() {
+            return Err(Error::Corrupt);
+        }
+        Ok(Reference { consensi })
     }
 }
 
@@ -248,6 +366,19 @@ impl Streams {
     }
 }
 
+/// Everything [`serialize`] needs beyond the reference and read lengths: the
+/// per-read edit streams grouped by contig (plus the trailing orphan group), the
+/// group counts, and the non-ACGT exception list. Produced by [`code_against`].
+struct Coded {
+    /// One count per contig (reads placed on it), then the orphan group count.
+    counts: Vec<u64>,
+    /// All edit streams, concatenated in group order.
+    all: Streams,
+    /// Non-ACGT exception positions (delta-coded) and their bytes.
+    exc_pos: Vec<u8>,
+    exc_bytes: Vec<u8>,
+}
+
 /// Estimate the block's fold coverage from its distinct-minimizer count
 /// (genome ≈ distinct × (w+1)/2, minimizer density 2/(w+1)) and turn it into a
 /// layout stride targeting [`TARGET_LAYOUT_COVERAGE`]. Repeats bias the genome
@@ -282,23 +413,32 @@ fn derive_stride(sketch: Sketch, reads: &[&[u8]], total_bases: u64) -> usize {
     ((coverage / TARGET_LAYOUT_COVERAGE) as usize).max(1)
 }
 
-/// Compress a block of long reads. `lens[r]` is the length of read `r`; `seq` is
-/// their bases concatenated in order. Returns a self-contained block that
-/// [`decode`] inverts exactly.
-pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Error> {
-    let sketch = opts.sketch;
-    let n = lens.len();
-
-    let mut offs = Vec::with_capacity(n + 1);
+/// Cumulative byte offsets into `seq` for reads of the given `lens`, validating
+/// that the lengths sum to `seq.len()`.
+fn compute_offs(lens: &[u32], seq_len: usize) -> Result<Vec<usize>, Error> {
+    let mut offs = Vec::with_capacity(lens.len() + 1);
     let mut acc = 0usize;
     for &l in lens {
         offs.push(acc);
         acc += l as usize;
     }
     offs.push(acc);
-    if acc != seq.len() {
+    if acc != seq_len {
         return Err(Error::Corrupt);
     }
+    Ok(offs)
+}
+
+/// Assemble a [`Reference`] from long reads: subsample the layout to
+/// [`TARGET_LAYOUT_COVERAGE`], find overlaps, lay out contigs, and vote a
+/// consensus per multi-read contig. This is the assembly half of [`encode`],
+/// hoisted so the container can build one reference over the whole file and share
+/// it across blocks (issue #168). Pure function of the input (and thread-count
+/// invariant), so the shared reference is deterministic.
+pub fn build_reference(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Reference, Error> {
+    let sketch = opts.sketch;
+    let n = lens.len();
+    let offs = compute_offs(lens, seq.len())?;
     let read_at = |r: usize| &seq[offs[r]..offs[r + 1]];
     let all_refs: Vec<&[u8]> = (0..n).map(read_at).collect();
     let total_bases: u64 = lens.iter().map(|&l| u64::from(l)).sum();
@@ -359,6 +499,26 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
         })
         .collect();
 
+    Ok(Reference { consensi })
+}
+
+/// Place every read on its best-scoring consensus and code it as an edit script
+/// (or a literal orphan). This is the coding half of [`encode`], factored so both
+/// the self-contained [`encode`] and the shared-reference [`encode_against`] share
+/// it verbatim — the only difference between the two block versions is whether the
+/// caller stores `consensi` in the block.
+fn code_against(
+    consensi: &[Vec<u8>],
+    lens: &[u32],
+    seq: &[u8],
+    offs: &[usize],
+    opts: &EncodeOpts,
+) -> Result<Coded, Error> {
+    let sketch = opts.sketch;
+    let n = lens.len();
+    let read_at = |r: usize| &seq[offs[r]..offs[r + 1]];
+    let all_refs: Vec<&[u8]> = (0..n).map(read_at).collect();
+
     // ---- place every read on its best-scoring reference ----------------
     // One combined index over all consensi, queried once per read, rather than
     // one `place_against` pass per consensus (`consensi × reads` overlap searches
@@ -366,7 +526,7 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
     // `place_all` returns `(consensus index, placement)` per read; a read on no
     // reference stays `None` and codes standalone.
     let best: Vec<Option<(usize, Anchored)>> =
-        place_all(&consensi, &all_refs, sketch, ChainOpts::default());
+        place_all(consensi, &all_refs, sketch, ChainOpts::default());
 
     // Group placed reads by reference, ordered by (offset, read) so delta-coded
     // placements are small and the order is total.
@@ -512,10 +672,29 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
         }
     }
 
-    // ---- serialise -----------------------------------------------------
+    Ok(Coded {
+        counts,
+        all,
+        exc_pos,
+        exc_bytes,
+    })
+}
+
+/// Serialise a coded block. `store_ref` is `Some(consensi)` for a self-contained
+/// [`VERSION`] block (reference inline) and `None` for a shared-reference
+/// [`VERSION_SHARED`] block (the caller holds the reference). Everything else is
+/// identical, so the two block versions differ only by the reference streams.
+fn serialize(
+    version: u8,
+    store_ref: Option<&[Vec<u8>]>,
+    lens: &[u32],
+    total_bases: u64,
+    coded: &Coded,
+) -> Result<Vec<u8>, Error> {
+    let n = lens.len();
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.push(VERSION);
+    out.push(version);
     write_varint(&mut out, n as u64);
     write_varint(&mut out, total_bases);
 
@@ -525,162 +704,193 @@ pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Er
     }
     put_stream(&mut out, &lens_raw)?;
 
-    write_varint(&mut out, consensi.len() as u64);
-    let mut ref_lens_raw = Vec::new();
-    let mut ref_bytes = Vec::new();
-    for cs in &consensi {
-        write_varint(&mut ref_lens_raw, cs.len() as u64);
-        ref_bytes.extend_from_slice(cs);
+    if let Some(consensi) = store_ref {
+        write_varint(&mut out, consensi.len() as u64);
+        let mut ref_lens_raw = Vec::new();
+        let mut ref_bytes = Vec::new();
+        for cs in consensi {
+            write_varint(&mut ref_lens_raw, cs.len() as u64);
+            ref_bytes.extend_from_slice(cs);
+        }
+        put_stream(&mut out, &ref_lens_raw)?;
+        put_stream(&mut out, &ref_bytes)?;
     }
-    put_stream(&mut out, &ref_lens_raw)?;
-    put_stream(&mut out, &ref_bytes)?;
 
     let mut counts_raw = Vec::new();
-    for &c in &counts {
+    for &c in &coded.counts {
         write_varint(&mut counts_raw, c);
     }
     put_stream(&mut out, &counts_raw)?;
 
-    put_stream(&mut out, &all.read_ids)?;
-    put_stream(&mut out, &all.kinds)?;
-    put_stream(&mut out, &all.flips)?;
-    put_stream(&mut out, &all.placements)?;
+    put_stream(&mut out, &coded.all.read_ids)?;
+    put_stream(&mut out, &coded.all.kinds)?;
+    put_stream(&mut out, &coded.all.flips)?;
+    put_stream(&mut out, &coded.all.placements)?;
     // ops: range-coded with an order-3 op-history context (see `encode_ops`).
     {
-        let blob = encode_ops(&all.ops);
-        write_varint(&mut out, all.ops.len() as u64);
+        let blob = encode_ops(&coded.all.ops);
+        write_varint(&mut out, coded.all.ops.len() as u64);
         write_varint(&mut out, blob.len() as u64);
         out.extend_from_slice(&blob);
     }
-    put_stream(&mut out, &all.runs)?;
+    put_stream(&mut out, &coded.all.runs)?;
     // subs: range-coded conditioned on the reference base (see `encode_subs`).
     {
-        let blob = encode_subs(&all.subs, &all.sub_ctx);
-        write_varint(&mut out, all.subs.len() as u64);
+        let blob = encode_subs(&coded.all.subs, &coded.all.sub_ctx);
+        write_varint(&mut out, coded.all.subs.len() as u64);
         write_varint(&mut out, blob.len() as u64);
         out.extend_from_slice(&blob);
     }
     // ins_bases: range-coded conditioned on the preceding read base (homopolymer
     // context). Same 5-context base coder as subs, keyed on `ins_ctx`.
     {
-        let blob = encode_subs(&all.ins_bases, &all.ins_ctx);
-        write_varint(&mut out, all.ins_bases.len() as u64);
+        let blob = encode_subs(&coded.all.ins_bases, &coded.all.ins_ctx);
+        write_varint(&mut out, coded.all.ins_bases.len() as u64);
         write_varint(&mut out, blob.len() as u64);
         out.extend_from_slice(&blob);
     }
-    put_stream(&mut out, &all.indel_lens)?;
-    put_stream(&mut out, &all.literals)?;
-    put_stream(&mut out, &exc_pos)?;
-    put_stream(&mut out, &exc_bytes)?;
+    put_stream(&mut out, &coded.all.indel_lens)?;
+    put_stream(&mut out, &coded.all.literals)?;
+    put_stream(&mut out, &coded.exc_pos)?;
+    put_stream(&mut out, &coded.exc_bytes)?;
 
     Ok(out)
 }
 
-/// Decompress a block produced by [`encode`], returning `(lens, seq)` in the
-/// original read order.
-pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
-    let mut pos = 0usize;
+/// Compress a block of long reads. `lens[r]` is the length of read `r`; `seq` is
+/// their bases concatenated in order. Returns a self-contained block that
+/// [`decode`] inverts exactly — the reference consensi are stored inline. For the
+/// shared-reference variant (reference stored once per file) see
+/// [`build_reference`] + [`encode_against`].
+pub fn encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Error> {
+    let offs = compute_offs(lens, seq.len())?;
+    let total_bases: u64 = lens.iter().map(|&l| u64::from(l)).sum();
+    let refr = build_reference(lens, seq, opts)?;
+    let coded = code_against(&refr.consensi, lens, seq, &offs, opts)?;
+    serialize(VERSION, Some(&refr.consensi), lens, total_bases, &coded)
+}
+
+/// Compress a block of long reads against a shared, externally-stored
+/// [`Reference`]. The returned block omits the reference streams (so the reference
+/// is not re-stored per block); [`decode_against`] inverts it given the same
+/// reference. `opts` need not match the reference's build options — placement and
+/// coding are pure functions of the reference the caller passes in — though the
+/// sketch should match so overlaps are found the same way.
+pub fn encode_against(
+    reference: &Reference,
+    lens: &[u32],
+    seq: &[u8],
+    opts: &EncodeOpts,
+) -> Result<Vec<u8>, Error> {
+    let offs = compute_offs(lens, seq.len())?;
+    let total_bases: u64 = lens.iter().map(|&l| u64::from(l)).sum();
+    let coded = code_against(&reference.consensi, lens, seq, &offs, opts)?;
+    serialize(VERSION_SHARED, None, lens, total_bases, &coded)
+}
+
+/// Parse the shared block header (`MAGIC`, expected version, `n`, `total_bases`)
+/// and read the per-read lengths, returning `(n, total_bases, lens, offs)` with
+/// `pos` advanced to the first stream after the lengths.
+fn read_header(
+    src: &[u8],
+    pos: &mut usize,
+    expect_version: u8,
+) -> Result<(usize, usize, Vec<u32>, Vec<usize>), Error> {
     if src.get(..3) != Some(&MAGIC) {
         return Err(Error::Corrupt);
     }
-    pos += 3;
-    let version = *src.get(pos).ok_or(Error::Corrupt)?;
-    pos += 1;
-    if version != VERSION {
+    *pos += 3;
+    let version = *src.get(*pos).ok_or(Error::Corrupt)?;
+    *pos += 1;
+    if version != expect_version {
         return Err(Error::Corrupt);
     }
-    let n = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
-    let total_bases = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let n = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
+    let total_bases = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
 
-    // Lengths.
-    let lens_raw = get_stream(src, &mut pos)?;
+    let lens_raw = get_stream(src, pos)?;
     let mut lp = 0usize;
     let mut lens = Vec::with_capacity(n);
     for _ in 0..n {
         let l = read_varint(&lens_raw, &mut lp).ok_or(Error::Corrupt)?;
         lens.push(u32::try_from(l).map_err(|_| Error::Corrupt)?);
     }
-    let mut offs = Vec::with_capacity(n + 1);
-    let mut acc = 0usize;
-    for &l in &lens {
-        offs.push(acc);
-        acc += l as usize;
-    }
-    offs.push(acc);
-    if acc != total_bases {
-        return Err(Error::Corrupt);
-    }
+    let offs = compute_offs(&lens, total_bases)?;
+    Ok((n, total_bases, lens, offs))
+}
 
-    // References.
-    let n_contigs = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
-    let ref_lens_raw = get_stream(src, &mut pos)?;
-    let ref_bytes = get_stream(src, &mut pos)?;
-    let mut rlp = 0usize;
-    let mut refs: Vec<&[u8]> = Vec::with_capacity(n_contigs);
-    let mut roff = 0usize;
-    for _ in 0..n_contigs {
-        let rl = read_varint(&ref_lens_raw, &mut rlp).ok_or(Error::Corrupt)? as usize;
-        let end = roff.checked_add(rl).ok_or(Error::Corrupt)?;
-        refs.push(ref_bytes.get(roff..end).ok_or(Error::Corrupt)?);
-        roff = end;
-    }
+/// Reconstruct the reads from the edit streams, given the reference contigs
+/// `refs`. Shared by [`decode`] (reference read from the block) and
+/// [`decode_against`] (reference supplied by the caller). `pos` must point at the
+/// group-counts stream.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct(
+    src: &[u8],
+    pos: &mut usize,
+    refs: &[&[u8]],
+    n: usize,
+    lens: &[u32],
+    offs: &[usize],
+    total_bases: usize,
+) -> Result<Vec<u8>, Error> {
+    let n_contigs = refs.len();
 
     // Groups + manifest + streams.
-    let counts_raw = get_stream(src, &mut pos)?;
+    let counts_raw = get_stream(src, pos)?;
     let mut cp = 0usize;
     let mut counts = Vec::with_capacity(n_contigs + 1);
     for _ in 0..n_contigs + 1 {
         counts.push(read_varint(&counts_raw, &mut cp).ok_or(Error::Corrupt)? as usize);
     }
 
-    let read_ids = get_stream(src, &mut pos)?;
-    let kinds = get_stream(src, &mut pos)?;
-    let flips = get_stream(src, &mut pos)?;
-    let placements = get_stream(src, &mut pos)?;
+    let read_ids = get_stream(src, pos)?;
+    let kinds = get_stream(src, pos)?;
+    let flips = get_stream(src, pos)?;
+    let placements = get_stream(src, pos)?;
     // ops: range-coded with an order-3 op-history context (see `encode_ops`).
     // Decoded inline during reconstruction; the rolling context is rebuilt from the
     // decoded ops exactly as on encode.
-    let ops_count = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
-    let ops_blob_len = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let ops_count = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
+    let ops_blob_len = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
     let ops_end = pos.checked_add(ops_blob_len).ok_or(Error::Corrupt)?;
-    let ops_blob = src.get(pos..ops_end).ok_or(Error::Corrupt)?;
-    pos = ops_end;
+    let ops_blob = src.get(*pos..ops_end).ok_or(Error::Corrupt)?;
+    *pos = ops_end;
     let mut op_dec = fqxv_range::Decoder::new(ops_blob);
     let mut op_models: [fqxv_range::SimpleModel<4>; OP_CTXS] =
         std::array::from_fn(|_| fqxv_range::SimpleModel::new());
     let mut op_ctx = 0usize;
     let mut ops_seen = 0usize;
-    let runs = get_stream(src, &mut pos)?;
+    let runs = get_stream(src, pos)?;
     // subs: range-coded, conditioned on the reference base (see `encode_subs`).
     // Decoded inline during reconstruction — the consensus base at each substitution
     // selects the model, exactly as on encode.
-    let subs_count = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
-    let subs_blob_len = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let subs_count = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
+    let subs_blob_len = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
     let subs_end = pos.checked_add(subs_blob_len).ok_or(Error::Corrupt)?;
-    let subs_blob = src.get(pos..subs_end).ok_or(Error::Corrupt)?;
-    pos = subs_end;
+    let subs_blob = src.get(*pos..subs_end).ok_or(Error::Corrupt)?;
+    *pos = subs_end;
     let mut sub_dec = fqxv_range::Decoder::new(subs_blob);
     let mut sub_models: [fqxv_range::SimpleModel<SUB_SYMS>; SUB_SYMS] =
         std::array::from_fn(|_| fqxv_range::SimpleModel::new());
     let mut subs_seen = 0usize;
     // ins_bases: range-coded, conditioned on the preceding read base. Decoded
     // inline during reconstruction with the same rolling context.
-    let ins_count = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
-    let ins_blob_len = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let ins_count = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
+    let ins_blob_len = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
     let ins_end = pos.checked_add(ins_blob_len).ok_or(Error::Corrupt)?;
-    let ins_blob = src.get(pos..ins_end).ok_or(Error::Corrupt)?;
-    pos = ins_end;
+    let ins_blob = src.get(*pos..ins_end).ok_or(Error::Corrupt)?;
+    *pos = ins_end;
     let mut ins_dec = fqxv_range::Decoder::new(ins_blob);
     let mut ins_models: [fqxv_range::SimpleModel<SUB_SYMS>; SUB_SYMS] =
         std::array::from_fn(|_| fqxv_range::SimpleModel::new());
     let mut ins_seen = 0usize;
-    let indel_lens = get_stream(src, &mut pos)?;
-    let literals = get_stream(src, &mut pos)?;
-    let exc_pos = get_stream(src, &mut pos)?;
-    let exc_bytes = get_stream(src, &mut pos)?;
+    let indel_lens = get_stream(src, pos)?;
+    let literals = get_stream(src, pos)?;
+    let exc_pos = get_stream(src, pos)?;
+    let exc_bytes = get_stream(src, pos)?;
 
     let mut seq = vec![0u8; total_bases];
-    // Cursors into each stream, advanced in the exact order `encode` wrote them.
+    // Cursors into each stream, advanced in the exact order `serialize` wrote them.
     let mut idp = 0usize; // read_ids
     let mut kp = 0usize; // kinds
     let mut fp = 0usize; // flips
@@ -817,6 +1027,41 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
         // itself, gpos already holds the absolute position.
     }
 
+    Ok(seq)
+}
+
+/// Decompress a block produced by [`encode`], returning `(lens, seq)` in the
+/// original read order.
+pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
+    let mut pos = 0usize;
+    let (n, total_bases, lens, offs) = read_header(src, &mut pos, VERSION)?;
+
+    // References, stored inline in a `VERSION` block.
+    let n_contigs = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    let ref_lens_raw = get_stream(src, &mut pos)?;
+    let ref_bytes = get_stream(src, &mut pos)?;
+    let mut rlp = 0usize;
+    let mut refs: Vec<&[u8]> = Vec::with_capacity(n_contigs);
+    let mut roff = 0usize;
+    for _ in 0..n_contigs {
+        let rl = read_varint(&ref_lens_raw, &mut rlp).ok_or(Error::Corrupt)? as usize;
+        let end = roff.checked_add(rl).ok_or(Error::Corrupt)?;
+        refs.push(ref_bytes.get(roff..end).ok_or(Error::Corrupt)?);
+        roff = end;
+    }
+
+    let seq = reconstruct(src, &mut pos, &refs, n, &lens, &offs, total_bases)?;
+    Ok((lens, seq))
+}
+
+/// Decompress a block produced by [`encode_against`], returning `(lens, seq)` in
+/// the original read order. `reference` must be the exact same [`Reference`] the
+/// block was coded against.
+pub fn decode_against(reference: &Reference, src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
+    let mut pos = 0usize;
+    let (n, total_bases, lens, offs) = read_header(src, &mut pos, VERSION_SHARED)?;
+    let refs: Vec<&[u8]> = reference.consensi.iter().map(Vec::as_slice).collect();
+    let seq = reconstruct(src, &mut pos, &refs, n, &lens, &offs, total_bases)?;
     Ok((lens, seq))
 }
 
@@ -846,6 +1091,31 @@ mod tests {
         assert_eq!(ds, seq, "sequence must round-trip exactly");
     }
 
+    /// Round-trip through the shared-reference path: build one reference over the
+    /// reads, code them against it (no inline reference), and decode with the same
+    /// reference. Must reconstruct the reads exactly.
+    fn roundtrip_shared(reads: &[Vec<u8>], opts: &EncodeOpts) {
+        let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
+        let seq: Vec<u8> = reads.iter().flat_map(|r| r.iter().copied()).collect();
+        let reference = build_reference(&lens, &seq, opts).expect("build_reference");
+        // The reference frame round-trips independently.
+        let frame = reference.encode().expect("reference encode");
+        let reference2 = Reference::decode(&frame).expect("reference decode");
+        assert_eq!(
+            reference2.consensi(),
+            reference.consensi(),
+            "reference frame"
+        );
+
+        let enc = encode_against(&reference, &lens, &seq, opts).expect("encode_against");
+        let (dl, ds) = decode_against(&reference2, &enc).expect("decode_against");
+        assert_eq!(dl, lens, "lengths");
+        assert_eq!(
+            ds, seq,
+            "sequence must round-trip exactly against a shared reference"
+        );
+    }
+
     fn owned(reads: &[&[u8]]) -> Vec<Vec<u8>> {
         reads.iter().map(|r| r.to_vec()).collect()
     }
@@ -859,6 +1129,11 @@ mod tests {
         roundtrip(&[], &opts);
         roundtrip(&owned(&[b"ACGTACGTACGT"]), &opts);
         roundtrip(&owned(&[b"", b"A", b"ACGT"]), &opts);
+        // The shared path must also degrade gracefully on trivial input (a
+        // reference with no contigs → every read is an orphan literal).
+        roundtrip_shared(&[], &opts);
+        roundtrip_shared(&owned(&[b"ACGTACGTACGT"]), &opts);
+        roundtrip_shared(&owned(&[b"", b"A", b"ACGT"]), &opts);
     }
 
     #[test]
@@ -870,6 +1145,8 @@ mod tests {
         // These form no contig, so they exercise the literal + exception path.
         roundtrip(&owned(&[b"ACGTNNNNacgtACGTRYKM"]), &opts);
         roundtrip(&owned(&[b"NNNN", b"acgtacgt", b"ACGTNacgtN"]), &opts);
+        roundtrip_shared(&owned(&[b"ACGTNNNNacgtACGTRYKM"]), &opts);
+        roundtrip_shared(&owned(&[b"NNNN", b"acgtacgt", b"ACGTNacgtN"]), &opts);
     }
 
     /// Reads that tile a genome form a contig and are coded against its
@@ -914,6 +1191,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn tiled_contig_roundtrips_against_shared_reference() {
+        let opts = EncodeOpts {
+            sketch: Sketch::ont(),
+            stride: Some(1),
+            ..EncodeOpts::default()
+        };
+        for seed in [1u64, 88, 12345] {
+            roundtrip_shared(&tiled_reads(seed), &opts);
+        }
+    }
+
+    /// A reference built over the WHOLE set codes every one of several disjoint
+    /// blocks — the container's use case (issue #168): one shared reference,
+    /// coded per block, each block decoded against the same reference.
+    #[test]
+    fn shared_reference_codes_disjoint_blocks() {
+        let opts = EncodeOpts {
+            sketch: Sketch::ont(),
+            stride: Some(1),
+            ..EncodeOpts::default()
+        };
+        let all = tiled_reads(88);
+        let lens: Vec<u32> = all.iter().map(|r| r.len() as u32).collect();
+        let seq: Vec<u8> = all.iter().flat_map(|r| r.iter().copied()).collect();
+        let reference = build_reference(&lens, &seq, &opts).expect("build_reference");
+
+        // Split the reads into three contiguous blocks; each is coded against the
+        // whole-file reference and must decode to its own reads exactly.
+        let bounds = [0usize, 4, 8, all.len()];
+        for w in bounds.windows(2) {
+            let (s, e) = (w[0], w[1]);
+            let blk_lens: Vec<u32> = lens[s..e].to_vec();
+            let blk_seq: Vec<u8> = all[s..e].iter().flat_map(|r| r.iter().copied()).collect();
+            let enc =
+                encode_against(&reference, &blk_lens, &blk_seq, &opts).expect("encode_against");
+            let (dl, ds) = decode_against(&reference, &enc).expect("decode_against");
+            assert_eq!(dl, blk_lens, "block [{s},{e}) lengths");
+            assert_eq!(ds, blk_seq, "block [{s},{e}) sequence");
+        }
+    }
+
     proptest::proptest! {
         // A full assemble + encode + decode per case; cap the count so this
         // stays a fast regression net rather than a slow test.
@@ -921,7 +1240,8 @@ mod tests {
 
         /// Any pile of arbitrary-byte reads round-trips exactly — the exception
         /// list makes losslessness independent of the alphabet, and short/empty
-        /// reads exercise the boundaries.
+        /// reads exercise the boundaries. Both the self-contained and the
+        /// shared-reference paths must reconstruct exactly.
         #[test]
         fn arbitrary_reads_round_trip(
             reads in proptest::collection::vec(
@@ -932,10 +1252,17 @@ mod tests {
             let opts = EncodeOpts { stride: Some(1), ..EncodeOpts::default() };
             let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
             let seq: Vec<u8> = reads.iter().flat_map(|r| r.iter().copied()).collect();
+
             let enc = encode(&lens, &seq, &opts).expect("encode");
             let (dl, ds) = decode(&enc).expect("decode");
-            proptest::prop_assert_eq!(dl, lens);
-            proptest::prop_assert_eq!(ds, seq);
+            proptest::prop_assert_eq!(&dl, &lens);
+            proptest::prop_assert_eq!(&ds, &seq);
+
+            let reference = build_reference(&lens, &seq, &opts).expect("build_reference");
+            let enc2 = encode_against(&reference, &lens, &seq, &opts).expect("encode_against");
+            let (dl2, ds2) = decode_against(&reference, &enc2).expect("decode_against");
+            proptest::prop_assert_eq!(dl2, lens);
+            proptest::prop_assert_eq!(ds2, seq);
         }
     }
 
@@ -960,6 +1287,38 @@ mod tests {
             run(1),
             run(8),
             "encode output must be byte-identical regardless of thread count"
+        );
+    }
+
+    /// The shared-reference path is likewise thread-count invariant: both the
+    /// reference assembly and the per-block coding must be pure functions.
+    #[test]
+    fn shared_reference_is_thread_count_invariant() {
+        let reads = tiled_reads(88);
+        let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
+        let seq: Vec<u8> = reads.iter().flat_map(|r| r.iter().copied()).collect();
+        let opts = EncodeOpts {
+            sketch: Sketch::ont(),
+            stride: Some(1),
+            ..EncodeOpts::default()
+        };
+        let run = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    let reference = build_reference(&lens, &seq, &opts).expect("build_reference");
+                    let frame = reference.encode().expect("reference encode");
+                    let block =
+                        encode_against(&reference, &lens, &seq, &opts).expect("encode_against");
+                    (frame, block)
+                })
+        };
+        assert_eq!(
+            run(1),
+            run(8),
+            "shared-reference output must be byte-identical regardless of thread count"
         );
     }
 }
