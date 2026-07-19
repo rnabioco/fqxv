@@ -365,19 +365,8 @@ pub fn compress_multi<'a, W: Write>(
     }
     let refs: Vec<&[u8]> = primed.iter().map(|(d, _, _)| d.as_slice()).collect();
     let platform = params.platform.unwrap_or_else(|| detect_platform(&refs));
-    // Wide blocks and the overlap-codec memory cap key on read *length* (the same
-    // `is_long_read` gate the codec itself uses), not the name-vote platform tag —
-    // which can be `Unknown` for a genuine long-read file whose names we don't
-    // recognize, and would then leave the memory-heavy overlap path uncapped.
-    let long_read = super::reorder::is_long_read(
-        &primed
-            .iter()
-            .map(|(_, s, _)| s.len() as u32)
-            .collect::<Vec<_>>(),
-    );
     let mut primed = Some(primed).filter(|p| !p.is_empty());
-    let block_seq_budget = max_block_seq_bytes(long_read);
-    drive(writer, params, g as u8, platform, long_read, |b| {
+    drive(writer, params, g as u8, platform, |b| {
         // Emit the primed first spot into the first block before reading on.
         if let Some(spot) = primed.take() {
             for (header, seq, qual) in &spot {
@@ -387,7 +376,7 @@ pub fn compress_multi<'a, W: Write>(
         // Cut on reads OR the raw-sequence byte budget, whichever comes first;
         // the loop reads whole spots, so a byte cut still lands on a spot
         // boundary. Matches the byte budgeting in `block_ranges`.
-        while b.n_reads() < block_reads && b.seq.len() < block_seq_budget {
+        while b.n_reads() < block_reads && b.seq.len() < MAX_BLOCK_SEQ_BYTES {
             // Read one record from each input; member 0 EOF ends cleanly.
             for j in 0..g {
                 if !read_raw_record(&mut fqs[j], &mut defs[j], &mut seqs[j], &mut quals[j])? {
@@ -469,17 +458,6 @@ fn compress_buffered_plain<W: Write>(
     );
     let (chunks, gstart, _n) = parse_chunks(buf, g, &pool)?;
     let platform = resolve_platform_buf(params.platform, buf);
-    // Block width + overlap-codec memory cap key on read length, not the platform
-    // tag (see `max_block_seq_bytes`). Sample the leading reads — length regime is
-    // uniform enough that the head classifies the file.
-    let long_read = super::reorder::is_long_read(
-        &chunks
-            .iter()
-            .flat_map(|c| c.recs.iter())
-            .take(256)
-            .map(|r| r.seq_len)
-            .collect::<Vec<_>>(),
-    );
 
     let mut w = CrcWriter::new(BufWriter::new(writer));
     write_header(&mut w, &params, group_size, platform)?;
@@ -495,18 +473,9 @@ fn compress_buffered_plain<W: Write>(
     // Byte-budgeted row-group ranges (min of block_reads and a raw-sequence byte
     // cap, on whole-spot boundaries) — a pure function of the read lengths, so
     // determinism holds regardless of thread count.
-    let ranges = block_ranges(&chunks, block_reads, max_block_seq_bytes(long_read), g);
+    let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
     let num_blocks = ranges.len();
-    // Cap how many blocks build+compress at once so the long-read overlap codec's
-    // per-block peak can't OOM (short reads keep full parallelism). Inner codec
-    // parallelism still fills idle cores via the shared pool, so this bounds memory
-    // without stalling throughput. A pure function of length/RAM/threads, so it
-    // never affects the output bytes.
-    let batch = block_concurrency(
-        long_read,
-        max_block_seq_bytes(long_read),
-        pool.current_num_threads(),
-    );
+    let batch = pool.current_num_threads().max(1);
     let mut index = FooterIndex::new();
     for batch_start in (0..num_blocks).step_by(batch) {
         let batch_end = (batch_start + batch).min(num_blocks);
@@ -687,7 +656,6 @@ pub(crate) fn drive<W, F>(
     params: Params,
     group_size: u8,
     platform: Platform,
-    long_read: bool,
     mut fill: F,
 ) -> Result<Stats>
 where
@@ -695,13 +663,8 @@ where
     F: FnMut(&mut RawBlock) -> Result<usize> + Send,
 {
     let nworkers = resolve_threads(params.threads);
-    // Long-read blocks encode through the memory-heavy overlap codec; cap how many
-    // compress at once so peak RSS fits available RAM (short reads stay uncapped).
-    // See [`block_concurrency`]. Bounds memory only — output is unaffected.
-    let ncompress = block_concurrency(long_read, max_block_seq_bytes(long_read), nworkers);
     debug!(
         threads = nworkers,
-        compress_concurrency = ncompress,
         backend = ?fqxv_rans::Backend::detect(),
         "compress pipeline ready"
     );
@@ -727,11 +690,11 @@ where
     // writer reorders by index, so the output is byte-identical regardless of how
     // the workers interleave. Bound the channels by `nworkers` so at most ~2x that
     // many blocks are ever resident.
-    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<(usize, RawBlock)>(ncompress);
+    let (work_tx, work_rx) = std::sync::mpsc::sync_channel::<(usize, RawBlock)>(nworkers);
     let work_rx = std::sync::Arc::new(std::sync::Mutex::new(work_rx));
     #[allow(clippy::type_complexity)]
     let (done_tx, done_rx) =
-        std::sync::mpsc::sync_channel::<(usize, RawBlock, Result<Vec<u8>>)>(ncompress);
+        std::sync::mpsc::sync_channel::<(usize, RawBlock, Result<Vec<u8>>)>(nworkers);
 
     std::thread::scope(|scope| -> Result<()> {
         // Reader: serial parse, streaming each block as it is built.
@@ -754,7 +717,7 @@ where
 
         // Workers: pull the next block under a short lock, compress, hand on.
         let params_ref = &params;
-        for _ in 0..ncompress {
+        for _ in 0..nworkers {
             let work_rx = std::sync::Arc::clone(&work_rx);
             let done_tx = done_tx.clone();
             scope.spawn(move || {
