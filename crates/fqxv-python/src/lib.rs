@@ -66,7 +66,7 @@ impl Seek for SeekReader {
 
 /// Open a Python `source` (`bytes`, `str`, or `os.PathLike`) as a seekable reader.
 fn open_source(obj: &Bound<'_, PyAny>) -> PyResult<SeekReader> {
-    if let Ok(b) = obj.downcast::<PyBytes>() {
+    if let Ok(b) = obj.cast::<PyBytes>() {
         return Ok(SeekReader::Bytes(Cursor::new(b.as_bytes().to_vec())));
     }
     let path: PathBuf = obj
@@ -132,7 +132,7 @@ impl PyReader {
         // outstanding PyRefMut guard still blocks any concurrent borrow of this
         // Reader, so the &mut stays exclusive.
         let inner = &mut slf.inner;
-        match py.allow_threads(move || inner.next()) {
+        match py.detach(move || inner.next()) {
             None => Ok(None),
             Some(Ok(rec)) => Ok(Some(PyRecord { inner: rec })),
             Some(Err(e)) => Err(map_err(e)),
@@ -404,7 +404,7 @@ fn decompress_to_path(
     let file =
         File::create(&dest).map_err(|e| PyIOError::new_err(format!("{}: {e}", dest.display())))?;
     let stats = py
-        .allow_threads(move || fqxv_core::decompress(reader, io::BufWriter::new(file), threads))
+        .detach(move || fqxv_core::decompress(reader, io::BufWriter::new(file), threads))
         .map_err(map_err)?;
     Ok(stats.reads)
 }
@@ -419,7 +419,7 @@ fn decompress_to_bytes<'py>(
 ) -> PyResult<Bound<'py, PyBytes>> {
     let reader = open_source(source)?;
     let out = py
-        .allow_threads(move || {
+        .detach(move || {
             let mut buf = Vec::new();
             fqxv_core::decompress(reader, &mut buf, threads).map(|_| buf)
         })
@@ -432,7 +432,7 @@ fn decompress_to_bytes<'py>(
 fn inspect(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<PyInfo> {
     let reader = open_source(source)?;
     let info = py
-        .allow_threads(move || fqxv_core::inspect(reader))
+        .detach(move || fqxv_core::inspect(reader))
         .map_err(map_err)?;
     Ok(PyInfo { inner: info })
 }
@@ -442,7 +442,7 @@ fn inspect(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<PyInfo> {
 fn open_index(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<PyIndex> {
     let mut reader = open_source(source)?;
     let index = py
-        .allow_threads(move || Index::read(&mut reader))
+        .detach(move || Index::read(&mut reader))
         .map_err(map_err)?;
     let groups = index
         .groups()
@@ -469,7 +469,7 @@ fn read_names<'py>(
 ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
     let reader = open_source(source)?;
     let data = py
-        .allow_threads(move || project(reader, Stream::Names, groups))
+        .detach(move || project(reader, Stream::Names, groups))
         .map_err(map_err)?;
     Ok(to_bytes_list(py, data))
 }
@@ -484,7 +484,7 @@ fn read_sequences<'py>(
 ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
     let reader = open_source(source)?;
     let data = py
-        .allow_threads(move || project(reader, Stream::Sequence, groups))
+        .detach(move || project(reader, Stream::Sequence, groups))
         .map_err(map_err)?;
     Ok(to_bytes_list(py, data))
 }
@@ -499,7 +499,7 @@ fn read_qualities<'py>(
 ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
     let reader = open_source(source)?;
     let data = py
-        .allow_threads(move || project(reader, Stream::Quality, groups))
+        .detach(move || project(reader, Stream::Quality, groups))
         .map_err(map_err)?;
     Ok(to_bytes_list(py, data))
 }
@@ -509,7 +509,7 @@ fn read_qualities<'py>(
 fn read_block(py: Python<'_>, source: &Bound<'_, PyAny>, group: usize) -> PyResult<Vec<PyRecord>> {
     let reader = open_source(source)?;
     let recs = py
-        .allow_threads(move || read_one_block(reader, group))
+        .detach(move || read_one_block(reader, group))
         .map_err(map_err)?;
     Ok(recs.into_iter().map(|inner| PyRecord { inner }).collect())
 }
