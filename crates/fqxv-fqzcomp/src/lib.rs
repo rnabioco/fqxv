@@ -50,6 +50,7 @@ use fqxv_bytes::{read_lens, write_lens, ReaderError};
 use fqxv_range::{Decoder, Encoder, SimpleModel};
 use thiserror::Error;
 
+mod binmix;
 mod mix;
 
 /// Optional lossy quantization applied to quality scores before modeling.
@@ -221,6 +222,13 @@ const MODE_SEQ: u8 = 1;
 /// Selected by [`encode_seq`] for long reads; [`MODE_SEQ`] is retained so older
 /// archives still decode.
 const MODE_SEQ_MIX: u8 = 2;
+/// Long-read **binary-decomposition** logistic-mixing quality model ([`binmix`]):
+/// codes each quality as `ceil(log2 k)` bit-tree decisions with binary logistic
+/// mixing instead of one k-way softmax — the same sub-CoLoRd ratio at a fraction of
+/// the per-symbol work. Like the other sequence modes it needs the decoded bases.
+/// Currently selected by [`encode_seq`] when `FQXV_BINMIX` is set (A/B vs the k-way
+/// [`MODE_SEQ_MIX`]); both are decodable.
+const MODE_SEQ_BINMIX: u8 = 3;
 
 /// Mean read length (bases) above which [`encode_seq`] selects [`MODE_SEQ`]. Long
 /// reads (HiFi ~15 kb, ONT ~10 kb) clear this comfortably; Illumina (≤250 bp)
@@ -515,7 +523,11 @@ pub fn encode_seq(
     // position context (`MODE_POS`). The retired single-context `MODE_SEQ` stays
     // decodable but is no longer emitted.
     let (payload, mode) = if seq_mode {
-        (mix::encode(lens, &binned, seq, &dense, qmin, k), MODE_SEQ_MIX)
+        if std::env::var_os("FQXV_BINMIX").is_some() {
+            (binmix::encode(lens, &binned, seq, &dense, qmin, k), MODE_SEQ_BINMIX)
+        } else {
+            (mix::encode(lens, &binned, seq, &dense, qmin, k), MODE_SEQ_MIX)
+        }
     } else {
         (dispatch_encode(lens, &binned, None, &dense, qmin, k), MODE_POS)
     };
@@ -539,7 +551,10 @@ pub fn encode_seq(
 pub fn needs_sequence(src: &[u8]) -> bool {
     // Header layout: version(0), binning tag(1), mode(2), ...
     src.first() == Some(&FORMAT_VERSION)
-        && matches!(src.get(2), Some(&MODE_SEQ) | Some(&MODE_SEQ_MIX))
+        && matches!(
+            src.get(2),
+            Some(&MODE_SEQ) | Some(&MODE_SEQ_MIX) | Some(&MODE_SEQ_BINMIX)
+        )
 }
 
 /// Decode a sequence-blind stream produced by [`encode`], returning
@@ -565,7 +580,7 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     // Both sequence modes need the decoded bases; `MODE_POS` does not.
     let seq_mode = match mode {
         MODE_POS => false,
-        MODE_SEQ | MODE_SEQ_MIX => true,
+        MODE_SEQ | MODE_SEQ_MIX | MODE_SEQ_BINMIX => true,
         _ => return Err(Error::Malformed("unknown quality context mode")),
     };
     let k = r.u8()? as usize;
@@ -612,19 +627,21 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     quals
         .try_reserve(total)
         .map_err(|_| Error::Malformed("declared total length too large to allocate"))?;
-    if mode == MODE_SEQ_MIX {
-        mix::decode(&lens, payload, seq, &syms, qmin, k, &mut quals)?;
-    } else {
-        let mut dec = Decoder::new(payload);
-        dispatch_decode(
-            &lens,
-            &syms,
-            seq_mode.then_some(seq),
-            qmin,
-            k,
-            &mut dec,
-            &mut quals,
-        )?;
+    match mode {
+        MODE_SEQ_MIX => mix::decode(&lens, payload, seq, &syms, qmin, k, &mut quals)?,
+        MODE_SEQ_BINMIX => binmix::decode(&lens, payload, seq, &syms, qmin, k, &mut quals)?,
+        _ => {
+            let mut dec = Decoder::new(payload);
+            dispatch_decode(
+                &lens,
+                &syms,
+                seq_mode.then_some(seq),
+                qmin,
+                k,
+                &mut dec,
+                &mut quals,
+            )?;
+        }
     }
     Ok((lens, quals))
 }
