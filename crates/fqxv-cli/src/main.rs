@@ -1,5 +1,6 @@
 //! `fqxv` command-line interface — a thin front-end over the [`fqxv`] library.
 
+mod output;
 mod progress;
 mod report;
 
@@ -84,13 +85,19 @@ struct Cli {
 /// Install the `tracing` subscriber. Verbosity comes from `-v/-vv/-vvv` and
 /// `--quiet`; a set `RUST_LOG` overrides the computed level entirely. All output
 /// goes to **stderr** so decompressed FASTQ on stdout stays uncontaminated.
+///
+/// The default (no `-v`) is `warn`: the user-facing surface is the progress
+/// indicator plus the end-of-run summary, so routine `info` diagnostics — which
+/// otherwise interleave with and smear the live spinner/bar — are held back to
+/// `-v`. `-vv` adds `debug`, `-vvv` adds `trace` with targets and timing.
 fn init_tracing(verbose: u8, quiet: bool) {
     let level = if quiet {
-        "warn"
+        "error"
     } else {
         match verbose {
-            0 => "info",
-            1 => "debug",
+            0 => "warn",
+            1 => "info",
+            2 => "debug",
             _ => "trace",
         }
     };
@@ -461,6 +468,10 @@ fn main() -> anyhow::Result<()> {
         !cli.quiet && io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none(),
     );
     configure_global_pool(cli.threads).context("configuring the global thread pool")?;
+    // Clean up an in-progress temp archive if the user Ctrl-C's mid-compress, so
+    // an interrupted stream never orphans a partial file (the atomic rename
+    // already guarantees no corrupt archive lands at the destination path).
+    output::install_interrupt_handler();
     match cli.command {
         Command::Compress {
             inputs,
@@ -531,60 +542,92 @@ fn main() -> anyhow::Result<()> {
                 .filter_map(|p| std::fs::metadata(p).ok())
                 .map(|m| m.len())
                 .sum();
-            let out = create_output(&output, force)?;
+            // Write to a sibling temp file and rename into place only once the
+            // whole archive is on disk. An interrupted or failed run then never
+            // leaves a footer-less, corrupt `.fqxv` at the destination path.
+            let (archive, out) = output::AtomicOutput::create(&output, force)?;
 
-            // The reorder path opens with a long single-threaded prelude, so name
-            // the spinner after the slow work to set expectations. On a `?` bail
-            // the spinner's Drop clears the line before the error prints.
+            // The reorder path reads the whole input up front before its
+            // single-threaded compute begins, so input-byte progress would stall
+            // at 100% mid-run — give it an indeterminate readout and name it after
+            // the slow work. The streaming path tracks input consumption, so it
+            // gets a live bar (a percentage when the input size is known, a
+            // bytes + rate readout for a stdin stream of unknown length).
             let spin_msg = if params.reorder {
                 "compressing (reorder — this can take a while)…"
             } else {
                 "compressing…"
             };
-            let sp = progress::Spinner::start(spin_msg, cli.quiet);
 
             let t0 = Instant::now();
             let stats = if inputs.len() == 1 {
-                match interleaved {
-                    None => fqxv::compress_auto(open_input(&inputs[0])?, out, params)?,
-                    Some(g) if g > 1 => {
-                        fqxv::compress_interleaved(open_input(&inputs[0])?, out, params, g)?
-                    }
-                    Some(_) => fqxv::compress(open_input(&inputs[0])?, out, params)?,
-                }
+                // Create the byte counter before opening the reader so the
+                // gzip-sniffing read — which blocks on a not-yet-ready stdin — is
+                // already counted and the indicator is live while we wait on the
+                // upstream producer (a pause reads as `0 B`, not a hang).
+                let counter = Arc::new(AtomicU64::new(0));
+                let total = single_input_len(&inputs[0], params.reorder);
+                let reader = open_input_with_counter(&inputs[0], Arc::clone(&counter))?;
+                let bar = progress::Bar::start(spin_msg, cli.quiet, counter, total);
+                let stats = match interleaved {
+                    None => fqxv::compress_auto(reader, out, params)?,
+                    Some(g) if g > 1 => fqxv::compress_interleaved(reader, out, params, g)?,
+                    Some(_) => fqxv::compress(reader, out, params)?,
+                };
+                bar.abandon();
+                stats
             } else {
+                let sp = progress::Spinner::start(spin_msg, cli.quiet);
                 let readers: Vec<Box<dyn Read + Send>> = inputs
                     .iter()
                     .map(|p| open_input(p))
                     .collect::<anyhow::Result<_>>()?;
-                fqxv::compress_multi(readers, out, params)?
+                let stats = fqxv::compress_multi(readers, out, params)?;
+                sp.abandon();
+                stats
             };
             let secs = t0.elapsed().as_secs_f64();
-            sp.abandon();
 
             // Optional read-after-write verification: fully decode the archive we
-            // just wrote and confirm it round-trips before reporting success. The
-            // output handle was flushed and dropped by the compress call above, so
-            // reopen the path. On any failure the archive is left in place (for
-            // inspection) and we bail non-zero via `?` — a bad archive is never
-            // reported as done. The spinner's Drop clears its line on that bail.
+            // just wrote and confirm it round-trips *before* publishing it. We
+            // verify the temp file and only commit (atomically rename into place)
+            // on success, so `--verify` never leaves a bad archive at the
+            // destination. On a mismatch or decode error the temp is kept off the
+            // final path for inspection and we bail non-zero. On a `?` bail
+            // elsewhere the spinner's Drop clears its line before the error prints.
             if verify {
                 let sp = progress::Spinner::start("verifying…", cli.quiet);
-                let decoded = File::open(&output)
-                    .with_context(|| format!("reopening {} to verify", output.display()))
+                let verified = File::open(archive.temp_path())
+                    .with_context(|| {
+                        format!("reopening {} to verify", archive.temp_path().display())
+                    })
                     .and_then(|f| {
-                        fqxv::verify_roundtrip(f, cli.threads)
-                            .with_context(|| format!("verifying {}", output.display()))
-                    })?;
-                if decoded != stats.reads {
-                    anyhow::bail!(
-                        "verification of {} decoded {decoded} reads but {} were written",
-                        output.display(),
-                        stats.reads
-                    );
+                        fqxv::verify_roundtrip(f, cli.threads).context("verifying the archive")
+                    });
+                match verified {
+                    Ok(decoded) if decoded == stats.reads => sp.abandon(),
+                    Ok(decoded) => {
+                        let kept = archive.keep_for_inspection();
+                        anyhow::bail!(
+                            "verification decoded {decoded} reads but {} were written; \
+                             unverified output kept at {} (not published to {})",
+                            stats.reads,
+                            kept.display(),
+                            output.display()
+                        );
+                    }
+                    Err(e) => {
+                        let kept = archive.keep_for_inspection();
+                        return Err(e.context(format!(
+                            "unverified output kept at {} (not published to {})",
+                            kept.display(),
+                            output.display()
+                        )));
+                    }
                 }
-                sp.abandon();
             }
+            // Publish: atomically move the finished, verified archive into place.
+            archive.commit()?;
 
             // User-facing summary: printed to stderr, gated only on `--quiet` and
             // deliberately independent of the tracing log level. The structured
@@ -1680,16 +1723,40 @@ fn decode_input(mut src: Box<dyn Read + Send>) -> anyhow::Result<Box<dyn Read + 
 }
 
 /// Like [`open_input`], but tallies bytes pulled from the *raw* (pre-decode)
-/// source into the returned counter. `--estimate` uses this to learn how much
-/// on-disk input a sample consumed, so it can project the whole-file archive
-/// size — for a gzip input the count is on-disk (compressed) bytes.
-fn open_input_counted(path: &Path) -> anyhow::Result<(Box<dyn Read + Send>, Arc<AtomicU64>)> {
-    let count = Arc::new(AtomicU64::new(0));
+/// source into `count`. The compress progress bar drives a live readout from
+/// this counter; passing the counter in (rather than getting it back) lets the
+/// caller start the indicator *before* the reader's gzip-sniffing first read,
+/// which blocks on a not-yet-ready stdin. For a gzip input the count is on-disk
+/// (compressed) bytes, matching the file length the bar measures against.
+fn open_input_with_counter(
+    path: &Path,
+    count: Arc<AtomicU64>,
+) -> anyhow::Result<Box<dyn Read + Send>> {
     let counted: Box<dyn Read + Send> = Box::new(CountingReader {
         inner: raw_input(path)?,
-        count: Arc::clone(&count),
+        count,
     });
-    Ok((decode_input(counted)?, count))
+    decode_input(counted)
+}
+
+/// [`open_input_with_counter`] with a fresh counter returned alongside. `--estimate`
+/// uses this to learn how much on-disk input a sample consumed, so it can project
+/// the whole-file archive size.
+fn open_input_counted(path: &Path) -> anyhow::Result<(Box<dyn Read + Send>, Arc<AtomicU64>)> {
+    let count = Arc::new(AtomicU64::new(0));
+    let reader = open_input_with_counter(path, Arc::clone(&count))?;
+    Ok((reader, count))
+}
+
+/// The on-disk byte length to drive a compress progress bar, or `None` for an
+/// indeterminate readout. `None` when the input is stdin (`-`, no length) or
+/// when `reorder` is set — the reorder codec reads the whole input up front, so
+/// an input-byte bar would misleadingly stall at 100% during its compute.
+fn single_input_len(path: &Path, reorder: bool) -> Option<u64> {
+    if reorder || path.as_os_str() == "-" {
+        return None;
+    }
+    std::fs::metadata(path).ok().map(|m| m.len())
 }
 
 /// A pass-through reader that adds every byte it yields to a shared counter.
