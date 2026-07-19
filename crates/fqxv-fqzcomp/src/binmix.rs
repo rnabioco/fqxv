@@ -65,12 +65,14 @@ impl Logistic {
 
     #[inline]
     fn stretch(&self, p: u16) -> i32 {
-        i32::from(self.stretch[p as usize])
+        // SAFETY: `p` is a 12-bit probability, so `p <= PONE < stretch.len() = PONE+1`.
+        i32::from(unsafe { *self.stretch.get_unchecked(p as usize) })
     }
     #[inline]
     fn squash(&self, x: i32) -> u16 {
-        let xi = x.clamp(-2047, 2047) + 2048;
-        self.squash[xi as usize]
+        let xi = (x.clamp(-2047, 2047) + 2048) as usize;
+        // SAFETY: `xi ∈ [1, 4095] < squash.len() = 4096`.
+        unsafe { *self.squash.get_unchecked(xi) }
     }
 }
 
@@ -105,7 +107,7 @@ impl Tier {
 
 /// Binary-mixing coder state, shared by encode and decode.
 struct BinMixer {
-    tiers: Vec<Tier>,
+    tiers: [Tier; NMODELS],
     logistic: Logistic,
     weights: Vec<[i32; NMODELS]>, // per bit-position gate
     d: u32,
@@ -122,7 +124,7 @@ impl BinMixer {
     fn new(k: usize) -> Self {
         let d = if k <= 1 { 1 } else { u32::BITS - (k as u32 - 1).leading_zeros() };
         let nnodes = 1usize << d;
-        let tiers = vec![
+        let tiers = [
             Tier::new(16, nnodes, false),
             Tier::new(18, nnodes, false),
             Tier::new(RICH_BITS, nnodes, true),
@@ -152,9 +154,12 @@ impl BinMixer {
         let gate = bpos as usize;
         let mut st = [0i32; NMODELS];
         let mut x = 0i64;
-        let w = &self.weights[gate];
+        // SAFETY: `gate = bpos < d = weights.len()`; and `bases[t] + node <
+        // tiers[t].probs.len()` — `bases[t] ≤ (n_ctx-1)*nnodes` and the tree node
+        // stays in `[1, nnodes-1]` (`node = 2*node + bit` from 1, ≤ 2*(nnodes/2-1)+1).
+        let w = unsafe { self.weights.get_unchecked(gate) };
         for t in 0..NMODELS {
-            let p = self.tiers[t].probs[bases[t] + node];
+            let p = unsafe { *self.tiers[t].probs.get_unchecked(bases[t] + node) };
             let s = self.logistic.stretch(p);
             st[t] = s;
             x += i64::from(w[t]) * i64::from(s);
@@ -168,15 +173,18 @@ impl BinMixer {
     fn update(&mut self, bases: &[usize; NMODELS], node: usize, bit: u32, p: u16, st: &[i32; NMODELS], gate: usize) {
         let err = (bit << PBITS) as i32 - i32::from(p); // [-4095, 4095]
         let (lr_shift, prate_shift) = (self.lr_shift, self.prate_shift);
-        let w = &mut self.weights[gate];
+        let target = (bit << PBITS) as i32;
+        // SAFETY: same index invariants as `predict` (gate < weights.len(),
+        // bases[t] + node < probs.len()).
+        let w = unsafe { self.weights.get_unchecked_mut(gate) };
         for t in 0..NMODELS {
             w[t] += (err * st[t]) >> lr_shift;
         }
-        let target = (bit << PBITS) as i32;
         for t in 0..NMODELS {
             let idx = bases[t] + node;
-            let cur = i32::from(self.tiers[t].probs[idx]);
-            self.tiers[t].probs[idx] = (cur + ((target - cur) >> prate_shift)) as u16;
+            let slot = unsafe { self.tiers[t].probs.get_unchecked_mut(idx) };
+            let cur = i32::from(*slot);
+            *slot = (cur + ((target - cur) >> prate_shift)) as u16;
         }
     }
 
