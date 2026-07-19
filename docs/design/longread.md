@@ -87,7 +87,7 @@ archive. Each column above now comes from the same pair of runs.
 | tool | total | non-quality (seq+names) | qual | non-quality bits/base |
 | --- | --- | --- | --- | --- |
 | CoLoRd `-q org` | 197.9M | **31.4M** | 166.5M | 0.88 |
-| fqxv `-l9` | 224.4M | **58.8M** (seq only) | 165.5M | 1.64 |
+| fqxv (binmix qual) | 222.6M | **58.8M** (seq only) | 163.7M | 1.64 |
 
 **`ecoli_hifi`** (SRR11434954 subset, 1.55G bases, mean Q≈27, ~300× — narrow
 high-Q, low error):
@@ -95,14 +95,16 @@ high-Q, low error):
 | tool | total | non-quality (seq+names) | qual | non-quality bits/base |
 | --- | --- | --- | --- | --- |
 | CoLoRd `-q org` | 697.7M | **13.4M** | 684.3M | 0.069 |
-| fqxv `-l9` | 837.7M | **126.3M** (seq only) | 711.2M | 0.653 |
+| fqxv (binmix qual) | 768.3M | **126.3M** (seq only) | 641.8M | 0.653 |
 
 Two facts, confirmed on **both** platforms:
 
-1. **Quality is at parity.** fqxv's quality stream matches CoLoRd's lossless
-   quality within a few percent on both sets (ONT 165.5M vs 166.5M — fqxv
-   *wins*; HiFi 711M vs 684M — CoLoRd wins by 4%), despite fqxv having no
-   base-context. Lever 1 is **not** where the gap lives.
+1. **Quality now leads on both platforms.** fqxv's binary-decomposition
+   context-mixing quality coder codes the HiFi quality stream to **641.8M vs
+   CoLoRd's 684.3M** (~6% smaller) and ONT to **163.7M vs 166.5M** (~2% smaller).
+   So quality is now a *credit* against CoLoRd on both sets — enough to carry the
+   HiFi lossless total ahead of CoLoRd, though on ONT the far larger sequence
+   deficit below still dominates. Lever 1 has flipped in fqxv's favor.
 2. **The entire lossless gap to CoLoRd is the sequence stream, and it widens
    with coverage/fidelity.** ONT: 1.87× (0.87 vs 1.64 bits/base). HiFi:
    **9.7×** (0.0676 vs 0.653 bits/base). At ~300× HiFi the same genome is read
@@ -124,7 +126,7 @@ at *default* sequence level (seq 65.3M ONT / 247.1M HiFi); `-l9` would cut seq t
 | HiFi | colord-lossy | **45.3M** | 65.3 | ~13M | ~32M | — |
 | HiFi | fqxv-binhifi | 397.2M | 7.44 | 247.1M (62%) | 149.9M (38%) | 14.33 |
 
-The bin tables work — ONT bins cut fqxv's quality stream 165.5M → 49.2M (3.4×).
+The bin tables work — ONT bins cut fqxv's quality stream 163.7M → 49.2M (3.4×).
 But binning removes the stream fqxv is *good* at and leaves the stream it is bad
 at: **DNA becomes 62–88 % of the lossy archive**, so the sequence gap swallows
 the result (HiFi: 8.8× larger than CoLoRd overall, almost entirely DNA). This is

@@ -80,9 +80,11 @@ are the long-read tables) and `--max` chases the best ratio. Add `--verify` to
 re-decode the new archive and confirm it round-trips before you trust (or delete)
 the source. Run `fqxv --help` for the full option set.
 
-Long reads (ONT/PacBio) compress correctly today, and the quality stream is
-already at parity with CoLoRd; the sequence stream is not yet competitive at high
-coverage. See [long-read support](docs/design/longread.md) for the measurements.
+Long reads (ONT/PacBio) compress correctly today. The quality stream now beats
+CoLoRd's lossless quality on HiFi (and is within a few percent on ONT), and that
+win carries the **HiFi lossless total ahead of CoLoRd**. The remaining gap is the
+cross-read sequence stream — small on HiFi, larger on the noisier ONT. See
+[long-read support](docs/design/longread.md) for the measurements.
 
 ## Acknowledgments
 

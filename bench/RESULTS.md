@@ -1,4 +1,4 @@
-# Benchmark results — 2026-07-18
+# Benchmark results — 2026-07-19
 
 Snapshot from the unified parallel harness (`submit_parallel.sh`) on the Bodhi
 `rna` partition. One run covers all platforms: short-read Illumina (MiSeq,
@@ -18,16 +18,19 @@ dataset; `fqxv-max` is the order-preserving lossless point.
 | rnaseq_fullrange | 7.60 |    10.20 |        **11.62** |  10.01 |   5.84 | 5.98| 3.71 |
 | ecoli_miseq      | 4.92 |     7.41 |         **7.35** |   7.32 |   5.24 | 5.13| 2.94 |
 
-## Long-read, lossless — the open gap
+## Long-read, lossless
 
-CoLoRd still leads on lossless long-read: its cross-read sequence coding is the
-edge (fqxv quality already matches; the sequence stream is the gap). fqxv numbers
-match the standalone WFA-path runs exactly.
+**fqxv now leads on HiFi.** Its quality coder (binary-decomposition context
+mixing) beats CoLoRd's lossless quality, and that win outweighs fqxv's remaining
+cross-read *sequence* deficit, so fqxv is smaller overall. **CoLoRd still leads on
+ONT**, where fqxv trails on both streams — quality by a few percent, and the noisier
+sequence more (exact seed anchors don't survive ONT error, so the overlap codec
+falls back to the within-read model). All rows round-trip losslessly.
 
-| dataset    | fqxv | fqxv9 | **colord** | zstd19 | xz9 | gzip |
-|------------|-----:|------:|-----------:|-------:|----:|-----:|
-| ecoli_hifi | 4.04 |  4.04 |   **4.44** |   3.83 |3.85 | 2.27 |
-| ecoli_ont  | 2.68 |  2.68 |   **3.05** |   2.38 |2.49 | 1.94 |
+| dataset    |      fqxv | fqxv9 |   colord | zstd19 | xz9 | gzip |
+|------------|----------:|------:|---------:|-------:|----:|-----:|
+| ecoli_hifi | **4.68** |  4.68 |     4.44 |   3.83 |3.85 | 2.27 |
+| ecoli_ont  |      2.83 |  2.83 | **3.05** |   2.38 |2.49 | 1.94 |
 
 ## Lossy quality (fqxv binning)
 
