@@ -9,7 +9,10 @@ seek to any of them without scanning the file.
 
 ```text
 [4]  magic "FQXV"
-[2]  format version (LE)        (currently v3)
+[1]  format version major (LE)  (reader refuses a differing major)
+[1]  format version minor (LE)  (tolerated within a major; informational)
+[8]  required_features (LE u64) (coarse capability bits; an unknown set bit is
+                                 refused rather than mis-decoded)
 [1]  sequence context order (k)
 [1]  quality binning tag        (0 lossless, 1 bin8, 2 bin4, 3 bin2,
                                  4 ont, 5 hifi)
@@ -20,7 +23,11 @@ seek to any of them without scanning the file.
 [1]  group size G               (1 single-end, 2 paired, 3-4 single-cell)
 [1]  platform tag               (0 unknown, 1 Illumina, 2 Nanopore,
                                  3 PacBio, 4 MGI/BGI)
-[4]  header CRC-32C (LE)        (over the 11 header-field bytes above)
+[2]  ext_len (LE u16)           (bytes of the extension region below)
+[ ]  extension region           (TLV records [1 tag][2 len][len bytes];
+                                 empty at 1.0, lets a later minor add skippable
+                                 header fields without a major bump)
+[4]  header CRC-32C (LE)        (over the header prefix + extension region)
 repeated until the terminator:
   [4]  block sync marker "FQXB"          (recovery scans for it to resync)
   [8]  block payload length (LE, nonzero)
@@ -43,10 +50,19 @@ trailer (at EOF):
   [4]  magic "FQXF"
 ```
 
+The on-disk format is versioned `major.minor` (currently **1.0**). A reader
+refuses an archive whose **major** differs from its own — that archive is
+wire-incompatible — but tolerates a newer **minor**, since a minor bump only adds
+backward-compatible things (a skippable header extension record, or a new optional
+codec gated by a `required_features` bit). The fixed header prefix is 21 bytes; with
+the empty 1.0 extension region and the 4-byte CRC the whole header is 25 bytes.
+
 Each block payload:
 
 ```text
-[8]  content_digest (LE)               (xxh3-64 of the block's decoded content)
+[8]  names_digest (LE)                 (xxh3-64 of the block's decoded names)
+[8]  seq_digest   (LE)                 (xxh3-64 of the block's decoded sequence)
+[8]  qual_digest  (LE)                 (xxh3-64 of the block's decoded quality)
 [4]  n_reads (LE)
 [4]  names_len (LE)  [ ] names   (fqxv-tokenizer)
 [4]  seq_len   (LE)  [ ] seq     (fqxv-seq)
@@ -57,10 +73,11 @@ The three streams are contiguous within the payload, so each one's absolute
 `(offset, len, crc32c)` is recorded in the footer index (above). That is what
 lets a reader fetch a single **column** — just the names, or just the
 sequence — without reading the whole block; see
-[Column projection](#footer-index-info-and-random-access). The `content_digest`
-is an end-to-end round-trip check over the block's *decoded* content (names,
-sequence, post-binning quality), verified after decode — see
-[Integrity](#integrity).
+[Column projection](#footer-index-info-and-random-access). The three
+`*_digest` fields are an end-to-end round-trip check over the block's *decoded*
+content — one digest per stream (names, sequence, post-binning quality), verified
+after decode, so a mismatch localizes which stream a codec round-tripped wrong —
+see [Integrity](#integrity).
 
 ## Streaming vs. seeking
 
@@ -76,10 +93,10 @@ seeking reader skips straight past it.
 ## Footer index, `info`, and random access
 
 The footer records, per row group, its frame-marker byte offset, its read count
-(read-start is the running sum), and — since v3 — an `(offset, len, crc32c)`
-triple for each of the three coded streams (names, sequence, quality). It covers
+(read-start is the running sum), and an `(offset, len, crc32c)` triple for each
+of the three coded streams (names, sequence, quality). It covers
 the plain layout; reordered archives use a distinct self-describing layout
-(below). This buys three things over the old scan-everything approach:
+(below). This buys three things over a scan-everything approach:
 
 - **`info` is O(row groups), not O(bytes).** The per-stream sizes live in the
   footer itself, so `info` reads the footer once and sums them — no per-block
@@ -97,8 +114,9 @@ the plain layout; reordered archives use a distinct self-describing layout
   fetches ~100× less than the whole file; a sequence-only client (k-mer
   screening, taxonomic classification, alignment-free QC) skips the quality
   stream entirely. The per-stream `crc32c` makes the projection verifiable: the
-  block `content_digest` covers all three decoded streams jointly and so cannot
-  check one fetched column in isolation, so each stream carries its own CRC-32C.
+  block's content digests cover the *decoded* streams and so cannot check a
+  projected fetch of *coded* bytes, so each coded stream also carries its own
+  CRC-32C in the footer.
 
 ### Random-access API
 
@@ -222,8 +240,9 @@ Four checksums sit at four levels of the layout above:
 - **Per-stream CRC.** The footer's per-group `(offset, len, crc32c)` triples carry
   a CRC-32C over each coded stream's bytes, so a projected single-column fetch
   ([Column projection](#footer-index-info-and-random-access)) stays verifiable —
-  the per-block payload CRC and the `content_digest` both cover all three streams
-  jointly and cannot check one fetched column in isolation.
+  the per-block payload CRC covers all three coded streams at once, and the
+  content digests cover the *decoded* streams, so neither can check a projected
+  fetch of one coded stream in isolation.
 - **Footer CRC** (`footer_crc`) guards the row-group index. It covers the footer
   body and is checked before any byte offset in the index is trusted, so a
   damaged footer can't send a seeking reader to a bogus location.
@@ -231,11 +250,11 @@ Four checksums sit at four levels of the layout above:
   through the `total_reads` field — a single end-to-end digest of everything but
   the two footer CRCs and the trailer.
 
-A fifth check is not a CRC: each block payload leads with an xxh3-64
-`content_digest` over its *decoded* content (names, sequence, post-binning
-quality), verified after decode. Where the CRCs catch corruption of the *stored*
-bytes, the digest catches a codec that turned CRC-valid bytes into
-wrong-but-in-bounds output.
+A fifth check is not a CRC: each block payload leads with three xxh3-64 digests
+over its *decoded* content — one each for names, sequence, and post-binning
+quality — verified after decode. Where the CRCs catch corruption of the *stored*
+bytes, these digests catch a codec that turned CRC-valid bytes into
+wrong-but-in-bounds output, and localize the failure to the offending stream.
 
 [`fqxv verify`](../cli/verify.md) checks the whole-file, footer, and per-block
 CRCs in one pass without running any codec: it re-hashes the archive prefix

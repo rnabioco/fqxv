@@ -44,7 +44,7 @@ sample.fqxv
 │ quality        │ lossless                     │
 │ reordered      │ no                           │
 │ plus line      │ normalized                   │
-│ format         │ v1                           │
+│ format         │ v1.0                         │
 │ whole-file crc │ a1b2c3d4                     │
 │ file size      │ 1.01 MB (1,058,497 bytes)    │
 ╰────────────────┴──────────────────────────────╯
@@ -63,7 +63,9 @@ sample.fqxv
 
 `--tsv` emits a fixed header line plus one data line. The columns are stable
 (new fields are only ever appended), so it is safe to parse in scripts and the
-benchmark harness:
+benchmark harness. Note that `format_version` here is the numeric packing
+`(major << 8) | minor` — `256` for format 1.0 — not the `v1.0` string the human
+report prints:
 
 ```bash
 fqxv info sample.fqxv --tsv
@@ -71,7 +73,7 @@ fqxv info sample.fqxv --tsv
 
 ```text
 file_size	reads	blocks	group_size	seq_order	quality_binning	reordered	names_bytes	seq_bytes	qual_bytes	platform	format_version	whole_file_crc
-1058497	20000	1	2	11	0	0	76416	455180	526867	illumina	1	a1b2c3d4
+1058497	20000	1	2	11	0	0	76416	455180	526867	illumina	256	a1b2c3d4
 ```
 
 With `--stats`, five more columns are appended
@@ -109,7 +111,7 @@ fqxv info sample.fqxv --json
     "total": { "bytes": 1058463, "pct": 100.0, "per_read": 52.923 }
   },
   "bytes_per_read": 52.92,
-  "format_version": 1,
+  "format_version": 256,
   "whole_file_crc": "a1b2c3d4"
 }
 ```
@@ -141,6 +143,6 @@ fqxv info sample.fqxv --stats
 | `reordered` | Whether reads were clustered/reordered for a better ratio. |
 | `read order` | For reordered archives, whether the original order is restored. |
 | `plus line` | Whether the `+` line was normalized. |
-| `format` | On-disk container format version (currently 3). |
+| `format` | On-disk container format version, `vMAJOR.MINOR` (currently `v1.0`). |
 | `whole-file crc` | Stored whole-file CRC-32C (hex); the value `verify` recomputes. |
 | `names` / `sequence` / `quality` | Compressed bytes per stream, with share of the three-stream total. |
