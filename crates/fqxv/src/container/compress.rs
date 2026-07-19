@@ -235,12 +235,27 @@ pub fn compress_auto<'a, R: Read + Send + 'a, W: Write>(
         peeked.push(rec);
     }
     let g = detect_group_size(&peeked);
-    info!(group_size = g, reorder = params.reorder, "detected layout");
+    // Mean sequence length over the peeked records: long reads (nanopore/PacBio)
+    // want the buffered shared-reference layout (issue #168), so they can't take
+    // the streaming single-end shortcut below.
+    let long_read = {
+        let (sum, n) = peeked.iter().fold((0u64, 0u64), |(s, n), r| {
+            (s + r.sequence().len() as u64, n + 1)
+        });
+        n > 0 && sum / n > REORDER_MAX_MEAN_LEN
+    };
+    info!(
+        group_size = g,
+        reorder = params.reorder,
+        long_read,
+        "detected layout"
+    );
 
-    // Single-end, non-reorder: stream the peeked prefix then the rest through the
-    // drive path (#112). The other layouts need the whole input — reorder for its
-    // global clustering, interleaved for spot regrouping — so complete the buffer.
-    if g == 1 && !params.reorder {
+    // Single-end, short-read, non-reorder: stream the peeked prefix then the rest
+    // through the drive path (#112). The other layouts need the whole input —
+    // reorder for its global clustering, interleaved for spot regrouping, long-read
+    // for its whole-file shared reference — so complete the buffer.
+    if g == 1 && !params.reorder && !long_read {
         return compress(prefix.as_slice().chain(reader), writer, params);
     }
     if !eof {
@@ -390,10 +405,52 @@ pub fn compress_multi<'a, W: Write>(
     })
 }
 
-/// Compress an in-memory FASTQ buffer: parse it in parallel into blocks, then
-/// compress the blocks (in parallel) and write them in order. `group_size` is
-/// the interleaving already determined by the caller.
+/// Mean sequence length over the first few FASTQ records of a buffer, for routing
+/// the long-read shared-reference path without a full parse. Mirrors
+/// [`mean_read_len`](super::reorder::mean_read_len) over a small sample; returns 0
+/// for empty or unparseable input (so it is never treated as long-read).
+fn sample_mean_read_len(buf: &[u8]) -> u64 {
+    const SAMPLE: u64 = 256;
+    let mut fq = noodles_fastq::io::Reader::new(buf);
+    let mut rec = noodles_fastq::Record::default();
+    let (mut sum, mut n) = (0u64, 0u64);
+    while n < SAMPLE {
+        match fq.read_record(&mut rec) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                sum += rec.sequence().len() as u64;
+                n += 1;
+            }
+        }
+    }
+    sum.checked_div(n).unwrap_or(0)
+}
+
+/// Compress an in-memory FASTQ buffer. Long-read, non-reorder input is routed to
+/// the shared whole-file reference layout ([`compress_longread_shared_ref`], issue
+/// #168); everything else uses the plain per-block layout
+/// ([`compress_buffered_plain`]).
 pub(crate) fn compress_buffered<W: Write>(
+    buf: &[u8],
+    writer: W,
+    params: Params,
+    group_size: u8,
+) -> Result<Stats> {
+    // Long reads carry cross-read redundancy the within-read model can't see; a
+    // single whole-file consensus reference, coded against by every block, captures
+    // it once instead of re-storing a reference per block. Short reads keep the
+    // plain layout (the reference buys nothing and the streaming path is cheaper).
+    if !params.reorder && sample_mean_read_len(buf) > super::reorder::REORDER_MAX_MEAN_LEN {
+        return compress_longread_shared_ref(buf, writer, params, group_size);
+    }
+    compress_buffered_plain(buf, writer, params, group_size)
+}
+
+/// Plain per-block layout: parse the buffer in parallel into blocks, then compress
+/// the blocks (in parallel) and write them in order. `group_size` is the
+/// interleaving already determined by the caller. This is the layout for short
+/// reads and the fallback when the long-read shared reference does not pay off.
+fn compress_buffered_plain<W: Write>(
     buf: &[u8],
     writer: W,
     params: Params,
@@ -469,6 +526,150 @@ pub(crate) fn compress_buffered<W: Write>(
     let footer_bytes = write_footer(&mut w, &index, stats.reads)?;
     w.flush()?;
     stats.out_bytes += HEADER_LEN as u64 + footer_bytes;
+    Ok(stats)
+}
+
+/// Long-read plain layout with a **shared whole-file reference** (issue #168).
+///
+/// A per-block overlap codec re-assembles and re-stores the same consensus
+/// reference in every block; at high coverage a file split into several 256 MiB
+/// blocks stores ~one copy of the genome per block. This path assembles the
+/// consensus **once** over the whole file, stores it in a single reference frame
+/// between the header and the first block, and codes every block's reads against
+/// that frozen frame ([`SEQ_METHOD_OVERLAP_REF`]). Placement is per-read against an
+/// immutable frame, so a read codes identically regardless of which block holds it
+/// — blocks stay 256 MiB, parallel, and independently decodable.
+///
+/// Two passes over the buffered input:
+/// 1. build the reference and code each block's sequence against it (the expensive
+///    reference-aligned coding), holding the small edit streams;
+/// 2. whole-file never-worse gate — adopt the reference layout only when
+///    `reference frame + Σ chosen sequence` beats the plain order-k total; else
+///    fall back to [`compress_buffered_plain`] (the reference is not re-coded).
+///
+/// On the reference layout, pass 2 codes each block's names and quality and reuses
+/// the pass-1 sequence, writing blocks in order with bounded memory.
+fn compress_longread_shared_ref<W: Write>(
+    buf: &[u8],
+    writer: W,
+    params: Params,
+    group_size: u8,
+) -> Result<Stats> {
+    let g = group_size.max(1) as usize;
+    let block_reads = (params.block_reads.max(1) / g).max(1) * g;
+    let pool = build_pool(params.threads)?;
+    let (chunks, gstart, _n) = parse_chunks(buf, g, &pool)?;
+    let platform = resolve_platform_buf(params.platform, buf);
+    let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
+    let num_blocks = ranges.len();
+    let batch = pool.current_num_threads().max(1);
+
+    // Gather the whole file's read lengths and bases (sequence only — the reference
+    // needs no quality) in read order, from the parsed record offsets into `buf`.
+    let total_bases: usize = chunks
+        .iter()
+        .flat_map(|c| c.recs.iter())
+        .map(|r| r.seq_len as usize)
+        .sum();
+    let mut all_lens: Vec<u32> = Vec::new();
+    let mut all_seq: Vec<u8> = Vec::with_capacity(total_bases);
+    for chunk in &chunks {
+        for rec in &chunk.recs {
+            all_lens.push(rec.seq_len);
+            all_seq.extend_from_slice(&buf[rec.seq_off..rec.seq_off + rec.seq_len as usize]);
+        }
+    }
+
+    // Assemble the shared reference once over every read.
+    let opts = fqxv_lroverlap::EncodeOpts {
+        sketch: sketch_for(platform),
+        ..fqxv_lroverlap::EncodeOpts::default()
+    };
+    let reference = pool.install(|| fqxv_lroverlap::build_reference(&all_lens, &all_seq, &opts))?;
+    // Free the whole-file sequence buffer before the block passes allocate.
+    drop(all_seq);
+    drop(all_lens);
+
+    // No usable reference (no shared locus, e.g. amplicon-free or tiny input): the
+    // shared layout can only add overhead, so use the plain per-block layout.
+    if reference.is_empty() {
+        debug!("shared reference assembled no contigs; using plain layout");
+        return compress_buffered_plain(buf, writer, params, group_size);
+    }
+    let ref_frame = reference.encode()?;
+
+    // Pass 1: code each block's sequence against the shared reference (the
+    // expensive alignment), holding the small edit streams and the order-k baseline.
+    let seq_coded: Vec<(Vec<u8>, usize)> = pool.install(|| {
+        ranges
+            .par_iter()
+            .map(|&(gs, ge)| -> Result<(Vec<u8>, usize)> {
+                let blk = build_block(buf, &chunks, &gstart, gs, ge);
+                encode_sequence_stream_shared(&blk.lens, &blk.seq, &params, platform, &reference)
+            })
+            .collect::<Result<_>>()
+    })?;
+    let chosen_total: usize = seq_coded.iter().map(|(s, _)| s.len()).sum();
+    let orderk_total: usize = seq_coded.iter().map(|(_, k)| *k).sum();
+
+    // Whole-file never-worse gate: the reference frame plus the reference-coded
+    // sequence must beat the plain order-k sequence, or the reference is pure
+    // overhead. Fall back to the plain layout (which itself keeps the smaller of the
+    // per-block overlap and order-k codecs), never re-coding against the reference.
+    if ref_frame.len() + chosen_total >= orderk_total {
+        info!(
+            ref_frame = ref_frame.len(),
+            chosen_total, orderk_total, "shared reference does not pay off; using plain layout"
+        );
+        return compress_buffered_plain(buf, writer, params, group_size);
+    }
+    info!(
+        contigs = reference.len(),
+        ref_bases = reference.total_bases(),
+        ref_frame = ref_frame.len(),
+        "shared reference adopted"
+    );
+
+    // Pass 2: write header, the reference frame, then blocks (names + quality coded
+    // here, reusing the pass-1 sequence) in order.
+    let mut w = CrcWriter::new(BufWriter::new(writer));
+    let flags = FLAG_PLUS_NORMALIZED | FLAG_GLOBAL_REFERENCE;
+    write_header_prefix(
+        &mut w,
+        params.seq_order,
+        binning_tag(params.quality_binning),
+        flags,
+        group_size,
+        platform,
+        crate::feature::GLOBAL_REFERENCE,
+    )?;
+    write_framed(&mut w, &ref_frame)?;
+    // Framed slice on disk is [4 len][4 crc][bytes]; blocks begin past it.
+    let ref_frame_bytes = (4 + CRC_LEN + ref_frame.len()) as u64;
+
+    let mut stats = Stats {
+        group_size,
+        ..Stats::default()
+    };
+    let mut index = FooterIndex::new_at(HEADER_LEN as u64 + ref_frame_bytes);
+    for batch_start in (0..num_blocks).step_by(batch) {
+        let batch_end = (batch_start + batch).min(num_blocks);
+        let (blocks, compressed): (Vec<RawBlock>, Vec<Result<Vec<u8>>>) = pool.install(|| {
+            (batch_start..batch_end)
+                .into_par_iter()
+                .map(|bi| {
+                    let (gs, ge) = ranges[bi];
+                    let blk = build_block(buf, &chunks, &gstart, gs, ge);
+                    let payload = compress_block_with_seq(&blk, &params, &seq_coded[bi].0);
+                    (blk, payload)
+                })
+                .unzip()
+        });
+        write_blocks(&mut w, &blocks, compressed, &mut stats, &mut index)?;
+    }
+    let footer_bytes = write_footer(&mut w, &index, stats.reads)?;
+    w.flush()?;
+    stats.out_bytes += HEADER_LEN as u64 + ref_frame_bytes + footer_bytes;
     Ok(stats)
 }
 

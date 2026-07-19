@@ -426,9 +426,9 @@ fn grouped_block_rejects_partial_spot() {
     let payload = &archive[start..start + payload_len];
 
     // g that divides the count still decodes; g = 2 does not divide 3 and errors.
-    assert!(decode_block_group(payload, 1).is_ok());
-    assert!(decode_block_group(payload, 3).is_ok());
-    let err = decode_block_group(payload, 2).unwrap_err();
+    assert!(decode_block_group(payload, 1, None).is_ok());
+    assert!(decode_block_group(payload, 3, None).is_ok());
+    let err = decode_block_group(payload, 2, None).unwrap_err();
     assert!(
         matches!(err, Error::Malformed(_)),
         "partial-spot block must be rejected, got {err:?}"
@@ -742,9 +742,17 @@ fn long_reads_skip_reorder() {
 /// a test can assert *which* sequence codec the container kept, rather than
 /// assuming it from the input shape.
 fn first_block_seq_method(archive: &[u8]) -> u8 {
-    let len_off = HEADER_LEN + BLOCK_MAGIC.len();
+    // The shared-reference layout writes a framed reference (`[4 len][4 crc][bytes]`)
+    // between the header and the first block, so skip it when present.
+    let mut block_start = HEADER_LEN;
+    if archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REFERENCE != 0 {
+        let ref_len =
+            u32::from_le_bytes(archive[HEADER_LEN..HEADER_LEN + 4].try_into().unwrap()) as usize;
+        block_start += 4 + CRC_LEN + ref_len;
+    }
+    let len_off = block_start + BLOCK_MAGIC.len();
     let plen = u64::from_le_bytes(archive[len_off..len_off + 8].try_into().unwrap()) as usize;
-    let payload = &archive[HEADER_LEN + FRAME_HEAD_LEN..HEADER_LEN + FRAME_HEAD_LEN + plen];
+    let payload = &archive[block_start + FRAME_HEAD_LEN..block_start + FRAME_HEAD_LEN + plen];
     // payload: [24 stream digests][4 n_reads][4 names_len][names][4 seq_len][seq…]
     let names_len = u32::from_le_bytes(payload[28..32].try_into().unwrap()) as usize;
     payload[32 + names_len + 4] // first byte of the seq stream is the method tag
@@ -828,11 +836,116 @@ fn container_decodes_overlap_tagged_sequence_stream() {
     let mut stream = vec![SEQ_METHOD_OVERLAP];
     stream.extend_from_slice(&coded);
 
-    let (dlens, dseq) = decode_sequence_stream(&stream).expect("overlap dispatch decode");
+    let (dlens, dseq) = decode_sequence_stream(&stream, None).expect("overlap dispatch decode");
     assert_eq!(dlens, lens, "overlap decode must restore per-read lengths");
     assert_eq!(
         dseq, seq,
         "overlap decode must restore the bases byte-exact"
+    );
+}
+
+/// Deep-tiling long-read fixture: `n` reads of ~`read_len` bp tiling a genome at a
+/// short step (high coverage, so the overlap codec forms a contig), each carrying
+/// ~1% random substitution error — the sequencing noise that pollutes the order-k
+/// context model but is voted out by the consensus, which is what makes the shared
+/// reference win the size race (a clean synthetic genome is too easy for order-k).
+/// One `N` per read exercises the non-ACGT exception path. Returns FASTQ.
+fn deep_longread_fastq(n: usize, read_len: usize, step: usize, genome_len: usize) -> Vec<u8> {
+    // splitmix64, used for both the genome and the per-read error, so the genome is
+    // near-uniform ACGT (order-0 ≈ 2 bits/base) — a biased genome would let even a
+    // low-order model compress it below what the reference-coded stream achieves.
+    let rng = |x: &mut u64| {
+        *x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let genome: Vec<u8> = {
+        let mut g = 0x5eed_1234u64;
+        (0..genome_len)
+            .map(|_| b"ACGT"[(rng(&mut g) % 4) as usize])
+            .collect()
+    };
+    let mut input = Vec::new();
+    for i in 0..n {
+        let start = (i * step) % (genome.len() - read_len);
+        let mut s = genome[start..start + read_len].to_vec();
+        let mut state = 0x1234_5678u64.wrapping_add(i as u64);
+        for b in s.iter_mut() {
+            if rng(&mut state) % 300 == 0 {
+                *b = b"ACGT"[(rng(&mut state) % 4) as usize]; // ~0.3% substitution error (HiFi-like)
+            }
+        }
+        s[read_len / 2] = b'N'; // exercise the non-ACGT exception path
+        let qual = vec![b'I'; s.len()];
+        write_record(&mut input, format!("read.{i}").as_bytes(), &s, &qual);
+    }
+    input
+}
+
+#[test]
+fn shared_reference_longread_roundtrips_across_blocks() {
+    // The whole-file shared-reference layout (issue #168): deep-tiling long reads
+    // split across several blocks are coded against ONE reference stored between the
+    // header and the first block. This guards the whole wiring — reference frame
+    // written and read back, footer offsets that start past it, and every block's
+    // sequence decoded against the shared frame — with a byte-exact round trip,
+    // thread-count determinism, and a full verify.
+    let input = deep_longread_fastq(120, 2000, 20, 4000);
+
+    // Order-0 keeps the order-k baseline weak enough (~2 bits/base) that the
+    // reference-coded stream wins the size race on this compact synthetic fixture;
+    // at default order-11 the model would memorize such a tiny genome outright,
+    // which is why the plain long-read tests see order-k win. Small blocks force
+    // multiple row groups over the one shared reference, exercising the cross-block
+    // frame wiring.
+    let mk = |threads: usize| Params {
+        threads,
+        seq_order: 0,
+        block_reads: 60,
+        ..Params::default()
+    };
+    let mut archive = Vec::new();
+    let stats = compress_auto(&input[..], &mut archive, mk(4)).expect("compress");
+    assert!(stats.blocks > 1, "fixture must span multiple blocks");
+
+    // The reference must have been adopted: the header flag and feature bit are set.
+    assert_ne!(
+        archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REFERENCE,
+        0,
+        "shared reference must be adopted for deep-tiling long reads"
+    );
+    let features = u64::from_le_bytes(archive[6..14].try_into().unwrap());
+    assert_ne!(
+        features & crate::feature::GLOBAL_REFERENCE,
+        0,
+        "the reference feature bit must be set so pre-feature readers refuse the archive"
+    );
+
+    // At least one block actually used the reference-coded method (else the frame
+    // would be wasted overhead the whole-file gate should have rejected).
+    assert_eq!(
+        first_block_seq_method(&archive),
+        SEQ_METHOD_OVERLAP_REF,
+        "the first deep block should code against the shared reference"
+    );
+
+    // Byte-exact round trip and full structural + content verification.
+    let mut out = Vec::new();
+    decompress(&archive[..], &mut out, 4).expect("decompress");
+    assert_eq!(
+        out, input,
+        "shared-reference archive must round-trip byte-exact"
+    );
+    verify_roundtrip(io::Cursor::new(&archive), 4).expect("shared-reference archive must verify");
+
+    // Thread-count determinism: the reference build and per-block coding are pure.
+    let mut archive1 = Vec::new();
+    compress_auto(&input[..], &mut archive1, mk(1)).expect("compress 1-thread");
+    assert_eq!(
+        archive, archive1,
+        "shared-reference output must be byte-identical regardless of thread count"
     );
 }
 

@@ -73,7 +73,9 @@ mod wfa;
 
 pub use align::{align_banded, apply, Alignment, Op};
 pub use chain::{Anchor, Chain, ChainOpts, Chainer};
-pub use codec::{decode, encode, EncodeOpts};
+pub use codec::{
+    build_reference, decode, decode_against, encode, encode_against, EncodeOpts, Reference,
+};
 pub use consensus::{consensus, Consensus, ConsensusOpts};
 pub use index::{Index, Occ, Repeat};
 pub use layout::{layout, Contig, LayoutOpts, Placement};

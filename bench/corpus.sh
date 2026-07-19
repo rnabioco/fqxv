@@ -346,10 +346,15 @@ case "$cmd" in
     total=$(awk 'NF && !/^#/' "$ACC_LIST" | wc -l)
     [[ "$total" -ge 1 ]] || { echo "no accessions in $ACC_LIST" >&2; exit 1; }
     printf 'accession\tmode\tstatus\tnote\tbytes\tsecs\n' > "$RESULTS_TSV"
-    conc="${CORPUS_CONCURRENCY:-6}"
-    echo "submitting array 1-$total%$conc"
+    # No %concurrency cap: let Slurm schedule every array task as resources free
+    # up (each task is one accession, independent, and writes results under flock).
+    # Set CORPUS_CONCURRENCY to reimpose a throttle (e.g. to be a good neighbor on
+    # a busy partition); empty/unset = unthrottled.
+    conc="${CORPUS_CONCURRENCY:-}"
+    array_spec="1-${total}${conc:+%${conc}}"
+    echo "submitting array $array_spec"
     sbatch --job-name=fqxv-corpus --comment=fqxv-corpus --partition="${SLURM_PARTITION:-amilan}" \
-      --qos="${SLURM_QOS:-normal}" --array="1-${total}%${conc}" \
+      --qos="${SLURM_QOS:-normal}" --array="$array_spec" \
       --cpus-per-task="$THREADS" --mem="${CORPUS_MEM:-32G}" --time="${CORPUS_TIME:-02:00:00}" \
       --output="$LOG_DIR/slurm-%A_%a.out" \
       --wrap="cd '$HERE' && FQXV_CORPUS_DIR='$CORPUS_DIR' FQXV_BIN='$FQXV_BIN' FQDIGEST='$FQDIGEST' FQXV_MODES='$MODES' FQXV_THREADS='$THREADS' pixi run bash corpus.sh run"

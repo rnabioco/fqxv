@@ -285,7 +285,29 @@ a real, round-trip-verified archive of the whole `ecoli_hifi` file (120k reads,
 1.55 Gbase, 6 blocks at ~52×) the sequence stream is **0.107 bits/base — 6.1×
 smaller than the 0.653 fallback** (total archive 4.04×), but above CoLoRd's
 whole-file 0.068. Closing that remaining gap means more coverage per reference —
-larger long-read blocks, or a reference shared across blocks — the open lever.
+larger long-read blocks, or a reference shared across blocks.
+
+**Shared whole-file reference (implemented).** The gap *is* reference
+duplication: each block re-stored the same assembled genome, so a ~300× file kept
+~6 copies where 1 is needed. The container now assembles **one** consensus over
+the whole file, stores it once in a framed region between the header and the first
+block (gated by the `GLOBAL_REFERENCE` feature bit and flag bit5), and codes every
+block's reads against that frozen frame (sequence method byte 2,
+`fqxv_lroverlap::encode_against`). Because placement is per-read against an
+immutable frame, a read codes identically regardless of which block holds it —
+**no block-boundary penalty** — so blocks stay 256 MiB, `rayon`-parallel, and
+independently decodable given the shared frame. A whole-file never-worse gate
+adopts the layout only when `reference frame + Σ chosen sequence` beats the plain
+order-k total; otherwise no frame is written and the archive is the plain layout,
+so it can only ever shrink. This is the same pattern the reorder path uses for its
+global reference, and it removes the redundant reference copies without touching
+the near-optimal per-read edit term. Measured on `hifi_40k` (516 Mbase, 2 blocks,
+default order-11) the sequence stream drops **0.102 → 0.084 bits/base (−18%)**,
+storing the ~5 Mb consensus once (a 1.26 MB frame) instead of per block; the win
+widens with block count on deeper files. The compress path must **buffer** the
+input for this (the streaming single-end path keeps the per-block method-1
+fallback), and random-access single-stream projection of a shared-reference block
+fails closed — it has no access to the frame. See issue #168.
 
 ### Cost / benefit
 

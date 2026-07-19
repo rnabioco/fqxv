@@ -41,6 +41,18 @@ freely and archives are not guaranteed to be readable across releases until a
   streams (substitutions, ops, insertions) with per-stream context models. A WFA
   aligner (HiFi) and an AVX2 anti-diagonal aligner accelerate encoding, both
   byte-identical to the scalar reference.
+- **Shared whole-file reference for long reads** — the overlap codec reaches
+  CoLoRd parity *within* a block, but the container re-assembled and re-stored the
+  same consensus reference in every 256 MiB block. It now assembles one consensus
+  over the whole file and stores it **once** in a framed region between the header
+  and the first block, coding every block's reads against that frozen frame — so
+  the genome is stored once, not once per block. Auto-selected for long-read input,
+  behind a whole-file never-worse gate against order-k, and gated on the
+  `GLOBAL_REFERENCE` feature bit (which is set in the plain layout now as well as
+  the reorder layout, so a reader without it refuses rather than misreads). On
+  PacBio HiFi this drops the sequence stream ~0.102 → ~0.084 bits/base at two
+  blocks, widening with block count. New `fqxv-lroverlap` API: `Reference`,
+  `build_reference`, `encode_against`/`decode_against`.
 - **Python bindings (`fqxv` via PyO3 / maturin)** — read-only access from
   Python: a streaming record iterator and column projection (fetch just names,
   sequence, or quality) over an existing archive.
