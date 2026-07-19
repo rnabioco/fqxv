@@ -31,7 +31,7 @@
 
 use rayon::prelude::*;
 
-use crate::{find_overlaps, ChainOpts, Index, Repeat, Sketch};
+use crate::{ChainOpts, Index, Repeat, Sketch, find_overlaps};
 
 /// Where a read sits on a reference, found in a single hop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

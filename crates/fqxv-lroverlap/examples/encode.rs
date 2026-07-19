@@ -20,8 +20,8 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use fqxv_lroverlap::{
-    align_banded, consensus, find_overlaps, layout, place_against, Anchored, ChainOpts,
-    ConsensusOpts, Index, LayoutOpts, Op, Repeat, Sketch,
+    Anchored, ChainOpts, ConsensusOpts, Index, LayoutOpts, Op, Repeat, Sketch, align_banded,
+    consensus, find_overlaps, layout, place_against,
 };
 
 fn read_fastq(path: &str) -> (Vec<u32>, Vec<u8>) {

@@ -122,8 +122,8 @@
 //! spot adjacent for the sequence model. [`decompress`] streams interleaved
 //! FASTQ (pipe to an aligner); [`decompress_split`] restores the `G` files.
 
-pub(crate) use crate::crc::{crc32c, crc32c_combine, CrcWriter};
-pub(crate) use crate::{Error, Result, FORMAT_MAJOR, FORMAT_MINOR, KNOWN_FEATURES, MAGIC};
+pub(crate) use crate::crc::{CrcWriter, crc32c, crc32c_combine};
+pub(crate) use crate::{Error, FORMAT_MAJOR, FORMAT_MINOR, KNOWN_FEATURES, MAGIC, Result};
 pub(crate) use fqxv_fqzcomp::QualityBinning;
 pub(crate) use std::borrow::Cow;
 pub(crate) use std::fs::File;
@@ -156,18 +156,18 @@ pub(crate) use reorder::*;
 // Public surface, re-exported unchanged from `lib.rs` at the crate root. These
 // explicit `pub use`s elevate the names above the `pub(crate)` globs above so the
 // external API is preserved.
-pub use compress::{compress, compress_auto, compress_interleaved, compress_multi, Params, Stats};
-pub use decompress::{content_stats, decompress, decompress_recover, decompress_split, Recovery};
-pub use estimate::{estimate, Estimate};
-pub use inspect::{inspect, peek, ContentStats, Info, Platform, QUAL_MAX};
+pub use compress::{Params, Stats, compress, compress_auto, compress_interleaved, compress_multi};
+pub use decompress::{Recovery, content_stats, decompress, decompress_recover, decompress_split};
+pub use estimate::{Estimate, estimate};
+pub use inspect::{ContentStats, Info, Platform, QUAL_MAX, inspect, peek};
 pub use random_access::{
-    decode_block_contents, decode_names, decode_quality, decode_quality_with_seq, decode_sequence,
-    quality_needs_sequence, BlockContents, GroupLoc, Index, Stream, SuffixParse,
+    BlockContents, GroupLoc, Index, Stream, SuffixParse, decode_block_contents, decode_names,
+    decode_quality, decode_quality_with_seq, decode_sequence, quality_needs_sequence,
 };
-pub use records::{decompress_records, Record, RecordReader};
+pub use records::{Record, RecordReader, decompress_records};
 pub use verify::{
-    expected_reads, verify, verify_quick, verify_report, verify_roundtrip, VerifyCheck,
-    VerifyReport,
+    VerifyCheck, VerifyReport, expected_reads, verify, verify_quick, verify_report,
+    verify_roundtrip,
 };
 
 #[cfg(test)]

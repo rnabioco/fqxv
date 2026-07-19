@@ -371,11 +371,7 @@ mod tests {
             .map(|&oi| {
                 let oi = oi as usize;
                 let s = &seq[offs[oi]..offs[oi + 1]];
-                if p.flip[oi] {
-                    revcomp(s)
-                } else {
-                    s.to_vec()
-                }
+                if p.flip[oi] { revcomp(s) } else { s.to_vec() }
             })
             .collect();
         let refs: Vec<&[u8]> = cl.iter().map(Vec::as_slice).collect();
@@ -478,11 +474,7 @@ mod tests {
             .map(|&oi| {
                 let oi = oi as usize;
                 let s = &seq[offs[oi]..offs[oi + 1]];
-                if p.flip[oi] {
-                    revcomp(s)
-                } else {
-                    s.to_vec()
-                }
+                if p.flip[oi] { revcomp(s) } else { s.to_vec() }
             })
             .collect();
         let refs: Vec<&[u8]> = cl.iter().map(Vec::as_slice).collect();
@@ -553,11 +545,7 @@ mod tests {
             .map(|&oi| {
                 let oi = oi as usize;
                 let s = &seq[offs[oi]..offs[oi + 1]];
-                if p.flip[oi] {
-                    revcomp(s)
-                } else {
-                    s.to_vec()
-                }
+                if p.flip[oi] { revcomp(s) } else { s.to_vec() }
             })
             .collect();
         let refs: Vec<&[u8]> = cl.iter().map(Vec::as_slice).collect();

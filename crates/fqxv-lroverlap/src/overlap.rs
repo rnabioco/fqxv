@@ -5,8 +5,8 @@
 //! needs to pick a reference read and code against it.
 
 use crate::{
-    chain::{Anchor, ChainOpts, Chainer},
     Index,
+    chain::{Anchor, ChainOpts, Chainer},
 };
 
 /// A confident overlap between a query read and a target read.

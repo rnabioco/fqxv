@@ -51,7 +51,7 @@ FQDIGEST_SRC="$HERE/../tools/fqdigest.rs"
 ensure_fqdigest() {
   if [[ ! -x "$FQDIGEST" || "$FQDIGEST_SRC" -nt "$FQDIGEST" ]]; then
     mkdir -p "$(dirname "$FQDIGEST")"
-    rustc -O --edition 2021 "$FQDIGEST_SRC" -o "$FQDIGEST"
+    rustc -O --edition 2024 "$FQDIGEST_SRC" -o "$FQDIGEST"
   fi
 }
 ensure_fqdigest

@@ -213,7 +213,7 @@ pub fn layout(lens: &[u32], overlaps: &[Vec<Overlap>], opts: LayoutOpts) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{find_overlaps, ChainOpts, Index, Repeat, Sketch};
+    use crate::{ChainOpts, Index, Repeat, Sketch, find_overlaps};
 
     fn rand_seq(n: usize, seed: u32) -> Vec<u8> {
         let mut x = seed;
@@ -519,11 +519,7 @@ mod tests {
         let reads: Vec<Vec<u8>> = (0..10)
             .map(|i| {
                 let s = genome[i * 2000..i * 2000 + 6000].to_vec();
-                if i % 2 == 1 {
-                    revcomp(&s)
-                } else {
-                    s
-                }
+                if i % 2 == 1 { revcomp(&s) } else { s }
             })
             .collect();
         let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();

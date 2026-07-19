@@ -6,7 +6,7 @@
 //!
 //! Run on a compute node: `cargo bench -p fqxv-seq`.
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use fqxv_seq::{decode, encode};
 
 /// Deterministic ACGT bytes with rare `N` (~1 in 4096), no RNG dependency.

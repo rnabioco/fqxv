@@ -37,7 +37,7 @@ mkdir -p "$IN" "$WORK" "$LOGS"
 # Order-independent content digest via the fqdigest Rust tool, built on demand.
 if [[ ! -x "$FQDIGEST" || "$FQDIGEST_SRC" -nt "$FQDIGEST" ]]; then
   mkdir -p "$(dirname "$FQDIGEST")"
-  rustc -O --edition 2021 "$FQDIGEST_SRC" -o "$FQDIGEST"
+  rustc -O --edition 2024 "$FQDIGEST_SRC" -o "$FQDIGEST"
 fi
 digest() {  # file...
   "$FQDIGEST" "$@"

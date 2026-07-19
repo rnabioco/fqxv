@@ -42,8 +42,8 @@ use fqxv_bytes::{read_varint, write_varint};
 use fqxv_dna::{base_of_sym, is_acgt, revcomp_acgt};
 
 use crate::{
-    align_banded, apply, consensus, find_overlaps, layout, place_all, wfa_align_opt, Alignment,
-    Anchored, ChainOpts, ConsensusOpts, Error, Index, LayoutOpts, Op, Repeat, Sketch,
+    Alignment, Anchored, ChainOpts, ConsensusOpts, Error, Index, LayoutOpts, Op, Repeat, Sketch,
+    align_banded, apply, consensus, find_overlaps, layout, place_all, wfa_align_opt,
 };
 
 /// Above this drift-derived band the banded DP is the faster aligner; at or below
@@ -1164,11 +1164,7 @@ mod tests {
                     }
                 }
                 // Every other read comes off the sequencer reverse-complemented.
-                if i % 2 == 1 {
-                    revcomp_acgt(&s)
-                } else {
-                    s
-                }
+                if i % 2 == 1 { revcomp_acgt(&s) } else { s }
             })
             .collect();
         // A non-ACGT base and a lowercase base inside a placed read.

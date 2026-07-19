@@ -93,7 +93,7 @@ fn trim_len(l: &[u8]) -> usize {
 fn nth_tab(line: &[u8], n: usize) -> Option<usize> {
     line.iter()
         .enumerate()
-        .filter(|(_, &b)| b == b'\t')
+        .filter(|&(_, &b)| b == b'\t')
         .nth(n)
         .map(|(i, _)| i)
 }

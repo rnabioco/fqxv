@@ -30,7 +30,7 @@
 //! assert_eq!(out_seq, seq);
 //! ```
 
-use fqxv_bytes::{read_lens, write_lens, write_varint, ReaderError};
+use fqxv_bytes::{ReaderError, read_lens, write_lens, write_varint};
 use fqxv_dna::{BASE_LUT, SYM2BASE};
 use fqxv_range::{Decoder, Encoder};
 use thiserror::Error;
@@ -591,7 +591,7 @@ mod tests {
         assert_eq!(fit_order(11, 1), 1); // 1 base (the --block-reads 1 bomb) -> k=1, 4-entry table
         assert_eq!(fit_order(11, 16), 2); // 4^2 == 16
         assert_eq!(fit_order(11, 15), 1); // 4^2 > 15 -> stay at 1
-                                          // A block with >= 4^11 bases keeps the full requested order (normal blocks).
+        // A block with >= 4^11 bases keeps the full requested order (normal blocks).
         assert_eq!(fit_order(11, 1 << 22), 11);
         assert_eq!(fit_order(8, 1 << 22), 8); // never exceeds what was asked for
     }

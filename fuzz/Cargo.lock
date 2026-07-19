@@ -77,7 +77,9 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 name = "fqxv"
 version = "0.2.0"
 dependencies = [
+ "fqxv-bytes",
  "fqxv-fqzcomp",
+ "fqxv-lroverlap",
  "fqxv-range",
  "fqxv-rans",
  "fqxv-reorder",
@@ -93,6 +95,10 @@ dependencies = [
 
 [[package]]
 name = "fqxv-bytes"
+version = "0.2.0"
+
+[[package]]
+name = "fqxv-dna"
 version = "0.2.0"
 
 [[package]]
@@ -118,6 +124,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fqxv-lroverlap"
+version = "0.2.0"
+dependencies = [
+ "fqxv-bytes",
+ "fqxv-dna",
+ "fqxv-range",
+ "fqxv-rans",
+ "fqxv-seq",
+ "rayon",
+ "thiserror",
+]
+
+[[package]]
 name = "fqxv-range"
 version = "0.2.0"
 dependencies = [
@@ -136,6 +155,7 @@ name = "fqxv-reorder"
 version = "0.2.0"
 dependencies = [
  "fqxv-bytes",
+ "fqxv-dna",
  "fqxv-range",
  "fqxv-rans",
  "fqxv-seq",
@@ -148,6 +168,7 @@ name = "fqxv-seq"
 version = "0.2.0"
 dependencies = [
  "fqxv-bytes",
+ "fqxv-dna",
  "fqxv-range",
  "thiserror",
 ]

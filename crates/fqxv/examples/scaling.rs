@@ -12,7 +12,7 @@
 use std::io::Cursor;
 use std::time::Instant;
 
-use fqxv::{compress, Params};
+use fqxv::{Params, compress};
 
 fn main() {
     let mut args = std::env::args().skip(1);

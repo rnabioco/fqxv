@@ -78,7 +78,7 @@ FQDIGEST_SRC="$HERE/../tools/fqdigest.rs"
 ensure_fqdigest() {
   if [[ ! -x "$FQDIGEST" || "$FQDIGEST_SRC" -nt "$FQDIGEST" ]]; then
     mkdir -p "$(dirname "$FQDIGEST")"
-    rustc -O --edition 2021 "$FQDIGEST_SRC" -o "$FQDIGEST"
+    rustc -O --edition 2024 "$FQDIGEST_SRC" -o "$FQDIGEST"
   fi
 }
 ensure_fqdigest
@@ -365,8 +365,8 @@ case "$cmd" in
   build-digest)
     command -v rustc >/dev/null || { echo "rustc not on PATH (need the rust toolchain)" >&2; exit 1; }
     mkdir -p "$(dirname "$FQDIGEST")"
-    echo "rustc -O --edition 2021 $FQDIGEST_SRC -> $FQDIGEST"
-    rustc -O --edition 2021 "$FQDIGEST_SRC" -o "$FQDIGEST"
+    echo "rustc -O --edition 2024 $FQDIGEST_SRC -> $FQDIGEST"
+    rustc -O --edition 2024 "$FQDIGEST_SRC" -o "$FQDIGEST"
     "$FQDIGEST" --help >/dev/null 2>&1 && echo "ok: $FQDIGEST"
     ;;
   summary) print_summary ;;

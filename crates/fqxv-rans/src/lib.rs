@@ -540,10 +540,10 @@ mod tests {
                 *b = 0xFF;
             }
         }
-        if let Some(t) = trunc {
-            if !data.is_empty() {
-                data.truncate(t % data.len());
-            }
+        if let Some(t) = trunc
+            && !data.is_empty()
+        {
+            data.truncate(t % data.len());
         }
         data
     }

@@ -7,8 +7,8 @@ mod report;
 use std::fs::File;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::Context;
@@ -20,7 +20,7 @@ use tabled::builder::Builder as TableBuilder;
 use tabled::settings::object::Columns;
 use tabled::settings::{Alignment, Modify, Style};
 use tracing::warn;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 /// Terminal color scheme for `--help` (shared with the rnabioco tooling look):
 /// yellow-bold headings, green-bold literals, cyan value placeholders.
@@ -787,14 +787,14 @@ fn main() -> anyhow::Result<()> {
                     sink.finish()?;
                     stats
                 };
-                if let Some(expected) = expected {
-                    if stats.reads != expected {
-                        anyhow::bail!(
-                            "archive is truncated: footer declares {expected} reads but only \
+                if let Some(expected) = expected
+                    && stats.reads != expected
+                {
+                    anyhow::bail!(
+                        "archive is truncated: footer declares {expected} reads but only \
                              {} were decoded — the output is incomplete",
-                            stats.reads
-                        );
-                    }
+                        stats.reads
+                    );
                 }
                 let secs = t0.elapsed().as_secs_f64();
                 sp.abandon();
@@ -1208,7 +1208,7 @@ fn info_json_report(fi: &FileInfo) -> InfoReport {
                 .qual_hist
                 .iter()
                 .enumerate()
-                .filter(|(_, &count)| count > 0)
+                .filter(|&(_, &count)| count > 0)
                 .map(|(phred, &count)| QualBucketJson {
                     phred: phred as u8,
                     count,
@@ -2294,7 +2294,7 @@ mod tests {
         assert!(!is_bgzf(b"@read\n")); // plain FASTQ
         assert!(!is_bgzf(&[0x1f, 0x8b])); // gzip magic but too short for a BGZF header
         assert!(!is_bgzf(&[])); // empty
-                                // FEXTRA present but the extra subfield is not `BC`.
+        // FEXTRA present but the extra subfield is not `BC`.
         let mut hdr = BGZF_HEADER;
         hdr[12] = b'X';
         assert!(!is_bgzf(&hdr));

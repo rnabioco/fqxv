@@ -294,27 +294,15 @@ fn state_after_lit(s: usize) -> usize {
 }
 #[inline]
 fn state_after_match(s: usize) -> usize {
-    if s < 7 {
-        7
-    } else {
-        10
-    }
+    if s < 7 { 7 } else { 10 }
 }
 #[inline]
 fn state_after_rep(s: usize) -> usize {
-    if s < 7 {
-        8
-    } else {
-        11
-    }
+    if s < 7 { 8 } else { 11 }
 }
 #[inline]
 fn state_after_shortrep(s: usize) -> usize {
-    if s < 7 {
-        9
-    } else {
-        11
-    }
+    if s < 7 { 9 } else { 11 }
 }
 
 /// LZMA pos-slot for a 0-based distance.
@@ -584,11 +572,7 @@ pub(crate) fn lzma_encode(s: &[u8]) -> Vec<u8> {
                 m.is_match[state].encode(&mut enc, 0);
                 let match_byte = {
                     let back = reps[0] as usize + 1;
-                    if back <= pos {
-                        s[pos - back]
-                    } else {
-                        0
-                    }
+                    if back <= pos { s[pos - back] } else { 0 }
                 };
                 let ls = lit_state(m.lc, prev_byte);
                 let matched = state >= 7;
@@ -648,11 +632,7 @@ pub(crate) fn lzma_encode(s: &[u8]) -> Vec<u8> {
             m.is_match[state].encode(&mut enc, 0);
             let match_byte = {
                 let back = reps[0] as usize + 1;
-                if back <= pos {
-                    s[pos - back]
-                } else {
-                    0
-                }
+                if back <= pos { s[pos - back] } else { 0 }
             };
             let ls = lit_state(m.lc, prev_byte);
             let matched = state >= 7;
@@ -683,11 +663,7 @@ pub(crate) fn lzma_decode(buf: &[u8], n: usize) -> Result<Vec<u8>> {
             // Literal.
             let match_byte = {
                 let back = reps[0] as usize + 1;
-                if back <= pos {
-                    out[pos - back]
-                } else {
-                    0
-                }
+                if back <= pos { out[pos - back] } else { 0 }
             };
             let ls = lit_state(m.lc, prev_byte);
             let matched = state >= 7;

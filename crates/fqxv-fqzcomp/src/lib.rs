@@ -46,7 +46,7 @@
 
 use std::borrow::Cow;
 
-use fqxv_bytes::{read_lens, write_lens, ReaderError};
+use fqxv_bytes::{ReaderError, read_lens, write_lens};
 use fqxv_range::{Decoder, Encoder, SimpleModel};
 use thiserror::Error;
 
