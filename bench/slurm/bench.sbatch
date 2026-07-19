@@ -18,12 +18,17 @@
 set -euo pipefail
 
 export PATH="$HOME/.pixi/bin:$PATH"
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BENCH="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Tolerate submission from the repo root, bench/, or bench/slurm/.
+for _c in "$BENCH" "$BENCH/.." "$BENCH/bench"; do
+  [ -d "$_c/scripts" ] && [ -d "$_c/panels" ] && { BENCH="$(cd "$_c" && pwd)"; break; }
+done
+ROOT="$(cd "$BENCH/.." && pwd)"
 
 export FQXV_THREADS="${SLURM_CPUS_PER_TASK:-$(nproc)}"
 export RAYON_NUM_THREADS="$FQXV_THREADS"
 
 echo "==> node $(hostname), $FQXV_THREADS threads, $(date)"
-pixi run --manifest-path "$HERE/pixi.toml" bash "$HERE/run_bench.sh"
+pixi run -e bench --manifest-path "$ROOT/pixi.toml" bash "$BENCH/scripts/run_bench.sh"
 echo "==> rendering table"
-pixi run --manifest-path "$HERE/pixi.toml" python "$HERE/report.py"
+pixi run -e bench --manifest-path "$ROOT/pixi.toml" python "$BENCH/scripts/report.py"

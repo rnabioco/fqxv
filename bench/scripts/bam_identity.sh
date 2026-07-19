@@ -77,8 +77,8 @@ build_tool() {  # src bin
   echo "==> building $(basename "$2") -> $2"
   rustc -O --edition 2021 "$1" -o "$2"
 }
-build_tool "$HERE/bamcmp.rs" "$BAMCMP"
-build_tool "$HERE/fqdigest.rs" "$FQDIGEST"
+build_tool "$HERE/../tools/bamcmp.rs" "$BAMCMP"
+build_tool "$HERE/../tools/fqdigest.rs" "$FQDIGEST"
 
 prepare_ref() {  # src -> echoes local .fa path
   local src="$1" base fa
@@ -125,7 +125,7 @@ order_changed() {  # orig.fastq other.fastq -> yes/no
 yn() { [[ "$1" == "$2" ]] && echo YES || echo NO; }
 
 # --- resolve dataset ----------------------------------------------------------
-row="$(grep -v '^#' "$HERE/datasets.tsv" | awk -v L="$DATASET" '$2==L{print; exit}')"
+row="$(grep -v '^#' "$HERE/../panels/datasets.tsv" | awk -v L="$DATASET" '$2==L{print; exit}')"
 [[ -n "$row" ]] || { echo "no dataset labelled '$DATASET' in datasets.tsv" >&2; exit 1; }
 acc="$(awk '{print $1}' <<<"$row")"; src="$(awk '{print $7}' <<<"$row")"
 [[ "$src" != "-" && -n "$src" ]] || { echo "dataset '$DATASET' has no reference (col 7)"; exit 1; }

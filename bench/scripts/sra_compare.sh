@@ -16,7 +16,7 @@
 # on the login node — it is tiny and IO-bound); the fqxv compress needs a compute
 # node (never the login node). The `sizes` phase caches .sra sizes so the compute
 # phase needs no network:
-#   pixi run bash sra_compare.sh sizes       # login node: cache .sra sizes
+#   pixi run -e bench bash bench/scripts/sra_compare.sh sizes       # login node: cache .sra sizes
 #   srun ... pixi run bash sra_compare.sh run # compute node: compress + join
 # The default `all` does both in one go (fine when the node can reach the network).
 #
@@ -39,7 +39,7 @@ THREADS="${FQXV_THREADS:-$(nproc)}"
 POINTS="${SRA_POINTS:-max bin8 bin4 bin2}"
 INCLUDE_LARGE="${SRA_INCLUDE_LARGE:-0}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PANEL="${SRA_PANEL:-$HERE/sra_panel.tsv}"
+PANEL="${SRA_PANEL:-$HERE/../panels/sra_panel.tsv}"
 # Same resolution as run_bench.sh: cargo honors CARGO_TARGET_DIR (set to $SCRATCH
 # on this HPC), so resolve where cargo actually wrote the binary, not ROOT/target.
 FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$HERE/.." && pwd)/target}/release/fqxv}"
@@ -80,7 +80,7 @@ panel_rows() {
 # layout/spots. The awk `$1==acc` guard extracts exactly the data row, ignoring
 # any activation/log noise on stdout.
 do_sizes() {
-  command -v sracha >/dev/null 2>&1 || { echo "sracha not found (run under: pixi run bash sra_compare.sh sizes)" >&2; exit 1; }
+  command -v sracha >/dev/null 2>&1 || { echo "sracha not found (run under: pixi run -e bench bash bench/scripts/sra_compare.sh sizes)" >&2; exit 1; }
   echo -e "accession\tplatform\tregime\tlayout\tspots\tsra_bytes" > "$SIZES"
   panel_rows | while IFS=$'\t' read -r acc plat regime cls; do
     local line

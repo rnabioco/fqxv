@@ -13,6 +13,11 @@
 #   sbatch bam_identity.sbatch                 # default dataset (ecoli_miseq)
 #   sbatch bam_identity.sbatch ecoli_miseq     # explicit label
 set -euo pipefail
-cd "${SLURM_SUBMIT_DIR:-$(dirname "$0")}"
+BENCH="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Tolerate submission from the repo root, bench/, or bench/slurm/.
+for _c in "$BENCH" "$BENCH/.." "$BENCH/bench"; do
+  [ -d "$_c/scripts" ] && [ -d "$_c/panels" ] && { BENCH="$(cd "$_c" && pwd)"; break; }
+done
+ROOT="$(cd "$BENCH/.." && pwd)"
 export FQXV_THREADS="${SLURM_CPUS_PER_TASK:-32}"
-exec pixi run bash bam_identity.sh "$@"
+exec pixi run -e bench --manifest-path "$ROOT/pixi.toml" bash "$BENCH/scripts/bam_identity.sh" "$@"

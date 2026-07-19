@@ -335,16 +335,19 @@ the field reaches 0.35 bits/base and fqxv's within-read model cannot.
 
 ## Benchmark
 
-`bench/longread.sbatch` builds the worktree fqxv and runs the harness on the
-`ecoli_ont` dataset (DRR205413: 21,140 reads, mean 14.2 kb, max 91.7 kb, mean
-Q≈11.5 — ragged, noisy older-basecaller ONT, ~65× E. coli) against CoLoRd
-(`-q org`, lossless) plus gzip/zstd/xz.
+Long-read runs are rows of the main parallel matrix rather than separate job
+files — see `bench/README.md`. Both datasets live in `bench/panels/datasets.tsv`
+and are compared against CoLoRd (`-q org`, lossless) plus gzip/zstd/xz:
 
-`bench/longread_hifi.sbatch` covers the narrow-Q / low-error regime where the DNA
-lever matters most: it subsamples SRR11434954 (E. coli E2348/69 HiFi) to ~120k
-reads / ~1.5 Gbp (~300×) as `ecoli_hifi`. `bench/longread_lossy.sbatch` runs the
-binning tables against `colord-lossy`. The `fqxv-lroverlap` bits/base figures come
-from the crate's own harness rather than these scripts:
+- **`ecoli_ont`** (DRR205413: 21,140 reads, mean 14.2 kb, max 91.7 kb, mean
+  Q≈11.5 — ragged, noisy older-basecaller ONT, ~65× E. coli).
+- **`ecoli_hifi`** — the narrow-Q / low-error regime where the DNA lever matters
+  most, subsampled from SRR11434954 (E. coli E2348/69 HiFi) to ~120k reads /
+  ~1.5 Gbp (~300×) by `bench/slurm/prep.sbatch`.
+
+The lossy binning tables are matrix points too, compared against `colord-lossy`.
+Submit the matrix with `bench/scripts/submit_parallel.sh`. The `fqxv-lroverlap`
+bits/base figures come from the crate's own harness rather than the matrix:
 
 ```bash
 cargo run --release -p fqxv-lroverlap --example encode -- reads.fastq [ont|hifi]

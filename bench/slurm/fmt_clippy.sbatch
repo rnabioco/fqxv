@@ -15,7 +15,12 @@
 # passes). Run before committing the ONT/HiFi binning work.
 set -euo pipefail
 export PATH="$HOME/.cargo/bin:$PATH"
-ROOT="${SLURM_SUBMIT_DIR:-$(pwd)}/.."
+BENCH="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Tolerate submission from the repo root, bench/, or bench/slurm/.
+for _c in "$BENCH" "$BENCH/.." "$BENCH/bench"; do
+  [ -d "$_c/scripts" ] && [ -d "$_c/panels" ] && { BENCH="$(cd "$_c" && pwd)"; break; }
+done
+ROOT="$(cd "$BENCH/.." && pwd)"
 cd "$ROOT"
 echo "==> node $(hostname), $(nproc) cores"
 echo "==> cargo fmt --all (applying)"

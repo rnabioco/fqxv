@@ -6,9 +6,8 @@ Cargo.lock.orig
 /site
 /.zensical
 
-# pixi (lockfile IS committed for reproducibility; only the env dir is ignored)
+# pixi (single root manifest; lockfile IS committed for reproducibility, env dir ignored)
 /.pixi
-/bench/.pixi
 
 # benchmark data + outputs live on scratch, never in the repo
 /bench/data

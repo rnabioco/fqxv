@@ -17,7 +17,12 @@
 set -euo pipefail
 
 export PATH="$HOME/.pixi/bin:$PATH"
-HERE="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+BENCH="${SLURM_SUBMIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Tolerate submission from the repo root, bench/, or bench/slurm/.
+for _c in "$BENCH" "$BENCH/.." "$BENCH/bench"; do
+  [ -d "$_c/scripts" ] && [ -d "$_c/panels" ] && { BENCH="$(cd "$_c" && pwd)"; break; }
+done
+ROOT="$(cd "$BENCH/.." && pwd)"
 RESULTS_DIR="${FQXV_RESULTS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/results}"
 R="$RESULTS_DIR/results.tsv"
 
@@ -26,5 +31,5 @@ cat "$RESULTS_DIR/parts"/results.*.tsv >> "$R" 2>/dev/null || true
 echo "==> merged $(( $(wc -l < "$R") - 1 )) result rows into $R"
 
 echo "==> rendering table"
-pixi run --manifest-path "$HERE/pixi.toml" python "$HERE/report.py"
+pixi run -e bench --manifest-path "$ROOT/pixi.toml" python "$BENCH/scripts/report.py"
 echo "==> done $(date)"

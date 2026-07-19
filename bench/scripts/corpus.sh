@@ -41,6 +41,9 @@
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Repo root manifest: pixi is consolidated to one manifest at the repo root, with
+# the harness deps under the `bench` environment (see pixi.toml).
+ROOT_MANIFEST="$(cd "$HERE/../.." && pwd)/pixi.toml"
 CORPUS_DIR="${FQXV_CORPUS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/corpus}"
 DATA_DIR="$CORPUS_DIR/data"
 WORK_DIR="$CORPUS_DIR/work"
@@ -71,7 +74,7 @@ mkdir -p "$CORPUS_DIR" "$DATA_DIR" "$WORK_DIR" "$LOG_DIR"
 # Uses the fqdigest Rust tool (single O(n) pass, bounded memory, no sort), built
 # on demand from bench/fqdigest.rs.
 FQDIGEST="${FQDIGEST:-${SCRATCH:-$HOME/scratch}/fqxv/tools/bin/fqdigest}"
-FQDIGEST_SRC="$HERE/fqdigest.rs"
+FQDIGEST_SRC="$HERE/../tools/fqdigest.rs"
 ensure_fqdigest() {
   if [[ ! -x "$FQDIGEST" || "$FQDIGEST_SRC" -nt "$FQDIGEST" ]]; then
     mkdir -p "$(dirname "$FQDIGEST")"
@@ -357,7 +360,7 @@ case "$cmd" in
       --qos="${SLURM_QOS:-normal}" --array="$array_spec" \
       --cpus-per-task="$THREADS" --mem="${CORPUS_MEM:-32G}" --time="${CORPUS_TIME:-02:00:00}" \
       --output="$LOG_DIR/slurm-%A_%a.out" \
-      --wrap="cd '$HERE' && FQXV_CORPUS_DIR='$CORPUS_DIR' FQXV_BIN='$FQXV_BIN' FQDIGEST='$FQDIGEST' FQXV_MODES='$MODES' FQXV_THREADS='$THREADS' pixi run bash corpus.sh run"
+      --wrap="cd '$HERE' && FQXV_CORPUS_DIR='$CORPUS_DIR' FQXV_BIN='$FQXV_BIN' FQDIGEST='$FQDIGEST' FQXV_MODES='$MODES' FQXV_THREADS='$THREADS' pixi run -e bench --manifest-path '$ROOT_MANIFEST' bash corpus.sh run"
     ;;
   build-digest)
     command -v rustc >/dev/null || { echo "rustc not on PATH (need the rust toolchain)" >&2; exit 1; }

@@ -118,7 +118,7 @@ run_one() {  # acc label ref_src
   done
 }
 
-mapfile -t rows < <(grep -v '^#' "$HERE/datasets.tsv" | awk 'NF')
+mapfile -t rows < <(grep -v '^#' "$HERE/../panels/datasets.tsv" | awk 'NF')
 for row in "${rows[@]}"; do
   acc="$(awk '{print $1}' <<<"$row")"
   label="$(awk '{print $2}' <<<"$row")"
