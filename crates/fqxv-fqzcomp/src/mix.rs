@@ -181,7 +181,7 @@ enum Backend {
 
 fn detect_backend() -> Backend {
     #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("avx2") {
+    if std::env::var_os("FQXV_FORCE_SCALAR").is_none() && std::is_x86_feature_detected!("avx2") {
         return Backend::Avx2;
     }
     Backend::Scalar
@@ -301,6 +301,103 @@ unsafe fn dot_avx2(e: &[u32], f: &[i32], k: usize) -> i64 {
     }
 }
 
+/// Fill `dst[s] = ln[row[s]] - ln_tot` — a tier's per-symbol log-probability
+/// features. `row` are `u16` frequencies (`≤ MODEL_MAX_TOT`, valid `ln` indices).
+/// Scalar reference for [`featfill_avx2`].
+fn featfill_scalar(ln: &[i32], row: &[u16], ln_tot: i32, dst: &mut [i32], k: usize) {
+    for s in 0..k {
+        dst[s] = ln[row[s] as usize] - ln_tot;
+    }
+}
+
+/// AVX2 form of [`featfill_scalar`]: eight `ln[row[s]]` gathers per iteration
+/// (`vpgatherdd`), which the compiler does not auto-vectorize.
+///
+/// # Safety
+/// Requires AVX2; `row`/`dst` length ≥ `k`, every `row[s] < ln.len()`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn featfill_avx2(ln: &[i32], row: &[u16], ln_tot: i32, dst: &mut [i32], k: usize) {
+    use core::arch::x86_64::*;
+    // SAFETY: caller guarantees AVX2, slice lengths, and `row[s] < ln.len()`, so
+    // every gather index is in bounds; loads/stores stay within `row`/`dst[..k]`.
+    unsafe {
+        let lt = _mm256_set1_epi32(ln_tot);
+        let mut s = 0usize;
+        while s + 8 <= k {
+            let idx = _mm256_cvtepu16_epi32(_mm_loadu_si128(row.as_ptr().add(s) as *const __m128i));
+            let g = _mm256_i32gather_epi32::<4>(ln.as_ptr(), idx);
+            let r = _mm256_sub_epi32(g, lt);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(s) as *mut __m256i, r);
+            s += 8;
+        }
+        while s < k {
+            *dst.get_unchecked_mut(s) = *ln.get_unchecked(*row.get_unchecked(s) as usize) - ln_tot;
+            s += 1;
+        }
+    }
+}
+
+/// Fill `e[s] = exp[(max_logit - logit[s]) >> EXP_SHIFT]` (or 0 past the table) and
+/// return `Σ e[s]`. Scalar reference for [`exp_fill_avx2`].
+fn exp_fill_scalar(exp: &[u32], logit: &[i32], max_logit: i32, e: &mut [u32], k: usize) -> u64 {
+    let mut z = 0u64;
+    for s in 0..k {
+        let d = (max_logit - logit[s]) as u32;
+        let q = (d >> EXP_SHIFT) as usize;
+        let ev = if q < EXP_SIZE { exp[q] } else { 0 };
+        e[s] = ev;
+        z += u64::from(ev);
+    }
+    z
+}
+
+/// AVX2 form of [`exp_fill_scalar`]: eight `exp[q]` gathers per iteration, clamping
+/// the index into range and zeroing out-of-range lanes (matching the scalar `else
+/// 0`). `Σ e[s]` fits `u32` (`≤ k·EXP_ONE`), summed lane-wise then combined —
+/// integer addition is associative so the total is bit-identical.
+///
+/// # Safety
+/// Requires AVX2; `logit`/`e` length ≥ `k`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn exp_fill_avx2(exp: &[u32], logit: &[i32], max_logit: i32, e: &mut [u32], k: usize) -> u64 {
+    use core::arch::x86_64::*;
+    // SAFETY: caller guarantees AVX2 and lengths; `qc` is clamped to `EXP_SIZE-1`
+    // so every gather index is in bounds; loads/stores stay within `logit`/`e[..k]`.
+    unsafe {
+        let maxv = _mm256_set1_epi32(max_logit);
+        let size = _mm256_set1_epi32(EXP_SIZE as i32);
+        let cap = _mm256_set1_epi32((EXP_SIZE - 1) as i32);
+        let mut zsum = _mm256_setzero_si256();
+        let mut s = 0usize;
+        while s + 8 <= k {
+            let lg = _mm256_loadu_si256(logit.as_ptr().add(s) as *const __m256i);
+            let d = _mm256_sub_epi32(maxv, lg); // >= 0
+            let q = _mm256_srli_epi32::<{ EXP_SHIFT as i32 }>(d); // q >= 0, < 2^23
+            let inb = _mm256_cmpgt_epi32(size, q); // all-ones where q < EXP_SIZE
+            let qc = _mm256_min_epi32(q, cap);
+            let g = _mm256_i32gather_epi32::<4>(exp.as_ptr() as *const i32, qc);
+            let masked = _mm256_and_si256(g, inb);
+            _mm256_storeu_si256(e.as_mut_ptr().add(s) as *mut __m256i, masked);
+            zsum = _mm256_add_epi32(zsum, masked);
+            s += 8;
+        }
+        let mut lanes = [0u32; 8];
+        _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, zsum);
+        let mut z: u64 = lanes.iter().map(|&x| u64::from(x)).sum();
+        while s < k {
+            let d = (max_logit - *logit.get_unchecked(s)) as u32;
+            let q = (d >> EXP_SHIFT) as usize;
+            let ev = if q < EXP_SIZE { *exp.get_unchecked(q) } else { 0 };
+            *e.get_unchecked_mut(s) = ev;
+            z += u64::from(ev);
+            s += 1;
+        }
+        z
+    }
+}
+
 impl Mixer {
     fn new(k: usize) -> Self {
         let tiers = vec![
@@ -331,15 +428,20 @@ impl Mixer {
         // Per-tier log-prob features (tier-major) and the gate from the richest
         // tier's training. The k features of a tier are contiguous — a SIMD-shaped
         // layout, and the `tier.freq[base..base+k]` slice is one sequential scan.
+        let backend = self.backend;
+        let ln = &self.tables.ln;
         let mut gate = 0usize;
         for (t, tier) in self.tiers.iter().enumerate() {
             let base = tier.slot(keys[t]);
             let ci = tier.ctx(keys[t]);
-            let ln_tot = self.tables.ln[tier.tot[ci] as usize];
+            let ln_tot = ln[tier.tot[ci] as usize];
             let dst = &mut self.feat[t * k..t * k + k];
             let row = &tier.freq[base..base + k];
-            for (d, &f) in dst.iter_mut().zip(row) {
-                *d = self.tables.ln[f as usize] - ln_tot;
+            match backend {
+                #[cfg(target_arch = "x86_64")]
+                // SAFETY: AVX2 present; `row[s] ≤ MODEL_MAX_TOT < ln.len()`.
+                Backend::Avx2 => unsafe { featfill_avx2(ln, row, ln_tot, dst, k) },
+                Backend::Scalar => featfill_scalar(ln, row, ln_tot, dst, k),
             }
             if t == NMODELS - 1 {
                 // log2(tot) bucketed: tot in [k..MODEL_MAX_TOT] -> 0..GATES-1.
@@ -357,14 +459,16 @@ impl Mixer {
             Backend::Scalar => logit_scalar(&self.feat, w, k, &mut self.logit),
         };
         // softmax weights via the exp table
-        let mut z = 0u64;
-        for s in 0..k {
-            let d = (max_logit - self.logit[s]) as u32; // >= 0, Q16
-            let q = (d >> EXP_SHIFT) as usize;
-            let e = if q < EXP_SIZE { self.tables.exp[q] } else { 0 };
-            self.e[s] = e;
-            z += u64::from(e);
-        }
+        let z = match backend {
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: AVX2 present; `logit`/`e` are length `k`.
+            Backend::Avx2 => unsafe {
+                exp_fill_avx2(&self.tables.exp, &self.logit, max_logit, &mut self.e, k)
+            },
+            Backend::Scalar => {
+                exp_fill_scalar(&self.tables.exp, &self.logit, max_logit, &mut self.e, k)
+            }
+        };
         // Normalize to TOTAL by reciprocal-multiply — no per-symbol divide (~93
         // integer divides/symbol were the dominant cost), and the exact integer
         // form a SIMD backend reproduces bit-for-bit. Floor keeps Σ ≤ TOTAL, so
@@ -638,6 +742,28 @@ mod tests {
                     unsafe { dot_avx2(&ev, fv, k) },
                     "dot differs (k={k})"
                 );
+
+                // featfill: row ∈ [0, MODEL_MAX_TOT], real ln table.
+                let tabs = Tables::build();
+                let row: Vec<u16> =
+                    (0..k).map(|_| (rng() % (MODEL_MAX_TOT + 1)) as u16).collect();
+                let ln_tot = tabs.ln[(rng() % (MODEL_MAX_TOT + 1)) as usize];
+                let mut ds = vec![0i32; k];
+                let mut da = vec![0i32; k];
+                featfill_scalar(&tabs.ln, &row, ln_tot, &mut ds, k);
+                // SAFETY: guarded by the avx2 feature check above.
+                unsafe { featfill_avx2(&tabs.ln, &row, ln_tot, &mut da, k) };
+                assert_eq!(ds, da, "featfill differs (k={k})");
+
+                // exp_fill: reuse `ls` logits; `max` may push q past EXP_SIZE.
+                let mx = ls.iter().copied().max().unwrap();
+                let mut es = vec![0u32; k];
+                let mut ea = vec![0u32; k];
+                let zs = exp_fill_scalar(&tabs.exp, &ls, mx, &mut es, k);
+                // SAFETY: guarded by the avx2 feature check above.
+                let za = unsafe { exp_fill_avx2(&tabs.exp, &ls, mx, &mut ea, k) };
+                assert_eq!(es, ea, "exp e differs (k={k})");
+                assert_eq!(zs, za, "exp z differs (k={k})");
             }
         }
     }
