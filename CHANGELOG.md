@@ -119,6 +119,11 @@ freely and archives are not guaranteed to be readable across releases until a
 - Assorted CLI fixes: `--order any` no longer aborts on a truncated FASTQ that
   `preserve` rejects, `--estimate` handles empty input, `--interleaved 0` is
   rejected, and `--verify` honors `--threads`.
+- **Python binding tests** now build their own tiny `.fqxv` fixture with the CLI
+  instead of latching onto whatever archive sits at the repo root (the suite ran
+  for minutes against a large sample and could fail on a half-written one); they
+  now finish in well under a second. The `Info` repr also shows the container
+  version as `format=major.minor` instead of the raw packed integer.
 
 ### Security
 
