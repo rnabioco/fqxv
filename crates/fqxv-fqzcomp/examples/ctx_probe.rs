@@ -82,7 +82,10 @@ impl Design {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).expect("usage: ctx_probe <fastq> [Nreads]");
-    let nmax: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let nmax: usize = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(usize::MAX);
 
     // Candidates. `shipped` is the current long-read context; the rest add features
     // ranked by an earlier sweep (q3 = third-previous quality, next2 = next-next
@@ -143,11 +146,19 @@ fn main() {
     }
 
     let k = qseen.iter().filter(|&&x| x).count();
-    let mean_len = if nreads > 0 { totbases / nreads as u64 } else { 0 };
+    let mean_len = if nreads > 0 {
+        totbases / nreads as u64
+    } else {
+        0
+    };
     println!("reads={nreads}  distinct_qual_k={k}  mean_read_len={mean_len}");
     let base_h = designs[0].entropy().0;
     for d in &designs {
         let (h, nc) = d.entropy();
-        println!("H = {h:.4} bits/qual  d-vs-shipped {:+.4}  [ctxs={nc:>9}]  {}", h - base_h, d.name);
+        println!(
+            "H = {h:.4} bits/qual  d-vs-shipped {:+.4}  [ctxs={nc:>9}]  {}",
+            h - base_h,
+            d.name
+        );
     }
 }

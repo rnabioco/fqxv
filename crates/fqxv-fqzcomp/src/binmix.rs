@@ -1,8 +1,8 @@
 //! Binary-decomposition logistic-mixing quality coder for long reads.
 //!
-//! An alternative to the k-way softmax mixer ([`crate::mix`]) that codes each
-//! quality symbol as `d = ceil(log2(k))` binary decisions down a bit-tree instead
-//! of one 93-way distribution. Each bit is predicted by several context tiers whose
+//! Codes each long-read quality symbol as `d = ceil(log2(k))` binary decisions down
+//! a bit-tree instead of one k-way distribution over the alphabet. Each bit is
+//! predicted by several context tiers of increasing richness whose
 //! bit-probabilities are mixed in the logit domain (stretch/squash) with weights
 //! adapted per bit-position — the lpaq/zpaq design. This is ~an order of magnitude
 //! less work per symbol than the softmax path while keeping the same sub-CoLoRd
@@ -18,13 +18,13 @@ use crate::{Error, Result};
 /// Probability precision: 12-bit, `PONE` = 1.0. Also the range-coder total (< 2^16).
 const PBITS: u32 = 12;
 const PONE: u32 = 1 << PBITS; // 4096
-/// Number of context tiers mixed (coarse/mid/rich), matching [`crate::mix`].
+/// Number of context tiers mixed (coarse/mid/rich).
 const NMODELS: usize = 3;
-/// Rich context hashed into this many slots (see [`crate::mix`]).
+/// Rich context hashed into this many slots to bound the table.
 const RICH_BITS: u32 = 20;
 /// Mixer weight scale (Q16) and learning-rate shift. Weight update:
-/// `w += (err·stretch) >> LR_SHIFT`. 11 is the joint HiFi/ONT optimum from a real-
-/// byte sweep (overridable via `FQXV_LR` for re-tuning).
+/// `w += (err·stretch) >> LR_SHIFT`. 11 is the joint HiFi/ONT optimum from a
+/// real-byte sweep.
 const W_ONE: i32 = 1 << 16;
 const LR_SHIFT: u32 = 11;
 /// Per-tier bit-probability adaptation rate: `p += ((bit<<12) - p) >> PRATE_SHIFT`
@@ -111,18 +111,15 @@ struct BinMixer {
     logistic: Logistic,
     weights: Vec<[i32; NMODELS]>, // per bit-position gate
     d: u32,
-    lr_shift: u32,
-    prate_shift: u32,
-}
-
-/// Read a `u32` tuning knob from the environment (for A/B sweeps), else the default.
-fn env_shift(name: &str, default: u32) -> u32 {
-    std::env::var(name).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
 }
 
 impl BinMixer {
     fn new(k: usize) -> Self {
-        let d = if k <= 1 { 1 } else { u32::BITS - (k as u32 - 1).leading_zeros() };
+        let d = if k <= 1 {
+            1
+        } else {
+            u32::BITS - (k as u32 - 1).leading_zeros()
+        };
         let nnodes = 1usize << d;
         let tiers = [
             Tier::new(16, nnodes, false),
@@ -134,8 +131,6 @@ impl BinMixer {
             logistic: Logistic::build(),
             weights: vec![[W_ONE / NMODELS as i32; NMODELS]; d as usize],
             d,
-            lr_shift: env_shift("FQXV_LR", LR_SHIFT),
-            prate_shift: env_shift("FQXV_PRATE", PRATE_SHIFT),
         }
     }
 
@@ -150,7 +145,12 @@ impl BinMixer {
     }
 
     #[inline]
-    fn predict(&self, bases: &[usize; NMODELS], node: usize, bpos: u32) -> (u16, [i32; NMODELS], usize) {
+    fn predict(
+        &self,
+        bases: &[usize; NMODELS],
+        node: usize,
+        bpos: u32,
+    ) -> (u16, [i32; NMODELS], usize) {
         let gate = bpos as usize;
         let mut st = [0i32; NMODELS];
         let mut x = 0i64;
@@ -170,21 +170,28 @@ impl BinMixer {
 
     /// Adapt the mixer weights and each tier's node probability after coding `bit`.
     #[inline]
-    fn update(&mut self, bases: &[usize; NMODELS], node: usize, bit: u32, p: u16, st: &[i32; NMODELS], gate: usize) {
+    fn update(
+        &mut self,
+        bases: &[usize; NMODELS],
+        node: usize,
+        bit: u32,
+        p: u16,
+        st: &[i32; NMODELS],
+        gate: usize,
+    ) {
         let err = (bit << PBITS) as i32 - i32::from(p); // [-4095, 4095]
-        let (lr_shift, prate_shift) = (self.lr_shift, self.prate_shift);
         let target = (bit << PBITS) as i32;
         // SAFETY: same index invariants as `predict` (gate < weights.len(),
         // bases[t] + node < probs.len()).
         let w = unsafe { self.weights.get_unchecked_mut(gate) };
         for t in 0..NMODELS {
-            w[t] += (err * st[t]) >> lr_shift;
+            w[t] += (err * st[t]) >> LR_SHIFT;
         }
         for t in 0..NMODELS {
             let idx = bases[t] + node;
             let slot = unsafe { self.tiers[t].probs.get_unchecked_mut(idx) };
             let cur = i32::from(*slot);
-            *slot = (cur + ((target - cur) >> prate_shift)) as u16;
+            *slot = (cur + ((target - cur) >> PRATE_SHIFT)) as u16;
         }
     }
 
@@ -242,14 +249,29 @@ fn bcode(b: u8) -> usize {
     }
 }
 
-/// Context keys (coarse 16b, mid 18b, rich 22b) — identical features to
-/// [`crate::mix`], so the two coders condition on the same signal.
+/// Context keys (coarse 16b, mid 18b, rich 22b) from the base window and recent
+/// qualities — base identity and homopolymer runs, where long-read quality lives.
 #[inline]
-fn keys(q1: u8, q2: u8, q3: u8, base: usize, next: usize, next2: usize, prevbase: usize, hp: usize) -> [u32; 3] {
+#[allow(clippy::too_many_arguments)] // a context-key builder over one feature per arg
+fn keys(
+    q1: u8,
+    q2: u8,
+    q3: u8,
+    base: usize,
+    next: usize,
+    next2: usize,
+    prevbase: usize,
+    hp: usize,
+) -> [u32; 3] {
     let f1 = (q1 as u32 >> 1) & 0x3F;
     let q2c = (q2 as u32 >> 3) & 0x7;
     let q3c = (q3 as u32 >> 4) & 0x3;
-    let (b, nx, n2, pb) = (base as u32 & 3, next as u32 & 3, next2 as u32 & 3, prevbase as u32 & 3);
+    let (b, nx, n2, pb) = (
+        base as u32 & 3,
+        next as u32 & 3,
+        next2 as u32 & 3,
+        prevbase as u32 & 3,
+    );
     let h = hp.min(7) as u32;
     let coarse = f1 | (q2c << 6) | (b << 9) | (nx << 11) | (h << 13);
     let mid = coarse | (pb << 16);
@@ -258,7 +280,14 @@ fn keys(q1: u8, q2: u8, q3: u8, base: usize, next: usize, next2: usize, prevbase
 }
 
 /// Encode per-read qualities with the binary-mixing coder.
-pub(crate) fn encode(lens: &[u32], binned: &[u8], seq: &[u8], dense: &[u8; 256], qmin: u8, k: usize) -> Vec<u8> {
+pub(crate) fn encode(
+    lens: &[u32],
+    binned: &[u8],
+    seq: &[u8],
+    dense: &[u8; 256],
+    qmin: u8,
+    k: usize,
+) -> Vec<u8> {
     let mut mx = BinMixer::new(k);
     let mut enc = Encoder::new();
     let mut rest = binned;
@@ -277,7 +306,16 @@ pub(crate) fn encode(lens: &[u32], binned: &[u8], seq: &[u8], dense: &[u8; 256],
             let next = sread.get(pos + 1).copied().unwrap_or(u8::MAX);
             let next2 = sread.get(pos + 2).copied().unwrap_or(u8::MAX);
             run = if base == prev_base { run + 1 } else { 1 };
-            let kk = keys(q1, q2, q3, bcode(base), bcode(next), bcode(next2), bcode(prev_base), run);
+            let kk = keys(
+                q1,
+                q2,
+                q3,
+                bcode(base),
+                bcode(next),
+                bcode(next2),
+                bcode(prev_base),
+                run,
+            );
             prev_base = base;
             mx.encode_sym(&mut enc, &kk, dv);
             let cv = b - qmin;
@@ -316,7 +354,16 @@ pub(crate) fn decode(
             let next = sread.get(pos + 1).copied().unwrap_or(u8::MAX);
             let next2 = sread.get(pos + 2).copied().unwrap_or(u8::MAX);
             run = if base == prev_base { run + 1 } else { 1 };
-            let kk = keys(q1, q2, q3, bcode(base), bcode(next), bcode(next2), bcode(prev_base), run);
+            let kk = keys(
+                q1,
+                q2,
+                q3,
+                bcode(base),
+                bcode(next),
+                bcode(next2),
+                bcode(prev_base),
+                run,
+            );
             prev_base = base;
             let dv = mx.decode_sym(&mut dec, &kk);
             let b = *syms

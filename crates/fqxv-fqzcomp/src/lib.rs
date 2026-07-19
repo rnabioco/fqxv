@@ -51,7 +51,6 @@ use fqxv_range::{Decoder, Encoder, SimpleModel};
 use thiserror::Error;
 
 mod binmix;
-mod mix;
 
 /// Optional lossy quantization applied to quality scores before modeling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -197,39 +196,36 @@ const N_CTX: usize = 1 << 18;
 /// Saturating cap on the running delta counter (2 bits).
 const DELTA_MAX: u8 = 3;
 /// Stream format version. Bumped to 2 when the header gained its context-mode byte
-/// (see [`MODE_POS`]/[`MODE_SEQ`]); a v1 stream has no such byte, so rejecting it
+/// (see `MODE_POS`/`MODE_SEQ`); a v1 stream has no such byte, so rejecting it
 /// here is cleaner than silently misreading the old layout.
 const FORMAT_VERSION: u8 = 2;
 
 /// Context-model selector, stored as a byte in the stream header (after the
 /// binning tag). The decoder reads it to know which context to reconstruct — and,
-/// for [`MODE_SEQ`], that it must be handed the block's decoded sequence.
+/// for `MODE_SEQ`, that it must be handed the block's decoded sequence.
 ///
-/// - [`MODE_POS`]: the original sequence-blind context (q1, q2, q3, delta, pos).
+/// - `MODE_POS`: the original sequence-blind context (q1, q2, q3, delta, pos).
 ///   Tuned for short reads, whose quality tracks position; needs no sequence, so
 ///   the container decodes it in parallel with the sequence stream.
-/// - [`MODE_SEQ`]: a long-read context (q1, q2, current base, next base,
+/// - `MODE_SEQ`: a long-read context (q1, q2, current base, next base,
 ///   homopolymer run-length) that drops the position/delta features — useless on
 ///   long reads — for the base identity that HiFi/ONT quality actually follows.
 ///   Requires the decoded sequence, so the container serializes seq → qual.
 const MODE_POS: u8 = 0;
+/// Single-context long-read quality model (base + next base + homopolymer run).
+/// An early long-read design, superseded by `MODE_SEQ_BINMIX` and no longer
+/// emitted; still decodable. (Mode 2 was a k-way softmax mixer, since retired.)
 const MODE_SEQ: u8 = 1;
-/// Long-read logistic context-**mixing** quality model ([`mix`]): mixes several
-/// context tiers with adaptive weights instead of a single packed context. Beats
-/// the single-context [`MODE_SEQ`] on real bytes (a per-block adaptive model can't
-/// exploit a richer single context, but *can* mix a coarse and a rich one). Like
-/// [`MODE_SEQ`] it conditions on the sequence, so decode needs the decoded bases.
-/// Selected by [`encode_seq`] for long reads; [`MODE_SEQ`] is retained so older
-/// archives still decode.
-const MODE_SEQ_MIX: u8 = 2;
 /// Long-read **binary-decomposition** logistic-mixing quality model ([`binmix`]):
 /// codes each quality as `ceil(log2 k)` bit-tree decisions with binary logistic
-/// mixing instead of one k-way softmax — better ratio than [`MODE_SEQ_MIX`] on HiFi
-/// and ~2x faster on both HiFi and ONT, at a fraction of the per-symbol work. The
-/// **default** long-read quality mode; needs the decoded bases like the others.
+/// mixing across coarse/mid/rich context tiers. Beats a single packed context on
+/// ratio — a per-block adaptive model can't exploit a richer *single* context but
+/// *can* mix a well-trained coarse model with a sparse rich one — and runs faster
+/// than the single-context coder. The **default** long-read quality mode; needs the
+/// decoded bases like `MODE_SEQ`.
 const MODE_SEQ_BINMIX: u8 = 3;
 
-/// Mean read length (bases) above which [`encode_seq`] selects [`MODE_SEQ`]. Long
+/// Mean read length (bases) above which [`encode_seq`] selects `MODE_SEQ`. Long
 /// reads (HiFi ~15 kb, ONT ~10 kb) clear this comfortably; Illumina (≤250 bp)
 /// never does, so short-read archives keep the position context and the parallel
 /// decode. A middle ground here would only ever misclassify synthetic data.
@@ -283,7 +279,7 @@ fn base_code(b: u8) -> usize {
     }
 }
 
-/// Long-read ([`MODE_SEQ`]) context: condition each quality byte on the two
+/// Long-read (`MODE_SEQ`) context: condition each quality byte on the two
 /// previous qualities, the current and next base, and the homopolymer run-length
 /// ending at this position. This is where HiFi/ONT quality lives — base identity
 /// and homopolymer runs, not read position — so we spend the 18 bits there and
@@ -462,7 +458,7 @@ fn dispatch_decode(
 ///
 /// `lens` gives each read's quality length; `quals` is their concatenation.
 /// `binning` optionally quantizes qualities before modeling (lossy). Always
-/// selects the position context ([`MODE_POS`]); see [`encode_seq`] to let long
+/// selects the position context (`MODE_POS`); see [`encode_seq`] to let long
 /// reads condition quality on their bases.
 pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec<u8>> {
     encode_seq(lens, quals, &[], binning)
@@ -473,10 +469,10 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
 ///
 /// `seq` is the reads' concatenated bases in the same order and per-read lengths
 /// as `quals`. When it is present, non-empty, and the mean read length exceeds
-/// [`SEQ_MODE_MIN_MEAN_LEN`], the stream is coded in [`MODE_SEQ`] (base + next
+/// [`SEQ_MODE_MIN_MEAN_LEN`], the stream is coded in `MODE_SEQ` (base + next
 /// base + homopolymer run-length context); otherwise it falls back to the
-/// sequence-blind [`MODE_POS`] and `seq` is ignored. Pass `&[]` for `seq` to
-/// force [`MODE_POS`] — that is exactly what [`encode`] does. A `MODE_SEQ` stream
+/// sequence-blind `MODE_POS` and `seq` is ignored. Pass `&[]` for `seq` to
+/// force `MODE_POS` — that is exactly what [`encode`] does. A `MODE_SEQ` stream
 /// requires the decoded sequence at [`decode_seq`] time.
 pub fn encode_seq(
     lens: &[u32],
@@ -517,21 +513,21 @@ pub fn encode_seq(
     // original Phred scale (`cv = b - qmin`); only the coded symbol is the dense
     // index (`dv`).
     //
-    // Long reads take the logistic mixing model ([`mix`], `MODE_SEQ_MIX`), which
-    // beats the single packed context on real bytes; short reads keep the
-    // position context (`MODE_POS`). The retired single-context `MODE_SEQ` stays
-    // decodable but is no longer emitted.
+    // Long reads take the binary-decomposition mixing coder (`binmix`,
+    // `MODE_SEQ_BINMIX`); short reads keep the position context (`MODE_POS`). The
+    // retired single-context `MODE_SEQ` stays decodable but is no longer emitted.
     let (payload, mode) = if seq_mode {
-        // Binary-decomposition mixing ([`binmix`]) is the default long-read quality
-        // coder: better ratio than the k-way softmax mix on HiFi and ~2x faster on
-        // both HiFi and ONT. `FQXV_KWAY` forces the k-way mixer for comparison.
-        if std::env::var_os("FQXV_KWAY").is_some() {
-            (mix::encode(lens, &binned, seq, &dense, qmin, k), MODE_SEQ_MIX)
-        } else {
-            (binmix::encode(lens, &binned, seq, &dense, qmin, k), MODE_SEQ_BINMIX)
-        }
+        // Long reads take the binary-decomposition mixing coder ([`binmix`]): it
+        // beats the single-context model on ratio and runs faster than it.
+        (
+            binmix::encode(lens, &binned, seq, &dense, qmin, k),
+            MODE_SEQ_BINMIX,
+        )
     } else {
-        (dispatch_encode(lens, &binned, None, &dense, qmin, k), MODE_POS)
+        (
+            dispatch_encode(lens, &binned, None, &dense, qmin, k),
+            MODE_POS,
+        )
     };
 
     let mut out = Vec::with_capacity(16 + k + lens.len() + payload.len());
@@ -545,7 +541,7 @@ pub fn encode_seq(
     Ok(out)
 }
 
-/// Whether a stream was coded in [`MODE_SEQ`] and so needs the block's decoded
+/// Whether a stream was coded in `MODE_SEQ` and so needs the block's decoded
 /// sequence at [`decode_seq`] time. Lets the container peek the header cheaply and
 /// decide whether to serialize seq → qual or keep decoding them in parallel,
 /// without paying that serialization on the short-read common case. A truncated or
@@ -553,14 +549,11 @@ pub fn encode_seq(
 pub fn needs_sequence(src: &[u8]) -> bool {
     // Header layout: version(0), binning tag(1), mode(2), ...
     src.first() == Some(&FORMAT_VERSION)
-        && matches!(
-            src.get(2),
-            Some(&MODE_SEQ) | Some(&MODE_SEQ_MIX) | Some(&MODE_SEQ_BINMIX)
-        )
+        && matches!(src.get(2), Some(&MODE_SEQ) | Some(&MODE_SEQ_BINMIX))
 }
 
 /// Decode a sequence-blind stream produced by [`encode`], returning
-/// `(lengths, qualities)`. A [`MODE_SEQ`] stream (from [`encode_seq`] on long
+/// `(lengths, qualities)`. A `MODE_SEQ` stream (from [`encode_seq`] on long
 /// reads) is rejected here — use [`decode_seq`] with its decoded sequence.
 pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     decode_seq(src, &[])
@@ -569,9 +562,9 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
 /// Decode a stream produced by [`encode_seq`], returning `(lengths, qualities)`.
 /// In lossy modes the qualities are the binned values, not the originals.
 ///
-/// For a [`MODE_SEQ`] stream, `seq` must be the block's decoded sequence (same
+/// For a `MODE_SEQ` stream, `seq` must be the block's decoded sequence (same
 /// order and per-read lengths as the qualities) — see [`needs_sequence`]. For a
-/// [`MODE_POS`] stream `seq` is ignored and may be `&[]`.
+/// `MODE_POS` stream `seq` is ignored and may be `&[]`.
 pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     let mut r = ByteReader::new(src);
     if r.u8()? != FORMAT_VERSION {
@@ -582,7 +575,7 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     // Both sequence modes need the decoded bases; `MODE_POS` does not.
     let seq_mode = match mode {
         MODE_POS => false,
-        MODE_SEQ | MODE_SEQ_MIX | MODE_SEQ_BINMIX => true,
+        MODE_SEQ | MODE_SEQ_BINMIX => true,
         _ => return Err(Error::Malformed("unknown quality context mode")),
     };
     let k = r.u8()? as usize;
@@ -630,7 +623,6 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
         .try_reserve(total)
         .map_err(|_| Error::Malformed("declared total length too large to allocate"))?;
     match mode {
-        MODE_SEQ_MIX => mix::decode(&lens, payload, seq, &syms, qmin, k, &mut quals)?,
         MODE_SEQ_BINMIX => binmix::decode(&lens, payload, seq, &syms, qmin, k, &mut quals)?,
         _ => {
             let mut dec = Decoder::new(payload);
