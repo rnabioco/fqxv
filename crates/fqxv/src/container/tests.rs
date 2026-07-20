@@ -850,7 +850,16 @@ fn container_decodes_overlap_tagged_sequence_stream() {
 /// context model but is voted out by the consensus, which is what makes the shared
 /// reference win the size race (a clean synthetic genome is too easy for order-k).
 /// One `N` per read exercises the non-ACGT exception path. Returns FASTQ.
-fn deep_longread_fastq(n: usize, read_len: usize, step: usize, genome_len: usize) -> Vec<u8> {
+/// `err_period` sets the per-base substitution rate (`1/err_period`): 300 is
+/// HiFi-like (~0.3%), a small value is ONT-like and noisy enough that reads stop
+/// collapsing onto a shared consensus.
+fn deep_longread_fastq(
+    n: usize,
+    read_len: usize,
+    step: usize,
+    genome_len: usize,
+    err_period: u64,
+) -> Vec<u8> {
     // splitmix64, used for both the genome and the per-read error, so the genome is
     // near-uniform ACGT (order-0 ≈ 2 bits/base) — a biased genome would let even a
     // low-order model compress it below what the reference-coded stream achieves.
@@ -873,8 +882,8 @@ fn deep_longread_fastq(n: usize, read_len: usize, step: usize, genome_len: usize
         let mut s = genome[start..start + read_len].to_vec();
         let mut state = 0x1234_5678u64.wrapping_add(i as u64);
         for b in s.iter_mut() {
-            if rng(&mut state) % 300 == 0 {
-                *b = b"ACGT"[(rng(&mut state) % 4) as usize]; // ~0.3% substitution error (HiFi-like)
+            if rng(&mut state) % err_period == 0 {
+                *b = b"ACGT"[(rng(&mut state) % 4) as usize];
             }
         }
         s[read_len / 2] = b'N'; // exercise the non-ACGT exception path
@@ -885,6 +894,89 @@ fn deep_longread_fastq(n: usize, read_len: usize, step: usize, genome_len: usize
 }
 
 #[test]
+fn shared_reference_gate_measures_against_the_plain_layout() {
+    // Issue #184, pinned with the ONT numbers that actually regressed. The gate must
+    // compare the shared-reference layout against the plain layout it falls back to
+    // — per block, the smaller of the overlap codec and order-k — not against
+    // order-k alone.
+    //
+    // These constants are the measured `ecoli_ont` (DRR205413) totals: a 4.37 MB
+    // frame buys a sequence stream only 1.58 MB smaller than the plain layout's, so
+    // adopting it inflates the archive by ~2.8 MB. Crucially it still beats order-k
+    // (~1.8 b/base on ONT), which is exactly why the old bar let it through.
+    let (frame, shared, plain, order_k) = (4_369_101, 48_292_740, 49_868_432, 67_768_843);
+
+    assert!(
+        frame + shared > plain,
+        "fixture must describe a net loss against the plain layout"
+    );
+    assert!(
+        frame + shared < order_k,
+        "fixture must still clear the old order-k bar, or it would not be a regression"
+    );
+    assert!(
+        !adopt_shared_reference(frame, shared, plain),
+        "a reference that loses to the per-block overlap layout must be rejected"
+    );
+
+    // HiFi inverts the tradeoff: a compact consensus (1.36 MB frame) buys a 7.20 MB
+    // smaller sequence stream, so there the reference must still be adopted.
+    let (hifi_frame, hifi_plain, hifi_saving) = (1_356_344, 100_000_000, 7_201_416);
+    assert!(
+        adopt_shared_reference(hifi_frame, hifi_plain - hifi_saving, hifi_plain),
+        "a reference that pays for itself must still be adopted"
+    );
+
+    // A tie is a loss: an equal-size archive plus a frame is pure overhead.
+    let tie = 1_000;
+    assert!(!adopt_shared_reference(0, tie, tie));
+}
+
+#[test]
+fn longread_routing_roundtrips_and_never_loses_to_the_plain_layout() {
+    // Broad guard on the long-read routing: whichever layout the whole-file gate
+    // picks must decode byte-exact and must not produce a larger archive than the
+    // plain layout.
+    //
+    // This does NOT pin issue #184 — verified by mutation: forcing the gate to
+    // always adopt still passes here. Reproducing that regression needs the
+    // whole-file assembly to collapse *worse* than the per-block assemblies, which
+    // only happens at real coverage and read counts; on a fixture this small the
+    // frame is cheap and always pays off. The gate arithmetic is pinned by
+    // `shared_reference_gate_measures_against_the_plain_layout` instead, and the
+    // end-to-end behaviour by the benchmark suite.
+    for (label, err_period) in [("hifi-like", 300u64), ("ont-like", 12u64)] {
+        let input = deep_longread_fastq(120, 2000, 20, 4000, err_period);
+        // Order-0, small blocks: same fixture regime as the round-trip test above,
+        // where the order-k model is weak enough not to memorize the tiny genome.
+        let params = Params {
+            threads: 4,
+            seq_order: 0,
+            block_reads: 60,
+            ..Params::default()
+        };
+
+        let mut routed = Vec::new();
+        compress_auto(&input[..], &mut routed, params).expect("compress");
+        let mut plain = Vec::new();
+        compress_buffered_plain(&input, &mut plain, params, 1).expect("plain layout");
+
+        assert!(
+            routed.len() <= plain.len(),
+            "{label}: the shared-reference path must never produce a larger archive \
+             than the plain layout it falls back to ({} vs {} bytes)",
+            routed.len(),
+            plain.len(),
+        );
+
+        // Whichever layout the gate chose must still decode byte-exact.
+        let mut out = Vec::new();
+        decompress(&routed[..], &mut out, 4).expect("decompress");
+        assert_eq!(out, input, "{label}: archive must round-trip byte-exact");
+    }
+}
+
+#[test]
 fn shared_reference_longread_roundtrips_across_blocks() {
     // The whole-file shared-reference layout (issue #168): deep-tiling long reads
     // split across several blocks are coded against ONE reference stored between the
@@ -892,7 +984,7 @@ fn shared_reference_longread_roundtrips_across_blocks() {
     // written and read back, footer offsets that start past it, and every block's
     // sequence decoded against the shared frame — with a byte-exact round trip,
     // thread-count determinism, and a full verify.
-    let input = deep_longread_fastq(120, 2000, 20, 4000);
+    let input = deep_longread_fastq(120, 2000, 20, 4000, 300);
 
     // Order-0 keeps the order-k baseline weak enough (~2 bits/base) that the
     // reference-coded stream wins the size race on this compact synthetic fixture;

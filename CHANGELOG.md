@@ -13,6 +13,20 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The long-read shared-reference gate now measures against the layout it falls
+  back to.** Adoption of the whole-file reference was gated on beating the plain
+  *order-k* total, but the fallback path keeps the smaller of the per-block
+  overlap codec and order-k — a stronger result than the bar being tested. A
+  reference that lost to the per-block overlap codec could therefore still be
+  adopted. Both layouts are now coded in the first pass and the smaller wins, so
+  the never-worse property holds against the real alternative; the fallback
+  reuses those streams instead of re-coding them. No archive changes on the
+  benchmark corpus (ONT and HiFi output are byte-identical, and coding both ways
+  costs no measurable wall time — the extra encode fills otherwise-idle cores),
+  so this closes a latent hole rather than changing current results (#184).
+
 ### Changed
 
 - **`--version` reports git provenance on development builds.** A binary built
