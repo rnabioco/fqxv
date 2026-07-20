@@ -20,10 +20,16 @@ DATA_DIR="${FQXV_DATA_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/data}"
 # Tool sets are platform-aware, so short- and long-read datasets share one matrix
 # (this replaces the old standalone longread*.sbatch serial loops). Short-read
 # (Illumina) gets the full field matrix; ONT/PacBio get the long-read set with
-# CoLoRd and platform-appropriate quality bins.
-TOOLS="${FQXV_TOOLS:-fqxv fqxv9 fqxv-reorder fqxv-bin4 gzip zstd19 xz9 fqz_comp fqzcomp5 spring}"
-LR_TOOLS_ONT="${FQXV_LR_TOOLS_ONT:-fqxv fqxv9 fqxv-max fqxv-bin4 fqxv-bin2 fqxv-binont gzip zstd19 xz9 fqz_comp colord colord-lossy}"
-LR_TOOLS_HIFI="${FQXV_LR_TOOLS_HIFI:-fqxv fqxv9 fqxv-max fqxv-binhifi fqxv-binont gzip zstd19 xz9 colord colord-lossy}"
+# CoLoRd and platform-appropriate quality bins. The sets themselves live in
+# toolsets.sh, shared with run_bench.sh so the two drivers cannot drift apart.
+# shellcheck source=./toolsets.sh
+. "$HERE/toolsets.sh"
+# FQXV_TOOLS overrides every platform's set with one explicit list (no platform
+# filtering) — for running a specific tool everywhere. FQXV_LR_TOOLS_ONT /
+# FQXV_LR_TOOLS_HIFI override just that platform.
+TOOLS="${FQXV_TOOLS:-}"
+LR_TOOLS_ONT="${FQXV_LR_TOOLS_ONT:-}"
+LR_TOOLS_HIFI="${FQXV_LR_TOOLS_HIFI:-}"
 MAXPAR="${FQXV_MAXPAR:-}"   # empty = no cap; the scheduler manages concurrency
 
 mkdir -p "$RESULTS_DIR"
@@ -37,12 +43,19 @@ CELLS="$RESULTS_DIR/cells.tsv"
 # datasets.tsv columns: accession label platform layout quality approx_gz reference
 while read -r acc label platform layout quality approx _; do
   [[ -z "${acc:-}" || "$acc" == \#* ]] && continue
-  # Tool set by platform.
-  case "$platform" in
-    MinION|GridION|PromethION|*[Nn]anopore*|ONT) sel="$LR_TOOLS_ONT" ;;
-    SequelII|Sequel*|Revio|*[Hh]iFi*|PacBio*)    sel="$LR_TOOLS_HIFI" ;;
-    *)                                           sel="$TOOLS" ;;
-  esac
+  # Tool set by platform, unless explicitly overridden.
+  if [[ -n "$TOOLS" ]]; then
+    sel="$TOOLS"
+  else
+    case "$platform" in
+      MinION|GridION|PromethION|*[Nn]anopore*|ONT)
+        sel="${LR_TOOLS_ONT:-$FQXV_TOOLSET_ONT}" ;;
+      SequelII|Sequel*|Revio|*[Hh]iFi*|PacBio*)
+        sel="${LR_TOOLS_HIFI:-$FQXV_TOOLSET_HIFI}" ;;
+      *)
+        sel="$(fqxv_toolset_for_platform "$platform")" ;;
+    esac
+  fi
   # Require data now, EXCEPT datasets prep stages itself (approx_gz='subsampled',
   # e.g. HiFi) — prep runs before the array via the afterok dependency.
   if [[ "$approx" != "subsampled" \
