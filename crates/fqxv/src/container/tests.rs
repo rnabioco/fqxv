@@ -17,6 +17,18 @@ fn compress_bytes(input: &[u8], params: Params) -> Vec<u8> {
     out
 }
 
+/// Force the single-end clustered reorder layout, bypassing the never-worse gate
+/// (#196). Tests of the clustered layout's own machinery use small exact-duplicate
+/// fixtures on which the gate legitimately picks the plain layout, so a gated
+/// `compress` no longer yields a clustered archive; this restores one without
+/// weakening the production gate.
+fn compress_reorder_clustered(input: &[u8], params: Params) -> Vec<u8> {
+    let mut out = Vec::new();
+    super::reorder::compress_clustered_forced(input, &mut out, params, 1)
+        .expect("clustered compress");
+    out
+}
+
 /// A truncated FASTQ must be an error in BOTH `--order` modes, not an abort in
 /// one of them.
 ///
@@ -624,8 +636,7 @@ fn reorder_with_lossy_binning_roundtrips() {
             quality_binning: bin,
             ..Params::default()
         };
-        let mut archive = Vec::new();
-        compress(&input[..], &mut archive, params).unwrap();
+        let archive = compress_reorder_clustered(&input, params);
         assert_eq!(
             archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
             FLAG_GLOBAL_REORDER
@@ -891,6 +902,113 @@ fn deep_longread_fastq(
         write_record(&mut input, format!("read.{i}").as_bytes(), &s, &qual);
     }
     input
+}
+
+/// Random ACGT with no repeat structure: an order-0 stream. Deterministic
+/// (splitmix64), so the test is reproducible without an rng dependency.
+fn random_reads(n: usize, len: usize) -> (Vec<u32>, Vec<u8>) {
+    let mut x = 0x1234_5678_9abc_def0u64;
+    let mut next = || {
+        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = x;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let seq: Vec<u8> = (0..n * len)
+        .map(|_| b"ACGT"[(next() % 4) as usize])
+        .collect();
+    (vec![len as u32; n], seq)
+}
+
+#[test]
+fn hashed_tier_never_enlarges_the_order_k_stream() {
+    // #196, inversion (b): on a real low-redundancy library (BGISEQ-500) the
+    // order-13 hashed tier (levels 8+) cost 280 KB *more* than plain order-k, so
+    // `-l9`/`--max` produced a larger archive than the default.
+    //
+    // The gate in `order_k_stream` keeps the smaller of {tier off, tier on}, so
+    // enabling the tier can never enlarge the stream. This asserts that structural
+    // property directly by forcing the tier-off path through the tier-on
+    // parameters: whatever the data, the tier-on stream is no larger. A synthetic
+    // fixture cannot reproduce the 280 KB loss itself — order-0 random data never
+    // repeats a 13-mer, so the tier escapes to exactly plain rather than
+    // mispredicting — which is why the real regression is pinned by the measured
+    // MGI numbers in bench/RESULTS.md, not by a crafted input here.
+    let (lens, seq) = random_reads(4000, 120);
+    let tier_off = order_k_stream(
+        &lens,
+        &seq,
+        &Params {
+            seq_order: 11,
+            seq_hash_order: 0,
+            seq_hash_bits: 0,
+            ..Params::default()
+        },
+    )
+    .unwrap();
+    let tier_on = order_k_stream(
+        &lens,
+        &seq,
+        &Params {
+            seq_order: 11,
+            seq_hash_order: 13,
+            seq_hash_bits: 25,
+            ..Params::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        tier_on.len() <= tier_off.len(),
+        "enabling the hashed tier must never enlarge the stream ({} vs {})",
+        tier_on.len(),
+        tier_off.len(),
+    );
+    // Both are method-tagged order-k streams and must decode to the input.
+    for stream in [&tier_off, &tier_on] {
+        let (dl, ds) = decode_sequence_stream(stream, None).unwrap();
+        assert_eq!(dl, lens);
+        assert_eq!(ds, seq);
+    }
+}
+
+#[test]
+fn reorder_falls_back_to_plain_and_round_trips_on_low_redundancy() {
+    // #196, inversion (a): `--order any` scrambles per-position adjacency and adds
+    // a permutation stream, so on a low-redundancy library it enlarges the archive.
+    // The never-worse gate must fall back to the plain layout and still round-trip.
+    let (lens, seq) = random_reads(6000, 120);
+    let mut input = Vec::new();
+    let mut off = 0usize;
+    for (i, &l) in lens.iter().enumerate() {
+        let l = l as usize;
+        let s = &seq[off..off + l];
+        let qual = vec![b'I'; l];
+        write_record(&mut input, format!("r{i}").as_bytes(), s, &qual);
+        off += l;
+    }
+
+    let reordered = compress_bytes(
+        &input,
+        Params {
+            reorder: true,
+            ..Params::default()
+        },
+    );
+    // The gate's plain candidate is exactly compress_buffered(reorder=false); the
+    // reorder archive is min(clustered, that), so it can never exceed it.
+    let mut plain = Vec::new();
+    compress_buffered(&input, &mut plain, Params::default(), 1).unwrap();
+    assert!(
+        reordered.len() <= plain.len(),
+        "reorder must never exceed the plain layout it falls back to ({} vs {})",
+        reordered.len(),
+        plain.len(),
+    );
+
+    let mut out = Vec::new();
+    decompress(&reordered[..], &mut out, 4).expect("decompress");
+    assert_eq!(out, input, "reorder fallback must round-trip byte-exact");
 }
 
 #[test]
@@ -1741,16 +1859,13 @@ fn verify_roundtrip_accepts_reorder_archive() {
     // The globally-clustered layout has no whole-file CRC; verify_roundtrip must
     // decode it (frame CRCs + output digest) and still report the read count.
     let input = dup_rich_input('q');
-    let mut archive = Vec::new();
-    compress(
-        &input[..],
-        &mut archive,
+    let archive = compress_reorder_clustered(
+        &input,
         Params {
             reorder: true,
             ..Params::default()
         },
-    )
-    .unwrap();
+    );
     assert_eq!(
         archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
         FLAG_GLOBAL_REORDER,
@@ -1791,16 +1906,13 @@ fn verify_roundtrip_rejects_corrupt_reorder_read_count() {
     // multi-terabyte allocation. The reorder decode's capacity hints used to be
     // infallible `Vec::with_capacity(n)`.
     let input = dup_rich_input('q');
-    let mut archive = Vec::new();
-    compress(
-        &input[..],
-        &mut archive,
+    let mut archive = compress_reorder_clustered(
+        &input,
         Params {
             reorder: true,
             ..Params::default()
         },
-    )
-    .unwrap();
+    );
     assert_eq!(
         archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
         FLAG_GLOBAL_REORDER
@@ -1856,8 +1968,7 @@ fn verify_quick_falls_back_for_reorder_layout() {
         reorder: true,
         ..Params::default()
     };
-    let mut archive = Vec::new();
-    compress(&input[..], &mut archive, params).unwrap();
+    let archive = compress_reorder_clustered(&input, params);
     // Header flags byte sits at offset 8 ([4]magic [2]ver [1]order [1]binning).
     assert_eq!(
         archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
@@ -2043,16 +2154,13 @@ fn reorder_header_is_crc_protected() {
     // The reorder layout previously left its header (incl. the lossy binning
     // tag and flags) covered by no checksum; the header CRC now covers it too.
     let input = dup_rich_input('q');
-    let mut archive = Vec::new();
-    compress(
-        &input[..],
-        &mut archive,
+    let mut archive = compress_reorder_clustered(
+        &input,
         Params {
             reorder: true,
             ..Params::default()
         },
-    )
-    .unwrap();
+    );
     assert_eq!(
         archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
         FLAG_GLOBAL_REORDER
@@ -2072,16 +2180,13 @@ fn decompress_detects_reorder_output_digest_mismatch() {
     // digest frame's CRC after corrupting the stored digest, so only the
     // whole-output content check can reject the (otherwise valid) archive.
     let input = dup_rich_input('q');
-    let mut archive = Vec::new();
-    compress(
-        &input[..],
-        &mut archive,
+    let mut archive = compress_reorder_clustered(
+        &input,
         Params {
             reorder: true,
             ..Params::default()
         },
-    )
-    .unwrap();
+    );
     assert_eq!(
         archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REORDER,
         FLAG_GLOBAL_REORDER

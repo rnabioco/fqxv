@@ -94,22 +94,33 @@ pub(crate) fn compress_reordered_whole<R: Read + Send, W: Write>(
     encode_reordered(all, writer, params, group_size)
 }
 
-/// Globally cluster the buffered reads (SPRING-style) and write the whole-file
-/// reorder archive: cluster once, then code the clustered sequence in independent
-/// moderate blocks that fan out across cores (clustering is global, so block size
-/// trades only against parallelism, not ratio). Two modes:
-///
-/// - `keep_order`: names+quality are coded in ORIGINAL order and a global
-///   permutation (byte-plane rANS) restores it, so reads come back byte-exact in
-///   input order.
-/// - without `keep_order`: names+quality are coded in CLUSTERED order and NO
-///   permutation is written, so decode emits reads in clustered order (records
-///   preserved as a set) — smaller, but order is not restorable.
-///
-/// `group_size` is the mate interleaving (1 = single-end). When `group_size > 1`
-/// the original spot order *is* the mate interleaving, so the permutation is
-/// required to reconstruct it: `keep_order` is forced on regardless of
-/// `params.keep_order`, making grouped reorder order-preserving.
+/// Force the clustered reorder layout, bypassing the never-worse gate in
+/// [`encode_reordered`]. For tests that exercise the clustered layout's own
+/// machinery (its header CRC, output digest, quick-verify fallback, paired split):
+/// on the small exact-duplicate fixtures those tests use, the gate legitimately
+/// picks the plain layout, so a gated `compress` no longer guarantees a clustered
+/// archive. This does, without loosening the production gate.
+#[cfg(test)]
+pub(crate) fn compress_clustered_forced<R: Read + Send, W: Write>(
+    reader: R,
+    writer: W,
+    params: Params,
+    group_size: u8,
+) -> Result<Stats> {
+    let mut all = RawBlock::default();
+    let mut br = BufReader::new(reader);
+    let (mut def, mut seq, mut qual) = (Vec::new(), Vec::new(), Vec::new());
+    while read_raw_record(&mut br, &mut def, &mut seq, &mut qual)? {
+        all.push_raw(&def, &seq, &qual);
+    }
+    encode_reordered_clustered(all, writer, params, group_size)
+}
+
+/// Whole-file reorder entry point. Adapts to the input: long reads skip reorder
+/// (the deep-context path wins for far less cost), and short reads are coded both
+/// clustered and plain with the smaller kept, so `--order any`/`--max` is never a
+/// regression against the default (#196). The clustering codec itself is
+/// [`encode_reordered_clustered`].
 pub(crate) fn encode_reordered<W: Write>(
     all: RawBlock,
     writer: W,
@@ -131,6 +142,85 @@ pub(crate) fn encode_reordered<W: Write>(
         p.reorder = false;
         return compress_buffered(&serialize_block(&all), writer, p, group_size);
     }
+
+    // Never-worse gate (#196). Reorder wins big on redundant short-read libraries
+    // (Illumina RNA-seq, miRNA) but *loses* on low-redundancy ones — on a
+    // BGISEQ-500 library `--order any`/`--max` produced a larger archive than the
+    // default, because clustering scrambles the per-position adjacency the context
+    // models rely on and spends bytes on the permutation stream while finding too
+    // little cross-read redundancy to pay for it. The gain is adjacency-driven and
+    // scale-dependent, so there is no reliable cheap predictor; code both layouts
+    // and keep the smaller, the same rule the long-read shared reference (#192)
+    // and the overlap-vs-order-k choice already use. Both are valid archives, so
+    // `--order any` becomes "reorder if it helps", never a regression.
+    //
+    // Single-end only. Grouped input (paired mates, 10x) forces `keep_order` so the
+    // permutation reconstructs the spot interleaving — the permutation is paid
+    // regardless of clustering, so the tradeoff differs and #196's inversion (which
+    // is a single-end BGISEQ result) does not apply. Grouped reorder keeps its
+    // existing unconditional layout.
+    //
+    // The cost is a second whole-file encode on the opt-in max-effort path. The
+    // plain candidate is coded from a one-time serialization of the buffered
+    // reads, which also feeds nothing else, so it is dropped as soon as the
+    // comparison is made.
+    if group_size.max(1) != 1 {
+        return encode_reordered_clustered(all, writer, params, group_size);
+    }
+    let serialized = serialize_block(&all);
+    let mut reordered_buf = Vec::new();
+    let reordered_stats = encode_reordered_clustered(all, &mut reordered_buf, params, group_size)?;
+
+    let mut plain_params = params;
+    plain_params.reorder = false;
+    let mut plain_buf = Vec::new();
+    let plain_stats = compress_buffered(&serialized, &mut plain_buf, plain_params, group_size)?;
+    drop(serialized);
+
+    let mut writer = writer;
+    if plain_buf.len() < reordered_buf.len() {
+        info!(
+            reordered = reordered_buf.len(),
+            plain = plain_buf.len(),
+            "reorder does not pay off; using the preserve layout"
+        );
+        writer.write_all(&plain_buf)?;
+        return Ok(plain_stats);
+    }
+    info!(
+        reordered = reordered_buf.len(),
+        plain = plain_buf.len(),
+        "reorder pays off; using the clustered layout"
+    );
+    writer.write_all(&reordered_buf)?;
+    Ok(reordered_stats)
+}
+
+/// Globally cluster the buffered reads (SPRING-style) and write the whole-file
+/// reorder archive: cluster once, then code the clustered sequence in independent
+/// moderate blocks that fan out across cores (clustering is global, so block size
+/// trades only against parallelism, not ratio). Two modes:
+///
+/// - `keep_order`: names+quality are coded in ORIGINAL order and a global
+///   permutation (byte-plane rANS) restores it, so reads come back byte-exact in
+///   input order.
+/// - without `keep_order`: names+quality are coded in CLUSTERED order and NO
+///   permutation is written, so decode emits reads in clustered order (records
+///   preserved as a set) — smaller, but order is not restorable.
+///
+/// `group_size` is the mate interleaving (1 = single-end). When `group_size > 1`
+/// the original spot order *is* the mate interleaving, so the permutation is
+/// required to reconstruct it: `keep_order` is forced on regardless of
+/// `params.keep_order`, making grouped reorder order-preserving.
+///
+/// Wrapped by [`encode_reordered`], which keeps this only when it beats the plain
+/// layout.
+fn encode_reordered_clustered<W: Write>(
+    all: RawBlock,
+    writer: W,
+    params: Params,
+    group_size: u8,
+) -> Result<Stats> {
     let g = group_size.max(1);
     let pool = build_pool(params.threads)?;
     let n = all.n_reads();

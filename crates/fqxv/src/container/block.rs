@@ -263,18 +263,42 @@ pub(crate) fn sketch_for(platform: Platform, ctx: SeedContext) -> fqxv_lroverlap
     }
 }
 
-fn order_k_stream(lens: &[u32], seq: &[u8], params: &Params) -> Result<Vec<u8>> {
-    let coded = fqxv_seq::encode_hashed(
+fn tag_orderk(coded: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(coded.len() + 1);
+    out.push(SEQ_METHOD_ORDERK);
+    out.extend_from_slice(&coded);
+    out
+}
+
+pub(crate) fn order_k_stream(lens: &[u32], seq: &[u8], params: &Params) -> Result<Vec<u8>> {
+    let plain = fqxv_seq::encode(lens, seq, params.seq_order as usize)?;
+
+    // The hashed high-order tier (levels 8+, `seq_hash_order > seq_order`) adds an
+    // escape tier above order-k. It captures deep context on repetitive data but is
+    // not free: on a low-redundancy library its escapes cost more than they save,
+    // which made `-l9`/`--max` produce a *larger* archive than the default (#196).
+    // It is auto-detected from the stream on decode, so the tier-on and tier-off
+    // encodings decode identically — code both and keep the smaller, the same
+    // never-worse rule the overlap-vs-order-k choice already uses. `min(plain,
+    // hashed)` also floors this at the plain order-k cost, so enabling the tier can
+    // never regress a block.
+    let hashed_on = params.seq_hash_bits > 0
+        && usize::from(params.seq_hash_order) > usize::from(params.seq_order);
+    if !hashed_on {
+        return Ok(tag_orderk(plain));
+    }
+    let hashed = fqxv_seq::encode_hashed(
         lens,
         seq,
         params.seq_order as usize,
         params.seq_hash_order as usize,
         u32::from(params.seq_hash_bits),
     )?;
-    let mut out = Vec::with_capacity(coded.len() + 1);
-    out.push(SEQ_METHOD_ORDERK);
-    out.extend_from_slice(&coded);
-    Ok(out)
+    Ok(tag_orderk(if hashed.len() < plain.len() {
+        hashed
+    } else {
+        plain
+    }))
 }
 
 /// Encode the sequence stream, choosing the codec by a leading method byte.
