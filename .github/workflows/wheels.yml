@@ -1,8 +1,8 @@
 # Build and publish the `fqxv` Python wheels (crates/fqxv-python).
 #
-# Separate from release.yml (CLI binaries) and release-plz.yml (crates.io). A
-# `v*` tag triggers all three; this one builds abi3 wheels for every platform and
-# publishes them to PyPI via Trusted Publishing (OIDC — no API token secret).
+# Separate from release.yml (the GitHub Release + CLI binaries). A `v*` tag
+# triggers both; this one builds abi3 wheels for every platform and publishes
+# them to PyPI via Trusted Publishing (OIDC — no API token secret).
 name: wheels
 
 on:

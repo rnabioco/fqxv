@@ -1,14 +1,12 @@
 name: Release
 
-# Builds portable `fqxv` CLI binaries for every supported platform and attaches
-# them (plus a SHA256SUMS.txt) to the GitHub Release.
+# Builds portable `fqxv` CLI binaries for every supported platform and publishes
+# them (plus a SHA256SUMS.txt) to the GitHub Release for the tag.
 #
-# Coexistence with release-plz: `release-plz.yml` opens the version-bump PR and,
-# on merge, publishes the workspace to crates.io, pushes the `vX.Y.Z` tag, and
-# creates the GitHub Release with changelog notes (`git_release_enable = true`
-# in release-plz.toml). That tag push triggers THIS workflow, which builds the
-# binaries and uploads them to the release release-plz already created. We do
-# NOT generate our own notes here, so release-plz's changelog body is preserved.
+# Pushing a `vX.Y.Z` tag is the whole release procedure: merge the version bump,
+# tag the squash commit, push. This workflow creates the Release, takes its notes
+# from the matching CHANGELOG.md section, and attaches the binaries — no
+# `gh release create` beforehand.
 on:
   push:
     tags:
@@ -123,7 +121,7 @@ jobs:
           path: fqxv-${{ github.ref_name }}-${{ matrix.target }}.*
 
   release:
-    name: Attach binaries to Release
+    name: Publish Release
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -131,6 +129,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Needed for CHANGELOG.md — the release notes come from it.
+      - uses: actions/checkout@v7
+
       - name: Download artifacts
         uses: actions/download-artifact@v8
         with:
@@ -143,12 +144,26 @@ jobs:
           cd artifacts
           sha256sum fqxv-* > SHA256SUMS.txt
 
-      # Uploads the archives + checksums to the Release for this tag. release-plz
-      # creates that Release (with changelog notes) when it pushes the tag; this
-      # step updates it in place. We pass no `body`/`generate_release_notes`, so
-      # the notes release-plz wrote are left untouched.
-      - name: Attach binaries to Release
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: parse-changelog
+
+      # The tag's CHANGELOG.md section is the release body. parse-changelog exits
+      # non-zero if the tag has no matching section, so a forgotten changelog
+      # entry fails the release rather than publishing empty notes.
+      - name: Extract release notes
+        run: |
+          set -euo pipefail
+          parse-changelog CHANGELOG.md "${GITHUB_REF_NAME#v}" | tee notes.md
+
+      # Creates the Release for this tag if it doesn't exist, otherwise updates it
+      # in place. `overwrite_files` makes a re-run after a failed upload idempotent.
+      - name: Publish Release
         uses: softprops/action-gh-release@v3
         with:
+          body_path: notes.md
           files: |
             artifacts/*
+          overwrite_files: true
+          # A tag like v1.0.0-rc1 publishes as a prerelease.
+          prerelease: ${{ contains(github.ref_name, '-') }}

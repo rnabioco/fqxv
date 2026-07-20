@@ -121,9 +121,13 @@ comment at the top of `container.rs` — read it before touching the format.
 ## Conventions
 
 - Every crate is independently publishable to crates.io (path + version deps in
-  the workspace `Cargo.toml`); dual-licensed MIT OR Apache-2.0. Releases go
-  through release-plz (`.github/workflows/release-plz.yml`, gated on
-  `CARGO_REGISTRY_TOKEN`).
+  the workspace `Cargo.toml`); dual-licensed MIT OR Apache-2.0. Releasing is
+  bump-merge-tag: land a `chore(release): vX.Y.Z` PR (workspace version, the
+  internal path-dep pins, `Cargo.lock`, and a dated `CHANGELOG.md` section), then
+  tag the squash commit and push. `.github/workflows/release.yml` does the rest —
+  it creates the GitHub Release with that changelog section as the notes and
+  attaches the CLI binaries; `wheels.yml` publishes the Python wheels. Distribution
+  is via bioconda and PyPI, not crates.io.
 - Workspace lints forbid `unsafe_op_in_unsafe_fn` and warn on missing docs /
   debug impls / unreachable pub. `cast_possible_truncation` and
   `needless_range_loop` are allowed workspace-wide because the coders rely on
