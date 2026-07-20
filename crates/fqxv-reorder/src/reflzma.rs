@@ -736,7 +736,7 @@ fn decode_rep_index(m: &mut Models, dec: &mut Decoder<'_>, state: usize) -> usiz
 /// One window over the whole reference (the reference is coded once, so a serial
 /// decode is fine and the full reach is what captures the distant repeats).
 /// Frame: `[varint n_contigs][lens...][varint n_bases][lzma payload]`.
-pub(crate) fn encode(lens: &[u32], seq: &[u8]) -> Result<Vec<u8>> {
+pub fn encode(lens: &[u32], seq: &[u8]) -> Result<Vec<u8>> {
     let sum: usize = lens.iter().map(|&l| l as usize).sum();
     if sum != seq.len() {
         return Err(Error::Malformed("reflzma: length/seq disagreement"));
@@ -753,7 +753,7 @@ pub(crate) fn encode(lens: &[u32], seq: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Inverse of [`encode`]: returns `(lens, seq)`.
-pub(crate) fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
+pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     let mut p = 0usize;
     let nc =
         read_varint(src, &mut p).ok_or(Error::Malformed("reflzma: bad contig count"))? as usize;
