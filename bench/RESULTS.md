@@ -47,7 +47,7 @@ artifact of that dataset. All rows round-trip losslessly.
 | hifi_revio_amplicon |**21.79** | 21.79 |     19.88 |  15.12 | 14.45 | 8.96 |
 | hifi_revio_wgs      |     9.72 |  9.72 | **18.76** |  13.02 | 12.75 | 9.28 |
 | ecoli_hifi          | **4.73** |  4.73 |      4.44 |   3.83 |  3.85 | 2.27 |
-| ecoli_ont           |     2.79 |  2.79 |  **3.05** |   2.38 |  2.49 | 1.94 |
+| ecoli_ont           |     2.83 |  2.83 |  **3.05** |   2.38 |  2.49 | 1.94 |
 
 **On `hifi_revio_wgs` fqxv is beaten by nearly 2× — and not only by CoLoRd.**
 `zstd19` (13.02) and `xz9` (12.75) both beat it too; fqxv (9.72) barely clears
@@ -63,7 +63,7 @@ never enough:
 | ecoli_hifi          |        0.065 |   12,643,309 |     641,788,411 |       **98%** |
 | hifi_revio_amplicon |        0.083 |    6,299,312 |      49,187,324 |           86% |
 | hifi_revio_wgs      |    **1.391** |  234,726,792 |      44,876,883 |       **16%** |
-| ecoli_ont           |        1.283 |   48,292,740 |     163,660,203 |           41% |
+| ecoli_ont           |        1.325 |   49,868,432 |     163,660,203 |           77% |
 
 `ecoli_hifi` is **98% quality by bytes**, so its result is essentially a
 measurement of full-range quality coding — the one thing fqxv does better than
@@ -72,25 +72,26 @@ a single 4.6 Mb genome, where cross-read redundancy is enormous. Revio flips
 both halves: the 7-symbol quality alphabet (Phred 3–40) collapses quality to 16%
 of the archive, and a real genome at ordinary coverage gives the overlap codec
 almost nothing to exploit. The result is a **1.391 b/base** sequence stream —
-*worse than ONT's 1.283*, on data with a fraction of ONT's error rate.
+*worse than ONT's 1.325*, on data with a fraction of ONT's error rate.
 
 So the honest summary is: fqxv's quality coder is genuinely strong, and its
 sequence codec only looks strong when coverage is high enough to make reads
 redundant (300× E. coli, or amplicons). **The lever is the sequence stream on
 ordinary-coverage long reads**, which is now measurable on `hifi_revio_wgs`
-rather than hidden. `ecoli_ont` at 5.75 bits/base sits inside the corpus ONT-WGS
+rather than hidden. `ecoli_ont` at 5.67 bits/base sits inside the corpus ONT-WGS
 spread (5.53–6.21), so the ONT entry is representative; its deficit is likewise
 entirely sequence, bounded by the quality of the assembled consensus reads are
 coded against.
 
-> **Known regression on ONT.** The ONT total moved the *wrong* way with the shared
-> whole-file reference: 2.827 → 2.791. The reference shrinks the ONT edit streams
-> by 1.58 MB but costs 4.37 MB to store, a net loss of ~2.8 MB. It is adopted
-> anyway because the never-worse gate compares the reference layout against
-> **order-k**, not against the per-block overlap layout it replaces — and order-k
-> (~1.8 b/base) is a much weaker bar. HiFi is unaffected: there the reference costs
-> 1.36 MB and saves 7.2 MB. Tracked as a follow-up; the fix is to gate against the
-> better of the two layouts.
+> **The ONT regression is resolved** (was: 2.827 → 2.791 with the shared
+> whole-file reference). Two changes fixed it. The never-worse gate compared the
+> reference layout against *order-k* rather than against the per-block overlap
+> layout it actually displaces, so a losing reference could still be adopted
+> (#192). And the root cause was seeding: closed syncmers were applied to both
+> the whole-file reference and the per-block index, which sit on opposite sides
+> of a coverage crossover — syncmers win at full coverage (1.280 vs 1.416
+> b/base), minimizers win per block (1.243 vs 1.517). Choosing the scheme per
+> index recovered the full 2.79 MB (#198), putting ONT at **2.827**.
 
 ## Lossy quality (fqxv binning)
 
