@@ -23,9 +23,33 @@ misreading it. A format major bump would be announced as a breaking change.
   adopted. Both layouts are now coded in the first pass and the smaller wins, so
   the never-worse property holds against the real alternative; the fallback
   reuses those streams instead of re-coding them. No archive changes on the
-  benchmark corpus (ONT and HiFi output are byte-identical, and coding both ways
-  costs no measurable wall time — the extra encode fills otherwise-idle cores),
-  so this closes a latent hole rather than changing current results (#184).
+  benchmark corpus — ONT and HiFi output are byte-identical — so this closes a
+  latent hole rather than changing current results (#184). **Correction:** this
+  entry originally claimed coding both ways "costs no measurable wall time". That
+  was wrong; it came from an A/B in which the build had not picked up the change,
+  so two identical binaries were compared. Measured properly, coding the second
+  candidate roughly doubles long-read compress time (`ecoli_hifi` 225s → 461s,
+  six blocks). The correctness argument for the gate is unchanged, but the cost
+  is real and is the price of an exact never-worse comparison.
+
+- **ONT seeding is chosen by index coverage, recovering 2.79 MB.** Closed
+  syncmers conserve anchors better than window minimizers at ONT error rates, but
+  only once coverage is deep enough for the extra anchors to find partners. The
+  long-read encoder builds two indexes on opposite sides of that crossover, and
+  using syncmers for both put the ONT archive behind. Measured on `ecoli_ont`
+  (block 1, 268 Mbase):
+
+  | index | syncmer | minimizer |
+  |---|---:|---:|
+  | whole-file reference | **1.280 b/base** | 1.416 |
+  | per-block overlap | 1.517 | **1.243 b/base** |
+
+  Each index now takes the scheme that suits its coverage, so both land on their
+  better number instead of one giving up ~18%. `ecoli_ont` goes 216,381,249 →
+  213,587,759 bytes (ratio 2.791 → 2.827), verified content-lossless. Both
+  schemes share `w` and `k`, so anchor density and index cost are unchanged.
+  PacBio is deliberately left unsplit — at <1% error minimizers are already
+  near-optimal at either coverage — and HiFi output is byte-identical (#184).
 
 ### Changed
 
