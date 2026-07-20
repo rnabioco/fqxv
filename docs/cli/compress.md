@@ -185,7 +185,8 @@ ONT data the `ont` and `hifi` tables are byte-identical, since ONT never reaches
 Q93.
 
 On the `ecoli_ont` benchmark, `--quality-bin ont` cuts the quality stream from
-165.5 MB to 49.2 MB (3.4×) at mean |Δ| 3.35. Cutpoints should ultimately be
+163.7 MB to 47.0 MB (3.5×) — the whole archive from 2.79× to 6.06× — at mean
+|Δ| 3.35. Cutpoints should ultimately be
 judged by downstream fidelity, not raw ratio — see
 [Long-read support](../design/longread.md).
 

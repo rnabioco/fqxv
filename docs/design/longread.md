@@ -280,12 +280,13 @@ block self-assembles its own reference — which is what preserves blocked
 parallelism, per-block random access, and thread-determinism — but a block holds
 only ~256 MiB of bases, so on a 5 Mb genome one block sees tens of ×, not the
 whole file's 300×. The harness's 0.067 codes the *whole file* as one reference;
-the container cannot without giving up the per-block invariants. Measured through
-a real, round-trip-verified archive of the whole `ecoli_hifi` file (120k reads,
-1.55 Gbase, 6 blocks at ~52×) the sequence stream is **0.107 bits/base — 6.1×
-smaller than the 0.653 fallback** (total archive 4.04×), but above CoLoRd's
-whole-file 0.068. Closing that remaining gap means more coverage per reference —
-larger long-read blocks, or a reference shared across blocks.
+the container could not without giving up the per-block invariants. With a
+per-block reference, a real round-trip-verified archive of the whole `ecoli_hifi`
+file (120k reads, 1.55 Gbase, 6 blocks at ~52×) put the sequence stream at 0.107
+bits/base — 6.1× smaller than the 0.653 fallback (total archive 4.04×) — but
+above CoLoRd's whole-file 0.068, the gap being coverage per reference. That is
+what the shared whole-file reference below closes: the same archive now measures
+**0.065 bits/base at a 4.73× total, past CoLoRd's 0.068**.
 
 **Shared whole-file reference (implemented).** The gap *is* reference
 duplication: each block re-stored the same assembled genome, so a ~300× file kept

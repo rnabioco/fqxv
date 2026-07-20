@@ -82,7 +82,7 @@ short-read reorder codec auto-disables. The tables below measure each stream
 per-read against CoLoRd `-q org` (its lossless quality mode); the `fqxv -l9`
 rows' seq column is the **within-read** sequence baseline. The cross-read overlap codec that
 now ships for long reads (see [The sequence lever](#the-sequence-lever-wired))
-replaces that baseline and codes the HiFi sequence stream ~6× smaller.
+replaces that baseline and codes the HiFi sequence stream ~10× smaller.
 
 fqxv's columns come from `fqxv info`, which reports its real streams. CoLoRd has
 no such split, so its columns are taken by difference — `-q none` discards
@@ -114,7 +114,7 @@ Two facts hold on both platforms:
   context-mixing quality coder codes the HiFi quality stream to **641.8M vs
   CoLoRd's 684.3M** (~6% smaller) and ONT to **163.7M vs 166.5M** (~2% smaller).
   This quality win carries the **HiFi lossless total ahead of CoLoRd** (see the
-  repository's `bench/RESULTS.md`; fqxv 4.68× vs CoLoRd 4.44× on the full file);
+  repository's `bench/RESULTS.md`; fqxv 4.73× vs CoLoRd 4.44× on the full file);
   on ONT the much larger sequence deficit below keeps CoLoRd ahead on total.
 - **The remaining lossless gap is the sequence stream.** On HiFi it is now the
   *only* deficit (quality is a credit), so closing it widens fqxv's lead; on ONT it
@@ -150,21 +150,21 @@ by the per-block content digest and `compress --verify`).
 
 **It operates per block.** Each 256 MiB block self-assembles its own reference,
 which keeps the container's blocked parallelism, per-block random access, and
-thread-determinism intact — but caps within-block coverage at about
-`256 MiB / genome`, not the whole file's depth. Measured through a real,
-round-trip-verified archive of the whole `ecoli_hifi` file (120k reads, 1.55
-Gbase, 6 blocks at ~52× each), the sequence stream drops from **0.653 to 0.107
-bits/base — 6.1× smaller** than the within-read model (total archive 4.04×).
+thread-determinism intact. A per-block reference capped within-block coverage at
+about `256 MiB / genome` rather than the whole file's depth, so the reference was
+re-assembled and re-stored in every block. That is no longer how it works: the
+consensus is now assembled **once over the whole file** and stored once in a framed
+region before the first block, and every block's reads are coded against that
+frozen frame.
 
-That 0.107 does **not** reach CoLoRd's 0.068, and the difference is precisely the
-per-block coverage cap: CoLoRd assembles across the whole 300× file, a per-block
-reference sees ~52×. The measurement harness
-(`crates/fqxv-lroverlap/examples/encode.rs`) codes the whole file as one
-reference and reaches **0.067 bits/base — parity with CoLoRd's 0.068** (strides
-4–14 span 0.067–0.072, sample noise; the oracle with true-reference placement is
-0.040). So the ceiling is real and demonstrated; closing the container's gap to
-it means giving the codec more coverage per reference — larger long-read blocks
-or a reference shared across blocks — without breaking the per-block invariants.
+Measured through a real, round-trip-verified archive of the whole `ecoli_hifi`
+file (120k reads, 1.55 Gbase, 6 blocks), the sequence stream drops from **0.653 to
+0.065 bits/base — 10× smaller** than the within-read model, at a total archive
+ratio of **4.73×**. That **beats CoLoRd's 0.068**, so HiFi sequence is now a credit
+rather than a deficit — the per-block reference was the whole gap. For reference,
+the crate's own harness (`crates/fqxv-lroverlap/examples/encode.rs`) codes the
+whole file as one reference and reaches 0.067 (the oracle, with true-reference
+placement, is 0.040), so the container is now at that demonstrated ceiling.
 
 See [Long-read support](design/longread.md) for the full analysis.
 
