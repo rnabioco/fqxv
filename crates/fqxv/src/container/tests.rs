@@ -1043,20 +1043,60 @@ fn shared_reference_longread_roundtrips_across_blocks() {
 
 #[test]
 fn sketch_for_platform_picks_hifi_only_for_pacbio() {
-    // PacBio's low error rate earns the sparse HiFi sketch; every other platform
-    // (including a mis- or undetected one) falls back to the dense ONT sketch,
-    // which also works on HiFi and never misses ONT overlaps.
-    assert_eq!(sketch_for(Platform::PacBio), fqxv_lroverlap::Sketch::hifi());
-    assert_eq!(
-        sketch_for(Platform::Nanopore),
-        fqxv_lroverlap::Sketch::ont()
+    // PacBio's low error rate earns the sparse HiFi sketch at either coverage;
+    // every other platform (including a mis- or undetected one) falls back to the
+    // dense ONT sketch, which also works on HiFi and never misses ONT overlaps.
+    for ctx in [SeedContext::WholeFile, SeedContext::PerBlock] {
+        assert_eq!(
+            sketch_for(Platform::PacBio, ctx),
+            fqxv_lroverlap::Sketch::hifi()
+        );
+        for p in [
+            Platform::Nanopore,
+            Platform::Unknown,
+            Platform::Illumina,
+            Platform::MgiBgi,
+        ] {
+            let s = sketch_for(p, ctx);
+            let ont = fqxv_lroverlap::Sketch::ont();
+            assert_eq!((s.w, s.k), (ont.w, ont.k), "{p:?}/{ctx:?} keeps ONT (w, k)");
+        }
+    }
+}
+
+#[test]
+fn ont_seeding_scheme_follows_the_index_coverage() {
+    // Issue #184 follow-up. Syncmers conserve anchors better at ONT error rates
+    // but only pay off at depth, so the two long-read indexes want opposite
+    // schemes: the whole-file reference sees full coverage (syncmers, 1.280 vs
+    // 1.416 b/base measured on ecoli_ont), one block sees a fraction of it
+    // (minimizers, 1.243 vs 1.517). Using syncmers for both — the state before
+    // this split — cost 2.79 MB on that archive.
+    for p in [Platform::Nanopore, Platform::Unknown, Platform::MgiBgi] {
+        assert_eq!(
+            sketch_for(p, SeedContext::WholeFile).scheme,
+            fqxv_lroverlap::SeedScheme::Syncmer,
+            "{p:?}: the whole-file reference sees full coverage"
+        );
+        assert_eq!(
+            sketch_for(p, SeedContext::PerBlock).scheme,
+            fqxv_lroverlap::SeedScheme::Minimizer,
+            "{p:?}: a per-block index sees only its share of the coverage"
+        );
+    }
+    // Anchor density is 2/(w + 1) and specificity follows k, so the split changes
+    // only WHICH positions are selected — not how many, and not the index cost.
+    let (whole, block) = (
+        sketch_for(Platform::Nanopore, SeedContext::WholeFile),
+        sketch_for(Platform::Nanopore, SeedContext::PerBlock),
     );
-    assert_eq!(sketch_for(Platform::Unknown), fqxv_lroverlap::Sketch::ont());
+    assert_eq!((whole.w, whole.k), (block.w, block.k));
+    // PacBio is deliberately unsplit: at <1% error nearly every k-mer survives,
+    // so minimizers are already near-optimal at both coverages.
     assert_eq!(
-        sketch_for(Platform::Illumina),
-        fqxv_lroverlap::Sketch::ont()
+        sketch_for(Platform::PacBio, SeedContext::WholeFile),
+        sketch_for(Platform::PacBio, SeedContext::PerBlock),
     );
-    assert_eq!(sketch_for(Platform::MgiBgi), fqxv_lroverlap::Sketch::ont());
 }
 
 #[test]

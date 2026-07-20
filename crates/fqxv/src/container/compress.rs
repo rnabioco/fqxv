@@ -607,9 +607,11 @@ fn compress_longread_shared_ref<W: Write>(
         }
     }
 
-    // Assemble the shared reference once over every read.
+    // Assemble the shared reference once over every read — a whole-file index, so
+    // it takes the whole-file seeding scheme, matching what `encode_against` uses
+    // to place reads on it.
     let opts = fqxv_lroverlap::EncodeOpts {
-        sketch: sketch_for(platform),
+        sketch: sketch_for(platform, SeedContext::WholeFile),
         ..fqxv_lroverlap::EncodeOpts::default()
     };
     let reference = pool.install(|| fqxv_lroverlap::build_reference(&all_lens, &all_seq, &opts))?;

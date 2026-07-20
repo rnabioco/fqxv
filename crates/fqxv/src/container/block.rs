@@ -207,19 +207,59 @@ pub(crate) const SEQ_METHOD_OVERLAP: u8 = 1;
 /// closed if it is absent.
 pub(crate) const SEQ_METHOD_OVERLAP_REF: u8 = 2;
 
+/// Which index a sketch is being built for.
+///
+/// Seeding-scheme quality is **coverage-dependent**, and the long-read encoder
+/// builds two indexes over very different amounts of data, so they do not want
+/// the same scheme. See [`sketch_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SeedContext {
+    /// The shared whole-file reference: every read in the file contributes, so
+    /// this index sees the input's full coverage.
+    WholeFile,
+    /// One block's own overlap index, which sees only that block's share of the
+    /// coverage — on a file split into `n` blocks, roughly `1/n` of it.
+    PerBlock,
+}
+
 /// Minimizer sketch for the long-read overlap codec, chosen by the detected
-/// platform. PacBio's <1% error rate leaves nearly every k-mer intact, so its
-/// sparse `map-hifi` sketch suffices; everything else falls back to the dense
-/// `map-ont` sketch, the conservative default that also works on HiFi (it only
-/// costs index size) whereas HiFi's sparse sketch misses ONT overlaps. The
-/// sketch affects ratio and speed only — the block self-describes `(w, k)`, so
-/// decode is unaffected, and the keep-the-smaller rule in
+/// platform **and** by how much coverage the index will see.
+///
+/// PacBio's <1% error rate leaves nearly every k-mer intact, so its sparse
+/// `map-hifi` sketch suffices at either coverage; everything else falls back to
+/// the dense `map-ont` sketch, the conservative default that also works on HiFi
+/// (it only costs index size) whereas HiFi's sparse sketch misses ONT overlaps.
+///
+/// **Why ONT splits on context.** Closed syncmers conserve anchors better than
+/// window minimizers at ~10% error, but only pay off once coverage is deep
+/// enough for the extra surviving anchors to find partners; below that their
+/// weaker per-window specificity costs more than the conservation gains. The two
+/// indexes land on opposite sides of that crossover, measured on `ecoli_ont`
+/// (block 1, 268 Mbase):
+///
+/// | index | syncmer | minimizer |
+/// |---|---:|---:|
+/// | whole-file reference | **1.280 b/base** | 1.416 |
+/// | per-block overlap | 1.517 | **1.243 b/base** |
+///
+/// A single scheme across both therefore gives up ~18% on one index or ~10% on
+/// the other. Using one scheme everywhere (syncmers, issue #177) is what put the
+/// ONT archive 2.79 MB behind; splitting recovers it. Both schemes share `w` and
+/// `k`, so anchor density (`2/(w + 1)`) and specificity are unchanged — only
+/// *which* positions are selected differs.
+///
+/// The sketch affects ratio and speed only — the block self-describes `(w, k)`,
+/// so decode is unaffected, and the keep-the-smaller rule in
 /// [`encode_sequence_stream`] means a mis-detected platform can never regress a
 /// block below order-k.
-pub(crate) fn sketch_for(platform: Platform) -> fqxv_lroverlap::Sketch {
-    match platform {
-        Platform::PacBio => fqxv_lroverlap::Sketch::hifi(),
-        _ => fqxv_lroverlap::Sketch::ont(),
+pub(crate) fn sketch_for(platform: Platform, ctx: SeedContext) -> fqxv_lroverlap::Sketch {
+    match (platform, ctx) {
+        (Platform::PacBio, _) => fqxv_lroverlap::Sketch::hifi(),
+        (_, SeedContext::WholeFile) => fqxv_lroverlap::Sketch::ont(),
+        (_, SeedContext::PerBlock) => fqxv_lroverlap::Sketch {
+            scheme: fqxv_lroverlap::SeedScheme::Minimizer,
+            ..fqxv_lroverlap::Sketch::ont()
+        },
     }
 }
 
@@ -260,8 +300,10 @@ pub(crate) fn encode_sequence_stream(
     if !super::reorder::is_long_read(lens) {
         return order_k_stream(lens, seq, params);
     }
+    // This codec assembles a reference from THIS block's reads only, so it is a
+    // per-block index (see `SeedContext`).
     let opts = fqxv_lroverlap::EncodeOpts {
-        sketch: sketch_for(platform),
+        sketch: sketch_for(platform, SeedContext::PerBlock),
         ..Default::default()
     };
     let (overlap, order_k) = rayon::join(
@@ -337,13 +379,21 @@ pub(crate) fn encode_sequence_stream_shared(
     platform: Platform,
     reference: &fqxv_lroverlap::Reference,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    let opts = fqxv_lroverlap::EncodeOpts {
-        sketch: sketch_for(platform),
+    // The two candidates index different amounts of data and take the seeding
+    // scheme that suits each: `encode_against` places reads on the whole-file
+    // reference (built with the same whole-file sketch by the caller), while
+    // `encode` assembles a reference from this block alone.
+    let opts_shared = fqxv_lroverlap::EncodeOpts {
+        sketch: sketch_for(platform, SeedContext::WholeFile),
+        ..Default::default()
+    };
+    let opts_block = fqxv_lroverlap::EncodeOpts {
+        sketch: sketch_for(platform, SeedContext::PerBlock),
         ..Default::default()
     };
     let (against, (overlap, order_k)) = rayon::join(
         || {
-            fqxv_lroverlap::encode_against(reference, lens, seq, &opts).map(|coded| {
+            fqxv_lroverlap::encode_against(reference, lens, seq, &opts_shared).map(|coded| {
                 let mut out = Vec::with_capacity(coded.len() + 1);
                 out.push(SEQ_METHOD_OVERLAP_REF);
                 out.extend_from_slice(&coded);
@@ -353,7 +403,7 @@ pub(crate) fn encode_sequence_stream_shared(
         || {
             rayon::join(
                 || {
-                    fqxv_lroverlap::encode(lens, seq, &opts).map(|coded| {
+                    fqxv_lroverlap::encode(lens, seq, &opts_block).map(|coded| {
                         let mut out = Vec::with_capacity(coded.len() + 1);
                         out.push(SEQ_METHOD_OVERLAP);
                         out.extend_from_slice(&coded);
