@@ -5,23 +5,16 @@ tuned to it — a context model for quality, an order-k model for sequence, a
 positional tokenizer for names — and composes them into one parallel,
 block-based container.
 
-!!! warning "Not production-ready — the format is still stabilizing"
+!!! success "The on-disk format is stable at 1.0"
 
-    `fqxv` is in **early development** and the on-disk `.fqxv` format is **not
-    frozen**. Do not use it as the only copy of data you care about.
+    Archives written today stay readable by later releases. A reader accepts its
+    own format major version and tolerates newer minors, and additive features are
+    gated behind feature bits that an older reader refuses outright rather than
+    misreading — so compatibility fails loudly, never silently.
 
-    - **The format can change without notice.** A reader refuses an archive whose
-      format major version differs from its own, so an archive written today may be
-      unreadable by a future build that bumps the major. Pin an exact version if you
-      need archives to survive an upgrade — and prefer re-compressing from the
-      original FASTQ.
-    - **Bugs are still being found.** Correctness work is ongoing, including
-      defects that produced archives which could not be decompressed. Every
-      archive is checksummed and `compress --verify` will read one back to
-      confirm, but **keep your original FASTQ** until the format is frozen.
-
-    We will announce a frozen format and a stability guarantee before
-    recommending `fqxv` for archival use.
+    Every archive is deterministic (byte-identical regardless of thread count) and
+    carries per-block and per-stream checksums; `compress --verify` re-decodes a
+    freshly written archive and confirms it round-trips before you trust it.
 
 ![fqxv compress and decompress demo](images/readme.gif)
 

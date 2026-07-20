@@ -5,9 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The on-disk `.fqxv` format is **not yet stable**: `FORMAT_VERSION` is bumped
-freely and archives are not guaranteed to be readable across releases until a
-`1.0.0` (each build reads only its own format version).
+The on-disk `.fqxv` format is **stable at 1.0**. Archives written by a 1.x release
+remain readable by later ones: a reader accepts its own format major version and
+tolerates newer minors, and additive features are gated behind required-feature
+bits, so a reader that predates a feature refuses the archive outright rather than
+misreading it. A format major bump would be announced as a breaking change.
 
 ## [Unreleased]
 
