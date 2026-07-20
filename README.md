@@ -5,53 +5,34 @@ one-crate-per-algorithm codecs plus a container format and CLI.
 
 ![fqxv compress and decompress demo](docs/images/readme.gif)
 
-> [!WARNING]
-> **Not production-ready — the format is still stabilizing.** `fqxv` is in
-> **early development** (v0.2.0). The library and CLI work end-to-end and are
-> [benchmarked against the field](docs/benchmarks.md), but **do not use `fqxv` as
-> the only copy of data you care about.**
->
-> - **The on-disk `.fqxv` format (version 1.0) is not frozen and may change
->   incompatibly before a stability guarantee.** A reader accepts any archive with
->   its own major version (newer minors are tolerated) but refuses a different
->   major, so a future major bump can make today's archives unreadable. Pin an
->   exact version if you need archives to survive an upgrade — and prefer
->   re-compressing from the original FASTQ.
-> - **Bugs are still being found.** Correctness work is ongoing, including
->   defects that produced archives which could not be decompressed. Archives are
->   checksummed and `compress --verify` reads one back to confirm, but **keep
->   your original FASTQ** until the format is frozen.
->
-> A frozen format and a stability guarantee will be announced before `fqxv` is
-> recommended for archival use.
+**The on-disk format is stable at 1.0.** Archives written today stay readable by
+later releases: a reader accepts its own major version and tolerates newer minors,
+and additive features are gated behind feature bits that an older reader refuses
+outright rather than misreading. Every archive is **deterministic** (byte-identical
+regardless of thread count), checksummed, and **verified lossless** on decode.
 
-## Why
+## Results
 
-FASTQ splits into three streams that compress very differently, and the
-wins are additive:
+Best lossless ratio per platform, against the strongest alternative for that data
+([full benchmarks](docs/benchmarks.md)):
 
-| Stream | Share of a lossless archive | What moves it |
-| --- | --- | --- |
-| Quality scores | ~50–70% | context-model entropy coder (fqzcomp-class) |
-| Sequence (bases) | most of the rest | read reordering / assembly (PgRC2/SPRING-class) |
-| Read names | small | positional tokenizer |
+| Platform | fqxv | best alternative | gzip |
+| --- | ---: | ---: | ---: |
+| Illumina NovaSeq (binned quality) | **29.2×** | SPRING 25.3× | 5.0× |
+| Illumina GAIIx (full-range quality) | **11.6×** | SPRING 10.0× | 3.7× |
+| Illumina MiSeq (*E. coli* WGS) | **7.4×** | SPRING 7.3× | 2.9× |
+| PacBio HiFi (*E. coli*, ~300×) | **4.7×** | CoLoRd 4.4× | 2.3× |
+| Oxford Nanopore (MinION) | 2.8× | CoLoRd **3.1×** | 1.9× |
 
-`fqxv` handles each with a clean-room codec implemented from the [CRAM 3.1 codecs
-spec](https://samtools.github.io/hts-specs/CRAMcodecs.pdf) and the source papers —
-no mature FASTQ-domain compressor exists as a Rust crate today. On 4M-read RNA-seq
-subsets it is the **smallest lossless compressor of the field**, beating SPRING,
-`fqz_comp`, `zstd -19`, `xz -9`, and `gzip` (see [benchmarks](docs/benchmarks.md)):
+The Illumina rows use `--order shuffle`, which reorders reads and renumbers names —
+the same trade SPRING's own mode makes, so the comparison is like-for-like. Fully
+order-preserving numbers are in the [benchmarks](docs/benchmarks.md).
 
-| NovaSeq (binned), 4M reads | ratio | lossless |
-| --- | ---: | :---: |
-| **`fqxv --order shuffle`** | **23.9×** | seq+qual (renumbered) |
-| SPRING | 21.9× | reordered |
-| **`fqxv --max`** | 20.2× | **yes (order-preserving)** |
-| fqz_comp | 9.6× | no (fails round-trip) |
-| zstd -19 / xz -9 | 9.4× / 8.9× | yes |
+CoLoRd still leads on Nanopore. fqxv's ONT *quality* stream is the smaller of the
+two; the gap is entirely cross-read sequence, where a noisy consensus limits how
+well reads code against it. On HiFi both streams are now ahead.
 
-Every archive is **deterministic** (byte-identical regardless of thread count) and
-**verified lossless** on decode. Pure Rust, no external/C compressor.
+Pure Rust, no external or C compressor.
 
 ## Install
 
@@ -80,11 +61,9 @@ are the long-read tables) and `--max` chases the best ratio. Add `--verify` to
 re-decode the new archive and confirm it round-trips before you trust (or delete)
 the source. Run `fqxv --help` for the full option set.
 
-Long reads (ONT/PacBio) compress correctly today. The quality stream now beats
-CoLoRd's lossless quality on HiFi (and is within a few percent on ONT), and that
-win carries the **HiFi lossless total ahead of CoLoRd**. The remaining gap is the
-cross-read sequence stream — small on HiFi, larger on the noisier ONT. See
-[long-read support](docs/design/longread.md) for the measurements.
+Long reads (ONT/PacBio) get a cross-read overlap sequence codec and long-read
+quality models automatically, based on the detected platform — see [long-read
+support](docs/design/longread.md).
 
 ## Acknowledgments
 
