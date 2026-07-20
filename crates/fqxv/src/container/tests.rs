@@ -894,6 +894,40 @@ fn deep_longread_fastq(
 }
 
 #[test]
+fn block0_probe_shortcuts_only_when_the_reference_wins_overwhelmingly() {
+    // The probe extrapolates block 0's margin over the whole file and must clear
+    // the reference frame by a wide factor. Both fixtures are measured.
+    //
+    // HiFi (ecoli_hifi): the reference wins by ~1.5x on block 0 and the file is
+    // ~5.8 blocks long, so the predicted saving dwarfs the 1.34 MB frame — the
+    // plain candidate never had a chance and coding it for every block is what
+    // made compression ~2x slower.
+    assert!(
+        shortcut_to_shared_layout(2_238_332, 3_422_989, 268_442_087, 1_547_316_945, 1_337_533),
+        "HiFi: an overwhelming reference win must skip the plain candidate"
+    );
+
+    // ONT (ecoli_ont): block 0's PLAIN candidate is smaller than its shared one
+    // (41.7 MB vs 42.9 MB), so there is no margin at all and the exact gate must
+    // run — this is the case that recovers the 2.79 MB of issue #184.
+    assert!(
+        !shortcut_to_shared_layout(42_937_571, 41_723_362, 268_439_017, 301_194_857, 4_369_174),
+        "ONT: a negative margin must never shortcut"
+    );
+
+    // A thin positive margin that does not cover the frame must still run the
+    // exact gate: 1 KB/block over 2 blocks cannot pay for a 1 MB frame.
+    assert!(
+        !shortcut_to_shared_layout(1_000_000, 1_001_000, 1_000, 2_000, 1_000_000),
+        "a margin that cannot cover the frame must not shortcut"
+    );
+
+    // Degenerate inputs never shortcut.
+    assert!(!shortcut_to_shared_layout(10, 20, 0, 100, 1));
+    assert!(!shortcut_to_shared_layout(10, 10, 100, 100, 1));
+}
+
+#[test]
 fn shared_reference_gate_measures_against_the_plain_layout() {
     // Issue #184, pinned with the ONT numbers that actually regressed. The gate must
     // compare the shared-reference layout against the plain layout it falls back to
