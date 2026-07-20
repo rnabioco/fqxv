@@ -50,6 +50,14 @@ fqxv_toolset_for_platform() {
   case "$1" in
     MinION | GridION | PromethION | *[Nn]anopore* | ONT) echo "$FQXV_TOOLSET_ONT" ;;
     SequelII | Sequel* | Revio | *[Hh]iFi* | PacBio*) echo "$FQXV_TOOLSET_HIFI" ;;
+    # MGI/BGISEQ is short-read, so it takes the full short-read field matrix.
+    # Listed explicitly rather than left to the `*)` fallback: it reads as a
+    # deliberate choice, and it is the one short-read platform where a field
+    # tool may legitimately fail — SPRING assumes fixed-length Illumina reads,
+    # so a variable-length MGI run can record `rt=no`. That row is kept for the
+    # same reason ONT keeps its fqz_comp row: dropping it would make an
+    # untested tool indistinguishable from an inapplicable one.
+    BGISEQ* | MGISEQ* | DNBSEQ* | *[Mm][Gg][Ii]*) echo "$FQXV_TOOLSET_SHORT" ;;
     *) echo "$FQXV_TOOLSET_SHORT" ;;
   esac
 }

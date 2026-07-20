@@ -1,18 +1,23 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=fqxv-cell
 #SBATCH --comment=fqxv-cell
-#SBATCH --partition=amilan
+#SBATCH --partition=rna              # Bodhi default; submit_parallel.sh passes
+#                                    # --partition explicitly (see scripts/cluster.sh),
+#                                    # so this only applies to direct sbatch.
 #SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16       # Memory is the real floor: short-read xz9 on
 #SBATCH --mem=48G                # NovaSeq peaks ~22.5G, and the long-read cells
-#SBATCH --time=02:00:00          # (HiFi fqxv ~11G, CoLoRd on 1.5 Gbp more) want
-                                 # headroom — 48G covers both. On Bodhi's rna
-                                 # partition (no per-core mem cap) override the
-                                 # amilan defaults via SBATCH_PARTITION=rna.
+#SBATCH --time=02:00:00          # (HiFi fqxv ~11G, Revio fqxv ~9.2G, CoLoRd on
+                                 # 1.5 Gbp more) want headroom — 48G covers both.
                                  # 16 cpus gives throughput headroom while still
-                                 # packing several cells onto a node.
+                                 # packing several cells onto a node, and on
+                                 # Alpine's amilan (3840M/core cap) 16 cores is
+                                 # also what makes the 48G request satisfiable.
+                                 # 2h suits the short-read cells; the long-read
+                                 # ones want more — submit_parallel.sh callers
+                                 # should raise it via SBATCH_TIMELIMIT.
 # Fallback only: this lands in the submission dir. submit_parallel.sh overrides
 # it with --output so logs land in $FQXV_RESULTS_DIR/logs instead of the repo.
 #SBATCH --output=fqxv-cell-%A_%a.out

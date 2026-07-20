@@ -141,9 +141,9 @@ do_run() {
     if [[ ! -f "$r1" ]]; then echo "  [skip] $acc: $DATA_DIR/${acc}[_1].fastq missing (run fetch.sh)"; continue; fi
     local -a inputs; local fastq_bytes
     if [[ -f "$r2" ]]; then
-      inputs=("$r1" "$r2"); fastq_bytes=$(( $(stat -c %s "$r1") + $(stat -c %s "$r2") ))
+      inputs=("$r1" "$r2"); fastq_bytes=$(( $(stat -Lc %s "$r1") + $(stat -Lc %s "$r2") ))
     else
-      inputs=("$r1"); fastq_bytes="$(stat -c %s "$r1")"
+      inputs=("$r1"); fastq_bytes="$(stat -Lc %s "$r1")"
     fi
     local sra_b="${SRA_B[$acc]:-}" spots="${SPOTS[$acc]:-}" layout="${LAYOUT[$acc]:--}"
     echo "==> $acc ($plat, $regime)  fastq=$(numfmt --to=iec "$fastq_bytes")  .sra=${sra_b:+$(numfmt --to=iec "$sra_b")}"
@@ -155,7 +155,7 @@ do_run() {
       if [[ "$MEAS_RC" -ne 0 || ! -f "$comp" ]]; then
         echo "  [fail] $acc/$pt: compress exited $MEAS_RC"; rm -f "$comp"; continue
       fi
-      local fqxv_bytes; fqxv_bytes="$(stat -c %s "$comp")"
+      local fqxv_bytes; fqxv_bytes="$(stat -Lc %s "$comp")"
       # Per-stream sizes from `fqxv info --tsv`: header then one data row of
       #   file_size reads blocks group_size seq_order quality_binning reordered \
       #   names_bytes seq_bytes qual_bytes  (indices 7/8/9).

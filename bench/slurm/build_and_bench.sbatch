@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=fqxv-bench
 #SBATCH --comment=fqxv-bench
-#SBATCH --partition=amilan          # AMD EPYC 7713P; renamed 'acpu' after 2026-08-05
-#SBATCH --qos=normal                # renamed 'cpu-normal' after 2026-08-05
+#SBATCH --partition=rna             # Bodhi (Intel, 88+ cores / 754G). On Alpine use
+#SBATCH --qos=normal                # `SBATCH_PARTITION=amilan sbatch ...`, or source
+#                                   # scripts/cluster.sh, which detects the cluster.
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=32G
 #SBATCH --time=04:00:00
 #SBATCH --output=%x-%j.out
-## #SBATCH --account=amc-general    # uncomment if your default association is unset
+## #SBATCH --account=amc-general    # Alpine only, if your default association is unset
 #
 # Build the release binary AND run the full baseline benchmark on one compute
 # node (never the login node): compile with 32 cores, then benchmark with 32
