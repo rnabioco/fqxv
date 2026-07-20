@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=fqxv-prep
 #SBATCH --comment=fqxv-prep
-#SBATCH --partition=amilan
+#SBATCH --partition=rna              # Bodhi default; submit_parallel.sh passes
+#                                    # --partition explicitly (see scripts/cluster.sh),
+#                                    # so this only applies to direct sbatch.
 #SBATCH --qos=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

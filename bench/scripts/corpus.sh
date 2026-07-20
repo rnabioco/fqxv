@@ -424,8 +424,16 @@ case "$cmd" in
     conc="${CORPUS_CONCURRENCY:-}"
     array_spec="1-${total}${conc:+%${conc}}"
     echo "submitting array $array_spec"
-    sbatch --job-name=fqxv-corpus --comment=fqxv-corpus --partition="${SLURM_PARTITION:-amilan}" \
-      --qos="${SLURM_QOS:-normal}" --array="$array_spec" \
+    # Partition/QoS from the shared cluster profile (Bodhi `rna` by default,
+    # Alpine `amilan` when detected) rather than a local `amilan` default that
+    # silently failed to schedule on Bodhi. SLURM_PARTITION/SLURM_QOS remain
+    # honored for backward compatibility.
+    # shellcheck source=./cluster.sh
+    . "$HERE/cluster.sh"
+    sbatch --job-name=fqxv-corpus --comment=fqxv-corpus \
+      --partition="${SLURM_PARTITION:-$FQXV_PARTITION}" \
+      --qos="${SLURM_QOS:-$FQXV_QOS}" ${FQXV_ACCOUNT:+--account="$FQXV_ACCOUNT"} \
+      --array="$array_spec" \
       --cpus-per-task="$THREADS" --mem="${CORPUS_MEM:-32G}" --time="${CORPUS_TIME:-02:00:00}" \
       --output="$LOG_DIR/slurm-%A_%a.out" \
       --wrap="cd '$HERE' && FQXV_CORPUS_DIR='$CORPUS_DIR' FQXV_BIN='$FQXV_BIN' FQDIGEST='$FQDIGEST' FQXV_MODES='$MODES' FQXV_THREADS='$THREADS' pixi run -e bench --manifest-path '$ROOT_MANIFEST' bash corpus.sh run"

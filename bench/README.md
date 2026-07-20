@@ -70,13 +70,13 @@ Check the quality alphabet of any file with `pixi run -e bench qstats <file.fast
 ## 2. Run the benchmark (compute node via Slurm — NOT the login node)
 
 ```bash
-sbatch slurm/bench.sbatch                 # one exclusive amilan node, 64 threads
+sbatch slurm/bench.sbatch                 # one exclusive node, 64 threads
 ```
 
 Or interactively:
 
 ```bash
-srun --partition=amilan --qos=normal --nodes=1 --ntasks=1 --cpus-per-task=64 \
+srun --partition=rna --qos=normal --nodes=1 --ntasks=1 --cpus-per-task=64 \
      --exclusive --mem=0 --time=02:00:00 --pty bash
 pixi run -e bench bash scripts/run_bench.sh
 ```
@@ -84,6 +84,28 @@ pixi run -e bench bash scripts/run_bench.sh
 Knobs (env vars): `FQXV_THREADS`, `FQXV_INPUT=r1|cat` (R1 only vs R1+R2
 concatenated), `FQXV_TOOLS="gzip zstd19 fqz_comp"` (subset), `FQXV_DATA_DIR`,
 `FQXV_RESULTS_DIR`.
+
+### Which cluster
+
+Submission parameters live in one place, [`scripts/cluster.sh`](scripts/cluster.sh),
+which the drivers source. It probes `sinfo` and picks a profile:
+
+| cluster | partition | notes |
+| --- | --- | --- |
+| **bodhi** (default) | `rna` | 88+ cores / 754G, no per-core memory cap |
+| alpine | `amilan` | caps memory at 3840M/core; may need `--account` |
+
+`submit_parallel.sh` passes `--partition`/`--qos` explicitly, so submission does
+not depend on each `.sbatch` file's own default — those had drifted (five said
+`amilan`, three said `rna`), and a plain run on Bodhi queued against a partition
+that does not exist there. The in-file defaults remain as a working fallback for
+direct `sbatch slurm/foo.sbatch`.
+
+Override with `FQXV_CLUSTER=bodhi|alpine`, or set `FQXV_PARTITION` / `FQXV_QOS` /
+`FQXV_ACCOUNT` individually. Sourcing `cluster.sh` also exports
+`SBATCH_PARTITION`/`SBATCH_QOS`, which Slurm honors over a script's own `#SBATCH`
+lines — so a bare `sbatch` from that shell lands correctly too. Raise the cell
+time limit for long-read-heavy matrices with `SBATCH_TIMELIMIT=08:00:00`.
 
 ### Which tools run
 

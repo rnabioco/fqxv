@@ -4,7 +4,7 @@
 # (for fqxv) per-stream byte sizes plus a thread-determinism check.
 #
 # Emits TSV to $RESULTS_DIR/results.tsv (+ per-dataset meta.tsv). Meant to run
-# INSIDE an srun/sbatch allocation on one amilan node (never the login node) so
+# INSIDE an srun/sbatch allocation on one compute node (never the login node) so
 # the throughput numbers are clean. Invoke via `pixi run bash run_bench.sh`.
 #
 # Env knobs:

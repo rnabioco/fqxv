@@ -24,6 +24,13 @@ DATA_DIR="${FQXV_DATA_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/data}"
 # toolsets.sh, shared with run_bench.sh so the two drivers cannot drift apart.
 # shellcheck source=./toolsets.sh
 . "$HERE/toolsets.sh"
+# Partition/QoS/account for whichever cluster this is (Bodhi `rna` by default,
+# Alpine `amilan` when detected or FQXV_CLUSTER=alpine). Passed explicitly to
+# every sbatch below so the submission does not depend on each .sbatch file's
+# own default — those had drifted and a plain run on Bodhi queued against
+# `amilan`, which does not exist there.
+# shellcheck source=./cluster.sh
+. "$HERE/cluster.sh"
 # FQXV_TOOLS overrides every platform's set with one explicit list (no platform
 # filtering) — for running a specific tool everywhere. FQXV_LR_TOOLS_ONT /
 # FQXV_LR_TOOLS_HIFI override just that platform.
@@ -76,22 +83,24 @@ done < <(grep -v '^#' "$HERE/../panels/datasets.tsv")
 N="$(wc -l < "$CELLS")"
 [[ "$N" -gt 0 ]] || { echo "no cells generated (no datasets present?)"; exit 1; }
 echo "==> $N cells ($(wc -l < <(grep -v '^#' "$HERE/../panels/datasets.tsv" | awk 'NF')) datasets x tools) -> $CELLS"
+echo "==> cluster $FQXV_CLUSTER_RESOLVED: partition=$FQXV_PARTITION qos=$FQXV_QOS${FQXV_ACCOUNT:+ account=$FQXV_ACCOUNT}"
 
 # Fresh run: clear previous parts so the merge only sees this submission.
 rm -f "$RESULTS_DIR/parts"/results.*.tsv "$RESULTS_DIR/parts"/meta.*.tsv 2>/dev/null || true
 
-jid_prep=$(sbatch --parsable --output="$LOG_DIR/%x-%j.out" "$HERE/../slurm/prep.sbatch")
+jid_prep=$(sbatch --parsable "${FQXV_SBATCH_OPTS[@]}" \
+                  --output="$LOG_DIR/%x-%j.out" "$HERE/../slurm/prep.sbatch")
 echo "prep   -> job $jid_prep"
 # Default: no concurrency cap — let the scheduler decide how many cells run at
 # once (each cell is one exclusive-ish node, so Slurm's partition limits already
 # bound it). Set FQXV_MAXPAR only to *deliberately* throttle.
 array="1-${N}"
 [[ -n "$MAXPAR" ]] && array="${array}%${MAXPAR}"
-jid_arr=$(sbatch --parsable --dependency=afterok:"$jid_prep" \
+jid_arr=$(sbatch --parsable "${FQXV_SBATCH_OPTS[@]}" --dependency=afterok:"$jid_prep" \
                  --output="$LOG_DIR/%x-%A_%a.out" \
                  --array="$array" "$HERE/../slurm/bench_cell.sbatch")
 echo "cells  -> job $jid_arr  (array $array)"
-jid_merge=$(sbatch --parsable --dependency=afterany:"$jid_arr" \
+jid_merge=$(sbatch --parsable "${FQXV_SBATCH_OPTS[@]}" --dependency=afterany:"$jid_arr" \
                    --output="$LOG_DIR/%x-%j.out" "$HERE/../slurm/merge.sbatch")
 echo "merge  -> job $jid_merge"
 echo
