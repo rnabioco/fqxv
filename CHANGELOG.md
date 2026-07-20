@@ -38,9 +38,29 @@ freely and archives are not guaranteed to be readable across releases until a
   edit script → rANS) wired into the container as the sequence path for long-read
   blocks, auto-selected and kept only when it beats order-k. It reaches CoLoRd
   parity on ONT/HiFi (e.g. ~0.653 → ~0.067 bits/base at depth) and codes its edit
-  streams (substitutions, ops, insertions) with per-stream context models. A WFA
-  aligner (HiFi) and an AVX2 anti-diagonal aligner accelerate encoding, both
-  byte-identical to the scalar reference.
+  streams (substitutions, ops, insertions) with per-stream context models rather
+  than a flat order-0 code — worth a further −4.3% on the ONT sequence stream,
+  losslessly. A WFA aligner (HiFi) and an AVX2 anti-diagonal aligner accelerate
+  encoding, both byte-identical to the scalar reference.
+- **Closed-syncmer seeding for ONT** — the overlap codec seeded from window
+  minimizers, which a base error in *any* k-mer of the window can deselect; at
+  Nanopore's ~10% error that is the dominant loss of shared anchors. ONT now seeds
+  with closed syncmers (a k-mer is an anchor when its minimal `s`-mer sits at its
+  first or last position), so selection depends only on the k-mer's own bases and
+  an intact shared k-mer is co-selected regardless of neighbouring errors. Density
+  is `2/(w+1)` as before, so `k`, anchor count and specificity are unchanged — only
+  conservation improves: ONT overlap-coded sequence goes 1.631 → 1.559 bits/base
+  against an order-k baseline of 1.808, widening with per-block coverage. Seeding
+  is encode-only, so archives stay decodable by any reader. PacBio keeps window
+  minimizers, which are already near-optimal below ~1% error.
+- **Content-based platform detection** — platform was detected from read-name
+  grammar alone, so SRA-reformatted runs (bare `SRR…` headers) recorded `unknown`
+  and were handed the Nanopore sketch. When names carry no platform signal, fqxv
+  now classifies long-read runs by mean per-base quality, which separates the
+  platforms cleanly (measured across 24 corpus accessions with ENA ground truth:
+  Nanopore 6.9–23.5, PacBio 36.9–84.5). Ambiguous data stays `unknown`, so a wrong
+  platform is still never recorded. On a real HiFi run this restores the
+  low-divergence WFA path and cuts encode time ~31%.
 - **Shared whole-file reference for long reads** — the overlap codec reaches
   CoLoRd parity *within* a block, but the container re-assembled and re-stored the
   same consensus reference in every 256 MiB block. It now assembles one consensus

@@ -20,17 +20,37 @@ dataset; `fqxv-max` is the order-preserving lossless point.
 
 ## Long-read, lossless
 
-**fqxv now leads on HiFi.** Its quality coder (binary-decomposition context
-mixing) beats CoLoRd's lossless quality, and that win outweighs fqxv's remaining
-cross-read *sequence* deficit, so fqxv is smaller overall. **CoLoRd still leads on
-ONT**, where fqxv trails on both streams — quality by a few percent, and the noisier
-sequence more (exact seed anchors don't survive ONT error, so the overlap codec
-falls back to the within-read model). All rows round-trip losslessly.
+**fqxv leads on HiFi.** Its quality coder (binary-decomposition context mixing)
+beats CoLoRd's lossless quality, and the shared whole-file reference has now taken
+the HiFi *sequence* stream past CoLoRd too — **0.065 bits/base against CoLoRd's
+0.068**, so fqxv is ahead on both streams. **CoLoRd still leads on ONT**, though
+not on quality: fqxv's ONT quality stream is the smaller of the two. The ONT
+deficit is entirely sequence, and it is no longer a seeding problem — closed
+syncmers select on a k-mer's own bases, so the overlap codec beats the within-read
+order-k baseline rather than falling back to it. What bounds it now is the quality
+of the assembled consensus the reads are coded against. All rows round-trip
+losslessly.
 
 | dataset    |      fqxv | fqxv9 |   colord | zstd19 | xz9 | gzip |
 |------------|----------:|------:|---------:|-------:|----:|-----:|
-| ecoli_hifi | **4.68** |  4.68 |     4.44 |   3.83 |3.85 | 2.27 |
-| ecoli_ont  |      2.83 |  2.83 | **3.05** |   2.38 |2.49 | 1.94 |
+| ecoli_hifi | **4.73** |  4.73 |     4.44 |   3.83 |3.85 | 2.27 |
+| ecoli_ont  |      2.79 |  2.79 | **3.05** |   2.38 |2.49 | 1.94 |
+
+Per-stream, over the run's own bases:
+
+| dataset    | seq (b/base) | quality (bytes) | reference frame |
+|------------|-------------:|----------------:|----------------:|
+| ecoli_hifi |    **0.065** |     641,788,411 |       1,356,344 |
+| ecoli_ont  |        1.283 |     163,660,203 |       4,369,101 |
+
+> **Known regression on ONT.** The ONT total moved the *wrong* way with the shared
+> whole-file reference: 2.827 → 2.791. The reference shrinks the ONT edit streams
+> by 1.58 MB but costs 4.37 MB to store, a net loss of ~2.8 MB. It is adopted
+> anyway because the never-worse gate compares the reference layout against
+> **order-k**, not against the per-block overlap layout it replaces — and order-k
+> (~1.8 b/base) is a much weaker bar. HiFi is unaffected: there the reference costs
+> 1.36 MB and saves 7.2 MB. Tracked as a follow-up; the fix is to gate against the
+> better of the two layouts.
 
 ## Lossy quality (fqxv binning)
 
@@ -55,5 +75,6 @@ read-reordering on top of binning.
 | DRR205413  | ONT-MinION  |       0.825 |
 
 NovaSeq wins most (its quality is pre-binned, so the lossless point is already
-compact); ONT wins least, since the long-read sequence stream — the CoLoRd gap
-above — dominates that archive.
+compact); ONT wins least, since the long-read sequence stream dominates that
+archive. The ONT row predates the edit-stream context coding, the shared
+whole-file reference, and syncmer seeding, so it should improve on a re-run.

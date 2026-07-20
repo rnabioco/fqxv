@@ -9,11 +9,15 @@
 //!   coarsely quantized), a running "how noisy has this read been so far" delta
 //!   counter, and the position within the read — the dominant signals in Illumina
 //!   quality streams (the same features fqz_comp conditions on).
-//! - **Sequence context** (long reads, via [`encode_seq`]): the two previous
-//!   qualities plus the current base, the next base, and the homopolymer
-//!   run-length — where HiFi/ONT quality actually lives. This drops the
-//!   position/delta features (useless on long reads) and requires the decoded
-//!   sequence at decode time (see [`decode_seq`]/[`needs_sequence`]).
+//! - **Sequence context** (long reads, via [`encode_seq`]): each quality is coded
+//!   as `ceil(log2 k)` binary bit-tree decisions, every bit predicted by several
+//!   context tiers (coarse/mid/rich) whose probabilities are mixed in the logit
+//!   domain — the binary-decomposition logistic mixer in `binmix`. The contexts
+//!   are built from the neighbouring qualities and the sequence (current base,
+//!   next base, homopolymer run-length), which is where HiFi/ONT quality actually
+//!   lives. This drops the position/delta features (useless on long reads) and
+//!   requires the decoded sequence at decode time (see
+//!   [`decode_seq`]/[`needs_sequence`]).
 //!
 //! Lossy quality binning ([`QualityBinning`]) is applied before modeling; the
 //! default is lossless. Three quantization tables are offered (exact ranges in
@@ -469,11 +473,14 @@ pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec
 ///
 /// `seq` is the reads' concatenated bases in the same order and per-read lengths
 /// as `quals`. When it is present, non-empty, and the mean read length exceeds
-/// [`SEQ_MODE_MIN_MEAN_LEN`], the stream is coded in `MODE_SEQ` (base + next
-/// base + homopolymer run-length context); otherwise it falls back to the
-/// sequence-blind `MODE_POS` and `seq` is ignored. Pass `&[]` for `seq` to
-/// force `MODE_POS` — that is exactly what [`encode`] does. A `MODE_SEQ` stream
-/// requires the decoded sequence at [`decode_seq`] time.
+/// [`SEQ_MODE_MIN_MEAN_LEN`], the stream is coded in `MODE_SEQ_BINMIX` — the
+/// binary-decomposition logistic mixer (`binmix`), which conditions on the
+/// neighbouring qualities and the sequence (base, next base, homopolymer run);
+/// otherwise it falls back to the sequence-blind `MODE_POS` and `seq` is ignored.
+/// Pass `&[]` for `seq` to force `MODE_POS` — that is exactly what [`encode`]
+/// does. Any sequence-context stream requires the decoded sequence at
+/// [`decode_seq`] time. (The earlier single-context `MODE_SEQ` is still decodable
+/// but is no longer emitted.)
 pub fn encode_seq(
     lens: &[u32],
     quals: &[u8],
