@@ -318,10 +318,24 @@ for row in "${rows[@]}"; do
       # Any fqxv variant (incl. fqxv-binont/binhifi) shares the one binary.
       *) if is_fqxv "$tool"; then bin="$FQXV_BIN"; else bin="$tool"; fi ;;
     esac
+    # An absent binary gets a *recorded* row (rt=miss), not a silent skip.
+    # Skipping made an untested tool indistinguishable from an inapplicable one,
+    # which is the very thing toolsets.sh keeps deliberate rt=no rows to avoid:
+    # fqzcomp5 contributed zero rows across five datasets in two consecutive full
+    # runs and nothing in results.tsv showed it (#195). `miss` is distinct from
+    # `no`, which means the tool ran and the round-trip did not match.
+    missing_reason=""
     if is_fqxv "$tool"; then
-      [[ -x "$bin" ]] || { echo "  [miss] $tool ($bin — run: cargo build --release)"; continue; }
+      [[ -x "$bin" ]] || missing_reason="$bin — run: cargo build --release"
     else
-      command -v "$bin" >/dev/null 2>&1 || { echo "  [miss] $tool ($bin)"; continue; }
+      command -v "$bin" >/dev/null 2>&1 || missing_reason="$bin not on PATH — run: build_tools.sh"
+    fi
+    if [[ -n "$missing_reason" ]]; then
+      echo "  [miss] $tool ($missing_reason)"
+      # Same shape as a failed-compress row (0 bytes, ratio 0.000) so report.py
+      # ranks it last; -1 marks "not measured" rather than "measured as zero".
+      echo -e "${label}\t${tool}\t${orig_bytes}\t0\t0.000\t-1\t-1\t-1\t-1\t-1\t-1\t-1\tmiss\tn/a\t-1\t-1\t-1" >> "$RESULTS"
+      continue
     fi
     pfx="$WORK/${label}.${tool}"; rt="$WORK/${label}.${tool}.rt.fastq"
     rm -f "$pfx".* "$rt"

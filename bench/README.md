@@ -123,6 +123,21 @@ on a separate node). `fqz_comp` is deliberately kept in the long-read sets even
 though it cannot parse long reads — it records `rt=no`, which distinguishes
 "inapplicable" from "never tested".
 
+The `rt` column carries three values, and the distinction is the point:
+
+| `rt` | meaning |
+| --- | --- |
+| `yes` | ran, and the content round-trip matched (lossless, or lossy-expected) |
+| `no` | ran, but the round-trip did not match — failed, or inapplicable to this data |
+| `miss` | **did not run: the binary is not installed** |
+
+`miss` exists because a silent skip made an *untested* tool look identical to an
+*inapplicable* one — the very thing the deliberate `rt=no` rows above are there
+to prevent. `fqzcomp5` contributed zero rows across five datasets in two
+consecutive full runs and nothing in `results.tsv` revealed it (#195). A `miss`
+row is recorded with 0 bytes so it ranks last; run `build_tools.sh` to populate
+the from-source baselines.
+
 Add a tool to `toolsets.sh` and every driver picks it up. `FQXV_TOOLS` overrides
 the platform sets with one explicit list for every dataset; `FQXV_LR_TOOLS_ONT`
 and `FQXV_LR_TOOLS_HIFI` override a single long-read platform.

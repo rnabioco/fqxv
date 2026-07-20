@@ -53,8 +53,11 @@ def main() -> None:
             cb = int(r["comp_bytes"])
             vs_gzip = gzip_bytes / cb if cb and gzip_bytes else 0.0
             bpb = (cb * 8) / nbases if nbases else 0.0
-            c_mb = (orig / 1e6) / float(r["c_secs"]) if float(r["c_secs"] or 0) else 0.0
-            d_mb = (orig / 1e6) / float(r["d_secs"]) if float(r["d_secs"] or 0) else 0.0
+            # Guard on > 0, not merely non-zero: -1 is the "not measured"
+            # sentinel (a tool whose binary is absent, rt=miss), and dividing by
+            # it printed a negative throughput as if it were a measurement.
+            c_mb = (orig / 1e6) / float(r["c_secs"]) if float(r["c_secs"] or 0) > 0 else 0.0
+            d_mb = (orig / 1e6) / float(r["d_secs"]) if float(r["d_secs"] or 0) > 0 else 0.0
             rss = int(r["c_rss_kb"])
             det = r.get("deterministic", "n/a")
             print(
