@@ -11,7 +11,8 @@ bench/
                                bam_identity.sh, concordance.sh, fetch.sh, report.py, …
   slurm/     batch job files    bench.sbatch, bench_cell.sbatch, prep.sbatch, merge.sbatch, …
   panels/    input tables       datasets.tsv (ratio matrix), sra_panel.tsv (vs .sra)
-  tools/     rustc helpers      fqdigest.rs (round-trip digest), bamcmp.rs (BAM digests)
+  tools/     rustc helpers      fqdigest.rs (round-trip digest), bamcmp.rs (BAM digests),
+                               fqsim.rs (synthetic per-platform FASTQ)
   RESULTS.md headline numbers
 ```
 
@@ -268,3 +269,35 @@ O(n) streaming pass with bounded memory, replacing a slow `awk | sort | md5sum`
 `scripts/corpus.sh` uses it when built and falls back to the awk pipeline otherwise, so
 results are identical either way. Build it once with `corpus.sh build-digest`
 (needs `rustc` on PATH; the harness never builds on the login node otherwise).
+
+## Synthetic input (`tools/fqsim.rs`)
+
+For tests that need FASTQ but not a specific accession — interrupt handling,
+edge cases, quick ratio sanity checks — `fqsim` generates it far faster than
+fetching, and reproducibly from a seed.
+
+```bash
+rustc -O -o "$SCRATCH/fqxv/tools/bin/fqsim" bench/tools/fqsim.rs
+
+fqsim --platform novaseq --reads 1000000 --paired sample   # sample_1/_2.fastq
+fqsim --platform ont  --reads 20000 --coverage 25 -o ont.fastq
+fqsim --platform hifi --reads 20000 --coverage 25 -o hifi.fastq
+```
+
+Platforms (`novaseq`, `hiseq`, `ont`, `hifi`) carry their own read length,
+error mix, quality model and name layout: NovaSeq emits 4-level RTA3-binned
+quality where HiSeq emits a continuous range, and the long-read profiles raise
+the indel rate inside homopolymer runs. Individual knobs (`--len`,
+`--sub-rate`, `--ins-rate`, `--del-rate`) override the profile.
+
+The important part is that reads are **sampled from a generated reference
+genome** at a chosen `--coverage`, not drawn independently. Independent random
+reads share no sequence, so the codecs built to exploit cross-read redundancy
+have nothing to find and measure the same as the plain context coder — which
+makes such data actively misleading. With genome-backed sampling the redundancy
+is real and coverage-tunable: on 400k NovaSeq reads, `--order any` beats
+`--order preserve` by 47% at 5× coverage and 31% at 60×.
+
+Output is plain FASTQ; pipe to `bgzip`/`gzip` if you need it compressed. Same
+`--seed` gives byte-identical output, so a failing case can be reproduced
+without staging a data file.
