@@ -736,9 +736,15 @@ fn main() -> anyhow::Result<()> {
                 // Recovery deliberately tolerates missing/corrupt blocks, so the
                 // completeness check below does not apply here.
                 let sp = progress::Spinner::start("recovering…", cli.quiet);
-                let mut sink = open_sink(output.as_deref(), stdout, force)?;
+                let (pending, mut sink) = open_sink(output.as_deref(), stdout, force)?;
                 let rec = fqxv::decompress_recover(open_in()?, &mut sink, cli.threads)?;
                 sink.finish()?;
+                // Recovery's output is deliberately incomplete, but it is still a
+                // *finished* artifact — publish it only once the salvage is done,
+                // so an interrupt mid-recover doesn't masquerade as one.
+                if let Some(pending) = pending {
+                    pending.commit()?;
+                }
                 let secs = t0.elapsed().as_secs_f64();
                 sp.abandon();
                 if rec.blocks_skipped > 0 {
@@ -769,23 +775,27 @@ fn main() -> anyhow::Result<()> {
                 // is written; otherwise we compare it against what we actually
                 // decode so a silently short file is caught rather than trusted.
                 let expected = fqxv::expected_reads(open_in()?)?;
-                let stats = if let Some(prefix) = split {
+                // Commits are deferred until after the completeness check below, so
+                // a truncated archive leaves nothing at the destination names.
+                let (stats, pending) = if let Some(prefix) = split {
                     let g = fqxv::peek(open_in()?)?.group_size as usize;
-                    let mut sinks: Vec<FastqSink> = (1..=g)
+                    let (pending, mut sinks): (Vec<_>, Vec<FastqSink>) = (1..=g)
                         .map(|i| {
                             open_fastq_file(&split_path(&prefix, i, mate_style, !no_gzip), force)
                         })
-                        .collect::<anyhow::Result<_>>()?;
+                        .collect::<anyhow::Result<Vec<_>>>()?
+                        .into_iter()
+                        .unzip();
                     let stats = fqxv::decompress_split(open_in()?, &mut sinks, cli.threads)?;
                     for sink in sinks {
                         sink.finish()?;
                     }
-                    stats
+                    (stats, pending)
                 } else {
-                    let mut sink = open_sink(output.as_deref(), stdout, force)?;
+                    let (pending, mut sink) = open_sink(output.as_deref(), stdout, force)?;
                     let stats = fqxv::decompress(open_in()?, &mut sink, cli.threads)?;
                     sink.finish()?;
-                    stats
+                    (stats, pending.into_iter().collect())
                 };
                 if let Some(expected) = expected
                     && stats.reads != expected
@@ -795,6 +805,9 @@ fn main() -> anyhow::Result<()> {
                              {} were decoded — the output is incomplete",
                         stats.reads
                     );
+                }
+                for out in pending {
+                    out.commit()?;
                 }
                 let secs = t0.elapsed().as_secs_f64();
                 sp.abandon();
@@ -2184,11 +2197,17 @@ fn is_gzip_path(path: &Path) -> bool {
 /// wins; `-Z/--stdout` streams raw to stdout; with neither we refuse rather than
 /// dump a whole FASTQ to the terminal. Stdout is always raw so a piped decode isn't
 /// gzip-wrapped; a file's `.gz` extension selects BGZF.
-fn open_sink(output: Option<&Path>, to_stdout: bool, force: bool) -> anyhow::Result<FastqSink> {
+/// Returns the sink together with a pending commit when the destination is a
+/// file; stdout has no destination name to protect, so it commits to nothing.
+fn open_sink(
+    output: Option<&Path>,
+    to_stdout: bool,
+    force: bool,
+) -> anyhow::Result<(Option<output::AtomicOutput>, FastqSink)> {
     match output {
-        Some(p) if p.as_os_str() == "-" => Ok(FastqSink::Raw(Box::new(io::stdout()))),
-        Some(p) => open_fastq_file(p, force),
-        None if to_stdout => Ok(FastqSink::Raw(Box::new(io::stdout()))),
+        Some(p) if p.as_os_str() == "-" => Ok((None, FastqSink::Raw(Box::new(io::stdout())))),
+        Some(p) => open_fastq_file(p, force).map(|(pending, sink)| (Some(pending), sink)),
+        None if to_stdout => Ok((None, FastqSink::Raw(Box::new(io::stdout())))),
         None => anyhow::bail!(
             "no output specified: pass -o FILE (\".gz\" for BGZF), --split PREFIX for separate \
              mate files, or -Z/--stdout to stream interleaved FASTQ to stdout"
@@ -2197,27 +2216,14 @@ fn open_sink(output: Option<&Path>, to_stdout: bool, force: bool) -> anyhow::Res
 }
 
 /// Create a FASTQ output file, choosing BGZF compression from its `.gz` extension.
-fn open_fastq_file(path: &Path, force: bool) -> anyhow::Result<FastqSink> {
-    let file = create_output(path, force)?;
-    Ok(FastqSink::new(Box::new(file), is_gzip_path(path)))
-}
-
-/// Create `path` for writing, refusing to clobber an existing file unless `force`.
-/// Without `force` the create is atomic (`create_new`), so it fails cleanly if the
-/// path appears between a check and the open rather than truncating a file another
-/// process just wrote. With `force` this truncates any existing file, as before.
-fn create_output(path: &Path, force: bool) -> anyhow::Result<File> {
-    if force {
-        return File::create(path).with_context(|| format!("creating output {}", path.display()));
-    }
-    match File::options().write(true).create_new(true).open(path) {
-        Ok(f) => Ok(f),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => anyhow::bail!(
-            "output {} already exists; pass -f/--force to overwrite",
-            path.display()
-        ),
-        Err(e) => Err(e).with_context(|| format!("creating output {}", path.display())),
-    }
+///
+/// The bytes go to a sibling temp that reaches `path` only when the returned
+/// [`output::AtomicOutput`] is committed, so an interrupted decode leaves no
+/// plausible-looking partial FASTQ at the destination name. The caller must
+/// finish the sink (flushing BGZF's EOF block) *before* committing.
+fn open_fastq_file(path: &Path, force: bool) -> anyhow::Result<(output::AtomicOutput, FastqSink)> {
+    let (pending, file) = output::AtomicOutput::create(path, force)?;
+    Ok((pending, FastqSink::new(Box::new(file), is_gzip_path(path))))
 }
 
 /// Build the path for member `i` (1-based) of a `--split` decode: `<prefix>` plus a
@@ -2301,25 +2307,62 @@ mod tests {
     }
 
     #[test]
-    fn create_output_refuses_existing_unless_forced() {
+    fn fastq_output_refuses_existing_unless_forced() {
         let dir = std::env::temp_dir().join(format!("fqxv-create-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("archive.fqxv");
+        let path = dir.join("reads.fastq");
 
-        // A fresh path is created regardless of `force`.
-        create_output(&path, false).unwrap();
+        // A fresh path is accepted regardless of `force`.
+        let (pending, sink) = open_fastq_file(&path, false).unwrap();
+        sink.finish().unwrap();
+        pending.commit().unwrap();
         assert!(path.exists());
         std::fs::write(&path, b"existing contents").unwrap();
 
         // Without force, an existing path errors and is left untouched.
-        let err = create_output(&path, false).unwrap_err().to_string();
+        // `unwrap_err` would need `Debug` on the sink, which wraps a `dyn Write`.
+        let err = match open_fastq_file(&path, false) {
+            Ok(_) => panic!("expected an error for an existing output"),
+            Err(e) => e.to_string(),
+        };
         assert!(err.contains("already exists"), "unexpected error: {err}");
         assert_eq!(std::fs::read(&path).unwrap(), b"existing contents");
 
-        // With force, the file is truncated for rewriting.
-        create_output(&path, true).unwrap();
-        assert!(std::fs::read(&path).unwrap().is_empty());
+        // With force, the destination keeps its old contents until the commit
+        // swaps the finished output in — a decode that dies partway leaves the
+        // previous file intact rather than a half-overwritten one.
+        let (pending, mut sink) = open_fastq_file(&path, true).unwrap();
+        sink.write_all(b"replacement").unwrap();
+        sink.finish().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"existing contents");
+        pending.commit().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The wart this guards: an interrupted `--split` decode used to leave
+    /// mate files at their real names, and a truncated `.fastq.gz` is
+    /// indistinguishable from a complete one. Dropping the pending output
+    /// (what a `?` bail does; the signal handler does the same via the ACTIVE
+    /// list) must leave *nothing* at the destination.
+    #[test]
+    fn abandoned_fastq_output_never_reaches_the_destination() {
+        let dir = std::env::temp_dir().join(format!("fqxv-abandon-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample_R1.fastq.gz");
+
+        let (pending, mut sink) = open_fastq_file(&path, false).unwrap();
+        sink.write_all(b"@r1\nACGT\n+\nIIII\n").unwrap();
+        sink.flush().unwrap();
+        // No `finish`/`commit` — models an interrupt mid-decode.
+        drop(sink);
+        drop(pending);
+
+        assert!(
+            !path.exists(),
+            "a partial mate file must never appear at the destination name"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
