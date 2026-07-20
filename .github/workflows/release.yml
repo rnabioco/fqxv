@@ -144,28 +144,17 @@ jobs:
           cd artifacts
           sha256sum fqxv-* > SHA256SUMS.txt
 
-      # The tag's CHANGELOG.md section is the release body. Matching is an exact
-      # prefix compare rather than a regex so the version's dots can't act as
-      # wildcards and pick up a neighbouring section.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: parse-changelog
+
+      # The tag's CHANGELOG.md section is the release body. parse-changelog exits
+      # non-zero if the tag has no matching section, so a forgotten changelog
+      # entry fails the release rather than publishing empty notes.
       - name: Extract release notes
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          awk -v hdr="## [$version]" '
-            index($0, hdr) == 1 { found = 1; next }
-            found && /^## \[/   { exit }   # next release section
-            found && /^\[[^]]+\]: / { exit }   # trailing link-ref block (oldest section)
-            found               { print }
-          ' CHANGELOG.md > notes.md
-          # Drop the blank line that follows the heading.
-          sed -i -e '/./,$!d' notes.md
-          if [ ! -s notes.md ]; then
-            echo "::error::No '## [$version]' section in CHANGELOG.md for tag $GITHUB_REF_NAME." \
-                 "Add one (or fix the heading) before tagging — refusing to publish empty notes."
-            exit 1
-          fi
-          echo "Release notes ($(wc -l < notes.md) lines):"
-          cat notes.md
+          parse-changelog CHANGELOG.md "${GITHUB_REF_NAME#v}" | tee notes.md
 
       # Creates the Release for this tag if it doesn't exist, otherwise updates it
       # in place. `overwrite_files` makes a re-run after a failed upload idempotent.
