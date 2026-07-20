@@ -20,7 +20,7 @@ crate-type = ["cdylib"]
 [dependencies]
 # The produced module (and this crate's `[lib] name`) is `fqxv`, which would
 # collide with a dependency also named `fqxv`; import the library under an alias.
-fqxv_core = { path = "../fqxv", version = "0.2.0", package = "fqxv" }
+fqxv_core = { path = "../fqxv", version = "0.3.0", package = "fqxv" }
 # `macros` (a pyo3 default we dropped at the workspace level) provides the
 # #[pyclass]/#[pymethods]/#[pyfunction] attributes; abi3-py39 → one forward-
 # compatible wheel per platform; extension-module keeps libpython unlinked.
