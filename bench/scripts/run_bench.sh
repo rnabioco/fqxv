@@ -26,8 +26,14 @@ INPUT_MODE="${FQXV_INPUT:-r1}"
 # (`-q binary`, 2-level) are SPRING's lossy quality modes — the only field tools
 # with Illumina-comparable binning, so they are the like-for-like lossy rivals to
 # fqxv-bin8 and fqxv-bin2 (fqz_comp/fqzcomp5 have no Illumina binning mode).
-ALL_TOOLS="fqxv fqxv9 fqxv-reorder fqxv-max fqxv-shuffle fqxv-bin8 fqxv-bin4 fqxv-bin2 fqxv-binont fqxv-binhifi fqxv-reorder-bin8 fqxv-reorder-bin4 fqxv-reorder-bin2 gzip zstd19 xz9 fqz_comp fqzcomp5 spring spring-illbin spring-binary colord colord-lossy"
-TOOLS="${FQXV_TOOLS:-$ALL_TOOLS}"
+# The sets live in toolsets.sh, shared with submit_parallel.sh so the sequential
+# and parallel drivers cannot drift apart. Unset here, TOOLS is resolved per
+# dataset from its platform (below); FQXV_TOOLS pins one explicit list for every
+# dataset, bypassing the platform filter.
+# shellcheck source=./toolsets.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/toolsets.sh"
+ALL_TOOLS="$FQXV_TOOLSET_ALL"
+TOOLS="${FQXV_TOOLS:-}"
 # The fqxv binary (built with `cargo build --release`). Cargo honors
 # CARGO_TARGET_DIR (set to $SCRATCH on this HPC), so the build lands there, NOT
 # in ROOT/target — resolve the same location cargo actually wrote to, else the
@@ -241,6 +247,12 @@ for row in "${rows[@]}"; do
     MiSeq | NovaSeq* | GAIIx | HiSeq* | NextSeq* | NovaSeq6000 | *[Ii]llumina*) PLAT_FLAG="--platform illumina" ;;
     *) PLAT_FLAG="" ;;
   esac
+  # Tools for THIS dataset: its platform's set, unless FQXV_TOOLS pins one list.
+  # Platform-filtering keeps the matrix meaningful rather than merely large —
+  # SPRING is Illumina-only, CoLoRd long-read-only, and fqxv-reorder* collapses
+  # to plain fqxv on long reads, so running every tool everywhere would just
+  # manufacture failure rows.
+  TOOLS="${FQXV_TOOLS:-$(fqxv_toolset_for_platform "$plat_col")}"
 
   # Array cells process a single dataset.
   [[ -n "${FQXV_ONLY_DATASET:-}" && "$label" != "$FQXV_ONLY_DATASET" ]] && continue

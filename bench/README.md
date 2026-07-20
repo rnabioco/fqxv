@@ -68,6 +68,26 @@ Knobs (env vars): `FQXV_THREADS`, `FQXV_INPUT=r1|cat` (R1 only vs R1+R2
 concatenated), `FQXV_TOOLS="gzip zstd19 fqz_comp"` (subset), `FQXV_DATA_DIR`,
 `FQXV_RESULTS_DIR`.
 
+### Which tools run
+
+By default each dataset runs the tool set for **its platform**, defined in one
+place — [`scripts/toolsets.sh`](scripts/toolsets.sh) — and shared by both the
+sequential driver (`run_bench.sh`) and the parallel Slurm driver
+(`submit_parallel.sh`). Illumina gets the full field matrix including
+`fqxv-max`/`fqxv-shuffle` and SPRING's two lossy modes; ONT and PacBio get the
+long-read set with CoLoRd and platform-calibrated quality bins.
+
+Platform filtering keeps the matrix meaningful rather than merely large: SPRING
+is Illumina-only, CoLoRd long-read-only, and `fqxv-reorder*` auto-disables above
+the long-read length threshold (so it would just duplicate the plain `fqxv` rows
+on a separate node). `fqz_comp` is deliberately kept in the long-read sets even
+though it cannot parse long reads — it records `rt=no`, which distinguishes
+"inapplicable" from "never tested".
+
+Add a tool to `toolsets.sh` and every driver picks it up. `FQXV_TOOLS` overrides
+the platform sets with one explicit list for every dataset; `FQXV_LR_TOOLS_ONT`
+and `FQXV_LR_TOOLS_HIFI` override a single long-read platform.
+
 ## 3. Read the table
 
 ```bash
