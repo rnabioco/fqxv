@@ -27,6 +27,11 @@ LR_TOOLS_HIFI="${FQXV_LR_TOOLS_HIFI:-fqxv fqxv9 fqxv-max fqxv-binhifi fqxv-binon
 MAXPAR="${FQXV_MAXPAR:-}"   # empty = no cap; the scheduler manages concurrency
 
 mkdir -p "$RESULTS_DIR"
+# Slurm writes job output relative to the submission dir, so the #SBATCH --output
+# directives would litter the repo root. Directives cannot expand variables, so
+# the submitter overrides them here and keeps every log with its results.
+LOG_DIR="$RESULTS_DIR/logs"
+mkdir -p "$LOG_DIR"
 CELLS="$RESULTS_DIR/cells.tsv"
 : > "$CELLS"
 # datasets.tsv columns: accession label platform layout quality approx_gz reference
@@ -57,7 +62,7 @@ echo "==> $N cells ($(wc -l < <(grep -v '^#' "$HERE/../panels/datasets.tsv" | aw
 # Fresh run: clear previous parts so the merge only sees this submission.
 rm -f "$RESULTS_DIR/parts"/results.*.tsv "$RESULTS_DIR/parts"/meta.*.tsv 2>/dev/null || true
 
-jid_prep=$(sbatch --parsable "$HERE/../slurm/prep.sbatch")
+jid_prep=$(sbatch --parsable --output="$LOG_DIR/%x-%j.out" "$HERE/../slurm/prep.sbatch")
 echo "prep   -> job $jid_prep"
 # Default: no concurrency cap — let the scheduler decide how many cells run at
 # once (each cell is one exclusive-ish node, so Slurm's partition limits already
@@ -65,9 +70,11 @@ echo "prep   -> job $jid_prep"
 array="1-${N}"
 [[ -n "$MAXPAR" ]] && array="${array}%${MAXPAR}"
 jid_arr=$(sbatch --parsable --dependency=afterok:"$jid_prep" \
+                 --output="$LOG_DIR/%x-%A_%a.out" \
                  --array="$array" "$HERE/../slurm/bench_cell.sbatch")
 echo "cells  -> job $jid_arr  (array $array)"
-jid_merge=$(sbatch --parsable --dependency=afterany:"$jid_arr" "$HERE/../slurm/merge.sbatch")
+jid_merge=$(sbatch --parsable --dependency=afterany:"$jid_arr" \
+                   --output="$LOG_DIR/%x-%j.out" "$HERE/../slurm/merge.sbatch")
 echo "merge  -> job $jid_merge"
 echo
 echo "watch:   squeue -u $USER"

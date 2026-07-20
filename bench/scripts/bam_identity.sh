@@ -54,7 +54,7 @@ set -euo pipefail
 DATA_DIR="${FQXV_DATA_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/data}"
 RESULTS_DIR="${FQXV_RESULTS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/results}"
 THREADS="${FQXV_THREADS:-$(nproc)}"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FQXV_BIN="${FQXV_BIN:-$ROOT/target/release/fqxv}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BAMCMP="${FQXV_BAMCMP:-${SCRATCH:-$HOME/scratch}/fqxv/tools/bin/bamcmp}"

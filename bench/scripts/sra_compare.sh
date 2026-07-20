@@ -42,7 +42,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PANEL="${SRA_PANEL:-$HERE/../panels/sra_panel.tsv}"
 # Same resolution as run_bench.sh: cargo honors CARGO_TARGET_DIR (set to $SCRATCH
 # on this HPC), so resolve where cargo actually wrote the binary, not ROOT/target.
-FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$HERE/.." && pwd)/target}/release/fqxv}"
+FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$HERE/../.." && pwd)/target}/release/fqxv}"
 
 mkdir -p "$RESULTS_DIR"
 SIZES="$RESULTS_DIR/sra_sizes.tsv"       # cached .sra metadata (sizes phase)

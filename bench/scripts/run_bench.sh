@@ -32,7 +32,7 @@ TOOLS="${FQXV_TOOLS:-$ALL_TOOLS}"
 # CARGO_TARGET_DIR (set to $SCRATCH on this HPC), so the build lands there, NOT
 # in ROOT/target — resolve the same location cargo actually wrote to, else the
 # harness silently measures a stale ROOT/target/release leftover.
-FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target}/release/fqxv}"
+FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/target}/release/fqxv}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="$RESULTS_DIR/work"
 
