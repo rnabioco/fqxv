@@ -26,7 +26,7 @@ IN="$EDGE_DIR/in"; WORK="$EDGE_DIR/work"; LOGS="$EDGE_DIR/logs"
 MANIFEST="$IN/manifest.tsv"
 RESULTS="$EDGE_DIR/results.tsv"
 
-FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$HERE/.." && pwd)/target}/release/fqxv}"
+FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$HERE/../.." && pwd)/target}/release/fqxv}"
 FQDIGEST="${FQDIGEST:-${SCRATCH:-$HOME/scratch}/fqxv/tools/bin/fqdigest}"
 FQDIGEST_SRC="$HERE/../tools/fqdigest.rs"
 THREADS="${FQXV_THREADS:-8}"

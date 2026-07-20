@@ -22,7 +22,7 @@ set -euo pipefail
 DATA_DIR="${FQXV_DATA_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/data}"
 RESULTS_DIR="${FQXV_RESULTS_DIR:-${SCRATCH:-$HOME/scratch}/fqxv/results}"
 THREADS="${FQXV_THREADS:-$(nproc)}"
-FQXV_BIN="${FQXV_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/fqxv}"
+FQXV_BIN="${FQXV_BIN:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/target/release/fqxv}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BINS="${FQXV_QUALITY_BINS:-bin8 bin4 bin2}"
 REFDIR="$RESULTS_DIR/refs"

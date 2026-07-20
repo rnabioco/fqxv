@@ -53,7 +53,7 @@ META_FILE="$CORPUS_DIR/metadata.tsv"
 RESULTS_TSV="$CORPUS_DIR/results.tsv"
 RESULTS_LOCK="$CORPUS_DIR/results.lock"
 
-FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$HERE/.." && pwd)/target}/release/fqxv}"
+FQXV_BIN="${FQXV_BIN:-${CARGO_TARGET_DIR:-$(cd "$HERE/../.." && pwd)/target}/release/fqxv}"
 THREADS="${FQXV_THREADS:-16}"
 # Second thread count for the once-per-accession determinism check. It only has to
 # DIFFER from THREADS (same count wouldn't test thread-count invariance); we use

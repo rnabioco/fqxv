@@ -15,6 +15,11 @@ Cargo.lock.orig
 *.fastq
 *.fastq.gz
 *.fqxv
+# Slurm job logs. submit_parallel.sh routes these to the results dir, but a
+# directly-submitted sbatch still writes to the submission dir — keep them out
+# of git status either way.
+fqxv-*.out
+slurm-*.out
 
 # Python bindings: virtualenvs, caches, and wheel build outputs
 .venv/

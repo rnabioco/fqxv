@@ -11,7 +11,11 @@
                                  # headroom — 48G covers both. On Bodhi's rna
                                  # partition (no per-core mem cap) override the
                                  # amilan defaults via SBATCH_PARTITION=rna.
-#SBATCH --output=fqxv-cell-%A_%a.out    # throughput headroom while still packing.
+                                 # 16 cpus gives throughput headroom while still
+                                 # packing several cells onto a node.
+# Fallback only: this lands in the submission dir. submit_parallel.sh overrides
+# it with --output so logs land in $FQXV_RESULTS_DIR/logs instead of the repo.
+#SBATCH --output=fqxv-cell-%A_%a.out
 ## #SBATCH --account=amc-general
 # Post-processing (round-trip digest + Δqual) is now all compiled fqdigest — the
 # per-variant single-thread determinism recompress and the interpreted per-byte
