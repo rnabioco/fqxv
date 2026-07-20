@@ -551,6 +551,60 @@ pub(crate) fn adopt_shared_reference(
     ref_frame + shared_total < plain_total
 }
 
+/// How many times the *predicted* whole-file saving must exceed the reference
+/// frame before the block-0 probe is trusted to stand in for the exact gate.
+///
+/// The probe extrapolates one block's margin to the whole file, so this is the
+/// headroom for blocks that are less favourable than the first. On `ecoli_hifi`
+/// the predicted saving is ~5.1x the frame, so the shortcut fires with room to
+/// spare; on `ecoli_ont` block 0's plain candidate is *smaller* than its shared
+/// one, so the margin is negative and the exact gate runs.
+const SHORTCUT_FRAME_MARGIN: u128 = 3;
+
+/// Whether the block-0 probe justifies skipping the plain candidate for the
+/// remaining blocks.
+///
+/// Coding both layouts makes the whole-file gate exact, but it costs a second
+/// long-read assembly per block — roughly a 2x compress-time penalty. On input
+/// where the reference wins overwhelmingly (HiFi: 0.067 vs 0.102 b/base, a ~30x
+/// margin over order-k) that second assembly is pure waste: the plain candidate
+/// never had a chance and is coded only to be dropped.
+///
+/// So extrapolate block 0's per-base margin over the whole file and require the
+/// predicted saving to clear the frame by [`SHORTCUT_FRAME_MARGIN`]:
+///
+/// ```text
+/// (plain_0 - shared_0) * total_bases  >  MARGIN * ref_frame * bases_0
+/// ```
+///
+/// Both sides are exact integer arithmetic in `u128`, so the decision is a pure
+/// function of the input and stays thread-count invariant. A negative margin
+/// (the plain candidate already wins on block 0) never shortcuts.
+///
+/// This trades the *exact* never-worse guarantee for a predicted one, and only
+/// in the regime where the two layouts are nowhere near each other. The downside
+/// is bounded: each block's shared candidate is still `min(reference-coded,
+/// order-k)`, so a mispredicted shortcut can never push a block below the
+/// context model — it can only forgo a per-block overlap win that the probe said
+/// was far out of reach.
+pub(crate) fn shortcut_to_shared_layout(
+    shared_0: usize,
+    plain_0: usize,
+    bases_0: u64,
+    total_bases: u64,
+    ref_frame: usize,
+) -> bool {
+    let Some(margin) = plain_0.checked_sub(shared_0) else {
+        return false; // the plain layout already wins block 0
+    };
+    if bases_0 == 0 || margin == 0 {
+        return false;
+    }
+    let predicted = margin as u128 * u128::from(total_bases);
+    let required = SHORTCUT_FRAME_MARGIN * ref_frame as u128 * u128::from(bases_0);
+    predicted > required
+}
+
 /// Long-read plain layout with a **shared whole-file reference** (issue #168).
 ///
 /// A per-block overlap codec re-assembles and re-stores the same consensus
@@ -627,59 +681,108 @@ fn compress_longread_shared_ref<W: Write>(
     }
     let ref_frame = reference.encode()?;
 
-    // Pass 1: code each block's sequence both ways — against the shared reference
-    // and with the plain per-block codec — holding both candidate streams so the
-    // gate below can compare the two layouts exactly.
-    let seq_coded: Vec<(Vec<u8>, Vec<u8>)> = pool.install(|| {
-        ranges
-            .par_iter()
-            .map(|&(gs, ge)| -> Result<(Vec<u8>, Vec<u8>)> {
-                let blk = build_block(buf, &chunks, &gstart, gs, ge);
-                encode_sequence_stream_shared(&blk.lens, &blk.seq, &params, platform, &reference)
-            })
-            .collect::<Result<_>>()
+    // Pass 1, probe: code the FIRST block both ways — against the shared reference
+    // and with the plain per-block codec. Block 0 is a pure function of the input,
+    // so this decision is thread-count invariant.
+    let blk0 = build_block(buf, &chunks, &gstart, ranges[0].0, ranges[0].1);
+    let bases_0: u64 = blk0.lens.iter().map(|&l| u64::from(l)).sum();
+    let (shared_0, plain_0) = pool.install(|| {
+        encode_sequence_stream_shared(&blk0.lens, &blk0.seq, &params, platform, &reference)
     })?;
-    let shared_total: usize = seq_coded.iter().map(|(s, _)| s.len()).sum();
-    let plain_total: usize = seq_coded.iter().map(|(_, p)| p.len()).sum();
+    drop(blk0);
 
-    // Whole-file never-worse gate (issue #184): the reference frame plus the
-    // reference-coded sequence must beat **the plain layout it would otherwise
-    // use** — which floors each block at `min(per-block overlap, order-k)`, not at
-    // order-k. Gating on order-k alone is a weaker bar than the fallback actually
-    // achieves, so a reference that loses to the per-block overlap codec still
-    // cleared it: on ONT the frame cost 4.37 MB to save 1.58 MB and was adopted
-    // anyway, inflating the archive by ~2.8 MB. Whether the frame pays for itself
-    // depends on error rate — a low-error consensus is compact and reads code
-    // against it almost free (HiFi: frame 1.36 MB, saves 7.20 MB), while noisy
-    // reads do not collapse onto a consensus and the frame never earns back its
-    // cost. Both layouts are coded above, so the comparison is exact rather than
-    // predicted; the loser's streams are simply dropped.
-    if !adopt_shared_reference(ref_frame.len(), shared_total, plain_total) {
+    // When the reference wins the probe by a wide enough margin, skip the plain
+    // candidate for the remaining blocks: it costs a second full long-read
+    // assembly per block and would only be discarded. See
+    // [`shortcut_to_shared_layout`].
+    let shortcut = num_blocks > 1
+        && shortcut_to_shared_layout(
+            shared_0.len(),
+            plain_0.len(),
+            bases_0,
+            total_bases as u64,
+            ref_frame.len(),
+        );
+
+    let shared_seq: Vec<Vec<u8>> = if shortcut {
         info!(
+            shared_0 = shared_0.len(),
+            plain_0 = plain_0.len(),
             ref_frame = ref_frame.len(),
-            shared_total, plain_total, "shared reference does not pay off; using plain layout"
+            "reference wins the block-0 probe by a wide margin; skipping the plain candidate"
         );
-        // Reuse the pass-1 plain streams: they are byte-identical to a fresh
-        // `compress_buffered_plain` pass (same ranges, same per-block choice), so
-        // this only skips re-running the expensive per-block overlap encode.
-        let plain_seq: Vec<Vec<u8>> = seq_coded.into_iter().map(|(_, p)| p).collect();
-        return write_plain_layout(
-            writer,
-            buf,
-            &chunks,
-            &gstart,
-            &ranges,
-            &params,
-            group_size,
-            platform,
-            &pool,
-            Some(&plain_seq),
-        );
-    }
+        let mut v = Vec::with_capacity(num_blocks);
+        v.push(shared_0);
+        v.extend(pool.install(|| {
+            ranges[1..]
+                .par_iter()
+                .map(|&(gs, ge)| -> Result<Vec<u8>> {
+                    let blk = build_block(buf, &chunks, &gstart, gs, ge);
+                    encode_sequence_stream_shared_only(
+                        &blk.lens, &blk.seq, &params, platform, &reference,
+                    )
+                })
+                .collect::<Result<Vec<_>>>()
+        })?);
+        v
+    } else {
+        // Exact whole-file never-worse gate (issue #184): the reference frame plus
+        // the reference-coded sequence must beat **the plain layout it would
+        // otherwise use** — which floors each block at `min(per-block overlap,
+        // order-k)`, not at order-k. Gating on order-k alone is a weaker bar than
+        // the fallback actually achieves, so a reference that loses to the
+        // per-block overlap codec still cleared it: on ONT the frame cost 4.37 MB
+        // to save 1.58 MB and was adopted anyway, inflating the archive by ~2.8 MB.
+        // Both layouts are coded here, so the comparison is exact rather than
+        // predicted; the loser's streams are simply dropped.
+        let rest: Vec<(Vec<u8>, Vec<u8>)> = pool.install(|| {
+            ranges[1..]
+                .par_iter()
+                .map(|&(gs, ge)| -> Result<(Vec<u8>, Vec<u8>)> {
+                    let blk = build_block(buf, &chunks, &gstart, gs, ge);
+                    encode_sequence_stream_shared(
+                        &blk.lens, &blk.seq, &params, platform, &reference,
+                    )
+                })
+                .collect::<Result<_>>()
+        })?;
+        let shared_total = shared_0.len() + rest.iter().map(|(s, _)| s.len()).sum::<usize>();
+        let plain_total = plain_0.len() + rest.iter().map(|(_, p)| p.len()).sum::<usize>();
+
+        if !adopt_shared_reference(ref_frame.len(), shared_total, plain_total) {
+            info!(
+                ref_frame = ref_frame.len(),
+                shared_total, plain_total, "shared reference does not pay off; using plain layout"
+            );
+            // Reuse the pass-1 plain streams: they are byte-identical to a fresh
+            // `compress_buffered_plain` pass (same ranges, same per-block choice),
+            // so this only skips re-running the expensive per-block overlap encode.
+            let mut plain_seq = Vec::with_capacity(num_blocks);
+            plain_seq.push(plain_0);
+            plain_seq.extend(rest.into_iter().map(|(_, p)| p));
+            return write_plain_layout(
+                writer,
+                buf,
+                &chunks,
+                &gstart,
+                &ranges,
+                &params,
+                group_size,
+                platform,
+                &pool,
+                Some(&plain_seq),
+            );
+        }
+        let mut v = Vec::with_capacity(num_blocks);
+        v.push(shared_0);
+        v.extend(rest.into_iter().map(|(s, _)| s));
+        v
+    };
     info!(
         contigs = reference.len(),
         ref_bases = reference.total_bases(),
         ref_frame = ref_frame.len(),
+        shortcut,
         "shared reference adopted"
     );
 
@@ -713,7 +816,7 @@ fn compress_longread_shared_ref<W: Write>(
                 .map(|bi| {
                     let (gs, ge) = ranges[bi];
                     let blk = build_block(buf, &chunks, &gstart, gs, ge);
-                    let payload = compress_block_with_seq(&blk, &params, &seq_coded[bi].0);
+                    let payload = compress_block_with_seq(&blk, &params, &shared_seq[bi]);
                     (blk, payload)
                 })
                 .unzip()

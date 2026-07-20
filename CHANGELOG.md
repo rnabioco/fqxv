@@ -13,6 +13,21 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ## [Unreleased]
 
+### Performance
+
+- **Long-read compression is ~40% faster where the shared reference wins
+  outright.** Making the whole-file gate exact meant coding both layouts for
+  every block, which costs a second long-read assembly per block — on PacBio
+  HiFi that roughly doubled compress time (225s → 461s on `ecoli_hifi`) to
+  evaluate a candidate that never had a chance. The encoder now probes only the
+  **first** block both ways and, when the reference wins by a wide enough margin
+  to cover the reference frame three times over, skips the plain candidate for
+  the remaining blocks. `ecoli_hifi` drops 461s → 275s with byte-identical
+  output; `ecoli_ont`, where the plain layout genuinely wins, sees a negative
+  margin and still runs the exact gate, so the ONT ratio is unchanged. The probe
+  is integer arithmetic over block 0, so the decision stays thread-count
+  invariant, and a shortcut block is still floored at order-k.
+
 ### Fixed
 
 - **The long-read shared-reference gate now measures against the layout it falls

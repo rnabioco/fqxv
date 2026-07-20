@@ -372,6 +372,48 @@ pub(crate) fn encode_sequence_stream(
 /// Unlike [`encode_sequence_stream`], the shared reference is not re-assembled or
 /// stored per block — it is built once by the caller and coded against here, which
 /// is the whole point of the shared frame.
+/// Code **only** the shared-reference candidate: the smaller of the
+/// reference-coded [`SEQ_METHOD_OVERLAP_REF`] stream and order-k.
+///
+/// The caller has already committed to the reference layout (see the block-0
+/// probe in `compress_longread_shared_ref`), so the per-block overlap candidate
+/// would be assembled and then thrown away. Skipping it is the difference
+/// between one and two full long-read assemblies per block, which on HiFi — where
+/// the shared reference wins by ~30x and the plain candidate never has a chance —
+/// is the bulk of compress time.
+///
+/// Order-k is still coded, so a block whose reads do not place on the reference
+/// cannot regress below the context model.
+pub(crate) fn encode_sequence_stream_shared_only(
+    lens: &[u32],
+    seq: &[u8],
+    params: &Params,
+    platform: Platform,
+    reference: &fqxv_lroverlap::Reference,
+) -> Result<Vec<u8>> {
+    let opts_shared = fqxv_lroverlap::EncodeOpts {
+        sketch: sketch_for(platform, SeedContext::WholeFile),
+        ..Default::default()
+    };
+    let (against, order_k) = rayon::join(
+        || {
+            fqxv_lroverlap::encode_against(reference, lens, seq, &opts_shared).map(|coded| {
+                let mut out = Vec::with_capacity(coded.len() + 1);
+                out.push(SEQ_METHOD_OVERLAP_REF);
+                out.extend_from_slice(&coded);
+                out
+            })
+        },
+        || order_k_stream(lens, seq, params),
+    );
+    let (against, order_k) = (against?, order_k?);
+    Ok(if against.len() < order_k.len() {
+        against
+    } else {
+        order_k
+    })
+}
+
 pub(crate) fn encode_sequence_stream_shared(
     lens: &[u32],
     seq: &[u8],
