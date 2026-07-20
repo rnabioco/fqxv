@@ -61,9 +61,15 @@ Examples:
   sracha get -Z --split interleaved SRR2584863 | fqxv compress - -o SRR2584863.fqxv
 ";
 
+/// Version reported by `--version`: the crate version alone for a clean
+/// release-tag build, or with the git description appended for anything else
+/// (`0.3.0 (v0.3.0-7-gab12cd34-dirty)`). Assembled in `build.rs`, which also
+/// explains the release/development distinction.
+const VERSION: &str = env!("FQXV_VERSION");
+
 /// Reference-free FASTQ archiver for short-read data.
 #[derive(Debug, Parser)]
-#[command(name = "fqxv", version, about, long_about = None, styles = STYLES, after_help = EXAMPLES)]
+#[command(name = "fqxv", version = VERSION, about, long_about = None, styles = STYLES, after_help = EXAMPLES)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -2456,6 +2462,25 @@ mod tests {
             "a partial mate file must never appear at the destination name"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Whatever `build.rs` resolves from git, the crate version must lead —
+    /// scripts and humans key off that prefix, and a git description alone
+    /// (or an empty string from a failed command) would break them.
+    #[test]
+    fn version_always_leads_with_the_crate_version() {
+        let pkg = env!("CARGO_PKG_VERSION");
+        assert!(
+            VERSION.starts_with(pkg),
+            "version {VERSION:?} must start with the crate version {pkg:?}"
+        );
+        // Either the bare version (a clean release tag) or it plus a
+        // parenthesized git description — never anything else.
+        let suffix = &VERSION[pkg.len()..];
+        assert!(
+            suffix.is_empty() || (suffix.starts_with(" (") && suffix.ends_with(')')),
+            "unexpected version suffix {suffix:?}"
+        );
     }
 
     #[test]

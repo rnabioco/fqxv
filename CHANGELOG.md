@@ -11,6 +11,17 @@ tolerates newer minors, and additive features are gated behind required-feature
 bits, so a reader that predates a feature refuses the archive outright rather than
 misreading it. A format major bump would be announced as a breaking change.
 
+## [Unreleased]
+
+### Changed
+
+- **`--version` reports git provenance on development builds.** A binary built
+  from a clean checkout of the release tag still prints just `fqxv 0.3.0`;
+  anything else — commits past the tag, a dirty tree, an untagged branch —
+  appends the git description (`fqxv 0.3.0 (v0.3.0-7-gab12cd34-dirty)`), so a
+  bug report identifies the exact build. Source trees with no git (a crates.io
+  tarball) print the plain version.
+
 ## [0.3.0] - 2026-07-19
 
 ### Added
