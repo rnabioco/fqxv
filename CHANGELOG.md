@@ -13,6 +13,22 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Higher effort no longer produces a larger archive.** On a low-redundancy
+  library (BGISEQ-500) `--max` and `-l9` compressed *worse* than the default,
+  because two effort knobs were applied unconditionally even where they cost more
+  than they saved (#196). Both are now never-worse: (1) the level-8+ hashed
+  high-order sequence tier is coded alongside plain order-k and the smaller kept,
+  so enabling it can only help; (2) single-end `--order any`/`--max` codes the
+  clustered and plain layouts and keeps the smaller, so reordering is used only
+  when it pays — the same "code both, keep the smaller" rule the long-read shared
+  reference (#192) and the overlap-vs-order-k choice already use. On the BGISEQ
+  case `--max` drops from a 340 KB regression to matching the default; on a
+  reorder-favourable NovaSeq set `--max` keeps its 2.4x win. Grouped (paired /
+  10x) reorder is unchanged: it pays the permutation for spot reconstruction
+  regardless, so the tradeoff differs.
+
 ### Performance
 
 - **Long-read compression is ~40% faster where the shared reference wins
