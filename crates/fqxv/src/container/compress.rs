@@ -542,13 +542,14 @@ fn write_plain_layout<W: Write>(
 /// Pulled out as a named function because the arithmetic is what regressed and the
 /// end-to-end behaviour cannot be pinned by a small fixture: whether the frame pays
 /// for itself depends on how well the whole-file assembly collapses, which only
-/// diverges from the per-block assemblies at real coverage and read counts.
+/// diverges from the per-block assemblies at real coverage and read counts. It is
+/// the shared-reference wording of the general [`adopt_over`] rule (#203).
 pub(crate) fn adopt_shared_reference(
     ref_frame: usize,
     shared_total: usize,
     plain_total: usize,
 ) -> bool {
-    ref_frame + shared_total < plain_total
+    adopt_over(shared_total, ref_frame, plain_total)
 }
 
 /// How many times the *predicted* whole-file saving must exceed the reference

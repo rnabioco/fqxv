@@ -140,6 +140,7 @@ mod parse;
 mod random_access;
 mod records;
 mod reorder;
+mod select;
 mod verify;
 
 // Internal flat namespace: every submodule item is `pub(crate)`, re-globbed here
@@ -150,6 +151,7 @@ pub(crate) use format::*;
 pub(crate) use inspect::*;
 pub(crate) use parse::*;
 pub(crate) use reorder::*;
+pub(crate) use select::*;
 // `decompress` and `verify` expose only their public surface (below) to the rest
 // of the crate; their internals stay module-private, so no `*` glob here.
 
