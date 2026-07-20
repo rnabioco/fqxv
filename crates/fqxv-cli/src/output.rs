@@ -1,14 +1,29 @@
-//! Atomic archive output.
+//! Atomic file output, for both directions of the codec.
 //!
-//! Compression writes to a sibling temp file and `rename`s it into place only
-//! once the whole archive — header, blocks, *and* footer trailer — is on disk.
-//! An interrupted or failed run therefore never leaves a truncated,
-//! footer-less `.fqxv` at the destination path (which [`fqxv::verify`] would
-//! rightly call CORRUPT). Cleanup is covered on both exits a compress can take:
-//! a `?` error bail runs [`AtomicOutput`]'s [`Drop`], and a Ctrl-C/terminate
-//! runs the signal handler installed by [`install_interrupt_handler`].
+//! Every named output file — the `.fqxv` an archive compresses to, and the
+//! FASTQ a decompress writes — streams into a sibling temp file that is moved
+//! to the destination only once the whole thing is on disk. An interrupted or
+//! failed run therefore never leaves a partial file at the destination path.
+//!
+//! Both directions need this, for different reasons. A truncated, footer-less
+//! `.fqxv` is at least *detectable* — [`fqxv::verify`] rightly calls it
+//! CORRUPT. Truncated FASTQ is not. BGZF blocks are self-contained, so a
+//! partial `.fastq.gz` inflates cleanly — `zcat` exits 0 with no warning — and
+//! FASTQ carries no terminator or record count, so nothing downstream can tell
+//! a half-written mate file from a complete one. Interrupting a `--split`
+//! decode of a 600k-read pair six seconds in produced two files that gzip
+//! called valid, held 524,100 reads apiece, and ended mid-record on a short
+//! quality line. Silently losing 13% of a run that way is the failure this
+//! guards against: the partial bytes must never reach the destination name.
+//!
+//! Cleanup is covered on both exits either direction can take: a `?` error
+//! bail runs [`AtomicOutput`]'s [`Drop`], and a Ctrl-C/terminate runs the
+//! signal handler installed by [`install_interrupt_handler`]. The handler
+//! matters on its own — it calls [`std::process::exit`], which does not
+//! unwind, so `Drop` alone would never run on a signal.
 
 use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -20,10 +35,10 @@ use anyhow::Context;
 static ACTIVE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// Install a Ctrl-C / SIGTERM / SIGHUP handler that removes any in-progress
-/// temp outputs and exits. Call once from `main`, before any compression. A
-/// leftover temp would be harmless (it is never a valid archive and never sits
-/// at the destination path), but this keeps the working tree clean and lets the
-/// exit code carry the interrupt.
+/// temp outputs and exits. Call once from `main`, before any compress or
+/// decompress. A leftover temp would be harmless (it never sits at a
+/// destination path), but this keeps the working tree clean and lets the exit
+/// code carry the interrupt.
 pub(crate) fn install_interrupt_handler() {
     // A failure here only means we lose the tidy-up-on-signal nicety; the
     // atomic rename still guarantees no corrupt archive is published, so it is
@@ -55,22 +70,31 @@ fn unregister(path: &Path) {
     }
 }
 
-/// A pending archive: bytes stream into a temp file that becomes `final_path`
-/// only on [`commit`](AtomicOutput::commit). Dropping without committing removes
-/// the temp.
+/// A pending output file: bytes stream into a temp file that becomes
+/// `final_path` only on [`commit`](AtomicOutput::commit). Dropping without
+/// committing removes the temp.
 #[derive(Debug)]
 pub(crate) struct AtomicOutput {
     tmp: PathBuf,
     final_path: PathBuf,
+    /// Whether the caller passed `-f/--force`, i.e. may replace an existing
+    /// destination. Recorded at create so `commit` can pick a publish that
+    /// enforces the same rule the initial check did.
+    force: bool,
     /// Set by `commit`/`keep_for_inspection` so `Drop` leaves the temp alone.
     settled: bool,
 }
 
 impl AtomicOutput {
     /// Create the temp file alongside `final_path` and return it with an open
-    /// [`File`] to write the archive into. Honors the same overwrite rule as a
+    /// [`File`] to write the output into. Honors the same overwrite rule as a
     /// direct write against the *final* path: without `force`, an existing
-    /// archive is refused.
+    /// destination is refused.
+    ///
+    /// This check is the fail-fast one — it rejects a doomed run before minutes
+    /// of coding work rather than after. It is not the only one: `commit`
+    /// re-enforces the rule atomically, so a destination that appears while we
+    /// are working is still not clobbered.
     pub(crate) fn create(final_path: &Path, force: bool) -> anyhow::Result<(Self, File)> {
         if !force && final_path.exists() {
             anyhow::bail!(
@@ -79,8 +103,8 @@ impl AtomicOutput {
             );
         }
         let tmp = temp_path(final_path);
-        // Truncate-create: a temp left by a crashed run was never a real archive,
-        // so overwriting it is safe.
+        // Truncate-create: a temp left by a crashed run was never a published
+        // output, so overwriting it is safe.
         let file = File::create(&tmp)
             .with_context(|| format!("creating temporary output {}", tmp.display()))?;
         register(&tmp);
@@ -88,6 +112,7 @@ impl AtomicOutput {
             Self {
                 tmp,
                 final_path: final_path.to_path_buf(),
+                force,
                 settled: false,
             },
             file,
@@ -99,16 +124,66 @@ impl AtomicOutput {
         &self.tmp
     }
 
-    /// Atomically move the finished temp into place. After this the archive
+    /// Atomically move the finished temp into place. After this the output
     /// exists at `final_path` and the temp is gone.
+    ///
+    /// Without `force` this publishes via `hard_link`, which fails rather than
+    /// replaces when the destination exists — the atomic create-if-absent that
+    /// a direct `File::options().create_new(true)` open used to provide, kept
+    /// intact now that the bytes route through a temp. `rename` alone would
+    /// silently clobber a file that appeared while we were decoding. With
+    /// `force` the caller has asked to replace, so a plain `rename` is right
+    /// (and is the only one of the two that is a single atomic step).
     pub(crate) fn commit(mut self) -> anyhow::Result<()> {
-        fs::rename(&self.tmp, &self.final_path).with_context(|| {
-            format!(
-                "finalizing {} (from {})",
-                self.final_path.display(),
-                self.tmp.display()
-            )
-        })?;
+        if self.force {
+            fs::rename(&self.tmp, &self.final_path).with_context(|| {
+                format!(
+                    "finalizing {} (from {})",
+                    self.final_path.display(),
+                    self.tmp.display()
+                )
+            })?;
+        } else {
+            match fs::hard_link(&self.tmp, &self.final_path) {
+                Ok(()) => {
+                    // The destination now has the content; drop our temp name for it.
+                    let _ = fs::remove_file(&self.tmp);
+                }
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    anyhow::bail!(
+                        "output {} already exists; pass -f/--force to overwrite",
+                        self.final_path.display()
+                    );
+                }
+                // Not every filesystem supports hard links. Where it is refused
+                // outright we fall back to the rename, accepting its weaker
+                // create-if-absent guarantee rather than failing the whole run —
+                // the `create` check above already covered the common case.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    fs::rename(&self.tmp, &self.final_path).with_context(|| {
+                        format!(
+                            "finalizing {} (from {})",
+                            self.final_path.display(),
+                            self.tmp.display()
+                        )
+                    })?;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "finalizing {} (from {})",
+                            self.final_path.display(),
+                            self.tmp.display()
+                        )
+                    });
+                }
+            }
+        }
         unregister(&self.tmp);
         self.settled = true;
         Ok(())
