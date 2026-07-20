@@ -11,7 +11,7 @@ tolerates newer minors, and additive features are gated behind required-feature
 bits, so a reader that predates a feature refuses the archive outright rather than
 misreading it. A format major bump would be announced as a breaking change.
 
-## [Unreleased]
+## [0.3.0] - 2026-07-19
 
 ### Added
 
@@ -124,12 +124,15 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Changed
 
-- **On-disk format versioning is now `FORMAT_MAJOR.FORMAT_MINOR` (currently
-  `1.0`)**, replacing the single monotonic `FORMAT_VERSION` integer. A reader
-  refuses a differing major and tolerates a newer minor (backward-compatible
-  additions), a documented forward-compatibility contract for the pre-stable
-  format. This release's format carries the long-read overlap codec, the extended
-  per-stream footer index, and the per-stream block digests below.
+- **The on-disk format is stable at 1.0.** Versioning moved from a single
+  monotonic `FORMAT_VERSION` integer to `FORMAT_MAJOR.FORMAT_MINOR`: a reader
+  refuses a differing major and tolerates a newer minor, and additive features are
+  gated behind required-feature bits so a reader that predates a feature refuses
+  the archive outright rather than misreading it. That contract is now a stability
+  guarantee — archives written by a 1.x release stay readable by later ones, and a
+  major bump would be announced as a breaking change. The 1.0 format carries the
+  long-read overlap codec, the extended per-stream footer index, and the
+  per-stream block digests below.
 - **`platform` has its own header byte** — the platform tag no longer shares bits
   with the flags byte (a prior collision made Illumina `--order any` archives
   undecodable).
@@ -145,6 +148,14 @@ misreading it. A format major bump would be announced as a breaking change.
   against the temp file, so a failed verification leaves the unverified output off
   the destination path (kept aside for inspection) and exits non-zero, rather than
   leaving a suspect archive in place.
+- **`--help` layout** — the flags most runs need are listed first and the
+  rarely-touched knobs are grouped under an `Advanced` heading, so the default
+  help is short enough to read. `-h` prints a one-line summary per flag and
+  `--help` expands the detail (when a knob changes the data or the guarantees,
+  the long form says so).
+- **Rust edition 2024** — the workspace moved from edition 2021. The MSRV is
+  unchanged at 1.95, so this is invisible to downstream builds on a supported
+  toolchain.
 
 ### Performance
 
@@ -298,5 +309,6 @@ of FASTQ. Codecs are clean-room implementations from specs and papers
   SPRING and fqz_comp do). Name, sequence, and quality are otherwise preserved
   exactly; this is the one documented deviation from byte-losslessness.
 
+[0.3.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.3.0
 [0.2.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.2.0
 [0.1.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.1.0
