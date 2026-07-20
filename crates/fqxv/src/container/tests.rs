@@ -772,10 +772,10 @@ fn first_block_seq_method(archive: &[u8]) -> u8 {
 #[test]
 fn long_read_path_tries_overlap_but_keeps_order_k_roundtrip_and_determinism() {
     // 600 bp reads clear the long-read gate (`is_long_read`, mean > 500), so the
-    // container *tries* the overlap codec and order-k and keeps the smaller — and
-    // at this scale order-k wins, so the block is stored order-k. (Overlap only
-    // beats order-k at realistic multi-kb reads and high depth; on a tiny genome
-    // the assembly/consensus overhead loses.) This test guards that long-read
+    // container tries every long-read candidate — overlap, order-k, raw LZMA — and
+    // keeps the smaller. At this scale the assembly/consensus *overlap* codec loses
+    // (it only beats the plain candidates at realistic multi-kb reads and high
+    // depth); one of the plain candidates wins. This test guards the long-read
     // *selection* path: it round-trips byte-exact and is thread-count invariant.
     // The overlap *decode* dispatch is covered separately by
     // `container_decodes_overlap_tagged_sequence_stream`.
@@ -804,11 +804,11 @@ fn long_read_path_tries_overlap_but_keeps_order_k_roundtrip_and_determinism() {
         compress(&input[..], &mut archive, params).unwrap();
         archives.push(archive);
     }
-    assert_eq!(
-        first_block_seq_method(&archives[0]),
-        SEQ_METHOD_ORDERK,
-        "order-k must win the size race at this scale; if overlap ever wins here, \
-         this test's premise (and name) is stale"
+    let method = first_block_seq_method(&archives[0]);
+    assert!(
+        method == SEQ_METHOD_ORDERK || method == SEQ_METHOD_LZMA,
+        "a plain candidate (order-k or LZMA) must win at this scale, not the \
+         overlap codec; got method {method}"
     );
     assert_eq!(
         archives[0], archives[1],
@@ -970,6 +970,60 @@ fn hashed_tier_never_enlarges_the_order_k_stream() {
         assert_eq!(dl, lens);
         assert_eq!(ds, seq);
     }
+}
+
+#[test]
+fn lzma_sequence_method_wins_and_round_trips_on_redundant_long_reads() {
+    // #197. Long reads drawn from a small genome carry heavy cross-read exact
+    // overlap — the regime where raw LZMA beats both order-k and the overlap codec.
+    // The block must be stored as SEQ_METHOD_LZMA and round-trip byte-exact,
+    // including the non-ACGT exception path.
+    let input = deep_longread_fastq(200, 1200, 30, 3000, 300);
+    let archive = compress_bytes(
+        &input,
+        Params {
+            seq_order: 0,
+            ..Params::default()
+        },
+    );
+    assert_eq!(
+        first_block_seq_method(&archive),
+        SEQ_METHOD_LZMA,
+        "raw LZMA must win on heavily-overlapping long reads"
+    );
+    let mut out = Vec::new();
+    decompress(&archive[..], &mut out, 4).expect("decompress");
+    assert_eq!(
+        out, input,
+        "LZMA sequence archive must round-trip byte-exact"
+    );
+
+    // The FQXV_SEQ_NO_LZMA toggle removes the candidate, so a different method wins
+    // and the archive is still lossless. SAFETY: set before compress spawns
+    // threads; nextest isolates the process so it does not leak.
+    unsafe { std::env::set_var("FQXV_SEQ_NO_LZMA", "1") };
+    let without = compress_bytes(
+        &input,
+        Params {
+            seq_order: 0,
+            ..Params::default()
+        },
+    );
+    unsafe { std::env::remove_var("FQXV_SEQ_NO_LZMA") };
+    assert_ne!(
+        first_block_seq_method(&without),
+        SEQ_METHOD_LZMA,
+        "disabling the candidate must stop LZMA from being chosen"
+    );
+    assert!(
+        archive.len() <= without.len(),
+        "LZMA must not enlarge the archive vs the same input without it ({} vs {})",
+        archive.len(),
+        without.len(),
+    );
+    let mut out2 = Vec::new();
+    decompress(&without[..], &mut out2, 4).expect("decompress without lzma");
+    assert_eq!(out2, input);
 }
 
 #[test]
@@ -1150,6 +1204,13 @@ fn shared_reference_longread_roundtrips_across_blocks() {
         block_reads: 60,
         ..Params::default()
     };
+    // This fixture's redundant reads compress trivially under raw LZMA, which would
+    // win the plain candidate and leave the reference unadopted — so disable the
+    // LZMA candidate to exercise the shared-reference wiring specifically. nextest
+    // runs each test in its own process, so the env var does not leak. (The
+    // reference-vs-LZMA contest on real data is a ratio question, not a wiring one.)
+    // SAFETY: single-threaded test setup, before any compress spawns threads.
+    unsafe { std::env::set_var("FQXV_SEQ_NO_LZMA", "1") };
     let mut archive = Vec::new();
     let stats = compress_auto(&input[..], &mut archive, mk(4)).expect("compress");
     assert!(stats.blocks > 1, "fixture must span multiple blocks");

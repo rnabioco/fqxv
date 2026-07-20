@@ -13,6 +13,21 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ## [Unreleased]
 
+### Added
+
+- **Raw-LZMA sequence codec for ordinary-coverage long reads** — a new per-block
+  sequence method (`SEQ_METHOD_LZMA`) codes the block's ASCII bases with a
+  large-window LZ, kept only when it beats the existing candidates. At ordinary
+  long-read coverage — a real genome, not 300× of one organism — overlapping HiFi
+  reads share long *exact* substrings that neither the within-read order-k model
+  nor the consensus-edit overlap codec captures, but a large-window LZ finds
+  directly. On the full PacBio Revio WGS run the archive goes from **9.72× to
+  13.35×** — from second-worst in the lossless field, below plain `zstd19`/`xz9`,
+  to above both — losslessly. The overlap codec still wins on
+  high-coverage/amplicon data, and the per-block `keep_smaller` gate picks the
+  right one automatically. `FQXV_SEQ_NO_LZMA` disables the candidate for A/B
+  measurement.
+
 ### Fixed
 
 - **Higher effort no longer produces a larger archive.** On a low-redundancy

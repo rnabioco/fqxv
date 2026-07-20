@@ -206,6 +206,14 @@ pub(crate) const SEQ_METHOD_OVERLAP: u8 = 1;
 /// (issue #168). Decoding requires that frame — [`decode_sequence_stream`] fails
 /// closed if it is absent.
 pub(crate) const SEQ_METHOD_OVERLAP_REF: u8 = 2;
+/// Raw-sequence LZMA (`fqxv_reorder::lzma_seq_encode`): a clean-room LZMA over the
+/// block's ASCII bases with an ~89 MB match window. At ordinary long-read coverage
+/// (a real genome, not 300x of one organism) overlapping reads share long *exact*
+/// substrings that neither the within-read order-k model nor the consensus-edit
+/// overlap codec captures, but a large-window LZ finds directly — 0.6 vs 1.4
+/// b/base on Revio WGS (#197). Self-contained; kept only when it beats the other
+/// candidates via [`keep_smaller`].
+pub(crate) const SEQ_METHOD_LZMA: u8 = 3;
 
 /// Which index a sketch is being built for.
 ///
@@ -270,6 +278,36 @@ fn tag_orderk(coded: Vec<u8>) -> Vec<u8> {
     out
 }
 
+/// Raw-sequence LZMA candidate (see [`SEQ_METHOD_LZMA`]): a method-tagged stream
+/// coding the block's ASCII bases with a large-window LZ. It wins where reads
+/// carry cross-read redundancy at ordinary coverage; the caller keeps it only when
+/// it is smaller than the other candidates.
+fn lzma_stream(lens: &[u32], seq: &[u8]) -> Result<Vec<u8>> {
+    let coded = fqxv_reorder::lzma_seq_encode(lens, seq)?;
+    let mut out = Vec::with_capacity(coded.len() + 1);
+    out.push(SEQ_METHOD_LZMA);
+    out.extend_from_slice(&coded);
+    Ok(out)
+}
+
+/// Whether to code the raw-LZMA sequence candidate (#197). `FQXV_SEQ_NO_LZMA`
+/// disables it — for A/B measurement of the LZMA lever, and for tests that must
+/// exercise a layout LZMA would otherwise win. Off by default (LZMA on), zero-cost
+/// when unset.
+fn lzma_candidate_enabled() -> bool {
+    std::env::var_os("FQXV_SEQ_NO_LZMA").is_none()
+}
+
+/// The optional LZMA candidate: `None` (skipping the encode entirely) when
+/// disabled, else the coded stream.
+fn lzma_candidate(lens: &[u32], seq: &[u8]) -> Result<Option<Vec<u8>>> {
+    if lzma_candidate_enabled() {
+        Ok(Some(lzma_stream(lens, seq)?))
+    } else {
+        Ok(None)
+    }
+}
+
 pub(crate) fn order_k_stream(lens: &[u32], seq: &[u8], params: &Params) -> Result<Vec<u8>> {
     let plain = fqxv_seq::encode(lens, seq, params.seq_order as usize)?;
 
@@ -320,13 +358,16 @@ pub(crate) fn encode_sequence_stream(
     if !super::reorder::is_long_read(lens) {
         return order_k_stream(lens, seq, params);
     }
-    // This codec assembles a reference from THIS block's reads only, so it is a
-    // per-block index (see `SeedContext`).
+    // Three candidates, coded in parallel and kept by the smaller (#197). The
+    // overlap codec assembles a reference from THIS block's reads only (a per-block
+    // index, see `SeedContext`); order-k is the within-read fallback; and raw LZMA
+    // catches the cross-read *exact* matches a real genome at ordinary coverage
+    // carries, which the other two miss.
     let opts = fqxv_lroverlap::EncodeOpts {
         sketch: sketch_for(platform, SeedContext::PerBlock),
         ..Default::default()
     };
-    let (overlap, order_k) = rayon::join(
+    let (overlap, (order_k, lzma)) = rayon::join(
         || {
             fqxv_lroverlap::encode(lens, seq, &opts).map(|coded| {
                 let mut out = Vec::with_capacity(coded.len() + 1);
@@ -335,31 +376,38 @@ pub(crate) fn encode_sequence_stream(
                 out
             })
         },
-        || order_k_stream(lens, seq, params),
+        || {
+            rayon::join(
+                || order_k_stream(lens, seq, params),
+                || lzma_candidate(lens, seq),
+            )
+        },
     );
-    let (overlap, order_k) = (overlap?, order_k?);
-    // `FQXV_DIAG_SEQ` reports the overlap-vs-order-k contest per long-read block
-    // (bytes and bits/base) so seeding/consensus changes can be judged against the
-    // real keep-the-smaller outcome, not a proxy. Off by default, zero-cost.
+    let (overlap, order_k, lzma) = (overlap?, order_k?, lzma?);
+    // `FQXV_DIAG_SEQ` reports the per-block contest (bytes and bits/base) so
+    // seeding/consensus changes can be judged against the real keep-the-smaller
+    // outcome, not a proxy. Off by default, zero-cost.
     if std::env::var_os("FQXV_DIAG_SEQ").is_some() {
         let bases: u64 = lens.iter().map(|&l| u64::from(l)).sum::<u64>().max(1);
         let bpb = |n: usize| (n as f64 * 8.0) / bases as f64;
+        let lzma_len = lzma.as_ref().map_or(usize::MAX, Vec::len);
         eprintln!(
-            "[diag seq] {} reads, {} bases | overlap {} B ({:.3} b/base) | order-k {} B ({:.3} b/base) | kept {}",
+            "[diag seq] {} reads, {} bases | overlap {} B ({:.3} b/base) | order-k {} B ({:.3} b/base) | lzma {} B ({:.3} b/base)",
             lens.len(),
             bases,
             overlap.len(),
             bpb(overlap.len()),
             order_k.len(),
             bpb(order_k.len()),
-            if overlap.len() < order_k.len() {
-                "OVERLAP"
-            } else {
-                "order-k"
-            },
+            lzma_len,
+            bpb(lzma_len),
         );
     }
-    Ok(keep_smaller(overlap, order_k))
+    let plain = keep_smaller(overlap, order_k);
+    Ok(match lzma {
+        Some(l) => keep_smaller(l, plain),
+        None => plain,
+    })
 }
 
 /// Code **only** the shared-reference candidate: the smaller of the
@@ -407,8 +455,9 @@ pub(crate) fn encode_sequence_stream_shared_only(
 ///   [`SEQ_METHOD_OVERLAP_REF`] stream and order-k. Valid only in an archive that
 ///   carries the reference frame.
 /// - `.1` — the **plain** candidate: exactly what [`encode_sequence_stream`] would
-///   produce for this block, i.e. the smaller of the per-block
-///   [`SEQ_METHOD_OVERLAP`] stream and order-k. Self-contained.
+///   produce for this block, i.e. the smallest of the per-block
+///   [`SEQ_METHOD_OVERLAP`] stream, order-k, and raw [`SEQ_METHOD_LZMA`].
+///   Self-contained.
 ///
 /// Both are needed because the gate must compare the shared-reference layout
 /// against *the layout it would otherwise use*. Gating on order-k alone measures
@@ -421,9 +470,7 @@ pub(crate) fn encode_sequence_stream_shared_only(
 /// the fallback layout without re-coding: the per-block overlap encode is the
 /// expensive half of this function, and `block_ranges` is a pure function of the
 /// input, so these streams are byte-identical to a fresh
-/// [`compress_buffered_plain`] pass. The dual keep-smaller below is spelled out
-/// rather than two [`keep_smaller`] calls so the shared order-k allocation is
-/// cloned only when it wins on both sides.
+/// [`compress_buffered_plain`] pass.
 pub(crate) fn encode_sequence_stream_shared(
     lens: &[u32],
     seq: &[u8],
@@ -443,7 +490,7 @@ pub(crate) fn encode_sequence_stream_shared(
         sketch: sketch_for(platform, SeedContext::PerBlock),
         ..Default::default()
     };
-    let (against, (overlap, order_k)) = rayon::join(
+    let (against, (overlap, (order_k, lzma))) = rayon::join(
         || {
             fqxv_lroverlap::encode_against(reference, lens, seq, &opts_shared).map(|coded| {
                 let mut out = Vec::with_capacity(coded.len() + 1);
@@ -462,17 +509,22 @@ pub(crate) fn encode_sequence_stream_shared(
                         out
                     })
                 },
-                || order_k_stream(lens, seq, params),
+                || {
+                    rayon::join(
+                        || order_k_stream(lens, seq, params),
+                        || lzma_candidate(lens, seq),
+                    )
+                },
             )
         },
     );
-    let (against, overlap, order_k) = (against?, overlap?, order_k?);
-    let (a_win, o_win) = (against.len() < order_k.len(), overlap.len() < order_k.len());
+    let (against, overlap, order_k, lzma) = (against?, overlap?, order_k?, lzma?);
     if std::env::var_os("FQXV_DIAG_SEQ").is_some() {
         let bases: u64 = lens.iter().map(|&l| u64::from(l)).sum::<u64>().max(1);
         let bpb = |n: usize| (n as f64 * 8.0) / bases as f64;
+        let lzma_len = lzma.as_ref().map_or(usize::MAX, Vec::len);
         eprintln!(
-            "[diag seq/shared] {} reads, {} bases | shared-ref {} B ({:.3} b/base) | per-block overlap {} B ({:.3} b/base) | order-k {} B ({:.3} b/base)",
+            "[diag seq/shared] {} reads, {} bases | shared-ref {} B ({:.3} b/base) | per-block overlap {} B ({:.3} b/base) | order-k {} B ({:.3} b/base) | lzma {} B ({:.3} b/base)",
             lens.len(),
             bases,
             against.len(),
@@ -481,16 +533,20 @@ pub(crate) fn encode_sequence_stream_shared(
             bpb(overlap.len()),
             order_k.len(),
             bpb(order_k.len()),
+            lzma_len,
+            bpb(lzma_len),
         );
     }
-    // Order-k is the fallback for both candidates, so it is cloned only when it
-    // wins on both sides (neither long-read codec paid off for this block).
-    Ok(match (a_win, o_win) {
-        (true, true) => (against, overlap),
-        (true, false) => (against, order_k),
-        (false, true) => (order_k, overlap),
-        (false, false) => (order_k.clone(), order_k),
-    })
+    // Shared candidate: the reference-coded stream vs order-k. Plain candidate: the
+    // layout the whole-file gate falls back to — the smallest of the per-block
+    // overlap codec, order-k, and raw LZMA (#197). Order-k feeds both sides, so it
+    // is cloned once (a cheap memcpy beside the encodes above).
+    let shared = keep_smaller(against, order_k.clone());
+    let mut plain = keep_smaller(overlap, order_k);
+    if let Some(l) = lzma {
+        plain = keep_smaller(l, plain);
+    }
+    Ok((shared, plain))
 }
 
 /// Decode a method-tagged sequence stream back to `(per-read lengths, bases)`.
@@ -508,6 +564,7 @@ pub(crate) fn decode_sequence_stream(
         .ok_or(Error::Malformed("empty sequence stream"))?;
     match method {
         SEQ_METHOD_ORDERK => Ok(fqxv_seq::decode(rest)?),
+        SEQ_METHOD_LZMA => Ok(fqxv_reorder::lzma_seq_decode(rest)?),
         SEQ_METHOD_OVERLAP => Ok(fqxv_lroverlap::decode(rest)?),
         SEQ_METHOD_OVERLAP_REF => {
             let reference = shared_ref.ok_or(Error::Malformed(
