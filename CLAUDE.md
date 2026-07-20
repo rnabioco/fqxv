@@ -145,3 +145,31 @@ comment at the top of `container.rs` — read it before touching the format.
   just the test jobs) need it.
 - Release profile is fat-LTO, single codegen unit, `panic = "abort"`. Use the
   `profiling` profile for samply/perf (keeps symbols, no LTO).
+
+## Profiling this codebase
+
+Hard-won on the reorder audit (#113); re-deriving these costs a run each.
+
+- **Profile the `profiling` profile, never release.** `perf --call-graph=dwarf`
+  aborts on the fat-LTO release binary (thin/stripped debug) but works fine on
+  `cargo build --profile profiling` (`debug=2`, `strip=false`, full
+  `.debug_frame`) — exit 0, clean stacks.
+- **`--call-graph=fp` is worse than useless here.** The hot loops clobber `rbp`,
+  so the frame-pointer walk reads *sequence data* as return addresses. If a call
+  graph shows addresses like `0x4341544141434141` (that is the ASCII `ACAATACA`),
+  discard it. This is what manufactured the phantom "22% unattributed".
+- **`call_mut` is not a mystery, it is the rayon closure shim.**
+  `core::ops::function::impls::<impl FnMut for &F>::call_mut` is where any fully
+  inlined closure-body code gets billed. Decompose it by srcline rather than
+  treating it as one symbol — half of it was hashbrown's get-side probe.
+- **Trust perf's own `--full-source-path` srcline resolution** over hand-rolled
+  `addr2line`: against a running PIE that needs the exact mmap base from
+  `perf script --show-mmap-events`, and guessing it silently resolves hot samples
+  into cold symbols (it once "found" 9% in `tabled::Table::fmt`).
+- LBR is unavailable on this cluster (`--call-graph=lbr` exits 255) — the PMU is
+  virtualised. Use `-e cpu-clock -F 999`.
+- Use hyperfine for wall-clock deltas, and **verify the binary you are timing
+  actually contains your change** (`strings`, or a probe log line). Cargo can
+  skip a rebuild after a `git stash pop`, and an A/B of two identical binaries
+  reports a confident, meaningless zero — that mistake shipped a 2x long-read
+  encode regression as "no measurable cost".
