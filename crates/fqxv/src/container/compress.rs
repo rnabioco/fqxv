@@ -439,7 +439,7 @@ pub(crate) fn compress_buffered<W: Write>(
 /// the blocks (in parallel) and write them in order. `group_size` is the
 /// interleaving already determined by the caller. This is the layout for short
 /// reads and the fallback when the long-read shared reference does not pay off.
-fn compress_buffered_plain<W: Write>(
+pub(crate) fn compress_buffered_plain<W: Write>(
     buf: &[u8],
     writer: W,
     params: Params,
@@ -458,9 +458,37 @@ fn compress_buffered_plain<W: Write>(
     );
     let (chunks, gstart, _n) = parse_chunks(buf, g, &pool)?;
     let platform = resolve_platform_buf(params.platform, buf);
+    // Byte-budgeted row-group ranges (min of block_reads and a raw-sequence byte
+    // cap, on whole-spot boundaries) — a pure function of the read lengths, so
+    // determinism holds regardless of thread count.
+    let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
+    write_plain_layout(
+        writer, buf, &chunks, &gstart, &ranges, &params, group_size, platform, &pool, None,
+    )
+}
 
+/// Write the plain per-block layout: header, blocks in order, footer.
+///
+/// `precoded_seq`, when present, supplies each block's already-coded sequence
+/// stream (indexed by block) and only names and quality are coded here. The
+/// long-read shared-reference path uses it to write the fallback layout without
+/// re-running the per-block overlap encode it already did in pass 1; passing
+/// `None` codes all three streams per block, the ordinary short-read path.
+#[allow(clippy::too_many_arguments)]
+fn write_plain_layout<W: Write>(
+    writer: W,
+    buf: &[u8],
+    chunks: &[ChunkParse],
+    gstart: &[usize],
+    ranges: &[(usize, usize)],
+    params: &Params,
+    group_size: u8,
+    platform: Platform,
+    pool: &rayon::ThreadPool,
+    precoded_seq: Option<&[Vec<u8>]>,
+) -> Result<Stats> {
     let mut w = CrcWriter::new(BufWriter::new(writer));
-    write_header(&mut w, &params, group_size, platform)?;
+    write_header(&mut w, params, group_size, platform)?;
     let mut stats = Stats {
         group_size,
         ..Stats::default()
@@ -470,10 +498,6 @@ fn compress_buffered_plain<W: Write>(
     // every block up front would hold a second full copy of the input alongside
     // `buf`. Each block is a pure function of its global index range, so lazy
     // per-batch building is byte-identical to building them all at once.
-    // Byte-budgeted row-group ranges (min of block_reads and a raw-sequence byte
-    // cap, on whole-spot boundaries) — a pure function of the read lengths, so
-    // determinism holds regardless of thread count.
-    let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
     let num_blocks = ranges.len();
     let batch = pool.current_num_threads().max(1);
     let mut index = FooterIndex::new();
@@ -484,8 +508,11 @@ fn compress_buffered_plain<W: Write>(
                 .into_par_iter()
                 .map(|bi| {
                     let (gs, ge) = ranges[bi];
-                    let blk = build_block(buf, &chunks, &gstart, gs, ge);
-                    let payload = compress_block(&blk, &params, platform);
+                    let blk = build_block(buf, chunks, gstart, gs, ge);
+                    let payload = match precoded_seq {
+                        Some(seqs) => compress_block_with_seq(&blk, params, &seqs[bi]),
+                        None => compress_block(&blk, params, platform),
+                    };
                     (blk, payload)
                 })
                 .unzip()
@@ -496,6 +523,32 @@ fn compress_buffered_plain<W: Write>(
     w.flush()?;
     stats.out_bytes += HEADER_LEN as u64 + footer_bytes;
     Ok(stats)
+}
+
+/// Whole-file never-worse gate for the long-read shared reference.
+///
+/// Adopt the reference layout only when the frame plus the reference-coded
+/// sequence beats **the plain layout it would otherwise fall back to** —
+/// `plain_total` being the sum, per block, of the smaller of the overlap codec and
+/// order-k.
+///
+/// The distinction is the whole point (issue #184). Gating against the order-k
+/// total alone is a weaker bar than the fallback actually achieves, so a reference
+/// that loses to the per-block overlap codec still clears it. That shipped as a
+/// real ONT regression: the frame cost 4.37 MB to save 1.58 MB, inflating the
+/// archive by ~2.8 MB while comfortably beating order-k. Ties do not adopt — an
+/// equal-size archive plus a reference frame is pure overhead.
+///
+/// Pulled out as a named function because the arithmetic is what regressed and the
+/// end-to-end behaviour cannot be pinned by a small fixture: whether the frame pays
+/// for itself depends on how well the whole-file assembly collapses, which only
+/// diverges from the per-block assemblies at real coverage and read counts.
+pub(crate) fn adopt_shared_reference(
+    ref_frame: usize,
+    shared_total: usize,
+    plain_total: usize,
+) -> bool {
+    ref_frame + shared_total < plain_total
 }
 
 /// Long-read plain layout with a **shared whole-file reference** (issue #168).
@@ -510,11 +563,16 @@ fn compress_buffered_plain<W: Write>(
 /// — blocks stay 256 MiB, parallel, and independently decodable.
 ///
 /// Two passes over the buffered input:
-/// 1. build the reference and code each block's sequence against it (the expensive
-///    reference-aligned coding), holding the small edit streams;
+/// 1. build the reference and code each block's sequence **both ways** — against
+///    the shared reference and with the plain per-block codec
+///    ([`encode_sequence_stream_shared`]) — holding the small streams;
 /// 2. whole-file never-worse gate — adopt the reference layout only when
-///    `reference frame + Σ chosen sequence` beats the plain order-k total; else
-///    fall back to [`compress_buffered_plain`] (the reference is not re-coded).
+///    `reference frame + Σ shared sequence` beats `Σ plain sequence`, the layout it
+///    would otherwise use; else write the plain layout, reusing the pass-1 plain
+///    streams rather than re-coding them.
+///
+/// Coding both ways is what makes the gate exact (issue #184); the loser's streams
+/// are dropped, and neither branch codes the sequence twice.
 ///
 /// On the reference layout, pass 2 codes each block's names and quality and reuses
 /// the pass-1 sequence, writing blocks in order with bounded memory.
@@ -567,30 +625,54 @@ fn compress_longread_shared_ref<W: Write>(
     }
     let ref_frame = reference.encode()?;
 
-    // Pass 1: code each block's sequence against the shared reference (the
-    // expensive alignment), holding the small edit streams and the order-k baseline.
-    let seq_coded: Vec<(Vec<u8>, usize)> = pool.install(|| {
+    // Pass 1: code each block's sequence both ways — against the shared reference
+    // and with the plain per-block codec — holding both candidate streams so the
+    // gate below can compare the two layouts exactly.
+    let seq_coded: Vec<(Vec<u8>, Vec<u8>)> = pool.install(|| {
         ranges
             .par_iter()
-            .map(|&(gs, ge)| -> Result<(Vec<u8>, usize)> {
+            .map(|&(gs, ge)| -> Result<(Vec<u8>, Vec<u8>)> {
                 let blk = build_block(buf, &chunks, &gstart, gs, ge);
                 encode_sequence_stream_shared(&blk.lens, &blk.seq, &params, platform, &reference)
             })
             .collect::<Result<_>>()
     })?;
-    let chosen_total: usize = seq_coded.iter().map(|(s, _)| s.len()).sum();
-    let orderk_total: usize = seq_coded.iter().map(|(_, k)| *k).sum();
+    let shared_total: usize = seq_coded.iter().map(|(s, _)| s.len()).sum();
+    let plain_total: usize = seq_coded.iter().map(|(_, p)| p.len()).sum();
 
-    // Whole-file never-worse gate: the reference frame plus the reference-coded
-    // sequence must beat the plain order-k sequence, or the reference is pure
-    // overhead. Fall back to the plain layout (which itself keeps the smaller of the
-    // per-block overlap and order-k codecs), never re-coding against the reference.
-    if ref_frame.len() + chosen_total >= orderk_total {
+    // Whole-file never-worse gate (issue #184): the reference frame plus the
+    // reference-coded sequence must beat **the plain layout it would otherwise
+    // use** — which floors each block at `min(per-block overlap, order-k)`, not at
+    // order-k. Gating on order-k alone is a weaker bar than the fallback actually
+    // achieves, so a reference that loses to the per-block overlap codec still
+    // cleared it: on ONT the frame cost 4.37 MB to save 1.58 MB and was adopted
+    // anyway, inflating the archive by ~2.8 MB. Whether the frame pays for itself
+    // depends on error rate — a low-error consensus is compact and reads code
+    // against it almost free (HiFi: frame 1.36 MB, saves 7.20 MB), while noisy
+    // reads do not collapse onto a consensus and the frame never earns back its
+    // cost. Both layouts are coded above, so the comparison is exact rather than
+    // predicted; the loser's streams are simply dropped.
+    if !adopt_shared_reference(ref_frame.len(), shared_total, plain_total) {
         info!(
             ref_frame = ref_frame.len(),
-            chosen_total, orderk_total, "shared reference does not pay off; using plain layout"
+            shared_total, plain_total, "shared reference does not pay off; using plain layout"
         );
-        return compress_buffered_plain(buf, writer, params, group_size);
+        // Reuse the pass-1 plain streams: they are byte-identical to a fresh
+        // `compress_buffered_plain` pass (same ranges, same per-block choice), so
+        // this only skips re-running the expensive per-block overlap encode.
+        let plain_seq: Vec<Vec<u8>> = seq_coded.into_iter().map(|(_, p)| p).collect();
+        return write_plain_layout(
+            writer,
+            buf,
+            &chunks,
+            &gstart,
+            &ranges,
+            &params,
+            group_size,
+            platform,
+            &pool,
+            Some(&plain_seq),
+        );
     }
     info!(
         contigs = reference.len(),

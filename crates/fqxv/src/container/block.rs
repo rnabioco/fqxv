@@ -304,29 +304,44 @@ pub(crate) fn encode_sequence_stream(
     })
 }
 
-/// Code a long-read block's sequence against a shared, whole-file
-/// [`fqxv_lroverlap::Reference`], returning the chosen method-tagged stream (the
-/// smaller of the reference-coded [`SEQ_METHOD_OVERLAP_REF`] and order-k) and the
-/// order-k stream's length. The length is the whole-file never-worse baseline the
-/// shared-reference compress path (issue #168) sums across blocks: it adopts the
-/// reference layout only when `reference frame + Σ chosen` beats `Σ order-k`, so
-/// the archive is never larger than the plain order-k layout.
+/// Code a long-read block's sequence **both ways** and return the two candidate
+/// streams the whole-file layout gate chooses between (issue #184):
 ///
-/// Unlike [`encode_sequence_stream`], the reference is not re-assembled or stored
-/// per block — it is built once by the caller and coded against here, which is the
-/// whole point of the shared frame.
+/// - `.0` — the **shared-reference** candidate: the smaller of the reference-coded
+///   [`SEQ_METHOD_OVERLAP_REF`] stream and order-k. Valid only in an archive that
+///   carries the reference frame.
+/// - `.1` — the **plain** candidate: exactly what [`encode_sequence_stream`] would
+///   produce for this block, i.e. the smaller of the per-block
+///   [`SEQ_METHOD_OVERLAP`] stream and order-k. Self-contained.
+///
+/// Both are needed because the gate must compare the shared-reference layout
+/// against *the layout it would otherwise use*. Gating on order-k alone measures
+/// against a bar weaker than the plain fallback (which floors each block at
+/// `min(overlap, order-k)`), so a reference that loses to the per-block overlap
+/// codec still clears it — the ONT regression in issue #184, where the frame cost
+/// 4.37 MB to save 1.58 MB and was adopted anyway.
+///
+/// Returning the plain candidate rather than just its length lets the caller write
+/// the fallback layout without re-coding: the per-block overlap encode is the
+/// expensive half of this function, and `block_ranges` is a pure function of the
+/// input, so these streams are byte-identical to a fresh
+/// [`compress_buffered_plain`] pass.
+///
+/// Unlike [`encode_sequence_stream`], the shared reference is not re-assembled or
+/// stored per block — it is built once by the caller and coded against here, which
+/// is the whole point of the shared frame.
 pub(crate) fn encode_sequence_stream_shared(
     lens: &[u32],
     seq: &[u8],
     params: &Params,
     platform: Platform,
     reference: &fqxv_lroverlap::Reference,
-) -> Result<(Vec<u8>, usize)> {
+) -> Result<(Vec<u8>, Vec<u8>)> {
     let opts = fqxv_lroverlap::EncodeOpts {
         sketch: sketch_for(platform),
         ..Default::default()
     };
-    let (against, order_k) = rayon::join(
+    let (against, (overlap, order_k)) = rayon::join(
         || {
             fqxv_lroverlap::encode_against(reference, lens, seq, &opts).map(|coded| {
                 let mut out = Vec::with_capacity(coded.len() + 1);
@@ -335,16 +350,45 @@ pub(crate) fn encode_sequence_stream_shared(
                 out
             })
         },
-        || order_k_stream(lens, seq, params),
+        || {
+            rayon::join(
+                || {
+                    fqxv_lroverlap::encode(lens, seq, &opts).map(|coded| {
+                        let mut out = Vec::with_capacity(coded.len() + 1);
+                        out.push(SEQ_METHOD_OVERLAP);
+                        out.extend_from_slice(&coded);
+                        out
+                    })
+                },
+                || order_k_stream(lens, seq, params),
+            )
+        },
     );
-    let (against, order_k) = (against?, order_k?);
-    let orderk_len = order_k.len();
-    let chosen = if against.len() < order_k.len() {
-        against
-    } else {
-        order_k
-    };
-    Ok((chosen, orderk_len))
+    let (against, overlap, order_k) = (against?, overlap?, order_k?);
+    let (a_win, o_win) = (against.len() < order_k.len(), overlap.len() < order_k.len());
+    if std::env::var_os("FQXV_DIAG_SEQ").is_some() {
+        let bases: u64 = lens.iter().map(|&l| u64::from(l)).sum::<u64>().max(1);
+        let bpb = |n: usize| (n as f64 * 8.0) / bases as f64;
+        eprintln!(
+            "[diag seq/shared] {} reads, {} bases | shared-ref {} B ({:.3} b/base) | per-block overlap {} B ({:.3} b/base) | order-k {} B ({:.3} b/base)",
+            lens.len(),
+            bases,
+            against.len(),
+            bpb(against.len()),
+            overlap.len(),
+            bpb(overlap.len()),
+            order_k.len(),
+            bpb(order_k.len()),
+        );
+    }
+    // Order-k is the fallback for both candidates, so it is cloned only when it
+    // wins on both sides (neither long-read codec paid off for this block).
+    Ok(match (a_win, o_win) {
+        (true, true) => (against, overlap),
+        (true, false) => (against, order_k),
+        (false, true) => (order_k, overlap),
+        (false, false) => (order_k.clone(), order_k),
+    })
 }
 
 /// Decode a method-tagged sequence stream back to `(per-read lengths, bases)`.
