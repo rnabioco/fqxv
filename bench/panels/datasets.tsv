@@ -20,3 +20,26 @@ DRR205413	ecoli_ont	MinION	single	full-range	260MB	-
 # (~1.5 Gbp, still ~300x) into $DATA_DIR/ecoli_hifi.fastq. Narrow high-Q, low
 # error — the regime where the cross-read DNA lever matters most.
 ecoli_hifi	ecoli_hifi	SequelII	single	full-range	subsampled	-
+# --- Promoted from the robustness corpus (bench/scripts/corpus.sh) -----------
+# The corpus runs 48 real ENA accessions across 4 platforms but only ever
+# recorded PASS/FAIL, so its ratio data went unused. These four close the
+# coverage gaps the curated panel above cannot see. They are already staged in
+# $CORPUS_DIR/data; fetch.sh will re-fetch them into $DATA_DIR on demand.
+#
+# PacBio Revio. ecoli_hifi above is Sequel II with a 93-symbol full-range
+# quality alphabet, and ~640MB of its 656MB archive is quality — so the
+# "fqxv beats CoLoRd on HiFi" result is a statement about full-range Sequel II
+# quality coding. Every Revio run in the corpus has a 7-symbol alphabet
+# (Phred 3-40), which collapses the quality stream and leaves sequence
+# dominant. Revio is the current PacBio instrument; without these rows the
+# HiFi claim is untested on the data the field actually produces.
+SRR36938642	hifi_revio_wgs	Revio	single	binned	750MB	-
+SRR37533400	hifi_revio_amplicon	Revio	single	binned	350MB	-
+# MGI/BGISEQ — absent from the panel entirely despite 12 corpus runs. DRR732136
+# is the corpus's hardest short-read case at 5.32 bits/base (137bp, 36-symbol
+# quality), well past the worst Illumina run; nothing currently measures
+# whether the field handles it better.
+DRR732136	mgi_bgiseq_hard	BGISEQ-500	single	full-range	60MB	-
+# Ultra-short reads (22bp mean) — names dominate the archive and the sequence
+# context model has almost no room to work. The panel has nothing under 100bp.
+SRR11412616	mgi_mirna_22bp	BGISEQ-500	single	full-range	550MB	-

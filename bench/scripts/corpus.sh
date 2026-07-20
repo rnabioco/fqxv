@@ -3,10 +3,17 @@
 # fqxv robustness corpus — fetch a spread of real SRA runs and hammer fqxv on
 # each, hunting for crashes, round-trip corruption, and thread-nondeterminism.
 #
-# This is NOT the performance benchmark (run_bench.sh, a curated 4-dataset
-# comparison against the field). This is a correctness net: throw a random pile
+# This is NOT the performance benchmark (run_bench.sh, a curated comparison
+# against the field). This is primarily a correctness net: throw a random pile
 # of real-world FASTQ at fqxv and confirm every archive round-trips byte-for-
 # content and builds identically regardless of thread count.
+#
+# It is secondarily a RATIO signal. The run already recompresses every accession
+# in every mode, so it records bits/base per row for free — a 48-dataset,
+# 4-platform regression check (`summary`, `diff`) that the curated panel is far
+# too small to provide. This matters more as the corpus stays green: once every
+# accession PASSes, the pass/fail column is saturated and bits/base is the only
+# thing still moving.
 #
 # For each accession we fetch FASTQ via sracha, then per compression MODE run:
 #   compress -> decompress -> order-independent content round-trip
@@ -25,7 +32,8 @@
 #   fetch                                   sracha get every accession (login-node OK: IO bound)
 #   run                                     compress/round-trip all fetched (COMPUTE NODE — srun/sbatch)
 #   sbatch                                  submit `run` as a slurm array (one accession per task)
-#   summary                                 print pass/fail tally + failing accessions
+#   summary                                 print pass/fail tally + failing accessions + bits/base
+#   diff OLD.tsv [NEW.tsv]                  bits/base delta between two runs (release regression check)
 #
 # Env: FQXV_BIN, FQXV_CORPUS_DIR (default $SCRATCH/fqxv/corpus), FQXV_MODES
 #      (default "default max"), FQXV_THREADS (default 16), CORPUS_N, CORPUS_SEED,
@@ -145,9 +153,23 @@ platform_models() {  # ENA platform -> echoes comma-separated instrument models 
   esac
 }
 
+# Total bases of the accession currently being processed — the denominator for
+# the bits/base column. Set once per accession by process_accession; 0 means
+# "unknown" (e.g. a row recorded before the inputs resolved), which writes `-`.
+CUR_BASES=0
+
 record() {  # accession mode status note comp_bytes secs
+  # bits/base is what makes this corpus a ratio signal and not just a pass/fail
+  # gate: the run already recompresses all 48 accessions every time, so deriving
+  # it here is free and lets releases be diffed against each other (see
+  # `summary`). Platform-neutral, unlike a ratio over FASTQ bytes, which moves
+  # with read-name length and line overhead.
+  local bpb="-"
+  if [[ -n "$5" && "$CUR_BASES" -gt 0 ]]; then
+    bpb=$(awk -v b="$5" -v n="$CUR_BASES" 'BEGIN{printf "%.4f", b*8/n}')
+  fi
   ( flock -x 200
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" >> "$RESULTS_TSV"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$bpb" >> "$RESULTS_TSV"
   ) 200>"$RESULTS_LOCK"
 }
 
@@ -156,6 +178,7 @@ process_accession() {
   local acc="$1"
   local log="$LOG_DIR/${acc}.log"
   : > "$log"
+  CUR_BASES=0   # reset so a failed fetch cannot inherit the previous accession's count
 
   # Fetch if not already present (idempotent; fetch subcommand pre-populates).
   local inputs
@@ -178,7 +201,10 @@ process_accession() {
   # shellcheck disable=SC2206
   local INPUTS=($inputs)
   local reads; reads=$(( $(wc -l < "${INPUTS[0]}") / 4 ))
-  echo "  $acc: inputs=${#INPUTS[@]} reads/member~$reads" | tee -a "$log"
+  # Across ALL members, since the archive covers all of them. One extra full
+  # pass, cheap next to the record digest below that this function already runs.
+  CUR_BASES=$(awk 'NR%4==2{b+=length($0)} END{print b+0}' "${INPUTS[@]}")
+  echo "  $acc: inputs=${#INPUTS[@]} reads/member~$reads bases=$CUR_BASES" | tee -a "$log"
 
   # Reference digests over the concatenated inputs (order-independent).
   local ref_lossless ref_bin8=""
@@ -205,7 +231,7 @@ process_accession() {
       continue
     fi
     secs=$((SECONDS-t0))
-    bytes=$(stat -c%s "$comp" 2>/dev/null || echo "")
+    bytes=$(stat -Lc%s "$comp" 2>/dev/null || echo "")
 
     # Decompress (interleaved to stdout captured to file).
     echo "=== decompress ($mode) ===" >> "$log"
@@ -269,6 +295,48 @@ print_summary() {
   echo
   echo "non-PASS:"
   awk -F'\t' 'NR>1 && $3!="PASS"{printf "  %-14s %-8s %-16s %s\n", $1, $2, $3, $4}' "$RESULTS_TSV"
+
+  # Ratio signal. Once every accession PASSes, the pass/fail tally above is
+  # saturated and says nothing; bits/base is what still moves release to
+  # release. Rows written before the column existed have no $7 and are skipped.
+  echo
+  echo "bits/base by mode (PASS rows only):"
+  # The header is printed here, not inside awk, so `sort` cannot bury it among
+  # the data rows.
+  printf "  %-10s %5s %8s %8s %-14s %8s %-14s\n" "mode" "n" "mean" "min" "(min acc)" "max" "(max acc)"
+  awk -F'\t' 'NR>1 && $3=="PASS" && $7 ~ /^[0-9.]+$/ {
+      s[$2]+=$7; n[$2]++
+      if (!($2 in lo) || $7+0 < lo[$2]) { lo[$2]=$7+0; loa[$2]=$1 }
+      if (!($2 in hi) || $7+0 > hi[$2]) { hi[$2]=$7+0; hia[$2]=$1 }
+    }
+    END {
+      if (!length(n)) { print "  (none — rerun to populate the column)"; exit }
+      for (m in n)
+        printf "  %-10s %5d %8.4f %8.4f %-14s %8.4f %-14s\n", m, n[m], s[m]/n[m], lo[m], loa[m], hi[m], hia[m]
+    }' "$RESULTS_TSV" | sort -k1,1
+}
+
+# Compare the bits/base of two corpus runs — the release-over-release regression
+# check the corpus could not do while it only recorded PASS/FAIL.
+print_diff() {  # old.tsv [new.tsv]
+  local old="$1" new="${2:-$RESULTS_TSV}"
+  [[ -f "$old" ]] || { echo "no such results file: $old" >&2; return 1; }
+  [[ -f "$new" ]] || { echo "no such results file: $new" >&2; return 1; }
+  echo "=== bits/base: $(basename "$old") -> $(basename "$new") ==="
+  awk -F'\t' '
+    function key(a,m) { return a SUBSEP m }
+    NR==FNR { if (FNR>1 && $7 ~ /^[0-9.]+$/) o[key($1,$2)]=$7; next }
+    FNR>1 && $7 ~ /^[0-9.]+$/ && (key($1,$2) in o) {
+      ov=o[key($1,$2)]; nv=$7; d=(nv-ov)/ov*100
+      printf "%-14s %-10s %8.4f -> %8.4f  %+7.2f%%\n", $1, $2, ov, nv, d
+      s+=d; n++; if (d>wd) { wd=d; wa=$1" "$2 }
+    }
+    END {
+      if (!n) { print "(no comparable rows — do both runs have the bits_per_base column?)"; exit }
+      printf "\n%d comparable rows, mean %+.2f%%", n, s/n
+      if (wa != "") printf ", worst regression %+.2f%% (%s)", wd, wa
+      printf "\n"
+    }' "$old" "$new"
 }
 
 # ---------- dispatch ----------
@@ -328,7 +396,7 @@ case "$cmd" in
     ;;
   run)
     [[ -x "$FQXV_BIN" ]] || { echo "no fqxv binary at $FQXV_BIN" >&2; exit 1; }
-    [[ -f "$RESULTS_TSV" ]] || printf 'accession\tmode\tstatus\tnote\tbytes\tsecs\n' > "$RESULTS_TSV"
+    [[ -f "$RESULTS_TSV" ]] || printf 'accession\tmode\tstatus\tnote\tbytes\tsecs\tbits_per_base\n' > "$RESULTS_TSV"
     if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
       acc=$(awk 'NF && !/^#/' "$ACC_LIST" | sed -n "${SLURM_ARRAY_TASK_ID}p")
       [[ -z "$acc" ]] && { echo "no accession at index $SLURM_ARRAY_TASK_ID" >&2; exit 1; }
@@ -348,7 +416,7 @@ case "$cmd" in
   sbatch)
     total=$(awk 'NF && !/^#/' "$ACC_LIST" | wc -l)
     [[ "$total" -ge 1 ]] || { echo "no accessions in $ACC_LIST" >&2; exit 1; }
-    printf 'accession\tmode\tstatus\tnote\tbytes\tsecs\n' > "$RESULTS_TSV"
+    printf 'accession\tmode\tstatus\tnote\tbytes\tsecs\tbits_per_base\n' > "$RESULTS_TSV"
     # No %concurrency cap: let Slurm schedule every array task as resources free
     # up (each task is one accession, independent, and writes results under flock).
     # Set CORPUS_CONCURRENCY to reimpose a throttle (e.g. to be a good neighbor on
@@ -370,6 +438,7 @@ case "$cmd" in
     "$FQDIGEST" --help >/dev/null 2>&1 && echo "ok: $FQDIGEST"
     ;;
   summary) print_summary ;;
+  diff)    print_diff "$@" ;;
   *)
     sed -n '3,40p' "$0" | sed 's/^# \{0,1\}//'
     exit 0

@@ -36,6 +36,20 @@ losslessly.
 | ecoli_hifi | **4.73** |  4.73 |     4.44 |   3.83 |3.85 | 2.27 |
 | ecoli_ont  |      2.79 |  2.79 | **3.05** |   2.38 |2.49 | 1.94 |
 
+> **The HiFi lead is measured only on Sequel II.** `ecoli_hifi` has a 93-symbol
+> full-range quality alphabet and ~640 MB of its 656 MB archive is quality — so
+> the row above is largely a statement about full-range quality coding, which is
+> exactly the lever that beats CoLoRd here. Every PacBio run in the robustness
+> corpus is a **Revio** run with a **7-symbol** alphabet (Phred 3–40); that
+> collapses the quality stream and leaves sequence dominant, which is the stream
+> CoLoRd has historically been stronger on. `ecoli_hifi` is also subsampled from
+> ~5000x to ~300x, and at 3.39 bits/base it is *harder* than all twelve corpus
+> PacBio runs (0.22–2.55). Revio is the current PacBio instrument, so treat
+> "fqxv leads on HiFi" as unverified on modern PacBio data until the
+> `hifi_revio_wgs` / `hifi_revio_amplicon` rows land. By contrast `ecoli_ont` at
+> 5.75 bits/base sits squarely inside the corpus ONT-WGS spread (5.53–6.21), so
+> the ONT panel is representative and needs no such caveat.
+
 Per-stream, over the run's own bases:
 
 | dataset    | seq (b/base) | quality (bytes) | reference frame |

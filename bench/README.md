@@ -39,7 +39,8 @@ pixi run -e bench bash scripts/fetch.sh              # all accessions in dataset
 pixi run -e bench bash scripts/fetch.sh SRR453566    # just one
 ```
 
-Datasets span both quality regimes (the thing a quality codec cares about):
+Datasets span both quality regimes (the thing a quality codec cares about), all
+four platforms fqxv compresses, and the read-length range from 22 bp to ~14 kb:
 
 | accession | label | platform | quality |
 | --- | --- | --- | --- |
@@ -47,6 +48,22 @@ Datasets span both quality regimes (the thing a quality codec cares about):
 | ERR10213669 | human_novaseq_exome | NovaSeq 6000 | binned |
 | DRR174812 | rnaseq_novaseq | NovaSeq 6000 | binned |
 | SRR453566 | rnaseq_fullrange | GAIIx | full-range |
+| DRR205413 | ecoli_ont | MinION | full-range |
+| ecoli_hifi | ecoli_hifi | Sequel II | full-range (93-symbol) |
+| SRR36938642 | hifi_revio_wgs | Revio | binned (7-symbol) |
+| SRR37533400 | hifi_revio_amplicon | Revio | binned (7-symbol) |
+| DRR732136 | mgi_bgiseq_hard | BGISEQ-500 | full-range |
+| SRR11412616 | mgi_mirna_22bp | BGISEQ-500 | full-range |
+
+The bottom four were promoted from the robustness corpus, which had been
+recording ratio data nothing read. They close gaps the curated panel could not
+see, and the Revio pair is the important one: `ecoli_hifi` is a Sequel II run
+with a 93-symbol quality alphabet and ~640 MB of its 656 MB archive is quality,
+so a HiFi result measured only there is really a statement about full-range
+Sequel II quality coding. Every Revio run in the corpus has a **7-symbol**
+alphabet (Phred 3–40), which collapses the quality stream and leaves sequence
+dominant. Revio is the current PacBio instrument, so without those rows the HiFi
+claim is untested on the data the field actually produces.
 
 Check the quality alphabet of any file with `pixi run -e bench qstats <file.fastq>`.
 
@@ -245,15 +262,29 @@ order-sensitive** (~1.2% of reads realign differently — deterministic, not
 threading, unaffected by `-K`), which is why preserving read order is what makes
 a BAM reproducible. Tools: `bwa`, `samtools`, `rustc`.
 
-## Robustness corpus (`scripts/corpus.sh`) — correctness, not ratio
+## Robustness corpus (`scripts/corpus.sh`) — correctness *and* a ratio signal
 
-`scripts/run_bench.sh` is a curated *ratio* comparison against the field.
-`scripts/corpus.sh` is the opposite: a *correctness net* that throws a random pile of
+`scripts/run_bench.sh` is a curated comparison against the field.
+`scripts/corpus.sh` is the complement: a *correctness net* that throws a random pile of
 real SRA runs at fqxv and asserts every archive round-trips and builds
 identically regardless of thread count. It's how we shake out the messy long
 tail (odd read lengths, wide/narrow quality alphabets, Ns, empty reads, long
-names) that four curated datasets never hit. Modeled on sracha-rs'
+names) that a handful of curated datasets never hit. Modeled on sracha-rs'
 `validation/random_corpus.sh`.
+
+It is **also** a ratio signal. The run already recompresses every accession in
+every mode, so it records `bits_per_base` per row for free — a 48-dataset,
+4-platform regression check the curated panel is far too small to provide. This
+matters more the greener the corpus gets: once every accession PASSes, the
+pass/fail column is saturated and says nothing, and bits/base is the only thing
+still moving. `summary` prints per-mode mean/min/max; `diff` compares two runs:
+
+```bash
+pixi run -e bench bash scripts/corpus.sh diff results-prev.tsv results.tsv
+```
+
+Rows written before the column existed simply have no `bits_per_base` field and
+are skipped, so old `results.tsv` files still summarize cleanly.
 
 For each accession, per compression **mode** it runs:
 
@@ -273,7 +304,8 @@ pixi run -e bench bash scripts/corpus.sh sample -n 20 -s 42   # random ENA acces
 pixi run -e bench bash scripts/corpus.sh build-digest         # compile fqdigest (fast round-trip hash; optional)
 pixi run -e bench bash scripts/corpus.sh fetch                # sracha get every accession (login node — I/O bound)
 pixi run -e bench bash scripts/corpus.sh sbatch               # fan out as a slurm array (COMPUTE) — one accession/task
-pixi run -e bench bash scripts/corpus.sh summary              # pass/fail tally + failing accessions
+pixi run -e bench bash scripts/corpus.sh summary              # pass/fail tally + failures + bits/base by mode
+pixi run -e bench bash scripts/corpus.sh diff OLD.tsv [NEW]   # bits/base delta between two runs
 ```
 
 `sample` draws random Illumina runs by default (`-p all` for every platform);

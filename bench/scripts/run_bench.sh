@@ -257,13 +257,17 @@ for row in "${rows[@]}"; do
   # Array cells process a single dataset.
   [[ -n "${FQXV_ONLY_DATASET:-}" && "$label" != "$FQXV_ONLY_DATASET" ]] && continue
 
-  # Resolve input (R1, or R1+R2 concatenated). Single-end runs (e.g. Nanopore)
-  # are written by `sracha --split split-3` as `${acc}.fastq` with no `_1`
-  # suffix, so fall back to that name when the paired R1 is absent.
+  # Resolve input (R1, or R1+R2 concatenated). Single-end runs land under one of
+  # two names and `--split split-3` alone does not decide which: sracha writes
+  # `${acc}.fastq` for some runs and `${acc}_0.fastq` for others (it follows the
+  # run's own member layout). Both appear side by side in the corpus data dir
+  # from a single fetch, so try both — missing the `_0` form silently dropped
+  # single-end datasets from the matrix with only a "[skip] ... missing" line.
   r1="$DATA_DIR/${acc}_1.fastq"
   r2="$DATA_DIR/${acc}_2.fastq"
   [[ -f "$r1" ]] || r1="$DATA_DIR/${acc}.fastq"
-  [[ -f "$r1" ]] || { echo "[skip] $label: $DATA_DIR/${acc}[_1].fastq missing (run fetch.sh)"; continue; }
+  [[ -f "$r1" ]] || r1="$DATA_DIR/${acc}_0.fastq"
+  [[ -f "$r1" ]] || { echo "[skip] $label: $DATA_DIR/${acc}[_1|_0|].fastq missing (run fetch.sh)"; continue; }
   if [[ "$INPUT_MODE" == "cat" && -f "$r2" ]]; then
     in="$WORK/${label}.fastq"
     [[ -f "$in" ]] || cat "$r1" "$r2" > "$in"
@@ -280,7 +284,7 @@ for row in "${rows[@]}"; do
     # shellcheck disable=SC1090
     source "$prep"
   else
-    orig_bytes="$(stat -c %s "$in")"
+    orig_bytes="$(stat -Lc %s "$in")"
     nrec="$(fastq_records "$in")"
     nbases="$(awk 'NR%4==2{b+=length($0)} END{print b+0}' "$in")"
     in_full="$(record_digest "$in" full)"
@@ -329,7 +333,7 @@ for row in "${rows[@]}"; do
       echo "  [fail] $tool: compress exited $c_rc (recorded rt=no, continuing)"
       rm -f "$COMP"; comp_bytes=0
     else
-      comp_bytes="$(stat -c %s "$COMP" 2>/dev/null || echo 0)"
+      comp_bytes="$(stat -Lc %s "$COMP" 2>/dev/null || echo 0)"
     fi
     # Only attempt decompress when compress produced a real archive; a tool that
     # cannot handle this data (e.g. fqz_comp on long reads) is left as rt=no.
@@ -398,12 +402,12 @@ for row in "${rows[@]}"; do
   # recorded as a `fqxv-paired` row so its size/streams/losslessness are tracked.
   if [[ -f "$r2" ]] && is_fqxv fqxv && [[ -x "$FQXV_BIN" ]] && [[ " $TOOLS " == *" fqxv "* ]]; then
     pcat="$WORK/${label}.paircat.fastq"; cat "$r1" "$r2" > "$pcat"
-    p_orig="$(stat -c %s "$pcat")"
+    p_orig="$(stat -Lc %s "$pcat")"
     p_full="$(record_digest "$pcat" full)"
     pfx="$WORK/${label}.fqxv-paired"; COMP="$pfx.fqxv"; rt="$WORK/${label}.fqxv-paired.rt"
     rm -f "$pfx".* "$rt"_*
     measure "$FQXV_BIN" compress "$r1" "$r2" -o "$COMP" --force --threads "$THREADS"; c_secs="$MEAS_SECS"; c_rss="$MEAS_RSS_KB"
-    comp_bytes="$(stat -c %s "$COMP" 2>/dev/null || echo 0)"
+    comp_bytes="$(stat -Lc %s "$COMP" 2>/dev/null || echo 0)"
     # Restore both mates and concatenate to compare the multiset against R1+R2.
     measure "$FQXV_BIN" decompress "$COMP" --split "$rt" --force --threads "$THREADS"; d_secs="$MEAS_SECS"; d_rss="$MEAS_RSS_KB"
     rt_ok="no"

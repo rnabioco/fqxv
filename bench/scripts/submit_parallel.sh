@@ -58,8 +58,13 @@ while read -r acc label platform layout quality approx _; do
   fi
   # Require data now, EXCEPT datasets prep stages itself (approx_gz='subsampled',
   # e.g. HiFi) — prep runs before the array via the afterok dependency.
+  # Single-end runs land as either `${acc}.fastq` or `${acc}_0.fastq` depending
+  # on the run's member layout (sracha decides, not the --split flag), so test
+  # both — matching run_bench.sh. Missing the `_0` form silently dropped whole
+  # datasets from the matrix behind a single "[skip]" line.
   if [[ "$approx" != "subsampled" \
-        && ! -f "$DATA_DIR/${acc}_1.fastq" && ! -f "$DATA_DIR/${acc}.fastq" ]]; then
+        && ! -f "$DATA_DIR/${acc}_1.fastq" && ! -f "$DATA_DIR/${acc}.fastq" \
+        && ! -f "$DATA_DIR/${acc}_0.fastq" ]]; then
     echo "[skip] $label ($acc): no data in $DATA_DIR"
     continue
   fi
