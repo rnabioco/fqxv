@@ -634,13 +634,19 @@ fn main() -> anyhow::Result<()> {
                 bar.abandon();
                 stats
             } else {
-                let sp = progress::Spinner::start(spin_msg, cli.quiet);
+                // Interleaving reads every input in lockstep, so one shared counter
+                // over all of them against their summed length is the same measure
+                // the single-input bar uses — paired mates get a real percentage
+                // rather than the bare spinner this path used to fall back to.
+                let counter = Arc::new(AtomicU64::new(0));
+                let total = multi_input_len(&inputs, params.reorder);
                 let readers: Vec<Box<dyn Read + Send>> = inputs
                     .iter()
-                    .map(|p| open_input(p))
+                    .map(|p| open_input_with_counter(p, Arc::clone(&counter)))
                     .collect::<anyhow::Result<_>>()?;
+                let bar = progress::Bar::start(spin_msg, cli.quiet, Arc::clone(&counter), total);
                 let stats = fqxv::compress_multi(readers, out, params)?;
-                sp.abandon();
+                bar.abandon();
                 stats
             };
             let secs = t0.elapsed().as_secs_f64();
@@ -769,32 +775,52 @@ fn main() -> anyhow::Result<()> {
                     "recovered"
                 );
             } else {
-                let sp = progress::Spinner::start("decompressing…", cli.quiet);
                 // Read the footer's authoritative read count first. For a truncated
                 // archive (which also lost its footer) this errors before any output
                 // is written; otherwise we compare it against what we actually
                 // decode so a silently short file is caught rather than trusted.
                 let expected = fqxv::expected_reads(open_in()?)?;
+                // Reads written drive the readout, measured against the footer's
+                // count. Archive bytes consumed would be the easier counter but a
+                // misleading one: decode pulls blocks in batches of `--threads`, so
+                // input consumption runs ahead of the work and pins at 100% while
+                // the last batch is still decoding. Output records track what is
+                // actually finished. A global-reorder archive has no footer count,
+                // and degrades to a reads-so-far readout.
+                let done = Arc::new(AtomicU64::new(0));
+                let lines = Arc::new(AtomicU64::new(0));
+                let bar = progress::Bar::start_with_unit(
+                    "decompressing…",
+                    cli.quiet,
+                    Arc::clone(&done),
+                    expected,
+                    progress::Unit::Reads,
+                );
                 // Commits are deferred until after the completeness check below, so
                 // a truncated archive leaves nothing at the destination names.
                 let (stats, pending) = if let Some(prefix) = split {
                     let g = fqxv::peek(open_in()?)?.group_size as usize;
-                    let (pending, mut sinks): (Vec<_>, Vec<FastqSink>) = (1..=g)
+                    let (pending, sinks): (Vec<_>, Vec<FastqSink>) = (1..=g)
                         .map(|i| {
                             open_fastq_file(&split_path(&prefix, i, mate_style, !no_gzip), force)
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?
                         .into_iter()
                         .unzip();
+                    let mut sinks: Vec<CountingSink> = sinks
+                        .into_iter()
+                        .map(|s| CountingSink::new(s, Arc::clone(&lines), Arc::clone(&done)))
+                        .collect();
                     let stats = fqxv::decompress_split(open_in()?, &mut sinks, cli.threads)?;
                     for sink in sinks {
-                        sink.finish()?;
+                        sink.into_inner().finish()?;
                     }
                     (stats, pending)
                 } else {
-                    let (pending, mut sink) = open_sink(output.as_deref(), stdout, force)?;
+                    let (pending, sink) = open_sink(output.as_deref(), stdout, force)?;
+                    let mut sink = CountingSink::new(sink, Arc::clone(&lines), Arc::clone(&done));
                     let stats = fqxv::decompress(open_in()?, &mut sink, cli.threads)?;
-                    sink.finish()?;
+                    sink.into_inner().finish()?;
                     (stats, pending.into_iter().collect())
                 };
                 if let Some(expected) = expected
@@ -810,7 +836,7 @@ fn main() -> anyhow::Result<()> {
                     out.commit()?;
                 }
                 let secs = t0.elapsed().as_secs_f64();
-                sp.abandon();
+                bar.abandon();
                 if !cli.quiet {
                     eprintln!(
                         "{}",
@@ -1827,6 +1853,72 @@ fn single_input_len(path: &Path, reorder: bool) -> Option<u64> {
         return None;
     }
     std::fs::metadata(path).ok().map(|m| m.len())
+}
+
+/// [`single_input_len`] for an interleaved multi-input compress: the summed
+/// on-disk length of every input, or `None` for an indeterminate readout. The
+/// `reorder` and stdin carve-outs apply for the same reasons, and a single
+/// unstattable input makes the whole total meaningless — a bar measuring
+/// against a short total would run past 100%, so fall back rather than lie.
+fn multi_input_len(paths: &[PathBuf], reorder: bool) -> Option<u64> {
+    if reorder {
+        return None;
+    }
+    paths
+        .iter()
+        .map(|p| single_input_len(p, false))
+        .sum::<Option<u64>>()
+}
+
+/// A pass-through FASTQ sink that counts the records passing through it, so a
+/// decompress bar can report reads finished against the footer's read count.
+///
+/// Counts newlines and divides by four rather than parsing: fqxv emits exactly
+/// four lines per record (the `+` line is normalized to a bare `+`), so the
+/// division is exact for what we write, and a byte scan costs far less than the
+/// decode it is measuring.
+///
+/// Both counters are shared across every sink of a `--split` decode — the bar
+/// wants one total, not one per mate. The running value is approximate between
+/// updates (two sinks can interleave a fetch_add and a store), which is all a
+/// progress readout needs; the authoritative count is `Stats::reads`.
+struct CountingSink {
+    inner: FastqSink,
+    /// Newlines seen, the raw quantity this can count incrementally.
+    lines: Arc<AtomicU64>,
+    /// Records finished — `lines / 4`, kept separately because the bar reads a
+    /// counter directly and cannot divide.
+    reads: Arc<AtomicU64>,
+}
+
+impl CountingSink {
+    fn new(inner: FastqSink, lines: Arc<AtomicU64>, reads: Arc<AtomicU64>) -> Self {
+        Self {
+            inner,
+            lines,
+            reads,
+        }
+    }
+
+    fn into_inner(self) -> FastqSink {
+        self.inner
+    }
+}
+
+impl Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        let newlines = buf[..n].iter().filter(|&&b| b == b'\n').count() as u64;
+        if newlines > 0 {
+            let total = self.lines.fetch_add(newlines, Ordering::Relaxed) + newlines;
+            self.reads.store(total / 4, Ordering::Relaxed);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// A pass-through reader that adds every byte it yields to a shared counter.

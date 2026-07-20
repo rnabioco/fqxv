@@ -81,20 +81,43 @@ impl Drop for Spinner {
     }
 }
 
-/// A live compress readout driven by `counter` (bytes pulled from the input).
-/// `total` is the input's byte length when known (a file) — then a real
-/// percentage bar is drawn; `None` (stdin) draws a bytes + rate spinner instead.
+/// What a [`Bar`]'s counter is measuring, which picks how the numbers are
+/// formatted — `1.2 GiB` for bytes, `4,500,000` for reads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Unit {
+    /// Bytes pulled from the input, for compress.
+    Bytes,
+    /// Reads written to the output, for decompress. Byte formatting would be
+    /// actively wrong here: the counter is a record count, not a size.
+    Reads,
+}
+
+/// A live readout driven by `counter`. `total` is the end value when known —
+/// then a real percentage bar with an ETA is drawn; `None` (a stdin stream, or
+/// an archive whose read count isn't in the footer) degrades to a rate spinner,
+/// which still shows the run is moving.
 #[derive(Debug)]
 pub(crate) struct Bar {
     pb: Option<ProgressBar>,
 }
 
 impl Bar {
+    /// A byte-counted bar — the compress input-consumption case.
     pub(crate) fn start(
         message: impl Into<String>,
         quiet: bool,
         counter: Arc<AtomicU64>,
         total: Option<u64>,
+    ) -> Self {
+        Self::start_with_unit(message, quiet, counter, total, Unit::Bytes)
+    }
+
+    pub(crate) fn start_with_unit(
+        message: impl Into<String>,
+        quiet: bool,
+        counter: Arc<AtomicU64>,
+        total: Option<u64>,
+        unit: Unit,
     ) -> Self {
         if quiet {
             return Self { pb: None };
@@ -107,24 +130,34 @@ impl Bar {
         let pb = match total {
             Some(len) => {
                 let pb = ProgressBar::new(len);
+                // ETA earns its width here: these runs are minutes long, and
+                // "how much longer" is the question a percentage alone leaves open.
+                let template = match unit {
+                    Unit::Bytes => {
+                        "{spinner:.cyan} {msg} [{bar:24.cyan/blue}] {bytes}/{total_bytes} ({percent}%, {eta} left)"
+                    }
+                    Unit::Reads => {
+                        "{spinner:.cyan} {msg} [{bar:24.cyan/blue}] {human_pos}/{human_len} reads ({percent}%, {eta} left)"
+                    }
+                };
                 pb.set_style(
-                    ProgressStyle::with_template(
-                        "{spinner:.cyan} {msg} [{bar:28.cyan/blue}] {bytes}/{total_bytes} ({percent}%)",
-                    )
-                    .expect("valid bar template")
-                    .tick_strings(TICK_STRINGS)
-                    .progress_chars("=>-"),
+                    ProgressStyle::with_template(template)
+                        .expect("valid bar template")
+                        .tick_strings(TICK_STRINGS)
+                        .progress_chars("=>-"),
                 );
                 pb
             }
             None => {
                 let pb = ProgressBar::new_spinner();
+                let template = match unit {
+                    Unit::Bytes => "{spinner:.cyan} {msg} {bytes} in ({bytes_per_sec})",
+                    Unit::Reads => "{spinner:.cyan} {msg} {human_pos} reads",
+                };
                 pb.set_style(
-                    ProgressStyle::with_template(
-                        "{spinner:.cyan} {msg} {bytes} in ({bytes_per_sec})",
-                    )
-                    .expect("valid stream template")
-                    .tick_strings(TICK_STRINGS),
+                    ProgressStyle::with_template(template)
+                        .expect("valid stream template")
+                        .tick_strings(TICK_STRINGS),
                 );
                 pb
             }
