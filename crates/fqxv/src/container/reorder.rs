@@ -178,7 +178,10 @@ pub(crate) fn encode_reordered<W: Write>(
     drop(serialized);
 
     let mut writer = writer;
-    if plain_buf.len() < reordered_buf.len() {
+    // Reorder is the challenger here (it adds the permutation and reshuffles the
+    // streams), so the plain layout is kept unless reorder is *strictly* smaller
+    // — `adopt_over(plain, 0, reordered)` (#203).
+    if adopt_over(plain_buf.len(), 0, reordered_buf.len()) {
         info!(
             reordered = reordered_buf.len(),
             plain = plain_buf.len(),

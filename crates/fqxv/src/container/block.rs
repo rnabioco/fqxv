@@ -294,11 +294,7 @@ pub(crate) fn order_k_stream(lens: &[u32], seq: &[u8], params: &Params) -> Resul
         params.seq_hash_order as usize,
         u32::from(params.seq_hash_bits),
     )?;
-    Ok(tag_orderk(if hashed.len() < plain.len() {
-        hashed
-    } else {
-        plain
-    }))
+    Ok(tag_orderk(keep_smaller(hashed, plain)))
 }
 
 /// Encode the sequence stream, choosing the codec by a leading method byte.
@@ -363,39 +359,9 @@ pub(crate) fn encode_sequence_stream(
             },
         );
     }
-    Ok(if overlap.len() < order_k.len() {
-        overlap
-    } else {
-        order_k
-    })
+    Ok(keep_smaller(overlap, order_k))
 }
 
-/// Code a long-read block's sequence **both ways** and return the two candidate
-/// streams the whole-file layout gate chooses between (issue #184):
-///
-/// - `.0` — the **shared-reference** candidate: the smaller of the reference-coded
-///   [`SEQ_METHOD_OVERLAP_REF`] stream and order-k. Valid only in an archive that
-///   carries the reference frame.
-/// - `.1` — the **plain** candidate: exactly what [`encode_sequence_stream`] would
-///   produce for this block, i.e. the smaller of the per-block
-///   [`SEQ_METHOD_OVERLAP`] stream and order-k. Self-contained.
-///
-/// Both are needed because the gate must compare the shared-reference layout
-/// against *the layout it would otherwise use*. Gating on order-k alone measures
-/// against a bar weaker than the plain fallback (which floors each block at
-/// `min(overlap, order-k)`), so a reference that loses to the per-block overlap
-/// codec still clears it — the ONT regression in issue #184, where the frame cost
-/// 4.37 MB to save 1.58 MB and was adopted anyway.
-///
-/// Returning the plain candidate rather than just its length lets the caller write
-/// the fallback layout without re-coding: the per-block overlap encode is the
-/// expensive half of this function, and `block_ranges` is a pure function of the
-/// input, so these streams are byte-identical to a fresh
-/// [`compress_buffered_plain`] pass.
-///
-/// Unlike [`encode_sequence_stream`], the shared reference is not re-assembled or
-/// stored per block — it is built once by the caller and coded against here, which
-/// is the whole point of the shared frame.
 /// Code **only** the shared-reference candidate: the smaller of the
 /// reference-coded [`SEQ_METHOD_OVERLAP_REF`] stream and order-k.
 ///
@@ -431,13 +397,33 @@ pub(crate) fn encode_sequence_stream_shared_only(
         || order_k_stream(lens, seq, params),
     );
     let (against, order_k) = (against?, order_k?);
-    Ok(if against.len() < order_k.len() {
-        against
-    } else {
-        order_k
-    })
+    Ok(keep_smaller(against, order_k))
 }
 
+/// Code a long-read block's sequence **both ways** and return the two candidate
+/// streams the whole-file layout gate chooses between (issue #184):
+///
+/// - `.0` — the **shared-reference** candidate: the smaller of the reference-coded
+///   [`SEQ_METHOD_OVERLAP_REF`] stream and order-k. Valid only in an archive that
+///   carries the reference frame.
+/// - `.1` — the **plain** candidate: exactly what [`encode_sequence_stream`] would
+///   produce for this block, i.e. the smaller of the per-block
+///   [`SEQ_METHOD_OVERLAP`] stream and order-k. Self-contained.
+///
+/// Both are needed because the gate must compare the shared-reference layout
+/// against *the layout it would otherwise use*. Gating on order-k alone measures
+/// against a bar weaker than the plain fallback (which floors each block at
+/// `min(overlap, order-k)`), so a reference that loses to the per-block overlap
+/// codec still clears it — the ONT regression in issue #184, where the frame cost
+/// 4.37 MB to save 1.58 MB and was adopted anyway.
+///
+/// Returning the plain candidate rather than just its length lets the caller write
+/// the fallback layout without re-coding: the per-block overlap encode is the
+/// expensive half of this function, and `block_ranges` is a pure function of the
+/// input, so these streams are byte-identical to a fresh
+/// [`compress_buffered_plain`] pass. The dual keep-smaller below is spelled out
+/// rather than two [`keep_smaller`] calls so the shared order-k allocation is
+/// cloned only when it wins on both sides.
 pub(crate) fn encode_sequence_stream_shared(
     lens: &[u32],
     seq: &[u8],
