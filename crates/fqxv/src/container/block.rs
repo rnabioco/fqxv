@@ -385,23 +385,18 @@ pub(crate) fn encode_sequence_stream(
         sketch: sketch_for(platform, SeedContext::PerBlock),
         ..Default::default()
     };
-    let (overlap, (order_k, lzma)) = rayon::join(
-        || {
-            fqxv_lroverlap::encode(lens, seq, &opts).map(|coded| {
-                let mut out = Vec::with_capacity(coded.len() + 1);
-                out.push(SEQ_METHOD_OVERLAP);
-                out.extend_from_slice(&coded);
-                out
-            })
-        },
-        || {
-            rayon::join(
-                || order_k_stream(lens, seq, params),
-                || lzma_candidate(lens, seq, lzma_wanted(platform)),
-            )
-        },
-    );
-    let (overlap, order_k, lzma) = (overlap?, order_k?, lzma?);
+    // Sequential, not a `rayon::join` fan, so the overlap assembly's working set
+    // and the LZMA `prev` array are not resident at once — see the same rationale
+    // in `encode_sequence_stream_shared`. Byte-identical (keep_smaller is
+    // order-independent); the overlap assembly parallelizes internally.
+    let overlap = fqxv_lroverlap::encode(lens, seq, &opts).map(|coded| {
+        let mut out = Vec::with_capacity(coded.len() + 1);
+        out.push(SEQ_METHOD_OVERLAP);
+        out.extend_from_slice(&coded);
+        out
+    })?;
+    let order_k = order_k_stream(lens, seq, params)?;
+    let lzma = lzma_candidate(lens, seq, lzma_wanted(platform))?;
     // `FQXV_DIAG_SEQ` reports the per-block contest (bytes and bits/base) so
     // seeding/consensus changes can be judged against the real keep-the-smaller
     // outcome, not a proxy. Off by default, zero-cost.
@@ -451,18 +446,16 @@ pub(crate) fn encode_sequence_stream_shared_only(
         sketch: sketch_for(platform, SeedContext::WholeFile),
         ..Default::default()
     };
-    let (against, order_k) = rayon::join(
-        || {
-            fqxv_lroverlap::encode_against(reference, lens, seq, &opts_shared).map(|coded| {
-                let mut out = Vec::with_capacity(coded.len() + 1);
-                out.push(SEQ_METHOD_OVERLAP_REF);
-                out.extend_from_slice(&coded);
-                out
-            })
-        },
-        || order_k_stream(lens, seq, params),
-    );
-    let (against, order_k) = (against?, order_k?);
+    // Sequential (see `encode_sequence_stream_shared`): the reference assembly's
+    // working set is freed before order-k allocates. Byte-identical.
+    let against =
+        fqxv_lroverlap::encode_against(reference, lens, seq, &opts_shared).map(|coded| {
+            let mut out = Vec::with_capacity(coded.len() + 1);
+            out.push(SEQ_METHOD_OVERLAP_REF);
+            out.extend_from_slice(&coded);
+            out
+        })?;
+    let order_k = order_k_stream(lens, seq, params)?;
     Ok(keep_smaller(against, order_k))
 }
 
@@ -512,35 +505,30 @@ pub(crate) fn encode_sequence_stream_shared(
         sketch: sketch_for(platform, SeedContext::PerBlock),
         ..Default::default()
     };
-    let (against, (overlap, (order_k, lzma))) = rayon::join(
-        || {
-            fqxv_lroverlap::encode_against(reference, lens, seq, &opts_shared).map(|coded| {
-                let mut out = Vec::with_capacity(coded.len() + 1);
-                out.push(SEQ_METHOD_OVERLAP_REF);
-                out.extend_from_slice(&coded);
-                out
-            })
-        },
-        || {
-            rayon::join(
-                || {
-                    fqxv_lroverlap::encode(lens, seq, &opts_block).map(|coded| {
-                        let mut out = Vec::with_capacity(coded.len() + 1);
-                        out.push(SEQ_METHOD_OVERLAP);
-                        out.extend_from_slice(&coded);
-                        out
-                    })
-                },
-                || {
-                    rayon::join(
-                        || order_k_stream(lens, seq, params),
-                        || lzma_candidate(lens, seq, lzma_wanted(platform)),
-                    )
-                },
-            )
-        },
-    );
-    let (against, overlap, order_k, lzma) = (against?, overlap?, order_k?, lzma?);
+    // Code the candidates SEQUENTIALLY rather than in a `rayon::join` fan. The fan
+    // held every candidate's working set resident at once — TWO full long-read
+    // assemblies (whole-file `encode_against` + per-block `encode`) plus the LZMA
+    // `prev` array — the dominant long-read memory peak. Sequential coding frees
+    // each working set before the next allocates, roughly halving per-block peak.
+    // It is ~throughput-neutral: each assembly parallelizes internally across the
+    // block's reads and saturates the pool on its own, so two of them serialized
+    // do the same total core-work as two sharing the pool. `keep_smaller` is
+    // order-independent, so the output is byte-identical.
+    let against =
+        fqxv_lroverlap::encode_against(reference, lens, seq, &opts_shared).map(|coded| {
+            let mut out = Vec::with_capacity(coded.len() + 1);
+            out.push(SEQ_METHOD_OVERLAP_REF);
+            out.extend_from_slice(&coded);
+            out
+        })?;
+    let overlap = fqxv_lroverlap::encode(lens, seq, &opts_block).map(|coded| {
+        let mut out = Vec::with_capacity(coded.len() + 1);
+        out.push(SEQ_METHOD_OVERLAP);
+        out.extend_from_slice(&coded);
+        out
+    })?;
+    let order_k = order_k_stream(lens, seq, params)?;
+    let lzma = lzma_candidate(lens, seq, lzma_wanted(platform))?;
     if std::env::var_os("FQXV_DIAG_SEQ").is_some() {
         let bases: u64 = lens.iter().map(|&l| u64::from(l)).sum::<u64>().max(1);
         let bpb = |n: usize| (n as f64 * 8.0) / bases as f64;
