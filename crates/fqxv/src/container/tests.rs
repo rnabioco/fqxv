@@ -855,6 +855,56 @@ fn container_decodes_overlap_tagged_sequence_stream() {
     );
 }
 
+#[test]
+fn container_decodes_tile_tagged_sequence_stream() {
+    // Cover the tiling decode dispatch (`SEQ_METHOD_TILE` ->
+    // `fqxv_lroverlap::tile_decode`) directly: build a genuine tile-coded stream
+    // over overlapping long reads (with an `N`, so the exception path runs end to
+    // end), tag it, and round-trip it through the container's
+    // `decode_sequence_stream`. The compress path selects tiling only on real ONT
+    // data, so this exercises the dispatch arm without depending on that selection.
+    let (lens, mut seq) = deep_longread_seq(120, 1000, 100, 3000, 200);
+    seq[321] = b'N';
+    let opts = fqxv_lroverlap::EncodeOpts::default();
+    let coded = fqxv_lroverlap::tile_encode(&lens, &seq, &opts).expect("tile encode");
+    let mut stream = vec![SEQ_METHOD_TILE];
+    stream.extend_from_slice(&coded);
+
+    let (dlens, dseq) = decode_sequence_stream(&stream, None).expect("tile dispatch decode");
+    assert_eq!(dlens, lens, "tile decode must restore per-read lengths");
+    assert_eq!(dseq, seq, "tile decode must restore the bases byte-exact");
+}
+
+#[test]
+fn tile_candidate_is_never_worse_than_order_k_on_nanopore() {
+    // Tiling is a Nanopore-gated, keep-the-smaller candidate: it can only shrink a
+    // block, never grow it. Through the real selection path, the Nanopore stream
+    // must (a) round-trip byte-exact — including the `N` exception path — and (b)
+    // never exceed the order-k floor that `encode_sequence_stream` guarantees.
+    let (lens, mut seq) = deep_longread_seq(200, 1200, 60, 3000, 150);
+    seq[500] = b'N';
+    let last = seq.len() - 7;
+    seq[last] = b'N';
+    let params = Params {
+        seq_order: 0,
+        ..Params::default()
+    };
+    let gated = encode_sequence_stream(&lens, &seq, &params, Platform::Nanopore).unwrap();
+    let order_k = order_k_stream(&lens, &seq, &params).unwrap();
+    assert!(
+        gated.len() <= order_k.len(),
+        "the never-worse candidate set must not exceed the order-k floor ({} vs {})",
+        gated.len(),
+        order_k.len(),
+    );
+    let (dl, ds) = decode_sequence_stream(&gated, None).expect("decode nanopore stream");
+    assert_eq!(
+        (dl, ds),
+        (lens, seq),
+        "the Nanopore tiling path must be lossless"
+    );
+}
+
 /// Deep-tiling long-read sequence: `n` reads of ~`read_len` bp tiling a genome at a
 /// short step (high coverage, so the overlap codec forms a contig), each carrying
 /// ~1% random substitution error — the sequencing noise that pollutes the order-k

@@ -62,7 +62,7 @@ const WFA_CODING_MAX_BAND: usize = 32;
 /// produced the edit script. On the rare read whose small band under-estimated
 /// its true divergence, WFA caps out and we fall back to the DP for a real
 /// alignment rather than take the bounded `[Del, Ins]` rewrite.
-fn align_for_coding(refr: &[u8], query: &[u8], band: usize) -> Alignment {
+pub(crate) fn align_for_coding(refr: &[u8], query: &[u8], band: usize) -> Alignment {
     if band <= WFA_CODING_MAX_BAND {
         // A low-drift read's true edit distance is ~O(band); cap generously above
         // it so a genuinely similar read never caps, while a mis-estimated one
@@ -115,7 +115,7 @@ const MAX_LAYOUT_SUBSAMPLE: usize = 32_768;
 
 /// One extra reference base past a read's own length, so the banded aligner has
 /// somewhere to place a trailing deletion.
-const REF_TAIL: usize = 64;
+pub(crate) const REF_TAIL: usize = 64;
 
 /// Options for [`encode`]. None affect [`decode`] — the block self-describes.
 #[derive(Debug, Clone)]
@@ -131,6 +131,14 @@ pub struct EncodeOpts {
     /// Hard cap on the band, so one pathological chain cannot allocate a
     /// quadratic DP table.
     pub band_cap: usize,
+    /// Alignment band half-width for the multi-reference tiler
+    /// ([`tile_encode`](crate::tile_encode)). Each read is coded against *raw*
+    /// earlier neighbour reads (not a voted consensus), so a tile sits at the
+    /// sum of both reads' error (~13.5% on ONT) and needs a wider band than the
+    /// consensus coder. 256 is the cheaper measured operating point (1.142
+    /// b/base on ONT); 768 trades encode time for ~1.056. Affects ratio and
+    /// speed only — the block self-describes, so decode is unaffected.
+    pub tile_band: usize,
 }
 
 impl Default for EncodeOpts {
@@ -140,6 +148,7 @@ impl Default for EncodeOpts {
             stride: None,
             band_margin: 32,
             band_cap: 2048,
+            tile_band: 256,
         }
     }
 }
@@ -241,7 +250,7 @@ impl Reference {
 /// placeholder the exception list overwrites on decode). Deliberately *not*
 /// case-folding — a lowercase base is preserved verbatim through the exceptions.
 #[inline]
-fn base_code(b: u8) -> u8 {
+pub(crate) fn base_code(b: u8) -> u8 {
     match b {
         b'A' => 0,
         b'C' => 1,
@@ -255,7 +264,7 @@ fn base_code(b: u8) -> u8 {
 /// `[varint raw_len][varint enc_len][enc bytes]`. Empty streams store only a
 /// zero length. The order tag lives inside the rANS header, so [`get_stream`]
 /// needs no discriminator of its own.
-fn put_stream(out: &mut Vec<u8>, raw: &[u8]) -> Result<(), Error> {
+pub(crate) fn put_stream(out: &mut Vec<u8>, raw: &[u8]) -> Result<(), Error> {
     write_varint(out, raw.len() as u64);
     if raw.is_empty() {
         return Ok(());
@@ -269,7 +278,7 @@ fn put_stream(out: &mut Vec<u8>, raw: &[u8]) -> Result<(), Error> {
 }
 
 /// Substitution alphabet: ACGT (codes 0-3) plus a non-ACGT placeholder (4).
-const SUB_SYMS: usize = 5;
+pub(crate) const SUB_SYMS: usize = 5;
 
 /// Range-code the substituted bases conditioned on the reference base each replaced.
 /// ONT substitutions are strongly reference-base-dependent, so a per-ref-base
@@ -277,7 +286,7 @@ const SUB_SYMS: usize = 5;
 /// the reference base similarly). The models start uniform and adapt in stream order;
 /// [`decode`] rebuilds the same models with the same contexts (the consensus base at
 /// each position), so it round-trips exactly.
-fn encode_subs(subs: &[u8], sub_ctx: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_subs(subs: &[u8], sub_ctx: &[u8]) -> Vec<u8> {
     let mut enc = fqxv_range::Encoder::new();
     let mut models: [fqxv_range::SimpleModel<SUB_SYMS>; SUB_SYMS] =
         std::array::from_fn(|_| fqxv_range::SimpleModel::new());
@@ -289,14 +298,14 @@ fn encode_subs(subs: &[u8], sub_ctx: &[u8]) -> Vec<u8> {
 }
 
 /// Number of order-3 op-history contexts (last 3 ops × 2 bits).
-const OP_CTXS: usize = 64;
+pub(crate) const OP_CTXS: usize = 64;
 
 /// Range-code the op-type stream (Match/Sub/Ins/Del = 0..3) with an order-3 context
 /// over the three preceding op types. Op sequences are strongly self-correlated
 /// (Match follows Match; homopolymer indels cluster), so this beats the flat rANS.
 /// The rolling context is derived from the ops themselves, so decode rebuilds it
 /// identically as it decodes each op during reconstruction.
-fn encode_ops(ops: &[u8]) -> Vec<u8> {
+pub(crate) fn encode_ops(ops: &[u8]) -> Vec<u8> {
     let mut enc = fqxv_range::Encoder::new();
     let mut models: [fqxv_range::SimpleModel<4>; OP_CTXS] =
         std::array::from_fn(|_| fqxv_range::SimpleModel::new());
@@ -309,7 +318,7 @@ fn encode_ops(ops: &[u8]) -> Vec<u8> {
     enc.finish()
 }
 
-fn get_stream(src: &[u8], pos: &mut usize) -> Result<Vec<u8>, Error> {
+pub(crate) fn get_stream(src: &[u8], pos: &mut usize) -> Result<Vec<u8>, Error> {
     let raw_len = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
     if raw_len == 0 {
         return Ok(Vec::new());
@@ -415,7 +424,7 @@ fn derive_stride(sketch: Sketch, reads: &[&[u8]], total_bases: u64) -> usize {
 
 /// Cumulative byte offsets into `seq` for reads of the given `lens`, validating
 /// that the lengths sum to `seq.len()`.
-fn compute_offs(lens: &[u32], seq_len: usize) -> Result<Vec<usize>, Error> {
+pub(crate) fn compute_offs(lens: &[u32], seq_len: usize) -> Result<Vec<usize>, Error> {
     let mut offs = Vec::with_capacity(lens.len() + 1);
     let mut acc = 0usize;
     for &l in lens {
