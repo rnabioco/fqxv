@@ -298,10 +298,28 @@ fn lzma_candidate_enabled() -> bool {
     std::env::var_os("FQXV_SEQ_NO_LZMA").is_none()
 }
 
-/// The optional LZMA candidate: `None` (skipping the encode entirely) when
-/// disabled, else the coded stream.
-fn lzma_candidate(lens: &[u32], seq: &[u8]) -> Result<Option<Vec<u8>>> {
-    if lzma_candidate_enabled() {
+/// Whether the raw-LZMA sequence candidate is worth coding for `platform`.
+///
+/// LZMA wins only where reads share long *exact* substrings — ordinary-coverage
+/// low-error long reads (PacBio HiFi, where it measured 0.60 vs the overlap
+/// codec's 1.39 b/base). On high-error Nanopore a base error every ~10 bases
+/// chops those matches short, so LZMA reliably *loses* to the overlap/order-k
+/// codecs (2.2 vs 1.79 b/base measured on ONT) while costing the most encode time
+/// of any candidate — coding it there is pure waste (the #197 encode-time
+/// regression). Skip it for Nanopore; code it for every other platform, including
+/// unknown, so the never-worse ratio guarantee holds wherever the loss cannot be
+/// ruled out up front.
+fn lzma_wanted(platform: Platform) -> bool {
+    !matches!(platform, Platform::Nanopore)
+}
+
+/// The optional LZMA candidate: `None` (skipping the encode entirely) when the
+/// caller's `want` flag is false or `FQXV_SEQ_NO_LZMA` is set, else the coded
+/// stream. `want` is [`lzma_wanted`] of the block's platform — the LZMA encode is
+/// the slowest candidate, so on platforms where it cannot win we skip it rather
+/// than code-and-discard.
+fn lzma_candidate(lens: &[u32], seq: &[u8], want: bool) -> Result<Option<Vec<u8>>> {
+    if want && lzma_candidate_enabled() {
         Ok(Some(lzma_stream(lens, seq)?))
     } else {
         Ok(None)
@@ -379,7 +397,7 @@ pub(crate) fn encode_sequence_stream(
         || {
             rayon::join(
                 || order_k_stream(lens, seq, params),
-                || lzma_candidate(lens, seq),
+                || lzma_candidate(lens, seq, lzma_wanted(platform)),
             )
         },
     );
@@ -471,6 +489,10 @@ pub(crate) fn encode_sequence_stream_shared_only(
 /// expensive half of this function, and `block_ranges` is a pure function of the
 /// input, so these streams are byte-identical to a fresh
 /// [`compress_buffered_plain`] pass.
+///
+/// The raw-LZMA plain candidate is coded only when [`lzma_wanted`] of `platform`
+/// allows it — skipped on high-error Nanopore, where it cannot win and is the
+/// slowest candidate.
 pub(crate) fn encode_sequence_stream_shared(
     lens: &[u32],
     seq: &[u8],
@@ -512,7 +534,7 @@ pub(crate) fn encode_sequence_stream_shared(
                 || {
                     rayon::join(
                         || order_k_stream(lens, seq, params),
-                        || lzma_candidate(lens, seq),
+                        || lzma_candidate(lens, seq, lzma_wanted(platform)),
                     )
                 },
             )

@@ -855,22 +855,22 @@ fn container_decodes_overlap_tagged_sequence_stream() {
     );
 }
 
-/// Deep-tiling long-read fixture: `n` reads of ~`read_len` bp tiling a genome at a
+/// Deep-tiling long-read sequence: `n` reads of ~`read_len` bp tiling a genome at a
 /// short step (high coverage, so the overlap codec forms a contig), each carrying
 /// ~1% random substitution error — the sequencing noise that pollutes the order-k
 /// context model but is voted out by the consensus, which is what makes the shared
 /// reference win the size race (a clean synthetic genome is too easy for order-k).
-/// One `N` per read exercises the non-ACGT exception path. Returns FASTQ.
+/// One `N` per read exercises the non-ACGT exception path. Returns `(lens, seq)`.
 /// `err_period` sets the per-base substitution rate (`1/err_period`): 300 is
 /// HiFi-like (~0.3%), a small value is ONT-like and noisy enough that reads stop
 /// collapsing onto a shared consensus.
-fn deep_longread_fastq(
+fn deep_longread_seq(
     n: usize,
     read_len: usize,
     step: usize,
     genome_len: usize,
     err_period: u64,
-) -> Vec<u8> {
+) -> (Vec<u32>, Vec<u8>) {
     // splitmix64, used for both the genome and the per-read error, so the genome is
     // near-uniform ACGT (order-0 ≈ 2 bits/base) — a biased genome would let even a
     // low-order model compress it below what the reference-coded stream achieves.
@@ -887,7 +887,8 @@ fn deep_longread_fastq(
             .map(|_| b"ACGT"[(rng(&mut g) % 4) as usize])
             .collect()
     };
-    let mut input = Vec::new();
+    let mut lens = Vec::with_capacity(n);
+    let mut seq = Vec::with_capacity(n * read_len);
     for i in 0..n {
         let start = (i * step) % (genome.len() - read_len);
         let mut s = genome[start..start + read_len].to_vec();
@@ -898,8 +899,30 @@ fn deep_longread_fastq(
             }
         }
         s[read_len / 2] = b'N'; // exercise the non-ACGT exception path
-        let qual = vec![b'I'; s.len()];
-        write_record(&mut input, format!("read.{i}").as_bytes(), &s, &qual);
+        lens.push(s.len() as u32);
+        seq.extend_from_slice(&s);
+    }
+    (lens, seq)
+}
+
+/// [`deep_longread_seq`] wrapped as FASTQ, quality a flat `b'I'` (Phred 40) and
+/// `read.<i>` names.
+fn deep_longread_fastq(
+    n: usize,
+    read_len: usize,
+    step: usize,
+    genome_len: usize,
+    err_period: u64,
+) -> Vec<u8> {
+    let (lens, seq) = deep_longread_seq(n, read_len, step, genome_len, err_period);
+    let mut input = Vec::new();
+    let mut off = 0usize;
+    for (i, &l) in lens.iter().enumerate() {
+        let l = l as usize;
+        let s = &seq[off..off + l];
+        let qual = vec![b'I'; l];
+        write_record(&mut input, format!("read.{i}").as_bytes(), s, &qual);
+        off += l;
     }
     input
 }
@@ -1024,6 +1047,45 @@ fn lzma_sequence_method_wins_and_round_trips_on_redundant_long_reads() {
     let mut out2 = Vec::new();
     decompress(&without[..], &mut out2, 4).expect("decompress without lzma");
     assert_eq!(out2, input);
+}
+
+#[test]
+fn lzma_candidate_is_gated_off_on_nanopore_platform() {
+    // #197 follow-up: raw LZMA is the slowest sequence candidate and only wins on
+    // low-error long reads (PacBio HiFi), where reads share long exact substrings.
+    // On high-error Nanopore it reliably loses, so it is skipped there entirely,
+    // which cuts the ONT encode-time regression LZMA added (~5.5x on a real 600 MB
+    // ONT run). Pinning the gate directly on `encode_sequence_stream` is exact:
+    // `Unknown` and `Nanopore` both take the same ONT minimizer sketch (see
+    // `sketch_for`), so the overlap and order-k candidates are byte-identical
+    // between the two calls — the *only* difference is whether the LZMA candidate
+    // is coded. On these heavily-overlapping reads LZMA wins when coded, so the
+    // method byte flips iff the gate suppressed it.
+    let (lens, seq) = deep_longread_seq(200, 1200, 30, 3000, 300);
+    let params = Params {
+        seq_order: 0,
+        ..Params::default()
+    };
+    let coded = encode_sequence_stream(&lens, &seq, &params, Platform::Unknown).unwrap();
+    let gated = encode_sequence_stream(&lens, &seq, &params, Platform::Nanopore).unwrap();
+
+    assert_eq!(
+        coded[0], SEQ_METHOD_LZMA,
+        "with the candidate coded (non-Nanopore), raw LZMA wins on redundant long reads"
+    );
+    assert_ne!(
+        gated[0], SEQ_METHOD_LZMA,
+        "the LZMA candidate must be gated off on Nanopore, not merely lose"
+    );
+
+    // Gating changes candidate selection, never correctness: the Nanopore stream
+    // still decodes to the exact input reads, exception path (`N`) and all.
+    let (dec_lens, dec_seq) = decode_sequence_stream(&gated, None).expect("decode gated stream");
+    assert_eq!(
+        (dec_lens, dec_seq),
+        (lens, seq),
+        "a gated-off LZMA candidate must not affect losslessness"
+    );
 }
 
 #[test]
