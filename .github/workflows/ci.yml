@@ -113,3 +113,31 @@ jobs:
           toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
+
+  python:
+    name: Python bindings
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # fqxv-python (the PyPI bindings) is otherwise only built at release time
+    # (wheels.yml). Build the extension and run its smoke tests here so a broken
+    # binding fails a PR rather than first surfacing when a release tag is cut.
+    steps:
+      - uses: actions/checkout@v7
+      # `.cargo/config.toml` links with lld; install it for the build steps.
+      - run: sudo apt-get update && sudo apt-get install -y lld
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+      # test_smoke.py compresses a tiny fixture with the CLI (target/debug/fqxv).
+      - run: cargo build -p fqxv-cli
+      - name: Build and install the bindings
+        run: |
+          python -m pip install --upgrade maturin pytest
+          maturin build --out dist --manifest-path crates/fqxv-python/Cargo.toml
+          python -m pip install dist/*.whl
+      - name: Smoke-test the bindings
+        env:
+          FQXV_BIN: target/debug/fqxv
+        run: python -m pytest crates/fqxv-python/tests/ -v

@@ -35,13 +35,19 @@ def _fqxv_cli():
     return None
 
 
-def _build_fixture(dest_dir):
-    """Compress a tiny synthetic FASTQ into a `.fqxv` the tests can read."""
+def _write_fastq(dest_dir):
+    """Write a tiny synthetic FASTQ and return its path."""
     fastq = dest_dir / "tiny.fastq"
     lines = []
     for i in range(8):
         lines += [f"@read{i} desc", "ACGTACGTACGTACGT", "+", "IIIIIIIIIIIIIIII"]
     fastq.write_text("\n".join(lines) + "\n")
+    return fastq
+
+
+def _build_fixture(dest_dir):
+    """Compress a tiny synthetic FASTQ into a `.fqxv` the tests can read."""
+    fastq = _write_fastq(dest_dir)
     cli = _fqxv_cli()
     if cli is None:
         pytest.skip("fqxv CLI not found (set FQXV_BIN or build the workspace)")
@@ -61,6 +67,12 @@ def archive(tmp_path_factory):
     if env and pathlib.Path(env).exists():
         return env
     return str(_build_fixture(tmp_path_factory.mktemp("fqxv")))
+
+
+@pytest.fixture(scope="session")
+def fastq(tmp_path_factory):
+    """A tiny raw FASTQ fixture. `estimate` reads FASTQ input, not an archive."""
+    return str(_write_fastq(tmp_path_factory.mktemp("fqxv_fastq")))
 
 
 def test_iterate_records(archive):
@@ -114,3 +126,36 @@ def test_projection_matches_iteration(archive):
     assert idx.total_reads == len(recs)
     block0 = fqxv.read_block(archive, 0)
     assert block0[0].sequence == recs[0].sequence
+
+
+def test_estimate_projects_size(fastq):
+    est = fqxv.estimate(fastq)
+    # The whole 8-read fixture fits in one sample, so the numbers are exact.
+    assert est.sample_reads == 8
+    assert est.exhausted
+    assert est.archive_bytes > 0
+    assert est.ratio > 0.0
+    # archive_bytes is the three streams plus per-block frame overhead.
+    assert est.names_bytes + est.sequence_bytes + est.quality_bytes <= est.archive_bytes
+
+
+def test_estimate_accepts_bytes_and_is_deterministic(fastq):
+    from_path = fqxv.estimate(fastq)
+    from_bytes = fqxv.estimate(pathlib.Path(fastq).read_bytes())
+    assert from_bytes.sample_reads == from_path.sample_reads
+    assert from_bytes.archive_bytes == from_path.archive_bytes
+
+
+def test_estimate_rejects_unknown_binning(fastq):
+    with pytest.raises(ValueError):
+        fqxv.estimate(fastq, quality_binning="nonsense")
+
+
+def test_verify_passes_on_good_archive(archive):
+    # Returns None on success; raises on failure.
+    assert fqxv.verify(archive) is None
+
+
+def test_verify_rejects_non_archive():
+    with pytest.raises(Exception):
+        fqxv.verify(b"definitely not an fqxv archive")

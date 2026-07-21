@@ -25,3 +25,7 @@ fqxv_core = { path = "../fqxv", version = "0.4.0", package = "fqxv" }
 # #[pyclass]/#[pymethods]/#[pyfunction] attributes; abi3-py39 → one forward-
 # compatible wheel per platform; extension-module keeps libpython unlinked.
 pyo3 = { workspace = true, features = ["abi3-py39", "extension-module", "macros"] }
+# `estimate` reads the raw FASTQ input, which is usually gzip/BGZF-compressed;
+# sniff the magic and decode transparently (BGZF is gzip-framed, so MultiGzDecoder
+# reads it too), mirroring the CLI's input auto-detection.
+flate2 = { workspace = true }

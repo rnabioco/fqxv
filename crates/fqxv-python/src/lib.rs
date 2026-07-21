@@ -12,14 +12,15 @@ use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
+use flate2::read::MultiGzDecoder;
 use pyo3::create_exception;
-use pyo3::exceptions::{PyException, PyIOError, PyTypeError};
+use pyo3::exceptions::{PyException, PyIOError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use fqxv_core::{
-    Index, Stream, decode_block_contents, decode_names, decode_quality, decode_quality_with_seq,
-    decode_sequence, quality_needs_sequence,
+    Index, Params, QualityBinning, Stream, decode_block_contents, decode_names, decode_quality,
+    decode_quality_with_seq, decode_sequence, quality_needs_sequence,
 };
 
 create_exception!(
@@ -514,6 +515,197 @@ fn read_block(py: Python<'_>, source: &Bound<'_, PyAny>, group: usize) -> PyResu
     Ok(recs.into_iter().map(|inner| PyRecord { inner }).collect())
 }
 
+/// Open a FASTQ `source` (path or `bytes`) as a plain byte reader, transparently
+/// decompressing gzip — BGZF is gzip-framed, so `MultiGzDecoder` reads it too.
+/// Mirrors the CLI's input auto-detection (minus stdin). Unlike [`open_source`]
+/// this yields a forward-only stream, which is all [`estimate`] needs.
+fn open_fastq(obj: &Bound<'_, PyAny>) -> PyResult<Box<dyn Read + Send>> {
+    let mut raw: Box<dyn Read + Send> = if let Ok(b) = obj.cast::<PyBytes>() {
+        Box::new(Cursor::new(b.as_bytes().to_vec()))
+    } else {
+        let path: PathBuf = obj.extract().map_err(|_| {
+            PyTypeError::new_err("source must be bytes, a str path, or an os.PathLike")
+        })?;
+        Box::new(
+            File::open(&path)
+                .map_err(|e| PyIOError::new_err(format!("{}: {e}", path.display())))?,
+        )
+    };
+    // Peek the 2-byte gzip magic, then chain it back so nothing is consumed.
+    let mut magic = [0u8; 2];
+    let mut got = 0;
+    while got < magic.len() {
+        match raw
+            .read(&mut magic[got..])
+            .map_err(|e| PyIOError::new_err(e.to_string()))?
+        {
+            0 => break,
+            n => got += n,
+        }
+    }
+    let chained = Cursor::new(magic[..got].to_vec()).chain(raw);
+    Ok(if got == 2 && magic == [0x1f, 0x8b] {
+        Box::new(MultiGzDecoder::new(chained))
+    } else {
+        Box::new(chained)
+    })
+}
+
+/// Parse a `quality_binning` name onto a [`QualityBinning`]. Names match the
+/// CLI's `--quality-bin` values.
+fn parse_binning(s: &str) -> PyResult<QualityBinning> {
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "lossless" | "none" => QualityBinning::Lossless,
+        "bin8" => QualityBinning::Bin8,
+        "bin4" => QualityBinning::Bin4,
+        "bin2" => QualityBinning::Bin2,
+        "ont" => QualityBinning::BinOnt,
+        "hifi" => QualityBinning::BinHifi,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown quality_binning {other:?}; expected lossless, bin8, bin4, bin2, ont, or hifi"
+            )));
+        }
+    })
+}
+
+// The 1-9 effort level → sequence-coding knobs. These mirror fqxv-cli's
+// `level_to_*` (crates/fqxv-cli/src/main.rs) and must stay in sync so
+// `estimate(level=N)` matches `fqxv compress --level N --estimate`. The reorder /
+// platform knobs `estimate` ignores are left at `Params::default()`.
+fn level_to_order(level: u8) -> u8 {
+    (level as usize + 6).clamp(1, 11) as u8
+}
+fn level_to_hash(level: u8) -> (u8, u8) {
+    if level >= 8 { (13, 25) } else { (0, 0) }
+}
+fn level_to_block(level: u8) -> usize {
+    match level {
+        0..=2 => 128 << 10,
+        3..=4 => 256 << 10,
+        5..=6 => 1 << 20,
+        7..=8 => 2 << 20,
+        _ => 4 << 20,
+    }
+}
+fn level_to_tile(level: u8) -> (usize, usize) {
+    match level {
+        0..=6 => (256, 1),
+        7 => (256, 2),
+        8 => (256, 4),
+        _ => (768, 4),
+    }
+}
+
+/// Projected compression of a FASTQ, from coding a bounded leading sample with the
+/// real codecs — the result of [`estimate`]. The byte counts describe the sample;
+/// `ratio` is scale-invariant and holds for the whole file.
+#[pyclass(name = "Estimate", frozen)]
+struct PyEstimate {
+    inner: fqxv_core::Estimate,
+}
+
+#[pymethods]
+impl PyEstimate {
+    #[getter]
+    fn sample_reads(&self) -> u64 {
+        self.inner.sample_reads
+    }
+    #[getter]
+    fn sample_bases(&self) -> u64 {
+        self.inner.sample_bases
+    }
+    #[getter]
+    fn raw_bytes(&self) -> u64 {
+        self.inner.raw_bytes
+    }
+    #[getter]
+    fn names_bytes(&self) -> u64 {
+        self.inner.names_bytes
+    }
+    #[getter]
+    fn sequence_bytes(&self) -> u64 {
+        self.inner.seq_bytes
+    }
+    #[getter]
+    fn quality_bytes(&self) -> u64 {
+        self.inner.qual_bytes
+    }
+    #[getter]
+    fn archive_bytes(&self) -> u64 {
+        self.inner.archive_bytes
+    }
+    /// `True` when the whole input fit in the sample, so the numbers are exact
+    /// rather than an extrapolation base.
+    #[getter]
+    fn exhausted(&self) -> bool {
+        self.inner.exhausted
+    }
+    /// Uncompressed FASTQ bytes ÷ archive bytes. Scale-invariant; `0.0` if empty.
+    #[getter]
+    fn ratio(&self) -> f64 {
+        self.inner.ratio()
+    }
+    fn __repr__(&self) -> String {
+        format!(
+            "Estimate(sample_reads={}, archive_bytes={}, ratio={:.3}, exhausted={})",
+            self.inner.sample_reads,
+            self.inner.archive_bytes,
+            self.inner.ratio(),
+            self.inner.exhausted,
+        )
+    }
+}
+
+/// Estimate the archive size and ratio for a FASTQ `source` (path or `bytes`,
+/// gzip/BGZF transparently decoded) without writing anything — the library behind
+/// `fqxv compress --estimate`. Codes the leading `sample_reads` records with the
+/// real codecs at the given effort `level` and `quality_binning`. Reordering is
+/// not modelled, so for data the real run would reorder this is a conservative
+/// lower bound (the archive comes out this size or smaller).
+#[pyfunction]
+#[pyo3(signature = (source, *, level = 5, quality_binning = "lossless", sample_reads = 1_048_576, threads = 0))]
+fn estimate(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    level: u8,
+    quality_binning: &str,
+    sample_reads: usize,
+    threads: usize,
+) -> PyResult<PyEstimate> {
+    let binning = parse_binning(quality_binning)?;
+    let reader = open_fastq(source)?;
+    let (seq_hash_order, seq_hash_bits) = level_to_hash(level);
+    let (tile_band, tile_max_refs) = level_to_tile(level);
+    let params = Params {
+        seq_order: level_to_order(level),
+        seq_hash_order,
+        seq_hash_bits,
+        block_reads: level_to_block(level),
+        quality_binning: binning,
+        threads,
+        tile_band,
+        tile_max_refs,
+        ..Params::default()
+    };
+    let est = py
+        .detach(move || fqxv_core::estimate(reader, params, sample_reads))
+        .map_err(map_err)?;
+    Ok(PyEstimate { inner: est })
+}
+
+/// Verify an archive's integrity — header, footer, and the parallel whole-file CRC
+/// (the globally-reordered layout, which has no footer, is checked by a full
+/// decode). Accepts a path or `bytes`. Returns `None` on success and raises
+/// `fqxv.FqxvError` (or `OSError`) if the archive is corrupt or unreadable.
+#[pyfunction]
+#[pyo3(signature = (source, *, threads = 0))]
+fn verify(py: Python<'_>, source: &Bound<'_, PyAny>, threads: usize) -> PyResult<()> {
+    let reader = open_source(source)?;
+    py.detach(move || fqxv_core::verify(reader, threads))
+        .map_err(map_err)
+}
+
 #[pymodule]
 fn fqxv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRecord>()?;
@@ -521,6 +713,7 @@ fn fqxv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyInfo>()?;
     m.add_class::<PyIndex>()?;
     m.add_class::<PyGroupLoc>()?;
+    m.add_class::<PyEstimate>()?;
     m.add("FqxvError", m.py().get_type::<FqxvError>())?;
     m.add_function(wrap_pyfunction!(open, m)?)?;
     m.add_function(wrap_pyfunction!(decompress_to_path, m)?)?;
@@ -531,5 +724,7 @@ fn fqxv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_sequences, m)?)?;
     m.add_function(wrap_pyfunction!(read_qualities, m)?)?;
     m.add_function(wrap_pyfunction!(read_block, m)?)?;
+    m.add_function(wrap_pyfunction!(estimate, m)?)?;
+    m.add_function(wrap_pyfunction!(verify, m)?)?;
     Ok(())
 }
