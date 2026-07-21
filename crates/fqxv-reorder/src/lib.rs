@@ -41,17 +41,7 @@ use thiserror::Error;
 // examples) keep working.
 pub use fqxv_dna::{revcomp, revcomp_into};
 
-mod reflzma;
 mod refpack;
-
-/// Clean-room LZMA over **raw** sequence bytes (~89 MB match window), the same
-/// coder the reorder reference uses internally, exposed for the container's
-/// raw-LZMA sequence method (#197). Codes the ASCII bases directly — no 2-bit
-/// packing, which destroys the byte-aligned cross-read matches an LZ needs on
-/// ordinary-coverage long reads (measured 2-bit+LZMA 1.134 vs raw 0.63 b/base).
-/// `lzma_seq_encode` stores the per-read lengths alongside the coded bases;
-/// `lzma_seq_decode` returns `(lens, seq)`.
-pub use reflzma::{decode as lzma_seq_decode, encode as lzma_seq_encode};
 
 /// A minimal integer hasher for the assembly maps. Their keys are already
 /// well-mixed — 2-bit-packed k-mers and dense contig ids — so a single
