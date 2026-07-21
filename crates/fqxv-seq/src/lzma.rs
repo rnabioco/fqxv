@@ -1,12 +1,11 @@
-//! Clean-room LZMA-class codec for the global reference bases.
+//! Clean-room LZMA-class byte coder for sequence bases.
 //!
-//! The order-k context model ([`fqxv_seq`], the shipped reference coder) and the
-//! block-sorting coder ([`super::refbwt`]) both leave the reference's *long-range*
-//! redundancy — near-duplicate contigs scattered across the whole reference — on
-//! the table, because neither *copies* a repeat: the context model re-codes it and
-//! BWT only models it statistically. The way to capture it is explicit LZ77
-//! matching with strong entropy coding, which is what xz/LZMA do (they reach
-//! ~1.79 b/base here vs the order-k model's 1.98). This module is a clean-room
+//! The order-k context model (the shipped [`encode`](crate::encode) sequence
+//! coder) leaves *long-range* redundancy — near-duplicate stretches scattered far
+//! apart in the input — on the table, because it re-codes a repeat rather than
+//! *copying* it. The way to capture that is explicit LZ77 matching with strong
+//! entropy coding, which is what xz/LZMA do (they reach ~1.79 b/base on a whole
+//! reference here vs the order-k model's 1.98). This module is a clean-room
 //! LZMA-class coder built only on the [`fqxv_range`] range coder — it is *not* a
 //! port of liblzma/xz; the bit-models, the match finder, the parse, and the
 //! stream layout are all local, following the well-known LZMA *design* (adaptive
@@ -14,15 +13,18 @@
 //! a length coder, position-slot + aligned distance coding, and rep0–3 short
 //! codes for repeated distances).
 //!
+//! Two consumers reach this module: the container's raw-LZMA sequence method,
+//! through the framed [`encode`]/[`decode`] over `(lens, seq)`; and
+//! `fqxv-reorder`'s reference packer, through the raw byte core
+//! [`encode_raw`]/[`decode_raw`] run over the 2-bit-packed reference.
+//!
 //! ## Window and determinism
 //!
-//! Unlike the per-read blocks (which must decode in parallel), the reference is
-//! coded and decoded exactly once per file, so this uses a single whole-reference
-//! window (a serial LZ decode) to give the match finder the full ~89 MB of reach
-//! — the whole point, since the repeats are far apart. Encoding is deterministic
-//! (a fixed greedy/lazy parse over a fixed hash chain), so the output is identical
-//! regardless of thread count. The container gates it never-worse against the
-//! order-k path, so it can only shrink the archive.
+//! This uses a single whole-input window (a serial LZ decode) so the match finder
+//! gets the full reach — the whole point, since the repeats can be far apart.
+//! Encoding is deterministic (a fixed greedy/lazy parse over a fixed hash chain),
+//! so the output is identical regardless of thread count. Callers gate it
+//! never-worse against the order-k path, so it can only shrink the archive.
 
 use fqxv_bytes::{read_varint, write_varint};
 use fqxv_range::{Decoder, Encoder};
@@ -514,10 +516,11 @@ const LC: u32 = 8;
 /// taken as reps (cheap distance). Distance-scaled below.
 const NORMAL_MIN: usize = 4;
 
-/// LZMA-encode the whole byte slice `s` into one range-coded stream. Exposed to
-/// sibling modules (e.g. [`super::refpack`]) that want the raw byte-domain LZMA
-/// core without the reference `(lens, seq)` framing.
-pub(crate) fn lzma_encode(s: &[u8]) -> Vec<u8> {
+/// LZMA-encode the whole byte slice `s` into one range-coded stream. This is the
+/// raw byte-domain core, exposed for callers (e.g. `fqxv-reorder`'s reference
+/// packer) that want the LZMA coder without the `(lens, seq)` framing [`encode`]
+/// adds. Reversed by [`decode_raw`].
+pub fn encode_raw(s: &[u8]) -> Vec<u8> {
     let n = s.len();
     let mut m = Models::new(LC);
     let mut enc = Encoder::new();
@@ -644,8 +647,9 @@ pub(crate) fn lzma_encode(s: &[u8]) -> Vec<u8> {
     enc.finish()
 }
 
-/// LZMA-decode `n` bytes from `buf`. Exposed to sibling modules.
-pub(crate) fn lzma_decode(buf: &[u8], n: usize) -> Result<Vec<u8>> {
+/// LZMA-decode `n` bytes from `buf`. The raw byte-domain core, reversing
+/// [`encode_raw`]; exposed for the same callers.
+pub fn decode_raw(buf: &[u8], n: usize) -> Result<Vec<u8>> {
     let mut m = Models::new(LC);
     let mut dec = Decoder::new(buf);
     let mut state = 0usize;
@@ -730,18 +734,18 @@ fn decode_rep_index(m: &mut Models, dec: &mut Decoder<'_>, state: usize) -> usiz
     }
 }
 
-// --- whole-reference framing -------------------------------------------------
+// --- whole-input framing -----------------------------------------------------
 
-/// LZMA-code a whole reference given per-contig `lens` and concatenated `seq`.
-/// One window over the whole reference (the reference is coded once, so a serial
-/// decode is fine and the full reach is what captures the distant repeats).
-/// Frame: `[varint n_contigs][lens...][varint n_bases][lzma payload]`.
+/// LZMA-code a whole sequence given per-record `lens` and concatenated `seq`.
+/// One window over the whole input (coded once, so a serial decode is fine and
+/// the full reach is what captures the distant repeats).
+/// Frame: `[varint n_records][lens...][varint n_bases][lzma payload]`.
 pub fn encode(lens: &[u32], seq: &[u8]) -> Result<Vec<u8>> {
     let sum: usize = lens.iter().map(|&l| l as usize).sum();
     if sum != seq.len() {
         return Err(Error::Malformed("reflzma: length/seq disagreement"));
     }
-    let payload = lzma_encode(seq);
+    let payload = encode_raw(seq);
     let mut out = Vec::with_capacity(payload.len() + lens.len() * 2 + 16);
     write_varint(&mut out, lens.len() as u64);
     for &l in lens {
@@ -775,7 +779,7 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
             "reflzma: declared length exceeds capacity",
         ));
     }
-    let seq = lzma_decode(&src[p..], nb)?;
+    let seq = decode_raw(&src[p..], nb)?;
     let sum: usize = lens.iter().map(|&l| l as usize).sum();
     if sum != seq.len() {
         return Err(Error::Malformed("reflzma: block length/seq disagreement"));
@@ -875,9 +879,9 @@ mod tests {
     }
 
     #[test]
-    fn lzma_decode_rejects_huge_len_without_aborting() {
+    fn decode_raw_rejects_huge_len_without_aborting() {
         // A corrupt decoded-length header must fail the reservation, not abort
         // the process on a huge infallible allocation.
-        assert!(lzma_decode(&[], usize::MAX).is_err());
+        assert!(decode_raw(&[], usize::MAX).is_err());
     }
 }

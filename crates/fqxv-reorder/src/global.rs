@@ -205,14 +205,14 @@ impl GlobalReference {
     /// the redundancy that separates xz (~1.79 b/base here) from the context model
     /// (~1.98). Coded over one whole-reference window (a serial decode, fine since
     /// the reference is coded once per file); deterministic, so thread-count
-    /// independent. See the `reflzma` module. Gated never-worse by the caller.
+    /// independent. See the `fqxv_seq::lzma` module. Gated never-worse by the caller.
     pub fn encode_lzma(&self) -> Result<Vec<u8>> {
-        reflzma::encode(&self.contig_lens(), &self.seq)
+        Ok(fqxv_seq::lzma::encode(&self.contig_lens(), &self.seq)?)
     }
 
     /// Reverse of [`encode_lzma`](GlobalReference::encode_lzma).
     pub fn decode_lzma(src: &[u8]) -> Result<GlobalReference> {
-        let (lens, seq) = reflzma::decode(src)?;
+        let (lens, seq) = fqxv_seq::lzma::decode(src)?;
         Self::from_lens_seq(&lens, seq)
     }
 

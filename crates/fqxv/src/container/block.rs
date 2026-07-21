@@ -206,7 +206,7 @@ pub(crate) const SEQ_METHOD_OVERLAP: u8 = 1;
 /// (issue #168). Decoding requires that frame — [`decode_sequence_stream`] fails
 /// closed if it is absent.
 pub(crate) const SEQ_METHOD_OVERLAP_REF: u8 = 2;
-/// Raw-sequence LZMA (`fqxv_reorder::lzma_seq_encode`): a clean-room LZMA over the
+/// Raw-sequence LZMA (`fqxv_seq::lzma::encode`): a clean-room LZMA over the
 /// block's ASCII bases with an ~89 MB match window. At ordinary long-read coverage
 /// (a real genome, not 300x of one organism) overlapping reads share long *exact*
 /// substrings that neither the within-read order-k model nor the consensus-edit
@@ -283,7 +283,7 @@ fn tag_orderk(coded: Vec<u8>) -> Vec<u8> {
 /// carry cross-read redundancy at ordinary coverage; the caller keeps it only when
 /// it is smaller than the other candidates.
 fn lzma_stream(lens: &[u32], seq: &[u8]) -> Result<Vec<u8>> {
-    let coded = fqxv_reorder::lzma_seq_encode(lens, seq)?;
+    let coded = fqxv_seq::lzma::encode(lens, seq)?;
     let mut out = Vec::with_capacity(coded.len() + 1);
     out.push(SEQ_METHOD_LZMA);
     out.extend_from_slice(&coded);
@@ -586,7 +586,7 @@ pub(crate) fn decode_sequence_stream(
         .ok_or(Error::Malformed("empty sequence stream"))?;
     match method {
         SEQ_METHOD_ORDERK => Ok(fqxv_seq::decode(rest)?),
-        SEQ_METHOD_LZMA => Ok(fqxv_reorder::lzma_seq_decode(rest)?),
+        SEQ_METHOD_LZMA => Ok(fqxv_seq::lzma::decode(rest)?),
         SEQ_METHOD_OVERLAP => Ok(fqxv_lroverlap::decode(rest)?),
         SEQ_METHOD_OVERLAP_REF => {
             let reference = shared_ref.ok_or(Error::Malformed(

@@ -55,6 +55,14 @@ pub enum Error {
 /// The result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Clean-room LZMA-class byte coder: large-window LZ77 with LZMA-style entropy
+/// coding, a companion to the order-k context model for the *long-range*
+/// redundancy the context model cannot copy. The framed [`lzma::encode`] /
+/// [`lzma::decode`] code a whole `(lens, seq)` (the container's raw-LZMA sequence
+/// method); the raw byte core [`lzma::encode_raw`] / [`lzma::decode_raw`] is used
+/// by `fqxv-reorder`'s reference packer.
+pub mod lzma;
+
 const FORMAT_VERSION: u8 = 1;
 
 /// Loose upper bound on bases the range coder can emit per compressed byte, used

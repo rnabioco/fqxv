@@ -15,15 +15,16 @@
 //! input 4× (≈22 MB for an 89 M-base reference), so the whole reference fits one
 //! LZ window / BWT block — full long-range reach, and fast.
 //!
-//! Entropy backend: the clean-room LZMA core ([`super::reflzma`]), which on the
+//! Entropy backend: the clean-room LZMA core ([`fqxv_seq::lzma`]), which on the
 //! packed bytes is in its natural byte-oriented regime (LZ/BSC on packed win here;
 //! see the measurements in the reference-coder notes). Gated never-worse by the
 //! container.
 
 use fqxv_bytes::{read_varint, write_varint};
 use fqxv_dna::{SYM2BASE, code_strict};
+use fqxv_seq::lzma;
 
-use crate::{Error, Result, reflzma};
+use crate::{Error, Result};
 
 /// 2-bit-pack `seq` (4 bases/byte, little-endian within a byte). Non-ACGT bytes
 /// are packed as `A` (code 0) and recorded as `(index, byte)` exceptions for
@@ -98,10 +99,8 @@ pub(crate) fn encode(lens: &[u32], seq: &[u8]) -> Result<Vec<u8>> {
     for &l in lens {
         write_varint(&mut lens_raw, u64::from(l));
     }
-    let (packed_coded, lens_coded) = rayon::join(
-        || reflzma::lzma_encode(&packed),
-        || reflzma::lzma_encode(&lens_raw),
-    );
+    let (packed_coded, lens_coded) =
+        rayon::join(|| lzma::encode_raw(&packed), || lzma::encode_raw(&lens_raw));
 
     let mut out =
         Vec::with_capacity(packed_coded.len() + lens_coded.len() + exceptions.len() * 3 + 32);
@@ -155,7 +154,7 @@ pub(crate) fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
         .get(p..end)
         .ok_or(Error::Malformed("refpack: truncated lens stream"))?;
     p = end;
-    let lens_raw = reflzma::lzma_decode(lens_coded, lens_raw_len)?;
+    let lens_raw = lzma::decode_raw(lens_coded, lens_raw_len)?;
     let mut lens = Vec::with_capacity(nc.min(1 << 20));
     let mut lp = 0usize;
     for _ in 0..nc {
@@ -190,7 +189,7 @@ pub(crate) fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
         p += 1;
         exceptions.push((pos, b));
     }
-    let packed = reflzma::lzma_decode(&src[p..], total.div_ceil(4))?;
+    let packed = lzma::decode_raw(&src[p..], total.div_ceil(4))?;
     let seq = unpack(&packed, total, &exceptions)?;
     let s: usize = lens.iter().map(|&l| l as usize).sum();
     if s != seq.len() {
