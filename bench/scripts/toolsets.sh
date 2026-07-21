@@ -62,6 +62,17 @@ fqxv_toolset_for_platform() {
   esac
 }
 
+# Read class (long|short) for a datasets.tsv platform column. Both drivers use it
+# for the `FQXV_ONLY=long|short` filter, so a long- or short-read-only run needs
+# no edited panel and the two drivers cannot disagree on what "long" means.
+fqxv_read_class() {
+  case "$1" in
+    MinION | GridION | PromethION | *[Nn]anopore* | ONT) echo long ;;
+    SequelII | Sequel* | Revio | *[Hh]iFi* | PacBio*) echo long ;;
+    *) echo short ;;
+  esac
+}
+
 # Union of every set, order-preserving and de-duplicated. Used where a
 # platform-independent list is needed (documentation, `build_tools.sh` probes).
 # PgRC is intentionally absent from all sets: it is a sequence-only read
