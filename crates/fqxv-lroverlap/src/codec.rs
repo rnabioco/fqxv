@@ -42,8 +42,9 @@ use fqxv_bytes::{read_varint, write_varint};
 use fqxv_dna::{base_of_sym, is_acgt, revcomp_acgt};
 
 use crate::{
-    Alignment, Anchored, ChainOpts, ConsensusOpts, Error, Index, LayoutOpts, Op, Repeat, Sketch,
-    align_banded, apply, consensus, find_overlaps, layout, place_all, wfa_align_opt,
+    Alignment, Anchored, ChainOpts, ConsensusOpts, Error, Index, LayoutOpts, MAX_BASES_PER_BYTE,
+    Op, Repeat, Sketch, align_banded, apply, consensus, find_overlaps, layout, place_all,
+    wfa_align_opt,
 };
 
 /// Above this drift-derived band the banded DP is the faster aligner; at or below
@@ -828,10 +829,30 @@ fn read_header(
     }
     let n = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
     let total_bases = read_varint(src, pos).ok_or(Error::Corrupt)? as usize;
+    // Reject a header whose declared base count could not possibly fit the coded
+    // block before it drives the `vec![0u8; total_bases]` output allocation — and,
+    // via each read's length, the op-replay buffers — in `reconstruct`. The #142
+    // "bound the aggregate allocation against the input" rule the tiler already
+    // applies (see `MAX_BASES_PER_BYTE`). Deliberately loose (a real block decodes
+    // far below this); it only fails a hostile length. In `decode_against`, `src`
+    // excludes the shared reference, so bases/byte runs higher there, but the
+    // constant keeps a wide margin over any real block.
+    if total_bases
+        > src
+            .len()
+            .saturating_mul(MAX_BASES_PER_BYTE)
+            .saturating_add(MAX_BASES_PER_BYTE)
+    {
+        return Err(Error::Corrupt);
+    }
 
     let lens_raw = get_stream(src, pos)?;
     let mut lp = 0usize;
-    let mut lens = Vec::with_capacity(n);
+    // `Vec::new`, not `with_capacity(n)`: `n` is an unvalidated header varint, so a
+    // capacity hint would itself be the alloc bomb. The push loop is bounded by
+    // `lens_raw` (a real stream) exhausting into `Corrupt`. Mirrors `tile_decode`
+    // and `Reference::decode`.
+    let mut lens = Vec::new();
     for _ in 0..n {
         let l = read_varint(&lens_raw, &mut lp).ok_or(Error::Corrupt)?;
         lens.push(u32::try_from(l).map_err(|_| Error::Corrupt)?);
@@ -996,6 +1017,13 @@ fn reconstruct(
                     }
                     2 => {
                         let k = read_varint(&indel_lens, &mut dp).ok_or(Error::Corrupt)? as usize;
+                        // A single insertion cannot legitimately produce more bases
+                        // than the whole read (`want`), so reject a hostile `k`
+                        // before it sizes the allocation below — `ins_dec` is a
+                        // range decoder that never exhausts to stop the loop itself.
+                        if k > want {
+                            return Err(Error::Corrupt);
+                        }
                         let mut bs: Vec<u8> = Vec::with_capacity(k);
                         for _ in 0..k {
                             let vc =
@@ -1062,7 +1090,10 @@ pub fn decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
     let ref_lens_raw = get_stream(src, &mut pos)?;
     let ref_bytes = get_stream(src, &mut pos)?;
     let mut rlp = 0usize;
-    let mut refs: Vec<&[u8]> = Vec::with_capacity(n_contigs);
+    // `n_contigs` is an untrusted header varint; do not pre-reserve (a crafted
+    // count is an allocation bomb). The loop is bounded by `ref_lens_raw`
+    // exhausting into `Corrupt`, exactly as `Reference::decode` documents.
+    let mut refs: Vec<&[u8]> = Vec::new();
     let mut roff = 0usize;
     for _ in 0..n_contigs {
         let rl = read_varint(&ref_lens_raw, &mut rlp).ok_or(Error::Corrupt)? as usize;
@@ -1139,6 +1170,49 @@ mod tests {
 
     fn owned(reads: &[&[u8]]) -> Vec<Vec<u8>> {
         reads.iter().map(|r| r.to_vec()).collect()
+    }
+
+    #[test]
+    fn decode_rejects_oversized_header_counts_without_aborting() {
+        // Decode-path allocation guards (#142 class): a hostile read count must not
+        // drive a `Vec::with_capacity` bomb, and a hostile `total_bases` must be
+        // rejected before it sizes the `vec![0u8; total_bases]` output zero-fill.
+        // Each returns `Corrupt` rather than aborting on the allocation. `decode`
+        // and `decode_against` share `read_header`, so the `total_bases` guard
+        // covers both.
+
+        // (a) Oversized read count `n`, empty lengths stream, zero total_bases:
+        // reaches the (now unreserved) length loop and errors on the exhausted
+        // stream instead of pre-reserving `n` elements.
+        let mut src = Vec::new();
+        src.extend_from_slice(&MAGIC);
+        src.push(VERSION);
+        write_varint(&mut src, 1u64 << 62);
+        write_varint(&mut src, 0);
+        put_stream(&mut src, &[]).unwrap();
+        assert!(matches!(decode(&src), Err(Error::Corrupt)));
+
+        // (b) `total_bases` far larger than the coded block could hold: rejected up
+        // front by the MAX_BASES_PER_BYTE guard.
+        let mut src = Vec::new();
+        src.extend_from_slice(&MAGIC);
+        src.push(VERSION);
+        write_varint(&mut src, 1);
+        write_varint(&mut src, 1u64 << 50);
+        assert!(matches!(decode(&src), Err(Error::Corrupt)));
+
+        // (c) Oversized inline contig count: the reference-collection loop is also
+        // unreserved and errors on the empty contig-length stream.
+        let mut src = Vec::new();
+        src.extend_from_slice(&MAGIC);
+        src.push(VERSION);
+        write_varint(&mut src, 0); // n reads
+        write_varint(&mut src, 0); // total_bases
+        put_stream(&mut src, &[]).unwrap(); // lens_raw
+        write_varint(&mut src, 1u64 << 62); // absurd n_contigs
+        put_stream(&mut src, &[]).unwrap(); // ref_lens_raw
+        put_stream(&mut src, &[]).unwrap(); // ref_bytes
+        assert!(matches!(decode(&src), Err(Error::Corrupt)));
     }
 
     #[test]

@@ -53,22 +53,15 @@ use crate::codec::{
     OP_CTXS, REF_TAIL, SUB_SYMS, align_for_coding, base_code, compute_offs, encode_ops,
     encode_subs, get_stream, put_stream,
 };
-use crate::{ChainOpts, EncodeOpts, Error, Index, Op, Overlap, Repeat, find_overlaps};
+use crate::{
+    ChainOpts, EncodeOpts, Error, Index, MAX_BASES_PER_BYTE, Op, Overlap, Repeat, find_overlaps,
+};
 
 /// Format tag for a tiling sequence block. Distinct from the consensus codec's
 /// `LRO`/`LRR` so a mis-dispatched block fails closed rather than mis-decodes.
 const TILE_MAGIC: [u8; 3] = *b"LRT";
 /// Bitstream version. Bump on any layout change (nothing on disk is stable yet).
 const TILE_VERSION: u8 = 1;
-
-/// Ceiling on decoded bases per coded byte, used to reject a hostile `total_bases`
-/// header before it drives the `vec![0u8; total_bases]` output allocation (issue
-/// #142). The tiler's `literals` stream must seed every distinct base at ~2
-/// bits/base, so even a pathological all-identical-reads block stays well under
-/// this (~6 K observed worst case vs the ~6 bases/byte of real ONT); it only fails
-/// a crafted length. Deliberately far below `1 << 18` so the bound also caps peak
-/// decode memory (`~3 × total_bases`) on a large hostile input, not just u64::MAX.
-const MAX_BASES_PER_BYTE: usize = 1 << 14;
 
 /// One read's contribution to the block streams: the shared edit streams plus the
 /// per-segment manifest. Accumulated per read in parallel and merged in id order,

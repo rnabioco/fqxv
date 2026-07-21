@@ -244,6 +244,8 @@ pub fn decode_clustered(src: &[u8]) -> Result<Vec<Vec<u8>>> {
     // The current contig, voted identically to the encoder.
     let mut contig: Vec<Column> = Vec::new();
     let mut prev_off: usize = 0;
+    // Running total of reconstructed bases, bounded below (see the accumulation).
+    let mut out_bases = 0usize;
 
     for i in 0..n {
         let op = *ops.get(i).ok_or(Error::Malformed("op underrun"))?;
@@ -311,6 +313,18 @@ pub fn decode_clustered(src: &[u8]) -> Result<Vec<Vec<u8>>> {
             }
             _ => return Err(Error::Malformed("unknown op")),
         }
+        // MATCH clones and CONTIG copies can expand a few KB of coded streams into
+        // unbounded output. Each per-read length is already capped (`alloc_read`,
+        // the literal streams), but the aggregate is not — bound it against the
+        // same per-block ceiling the rANS streams use. Reorder is a short-read
+        // layout written at <= `REORDER_BLOCK_READS` reads/block (~128 MiB honest
+        // max, half this ceiling), so only an amplification bomb trips it.
+        out_bases = out_bases
+            .checked_add(reads.last().map_or(0, Vec::len))
+            .filter(|&t| t <= MAX_DECODED_BASES)
+            .ok_or(Error::Malformed(
+                "reconstructed output exceeds decode limit",
+            ))?;
     }
     Ok(reads)
 }

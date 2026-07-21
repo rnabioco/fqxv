@@ -87,6 +87,18 @@ pub use script::{ScriptOpts, chain_span, script_from_chain};
 pub use tile::{tile_decode, tile_encode};
 pub use wfa::{wfa_align, wfa_align_opt, wfa_cells};
 
+/// Ceiling on decoded bases per coded byte, used to reject a hostile `total_bases`
+/// header before it drives a `vec![0u8; total_bases]` output allocation (issue
+/// #142). Shared by the two long-read decoders that size their output buffer from
+/// an untrusted header count — the consensus overlap codec ([`decode`] /
+/// [`decode_against`]) and the tiler ([`tile_decode`]). A real block seeds every
+/// distinct base at ~2 bits/base, so even a pathological all-identical-reads block
+/// stays far under this (~6 K observed worst case vs the ~6 bases/byte of real
+/// ONT); it only fails a crafted length. Deliberately far below `1 << 18` so the
+/// bound also caps peak decode memory (`~3 × total_bases`) on a large hostile
+/// input, not just `u64::MAX`.
+pub(crate) const MAX_BASES_PER_BYTE: usize = 1 << 14;
+
 /// Errors returned by this crate.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]

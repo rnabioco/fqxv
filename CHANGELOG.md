@@ -46,6 +46,28 @@ misreading it. A format major bump would be announced as a breaking change.
   right one automatically. `FQXV_SEQ_NO_LZMA` disables the candidate for A/B
   measurement.
 
+### Security
+
+- **Decode-path allocation guards for the long-read overlap and reorder codecs.**
+  Several decoders sized allocations straight from untrusted on-disk length fields,
+  before the backing bytes were known to exist — the #142 allocation-bomb class the
+  tiler and the reorder reference decoder already guard against, ported to the
+  siblings that had missed it. In `fqxv-lroverlap`'s consensus overlap decoder
+  (sequence methods `SEQ_METHOD_OVERLAP` / `SEQ_METHOD_OVERLAP_REF`) a ~10-byte
+  crafted block could pre-reserve a read-count or contig-count vector from a raw
+  header varint (a capacity-overflow *abort* under `panic = "abort"`) or drive a
+  multi-terabyte `total_bases` zero-fill; it now rejects an implausible
+  `total_bases` up front against a shared `MAX_BASES_PER_BYTE` ceiling, leaves the
+  count-driven vectors unreserved (each is bounded by the stream it reads from),
+  and caps every insertion run at the read length. The reorder clustered / rescue /
+  global block decoders bounded each input stream but not the *aggregate*
+  reconstructed output, so a few kilobytes of `MATCH`-clone and `CONTIG`-copy ops
+  could expand into unbounded memory; they now accumulate output bases against the
+  same per-block ceiling the streams use. All of these are reachable from
+  `fqxv decompress` on a crafted or corrupt archive (frame CRCs do not help — an
+  attacker recomputes them). Decode-only and byte-identical on every valid archive;
+  covered by a new regression test and the existing decode round-trips.
+
 ### Fixed
 
 - **Higher effort no longer produces a larger archive.** On a low-redundancy
@@ -63,6 +85,17 @@ misreading it. A format major bump would be announced as a breaking change.
   regardless, so the tradeoff differs.
 
 ### Performance
+
+- **Lower peak memory on Nanopore compression.** The minimizer-occurrence record
+  (`Occ`) that dominates the long-read overlap index is packed from 24 bytes to 16
+  — the read index and the strand flag now share one `u32` (read in the low 31
+  bits, strand in the high bit) instead of a `u32` beside a `bool` that padded the
+  struct out to a third 8-byte word. That is a one-third cut of the index's largest
+  allocation, on the order of a gigabyte on a large ONT block, so it directly eases
+  the Nanopore memory pressure. Output is byte-identical — a hand-written `Ord`
+  reproduces the previous `(hash, read, pos, strand)` sort order exactly — and that
+  was verified both by the determinism round-trips and by an archive-level diff
+  against the previous build.
 
 - **Nanopore compression is ~2.3x faster** — the shared whole-file reference layout
   (#168) is now skipped on high-error Nanopore, where it never pays off. It helps

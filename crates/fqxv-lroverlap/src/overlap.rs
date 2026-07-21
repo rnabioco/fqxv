@@ -81,11 +81,11 @@ pub fn find_overlaps(
         let occ = idx.query(m.hash);
         let step = occ.len().div_ceil(opts.max_fanout.max(1)).max(1);
         for o in occ.iter().step_by(step) {
-            if o.read == query_read {
+            if o.read() == query_read {
                 continue;
             }
-            let same = o.strand == m.strand;
-            let tlen = idx.read_len(o.read);
+            let same = o.strand() == m.strand;
+            let tlen = idx.read_len(o.read());
             // Map the hit into the query's frame when the strands disagree.
             let tpos = if same {
                 o.pos
@@ -96,7 +96,7 @@ pub fn find_overlaps(
                     None => continue,
                 }
             };
-            buckets.push((o.read, same, Anchor { tpos, qpos: m.pos }));
+            buckets.push((o.read(), same, Anchor { tpos, qpos: m.pos }));
         }
     }
     // Total order: (target, orientation, anchor).
