@@ -5,7 +5,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -17,16 +17,16 @@ categories = ["compression", "science"]
 
 [workspace.dependencies]
 # Internal crates (path + version so they can be published independently).
-fqxv-bytes = { path = "crates/fqxv-bytes", version = "0.3.0" }
-fqxv-dna = { path = "crates/fqxv-dna", version = "0.3.0" }
-fqxv-rans = { path = "crates/fqxv-rans", version = "0.3.0" }
-fqxv-range = { path = "crates/fqxv-range", version = "0.3.0" }
-fqxv-fqzcomp = { path = "crates/fqxv-fqzcomp", version = "0.3.0" }
-fqxv-tokenizer = { path = "crates/fqxv-tokenizer", version = "0.3.0" }
-fqxv-seq = { path = "crates/fqxv-seq", version = "0.3.0" }
-fqxv-reorder = { path = "crates/fqxv-reorder", version = "0.3.0" }
-fqxv-lroverlap = { path = "crates/fqxv-lroverlap", version = "0.3.0" }
-fqxv = { path = "crates/fqxv", version = "0.3.0" }
+fqxv-bytes = { path = "crates/fqxv-bytes", version = "0.4.0" }
+fqxv-dna = { path = "crates/fqxv-dna", version = "0.4.0" }
+fqxv-rans = { path = "crates/fqxv-rans", version = "0.4.0" }
+fqxv-range = { path = "crates/fqxv-range", version = "0.4.0" }
+fqxv-fqzcomp = { path = "crates/fqxv-fqzcomp", version = "0.4.0" }
+fqxv-tokenizer = { path = "crates/fqxv-tokenizer", version = "0.4.0" }
+fqxv-seq = { path = "crates/fqxv-seq", version = "0.4.0" }
+fqxv-reorder = { path = "crates/fqxv-reorder", version = "0.4.0" }
+fqxv-lroverlap = { path = "crates/fqxv-lroverlap", version = "0.4.0" }
+fqxv = { path = "crates/fqxv", version = "0.4.0" }
 
 # Shared third-party deps, versions pinned once here.
 rayon = "1.10"
