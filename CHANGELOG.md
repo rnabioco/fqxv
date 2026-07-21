@@ -11,7 +11,7 @@ tolerates newer minors, and additive features are gated behind required-feature
 bits, so a reader that predates a feature refuses the archive outright rather than
 misreading it. A format major bump would be announced as a breaking change.
 
-## [Unreleased]
+## [0.4.0] - 2026-07-21
 
 ### Added
 
@@ -46,43 +46,29 @@ misreading it. A format major bump would be announced as a breaking change.
   right one automatically. `FQXV_SEQ_NO_LZMA` disables the candidate for A/B
   measurement.
 
-### Security
+### Changed
 
-- **Decode-path allocation guards for the long-read overlap and reorder codecs.**
-  Several decoders sized allocations straight from untrusted on-disk length fields,
-  before the backing bytes were known to exist — the #142 allocation-bomb class the
-  tiler and the reorder reference decoder already guard against, ported to the
-  siblings that had missed it. In `fqxv-lroverlap`'s consensus overlap decoder
-  (sequence methods `SEQ_METHOD_OVERLAP` / `SEQ_METHOD_OVERLAP_REF`) a ~10-byte
-  crafted block could pre-reserve a read-count or contig-count vector from a raw
-  header varint (a capacity-overflow *abort* under `panic = "abort"`) or drive a
-  multi-terabyte `total_bases` zero-fill; it now rejects an implausible
-  `total_bases` up front against a shared `MAX_BASES_PER_BYTE` ceiling, leaves the
-  count-driven vectors unreserved (each is bounded by the stream it reads from),
-  and caps every insertion run at the read length. The reorder clustered / rescue /
-  global block decoders bounded each input stream but not the *aggregate*
-  reconstructed output, so a few kilobytes of `MATCH`-clone and `CONTIG`-copy ops
-  could expand into unbounded memory; they now accumulate output bases against the
-  same per-block ceiling the streams use. All of these are reachable from
-  `fqxv decompress` on a crafted or corrupt archive (frame CRCs do not help — an
-  attacker recomputes them). Decode-only and byte-identical on every valid archive;
-  covered by a new regression test and the existing decode round-trips.
+- **`--version` reports git provenance on development builds.** A binary built
+  from a clean checkout of the release tag still prints just `fqxv 0.4.0`;
+  anything else — commits past the tag, a dirty tree, an untagged branch —
+  appends the git description (`fqxv 0.4.0 (v0.4.0-7-gab12cd34-dirty)`), so a
+  bug report identifies the exact build. Source trees with no git (a crates.io
+  tarball) print the plain version.
 
-### Fixed
-
-- **Higher effort no longer produces a larger archive.** On a low-redundancy
-  library (BGISEQ-500) `--max` and `-l9` compressed *worse* than the default,
-  because two effort knobs were applied unconditionally even where they cost more
-  than they saved (#196). Both are now never-worse: (1) the level-8+ hashed
-  high-order sequence tier is coded alongside plain order-k and the smaller kept,
-  so enabling it can only help; (2) single-end `--order any`/`--max` codes the
-  clustered and plain layouts and keeps the smaller, so reordering is used only
-  when it pays — the same "code both, keep the smaller" rule the long-read shared
-  reference (#192) and the overlap-vs-order-k choice already use. On the BGISEQ
-  case `--max` drops from a 340 KB regression to matching the default; on a
-  reorder-favourable NovaSeq set `--max` keeps its 2.4x win. Grouped (paired /
-  10x) reorder is unchanged: it pays the permutation for spot reconstruction
-  regardless, so the tradeoff differs.
+- **Real progress bars for paired compress and decompress.** Both paths showed a
+  bare indeterminate spinner for the whole run — minutes of no information on a
+  paired sample at a few cores. Compress picked its indicator on input *count*, so
+  paired mates always fell through to the spinner even though the summed input
+  length the bar needs was already computed; interleaving reads every input in
+  lockstep, so one shared counter against that sum drives the same bar the
+  single-input path already used. Decompress had no counter at all and now reports
+  reads finished against the footer's read count (already read up front for the
+  truncation check) — counting output records, not archive bytes consumed, which in
+  `--threads`-sized batches runs ahead of the work and would pin at 100% while the
+  last batch is still decoding. Both bars now carry an ETA. The reorder and stdin
+  carve-outs still degrade to an indeterminate readout rather than report a
+  percentage that would stall or lie, and `--quiet` and non-TTY output are
+  unchanged (#189).
 
 ### Performance
 
@@ -154,6 +140,20 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Fixed
 
+- **Higher effort no longer produces a larger archive.** On a low-redundancy
+  library (BGISEQ-500) `--max` and `-l9` compressed *worse* than the default,
+  because two effort knobs were applied unconditionally even where they cost more
+  than they saved (#196). Both are now never-worse: (1) the level-8+ hashed
+  high-order sequence tier is coded alongside plain order-k and the smaller kept,
+  so enabling it can only help; (2) single-end `--order any`/`--max` codes the
+  clustered and plain layouts and keeps the smaller, so reordering is used only
+  when it pays — the same "code both, keep the smaller" rule the long-read shared
+  reference (#192) and the overlap-vs-order-k choice already use. On the BGISEQ
+  case `--max` drops from a 340 KB regression to matching the default; on a
+  reorder-favourable NovaSeq set `--max` keeps its 2.4x win. Grouped (paired /
+  10x) reorder is unchanged: it pays the permutation for spot reconstruction
+  regardless, so the tradeoff differs.
+
 - **The long-read shared-reference gate now measures against the layout it falls
   back to.** Adoption of the whole-file reference was gated on beating the plain
   *order-k* total, but the fallback path keeps the smaller of the per-block
@@ -190,14 +190,42 @@ misreading it. A format major bump would be announced as a breaking change.
   PacBio is deliberately left unsplit — at <1% error minimizers are already
   near-optimal at either coverage — and HiFi output is byte-identical (#184).
 
-### Changed
+- **Interrupting a decompress no longer leaves a partial FASTQ at the
+  destination.** Ctrl-C during a decode published truncated output at its real
+  name, and a short FASTQ is undetectable — BGZF blocks are self-contained so
+  `zcat` exits 0 with no warning, and FASTQ carries no terminator or record
+  count, so most of a run could sit there looking like a clean decode. Compress
+  was already protected (sibling temp, rename on completion, registered with the
+  signal handler); decompress created split mates and `-o FILE` directly at their
+  final paths, so the handler had nothing to clean up and `process::exit(130)`
+  never unwound to run `Drop`. Decompress outputs now route through the same
+  `AtomicOutput` as compress, and the commit is deferred until *after* the footer
+  read-count check, so a truncated archive also leaves the destination untouched
+  instead of publishing a short file and then erroring. Recover commits too — its
+  output is deliberately partial but still a finished artifact. Exit code is still
+  130, and a full decode round-trips byte-identically (#188).
 
-- **`--version` reports git provenance on development builds.** A binary built
-  from a clean checkout of the release tag still prints just `fqxv 0.3.0`;
-  anything else — commits past the tag, a dirty tree, an untagged branch —
-  appends the git description (`fqxv 0.3.0 (v0.3.0-7-gab12cd34-dirty)`), so a
-  bug report identifies the exact build. Source trees with no git (a crates.io
-  tarball) print the plain version.
+### Security
+
+- **Decode-path allocation guards for the long-read overlap and reorder codecs.**
+  Several decoders sized allocations straight from untrusted on-disk length fields,
+  before the backing bytes were known to exist — the #142 allocation-bomb class the
+  tiler and the reorder reference decoder already guard against, ported to the
+  siblings that had missed it. In `fqxv-lroverlap`'s consensus overlap decoder
+  (sequence methods `SEQ_METHOD_OVERLAP` / `SEQ_METHOD_OVERLAP_REF`) a ~10-byte
+  crafted block could pre-reserve a read-count or contig-count vector from a raw
+  header varint (a capacity-overflow *abort* under `panic = "abort"`) or drive a
+  multi-terabyte `total_bases` zero-fill; it now rejects an implausible
+  `total_bases` up front against a shared `MAX_BASES_PER_BYTE` ceiling, leaves the
+  count-driven vectors unreserved (each is bounded by the stream it reads from),
+  and caps every insertion run at the read length. The reorder clustered / rescue /
+  global block decoders bounded each input stream but not the *aggregate*
+  reconstructed output, so a few kilobytes of `MATCH`-clone and `CONTIG`-copy ops
+  could expand into unbounded memory; they now accumulate output bases against the
+  same per-block ceiling the streams use. All of these are reachable from
+  `fqxv decompress` on a crafted or corrupt archive (frame CRCs do not help — an
+  attacker recomputes them). Decode-only and byte-identical on every valid archive;
+  covered by a new regression test and the existing decode round-trips.
 
 ## [0.3.0] - 2026-07-19
 
@@ -497,6 +525,7 @@ of FASTQ. Codecs are clean-room implementations from specs and papers
   SPRING and fqz_comp do). Name, sequence, and quality are otherwise preserved
   exactly; this is the one documented deviation from byte-losslessness.
 
+[0.4.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.4.0
 [0.3.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.3.0
 [0.2.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.2.0
 [0.1.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.1.0
