@@ -46,6 +46,17 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Performance
 
+- **Nanopore compression is ~2.3x faster** — the shared whole-file reference layout
+  (#168) is now skipped on high-error Nanopore, where it never pays off. It helps
+  low-error PacBio HiFi (a clean consensus stored once), but on noisy ONT the
+  reference frame always costs more than it saves, so the whole-file gate (#184)
+  rejects it every time — *after* building the whole-file reference and coding every
+  block against it, a second full long-read assembly per block that profiling put at
+  ~45% of ONT compress CPU, all discarded. Skipping it on Nanopore goes straight to
+  the plain layout the gate would fall back to regardless, so the output is
+  **byte-identical** — measured 7:20 → 3:11 on a 600 MB E. coli ONT file. HiFi is
+  unaffected. Mirrors the Nanopore LZMA gate above.
+
 - **PacBio HiFi is smaller *and* ~2x faster to compress** — the raw-sequence LZMA
   codec (`SEQ_METHOD_LZMA`, #197) now seeds its match finder on **12 bytes**
   instead of 4. On raw ASCII a 4-byte seed keys only ~256 distinct DNA 4-grams, so

@@ -430,7 +430,22 @@ pub(crate) fn compress_buffered<W: Write>(
     // it once instead of re-storing a reference per block. Short reads keep the
     // plain layout (the reference buys nothing and the streaming path is cheaper).
     if !params.reorder && sample_mean_read_len(buf) > super::reorder::REORDER_MAX_MEAN_LEN {
-        return compress_longread_shared_ref(buf, writer, params, group_size);
+        // The shared whole-file reference (#168) pays off on low-error long reads
+        // (PacBio HiFi): a clean consensus is cheap to store once and cheap to code
+        // against. On high-error Nanopore the consensus is noisy, so the reference
+        // frame costs more than coding against it saves and the whole-file gate
+        // ALWAYS rejects it (#184) — but only after building the whole-file reference
+        // AND coding every block against it (`encode_against`), a second full
+        // long-read assembly per block that profiling put at ~45% of ONT compress
+        // CPU, all thrown away. Skip the shared path on Nanopore and go straight to
+        // the plain layout it would fall back to regardless: **byte-identical**
+        // output at ~2.3x the speed (measured 7:20 -> 3:11 on a 600 MB E. coli ONT
+        // file). Mirrors the #206 LZMA platform gate. (Peak RSS is ~neutral: the
+        // plain fallback fans more blocks out concurrently, which offsets the freed
+        // second assembly; candidate sequentialization reins the per-block peak in.)
+        if resolve_platform_buf(params.platform, buf) != Platform::Nanopore {
+            return compress_longread_shared_ref(buf, writer, params, group_size);
+        }
     }
     compress_buffered_plain(buf, writer, params, group_size)
 }
