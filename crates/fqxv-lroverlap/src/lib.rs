@@ -69,6 +69,7 @@ mod minimizer;
 mod overlap;
 mod refine;
 mod script;
+mod tile;
 mod wfa;
 
 pub use align::{Alignment, Op, align_banded, apply};
@@ -83,6 +84,7 @@ pub use minimizer::{Minimizer, minimizers, syncmers};
 pub use overlap::{Overlap, find_overlaps};
 pub use refine::{Anchored, place_against, place_all};
 pub use script::{ScriptOpts, chain_span, script_from_chain};
+pub use tile::{tile_decode, tile_encode};
 pub use wfa::{wfa_align, wfa_align_opt, wfa_cells};
 
 /// Errors returned by this crate.
