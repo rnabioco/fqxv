@@ -214,6 +214,16 @@ pub(crate) const SEQ_METHOD_OVERLAP_REF: u8 = 2;
 /// b/base on Revio WGS (#197). Self-contained; kept only when it beats the other
 /// candidates via [`keep_smaller`].
 pub(crate) const SEQ_METHOD_LZMA: u8 = 3;
+/// Multi-reference **tiling** overlap codec (`fqxv_lroverlap::tile_encode`): each
+/// read is coded against *earlier raw reads* rather than a voted consensus —
+/// tiled by a handful of overlapping neighbours, each tile a banded edit script,
+/// uncovered spans stored literally. On noisy Nanopore data this codes reads at
+/// their true read-to-read divergence (~13.5%) instead of read-to-consensus
+/// (~19% plus the consensus's own error), the CoLoRd approach. It is the ONT
+/// ratio lever (block-1 sequence 1.243 → 1.147 b/base, measured on `ecoli_ont`);
+/// self-contained and kept only when it beats the other candidates via
+/// [`keep_smaller`], and coded only on Nanopore (see [`tile_wanted`]).
+pub(crate) const SEQ_METHOD_TILE: u8 = 4;
 
 /// Which index a sketch is being built for.
 ///
@@ -326,6 +336,53 @@ fn lzma_candidate(lens: &[u32], seq: &[u8], want: bool) -> Result<Option<Vec<u8>
     }
 }
 
+/// Whether to code the multi-reference tiling candidate (see [`SEQ_METHOD_TILE`]).
+///
+/// Tiling codes each read against earlier *raw* reads. That only pays where a read
+/// sits closer to another single read than to a voted consensus — the high-error
+/// regime, where the consensus is itself divergent. On Nanopore (~10% error) that
+/// is the measured ONT ratio lever; on low-error PacBio the consensus wins and the
+/// tiler would only be coded and discarded, at the cost of a second full overlap
+/// search (the most expensive candidate). So it is gated to Nanopore — the same
+/// platform that (post-#211) takes this plain per-block path in the first place,
+/// and the mirror image of how [`lzma_wanted`] gates LZMA to everything *but*
+/// Nanopore, so the two never both run.
+fn tile_wanted(platform: Platform) -> bool {
+    matches!(platform, Platform::Nanopore)
+}
+
+/// Whether the tiling candidate is enabled at all. `FQXV_SEQ_NO_TILE` disables it
+/// — for A/B measurement of the tiling lever against the pre-tiling layout, and for
+/// tests that must exercise a layout the tiler would otherwise win. Off by default
+/// (tiling on for Nanopore), zero-cost when unset.
+fn tile_candidate_enabled() -> bool {
+    std::env::var_os("FQXV_SEQ_NO_TILE").is_none()
+}
+
+/// The optional tiling candidate: `None` (skipping the encode entirely) when the
+/// caller's `want` flag is false or `FQXV_SEQ_NO_TILE` is set, else the
+/// method-tagged stream. The tiler builds a per-block overlap index, so it takes
+/// the same per-block seeding scheme as the plain overlap candidate.
+fn tile_candidate(
+    lens: &[u32],
+    seq: &[u8],
+    platform: Platform,
+    want: bool,
+) -> Result<Option<Vec<u8>>> {
+    if !(want && tile_candidate_enabled()) {
+        return Ok(None);
+    }
+    let opts = fqxv_lroverlap::EncodeOpts {
+        sketch: sketch_for(platform, SeedContext::PerBlock),
+        ..Default::default()
+    };
+    let coded = fqxv_lroverlap::tile_encode(lens, seq, &opts)?;
+    let mut out = Vec::with_capacity(coded.len() + 1);
+    out.push(SEQ_METHOD_TILE);
+    out.extend_from_slice(&coded);
+    Ok(Some(out))
+}
+
 pub(crate) fn order_k_stream(lens: &[u32], seq: &[u8], params: &Params) -> Result<Vec<u8>> {
     let plain = fqxv_seq::encode(lens, seq, params.seq_order as usize)?;
 
@@ -376,11 +433,14 @@ pub(crate) fn encode_sequence_stream(
     if !super::reorder::is_long_read(lens) {
         return order_k_stream(lens, seq, params);
     }
-    // Three candidates, coded in parallel and kept by the smaller (#197). The
-    // overlap codec assembles a reference from THIS block's reads only (a per-block
-    // index, see `SeedContext`); order-k is the within-read fallback; and raw LZMA
-    // catches the cross-read *exact* matches a real genome at ordinary coverage
-    // carries, which the other two miss.
+    // Four candidates, coded sequentially and kept by the smaller (#197, #210). The
+    // overlap codec assembles a consensus reference from THIS block's reads only (a
+    // per-block index, see `SeedContext`); order-k is the within-read fallback; raw
+    // LZMA catches the cross-read *exact* matches a real genome at ordinary coverage
+    // carries; and the tiler codes reads against earlier raw reads (the ONT lever,
+    // Nanopore-only — the same platform that reaches this plain path post-#211).
+    // LZMA and tiling gate to disjoint platforms, so at most one of the two ever
+    // runs; the extra candidate is never a doubled cost.
     let opts = fqxv_lroverlap::EncodeOpts {
         sketch: sketch_for(platform, SeedContext::PerBlock),
         ..Default::default()
@@ -397,6 +457,7 @@ pub(crate) fn encode_sequence_stream(
     })?;
     let order_k = order_k_stream(lens, seq, params)?;
     let lzma = lzma_candidate(lens, seq, lzma_wanted(platform))?;
+    let tile = tile_candidate(lens, seq, platform, tile_wanted(platform))?;
     // `FQXV_DIAG_SEQ` reports the per-block contest (bytes and bits/base) so
     // seeding/consensus changes can be judged against the real keep-the-smaller
     // outcome, not a proxy. Off by default, zero-cost.
@@ -404,8 +465,9 @@ pub(crate) fn encode_sequence_stream(
         let bases: u64 = lens.iter().map(|&l| u64::from(l)).sum::<u64>().max(1);
         let bpb = |n: usize| (n as f64 * 8.0) / bases as f64;
         let lzma_len = lzma.as_ref().map_or(usize::MAX, Vec::len);
+        let tile_len = tile.as_ref().map_or(usize::MAX, Vec::len);
         eprintln!(
-            "[diag seq] {} reads, {} bases | overlap {} B ({:.3} b/base) | order-k {} B ({:.3} b/base) | lzma {} B ({:.3} b/base)",
+            "[diag seq] {} reads, {} bases | overlap {} B ({:.3} b/base) | order-k {} B ({:.3} b/base) | lzma {} B ({:.3} b/base) | tile {} B ({:.3} b/base)",
             lens.len(),
             bases,
             overlap.len(),
@@ -414,13 +476,18 @@ pub(crate) fn encode_sequence_stream(
             bpb(order_k.len()),
             lzma_len,
             bpb(lzma_len),
+            tile_len,
+            bpb(tile_len),
         );
     }
-    let plain = keep_smaller(overlap, order_k);
-    Ok(match lzma {
-        Some(l) => keep_smaller(l, plain),
-        None => plain,
-    })
+    let mut plain = keep_smaller(overlap, order_k);
+    if let Some(l) = lzma {
+        plain = keep_smaller(l, plain);
+    }
+    if let Some(t) = tile {
+        plain = keep_smaller(t, plain);
+    }
+    Ok(plain)
 }
 
 /// Code **only** the shared-reference candidate: the smaller of the
@@ -576,6 +643,7 @@ pub(crate) fn decode_sequence_stream(
         SEQ_METHOD_ORDERK => Ok(fqxv_seq::decode(rest)?),
         SEQ_METHOD_LZMA => Ok(fqxv_seq::lzma::decode(rest)?),
         SEQ_METHOD_OVERLAP => Ok(fqxv_lroverlap::decode(rest)?),
+        SEQ_METHOD_TILE => Ok(fqxv_lroverlap::tile_decode(rest)?),
         SEQ_METHOD_OVERLAP_REF => {
             let reference = shared_ref.ok_or(Error::Malformed(
                 "shared-reference sequence block but no reference frame in the archive",
