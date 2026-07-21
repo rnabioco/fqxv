@@ -15,6 +15,24 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Added
 
+- **Best-of-N reference selection takes the ONT tiler to CoLoRd parity** — the
+  multi-reference tiling codec (`SEQ_METHOD_TILE`) now weighs several earlier-read
+  references per tile and keeps the cheapest edit script, instead of blindly taking
+  the furthest-reaching neighbour. At ONT coverage many earlier reads span the same
+  region with independent error patterns, so the lowest-cost reference agrees with
+  the query at more positions — the way CoLoRd picks its anchor, applied per tile.
+  With a wider alignment band on top this is the dominant ONT sequence-ratio lever:
+  on the `ecoli_ont` archive the sequence stream drops from **43.3 MB to 34.5 MB
+  (1.150 → 0.915 bits/base)**, matching CoLoRd's ~34 MB, and the whole archive goes
+  **2.92× → 3.05×** — losslessly (`--verify`). It is encoder-only (the tile block
+  self-describes, so the decoder is unchanged and single-reference coding is
+  byte-for-byte identical to before) and compute-heavy (~linear in the fan-out on
+  the tiler's already-vectorised alignment), so it is gated to the top effort
+  levels: the default keeps the single-reference cover and today's ONT speed,
+  `-l7`/`-l8` enable best-of-2/-4, and `--max` reaches the parity operating point.
+  Nanopore long reads only. `FQXV_TILE_BAND` / `FQXV_TILE_REFS` override the band
+  and fan-out for rebuild-free A/B measurement.
+
 - **Raw-LZMA sequence codec for ordinary-coverage long reads** — a new per-block
   sequence method (`SEQ_METHOD_LZMA`) codes the block's ASCII bases with a
   large-window LZ, kept only when it beats the existing candidates. At ordinary

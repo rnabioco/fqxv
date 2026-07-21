@@ -139,6 +139,17 @@ pub struct EncodeOpts {
     /// b/base on ONT); 768 trades encode time for ~1.056. Affects ratio and
     /// speed only — the block self-describes, so decode is unaffected.
     pub tile_band: usize,
+    /// How many candidate reference reads the tiler tries per tile before
+    /// committing ([`tile_encode`](crate::tile_encode)). At high (ONT) coverage
+    /// many earlier reads overlap the same span, each with an independent error
+    /// pattern; aligning the furthest-reaching `tile_max_refs` of them and
+    /// keeping the cheapest edit script picks a reference that happens to agree
+    /// with the query at more positions, the way CoLoRd chooses its anchor. `1`
+    /// is the plain greedy max-reach cover (one alignment per tile, the cheapest
+    /// operating point); higher trades ~linearly more alignment time for ratio.
+    /// Affects ratio and speed only — the block self-describes, so decode is
+    /// unaffected.
+    pub tile_max_refs: usize,
 }
 
 impl Default for EncodeOpts {
@@ -149,6 +160,7 @@ impl Default for EncodeOpts {
             band_margin: 32,
             band_cap: 2048,
             tile_band: 256,
+            tile_max_refs: 1,
         }
     }
 }
