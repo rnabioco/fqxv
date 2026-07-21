@@ -10,8 +10,10 @@ Where each lever stands:
 | Lever | Status |
 | --- | --- |
 | Quality binning (`--quality-bin ont` / `hifi`) | **shipped** — usable from the CLI |
-| Quality base-context | not started; measured headroom is ~nil (see Lever 1) |
-| Overlap sequence codec (`fqxv-lroverlap`) | **shipped** — auto-selected for long-read blocks, kept only when it beats the order-k model; codes the HiFi sequence stream ~6× smaller through a real archive. See [Wiring](#wiring-and-the-per-block-coverage-cap). |
+| Quality base-context (long-read) | **shipped** — sequence-conditioned context-mixing took HiFi quality *below* CoLoRd |
+| Overlap sequence codec (`fqxv-lroverlap`) | **shipped** — auto-selected for long-read blocks, kept only when it beats order-k; a shared whole-file reference codes the HiFi sequence stream ~10× smaller. See [Wiring](#wiring-and-the-per-block-coverage-cap). |
+| Raw-LZMA sequence method | **shipped** — ordinary-coverage long reads (Revio WGS: seq 1.39 → 0.68 bits/base, archive 9.7× → 17×). |
+| Multi-reference tiling (Nanopore) | **shipped** — best-of-N references at `-l9`/`--max`; ONT seq 1.15 → 0.92 bits/base, total to CoLoRd parity. |
 
 The rest of this note is the analysis that set those priorities; it is written
 against the pre-`lroverlap` baseline, so the "fqxv seq" rows below are the
@@ -73,21 +75,23 @@ container overhead**, so CoLoRd's non-quality column is an *upper bound* on its
 sequence stream, while fqxv's `seq` is the real thing.
 
 For a seq-vs-seq comparison use **M1b's direct measurement of CoLoRd's sequence
-stream: 0.0676 bits/base** (13.1M on `ecoli_hifi`), which excludes names — that is
-the number the 9.7× gap below is computed from, and it is consistent with the
-0.069 upper bound here (the difference is names, ~0.0014 bits/base).
+stream: 0.0676 bits/base** (13.1M on `ecoli_hifi`), which excludes names and is
+consistent with the 0.069 upper bound here (the difference is names, ~0.0014
+bits/base). fqxv's shared-reference codec now codes the same stream to **0.065**,
+so on high-coverage HiFi the once-9.7× sequence gap has closed to a small credit —
+see Lever 2.
 
 The three sources are what went wrong before: the old table took `seq` from M1b,
 `qual` from `org - none`, and `total` from the benchmark harness — three separate
 runs, so the rows could not add up and the HiFi quality column exceeded its own
 archive. Each column above now comes from the same pair of runs.
 
-**`ecoli_ont`** (DRR205413, 287M bases, mean Q≈11.5 — noisy older-basecaller):
+**`ecoli_ont`** (DRR205413, 301 Mbase, mean Q≈11.5 — noisy older-basecaller):
 
 | tool | total | non-quality (seq+names) | qual | non-quality bits/base |
 | --- | --- | --- | --- | --- |
-| CoLoRd `-q org` | 197.9M | **31.4M** | 166.5M | 0.88 |
-| fqxv (binmix qual) | 222.6M | **58.8M** (seq only) | 163.7M | 1.64 |
+| CoLoRd `-q org` | 197.9M | **31.4M** | 166.5M | 0.84 |
+| fqxv `-l9` (tiling) | 198.2M | **34.5M** (seq) | 163.7M | 0.92 |
 
 **`ecoli_hifi`** (SRR11434954 subset, 1.55G bases, mean Q≈27, ~300× — narrow
 high-Q, low error):
@@ -95,43 +99,46 @@ high-Q, low error):
 | tool | total | non-quality (seq+names) | qual | non-quality bits/base |
 | --- | --- | --- | --- | --- |
 | CoLoRd `-q org` | 697.7M | **13.4M** | 684.3M | 0.069 |
-| fqxv (binmix qual) | 768.3M | **126.3M** (seq only) | 641.8M | 0.653 |
+| fqxv (shared ref) | 656.0M | **12.6M** (seq) | 641.8M | 0.065 |
 
 Two facts, confirmed on **both** platforms:
 
-1. **Quality now leads on both platforms.** fqxv's binary-decomposition
+1. **Quality leads on both platforms.** fqxv's binary-decomposition
    context-mixing quality coder codes the HiFi quality stream to **641.8M vs
    CoLoRd's 684.3M** (~6% smaller) and ONT to **163.7M vs 166.5M** (~2% smaller).
-   So quality is now a *credit* against CoLoRd on both sets — enough to carry the
-   HiFi lossless total ahead of CoLoRd, though on ONT the far larger sequence
-   deficit below still dominates. Lever 1 has flipped in fqxv's favor.
-2. **The entire lossless gap to CoLoRd is the sequence stream, and it widens
-   with coverage/fidelity.** ONT: 1.87× (0.87 vs 1.64 bits/base). HiFi:
-   **9.7×** (0.0676 vs 0.653 bits/base). At ~300× HiFi the same genome is read
-   hundreds of times; CoLoRd's overlap assembly encodes it once + diffs
-   (0.068 bits/base — its published high-coverage regime) while fqxv's
-   within-read model re-encodes every copy. **Lever 2 is the priority lever**,
-   decisively, and most of all on HiFi.
+   Quality is a *credit* against CoLoRd on both sets — enough to carry the HiFi
+   lossless total ahead of CoLoRd (656.0M vs 697.7M), and on ONT to net the total
+   to within 0.2% once the sequence lever lands. Lever 1 has flipped in fqxv's
+   favor.
+2. **The sequence stream — once the whole gap — is now closed on high-coverage
+   HiFi and near-closed on ONT.** HiFi Sequel II: the shared whole-file reference
+   codes seq to **0.065 vs CoLoRd's 0.069** — a *credit* (see Lever 2). ONT: the
+   multi-reference tiling codec brings seq to **0.92 vs ~0.84** (34.5M vs 31.4M,
+   ~10% behind), small enough that the quality credit nets the total to parity
+   (3.05× each). The one regime the within-read model still loses badly is
+   **ordinary-coverage HiFi** (Revio WGS): a real genome at typical depth carries
+   exact cross-read matches the voted consensus can't reach, closed by the
+   raw-LZMA method (seq **1.39 → 0.68 bits/base**, archive **9.7× → 17×**). All
+   three levers are detailed in Lever 2.
 
-### Lossy regime — the gap explodes
+### Lossy regime
 
-Measured vs `colord-lossy` (CoLoRd's default lossy quality). fqxv lossy rows run
-at *default* sequence level (seq 65.3M ONT / 247.1M HiFi); `-l9` would cut seq to
-58.8M / 126.3M but not change the verdict.
+Measured vs `colord-lossy` (CoLoRd's default lossy quality).
 
 | dataset | tool | total | ratio | seq | qual | Δqual mae |
 | --- | --- | --- | --- | --- | --- | --- |
 | ONT | colord-lossy | **73.2M** | 7.87 | — | — | — |
-| ONT | fqxv-binont | 114.6M | 5.03 | 65.3M (57%) | 49.2M (43%) | 3.35 |
+| ONT | fqxv-binont | 86.2M | 6.68 | 41.3M (48%) | 44.8M (52%) | 3.35 |
 | HiFi | colord-lossy | **45.3M** | 65.3 | ~13M | ~32M | — |
-| HiFi | fqxv-binhifi | 397.2M | 7.44 | 247.1M (62%) | 149.9M (38%) | 14.33 |
+| HiFi | fqxv-binhifi | 113.9M | 26.0 | 12.1M (11%) | 100.3M (89%) | 14.33 |
 
-The bin tables work — ONT bins cut fqxv's quality stream 163.7M → 49.2M (3.4×).
-But binning removes the stream fqxv is *good* at and leaves the stream it is bad
-at: **DNA becomes 62–88 % of the lossy archive**, so the sequence gap swallows
-the result (HiFi: 8.8× larger than CoLoRd overall, almost entirely DNA). This is
-the strongest argument for Lever 2 — the overlap codec is worth *more* in lossy
-mode, which is the mode long-read archives actually ship in.
+Binning removes the stream fqxv is *best* at (quality) and leaves sequence
+relatively larger, so the lossy gap to `colord-lossy` is wider than the lossless
+one — but far narrower than it once was, now that the sequence lever has landed. On
+ONT the gap is down to ~1.2× (86.2M vs 73.2M, from ~1.6×); on HiFi Sequel II the
+shared reference cut fqxv's sequence to 12.1M, so the once-8.8× lossy gap is now
+~2.5×. What keeps CoLoRd ahead on the aggressive HiFi point is its lossy *quality*
+model — `binhifi` keeps Q93 exact (mae 14.33), which costs ratio for fidelity.
 
 ### Platform tables are not interchangeable
 
@@ -140,8 +147,9 @@ mode, which is the mode long-read archives actually ship in.
 HiFi's max-quality semantics (`binhifi` keeps Q93 exact → mae 14.33). On ONT the
 two tables are byte-identical (ONT never reaches Q93). Consider warning when the
 selected table mismatches the detected `Platform` (the `warn_redundant_binning`
-pattern already exists). CoLoRd's lossy quality is still ~4.7× smaller than
-`binhifi` on HiFi — worth a look once Lever 2 lands, but it is not the headline.
+pattern already exists). With Lever 2 landed, CoLoRd's lossy HiFi archive is now
+~2.5× smaller than `binhifi` overall, and the remaining gap is its lossy *quality*
+model rather than sequence.
 
 Cutpoints must ultimately be set by downstream fidelity (`concordance.sh`), not
 raw ratio.
@@ -312,14 +320,14 @@ fails closed — it has no access to the frame. See issue #168.
 
 ### Cost / benefit
 
-The benchmark settles the priority: the **entire** measured lossless gap to
-CoLoRd is this stream (58.8M → 31.4M on offer, ~27M / 12% of the whole archive),
-while quality is already at parity. So the overlap codec is the lever that
-closes the CoLoRd gap — it is the larger project (overlap detection through
-noise is the crux; too sparse misses overlaps, too dense explodes the index;
-minimap2's chaining is the proven recipe) but it is *the* lever, not a
-secondary one. Expect the payoff to grow on modern high-Q ONT and HiFi, where
-the field reaches 0.35 bits/base and fqxv's within-read model cannot.
+The benchmark settled the priority, and the levers delivered. On ONT the tiling
+codec took the sequence stream from 58.8M (the old within-read baseline) to 34.5M
+— against CoLoRd's 31.4M — so the once-decisive gap is down to ~3M, and the quality
+credit nets the total to parity. On HiFi the shared whole-file reference made
+sequence a *credit* (0.065 vs 0.069), and on ordinary-coverage HiFi the raw-LZMA
+method halved it (1.39 → 0.68 bits/base). The remaining ONT headroom is
+consensus/reference quality — coding against another erroneous read carries *both*
+reads' errors — not the coverage available to it.
 
 ### Suggested sequencing
 
@@ -328,14 +336,17 @@ the field reaches 0.35 bits/base and fqxv's within-read model cannot.
    the file. Still needs a downstream-fidelity check (`concordance.sh`) to set
    cutpoints honestly; the current cutpoints are CoLoRd's, not ones fqxv
    validated.
-2. **Overlap sequence codec** (Lever 2) — **shipped.** The algorithm
-   (`fqxv-lroverlap`) is wired into the container behind a sequence-method tag
-   with `is_long_read` gating and a full decode path, auto-selected and kept only
-   when it beats order-k. Two follow-ups have since landed on top: the consensus
-   reference is assembled once for the whole file and stored once rather than
-   per block, and ONT seeds with closed syncmers instead of window minimizers.
-   What remains is consensus *quality* — the draft consensus still sits above a
-   raw read's error rate, which bounds the ONT edit cost.
+2. **Overlap sequence codec** (Lever 2) — **shipped**, plus two sibling methods
+   since. `fqxv-lroverlap` is wired behind a sequence-method tag with `is_long_read`
+   gating and a full decode path, auto-selected and kept only when it beats order-k;
+   the consensus reference is now assembled once for the whole file and stored once.
+   Two more per-block sequence methods joined it (each kept only when smallest):
+   **raw large-window LZMA** for ordinary-coverage long reads — the Revio WGS lever
+   that took that archive from 9.7× to 17× — and **multi-reference tiling** for
+   Nanopore, coding each read against earlier raw reads (best-of-N at `-l9`/`--max`),
+   which brought ONT to CoLoRd parity. What remains is consensus *quality* on ONT —
+   the draft consensus still sits above a raw read's error rate, which bounds how far
+   tiling and the reference path can go.
 3. Quality base-context (rest of Lever 1) — **shipped**, and it overshot the
    estimate: the sequence-conditioned, context-mixed coder took HiFi quality
    below CoLoRd rather than the ~nil headroom predicted from this ONT data.
