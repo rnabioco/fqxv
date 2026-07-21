@@ -50,6 +50,10 @@ CELLS="$RESULTS_DIR/cells.tsv"
 # datasets.tsv columns: accession label platform layout quality approx_gz reference
 while read -r acc label platform layout quality approx _; do
   [[ -z "${acc:-}" || "$acc" == \#* ]] && continue
+  # Optional read-class filter: FQXV_ONLY=long|short restricts the matrix to one
+  # class (e.g. `FQXV_ONLY=long` for a CoLoRd head-to-head without the short-read
+  # field). Empty runs everything.
+  [[ -n "${FQXV_ONLY:-}" && "$(fqxv_read_class "$platform")" != "$FQXV_ONLY" ]] && continue
   # Tool set by platform, unless explicitly overridden.
   if [[ -n "$TOOLS" ]]; then
     sel="$TOOLS"

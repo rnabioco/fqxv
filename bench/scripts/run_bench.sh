@@ -256,6 +256,8 @@ for row in "${rows[@]}"; do
 
   # Array cells process a single dataset.
   [[ -n "${FQXV_ONLY_DATASET:-}" && "$label" != "$FQXV_ONLY_DATASET" ]] && continue
+  # Read-class filter (shared with submit_parallel.sh): FQXV_ONLY=long|short.
+  [[ -n "${FQXV_ONLY:-}" && "$(fqxv_read_class "$plat_col")" != "$FQXV_ONLY" ]] && continue
 
   # Resolve input (R1, or R1+R2 concatenated). Single-end runs land under one of
   # two names and `--split split-3` alone does not decide which: sracha writes
