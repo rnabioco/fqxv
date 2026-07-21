@@ -46,6 +46,22 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Performance
 
+- **PacBio HiFi is smaller *and* ~2x faster to compress** — the raw-sequence LZMA
+  codec (`SEQ_METHOD_LZMA`, #197) now seeds its match finder on **12 bytes**
+  instead of 4. On raw ASCII a 4-byte seed keys only ~256 distinct DNA 4-grams, so
+  the hash chains collided catastrophically and the depth cap truncated them —
+  which both cost time (millions of pointer-chases through a capped chain) and
+  *lost matches* beyond the cap. A 12-base seed keys ~16.7M grams, so a 12-mer
+  recurs only ~a dozen times: chains are short, the cap never binds, and the
+  finder sees every candidate. On a 40k-read Revio WGS subset the sequence stream
+  drops **0.791 → 0.638 b/base** and the whole archive **29.4 → 25.2 MB
+  (−14%)**, while compress time **falls ~2x** (329s → 166s, below even the
+  original 4-byte path). Validated lossless and on a second HiFi dataset. The
+  match finder is tuned per call site, so the 2-bit packed-reference path keeps
+  its 4-byte seed and byte-identical output; decode is seed-agnostic, so no format
+  change. The match-extension inner loop is also AVX2-vectorized (CPU-feature
+  gated, byte-identical, ~8% on top; `FQXV_LZMA_NO_SIMD` forces scalar).
+
 - **Nanopore compression is ~5.5x faster** — the raw-LZMA sequence candidate
   (`SEQ_METHOD_LZMA`) is now skipped on high-error Nanopore, where it cannot win.
   LZMA pays off only where reads share long *exact* substrings — ordinary-coverage

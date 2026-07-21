@@ -423,47 +423,166 @@ fn decode_distance(m: &mut Models, dec: &mut Decoder<'_>, len: usize) -> Result<
 // --- match finder (hash-chain) -----------------------------------------------
 
 const NIL: u32 = u32::MAX;
-/// Bytes hashed to seed the chain; see [`hash_at`]. A 4-byte seed keys a 16-base
-/// match on the 2-bit-packed reference and finds more (shorter) matches than a
-/// long seed.
-const HASH_LEN: usize = 4;
 const HASH_BITS: u32 = 22;
 /// Stop searching once a match at least this long is found.
 const NICE_LEN: usize = 273;
-/// Max hash-chain nodes to visit per position.
-const MAX_CHAIN: usize = 1024;
+
+/// Hash seed on RAW ASCII sequence: 8 bytes = 8 bases spread the 4-letter DNA
+/// alphabet across buckets. A 4-byte seed keys only ~256 distinct 4-grams, so the
+/// chains collide catastrophically and the chain cap truncates the reach, which
+/// stranded the raw-sequence LZMA at 0.79 b/base on Revio WGS. A **12-base** seed
+/// keys ~16.7M distinct 12-grams, so a 12-mer recurs only ~a dozen times: the
+/// chain is short, `MAX_CHAIN` never binds, and the finder sees *every* candidate
+/// rather than the 512 most-recent an 8-mer's ~3300-long chain was capped to.
+/// Net vs the 8-mer: **better** ratio (0.638 vs 0.666 — no matches lost to the
+/// cap) at ~5x less encode time (fewer pointer-chases). (#197)
+const SEED_RAW: usize = 12;
+/// Hash seed on the 2-bit-PACKED reference: 4 bytes already spans 16 bases, so the
+/// packed path keeps the shorter seed — and thus produces byte-identical output to
+/// before the raw path widened.
+const SEED_PACKED: usize = 4;
+/// Chain depth on the raw-sequence path. With the 12-base seed the natural chain
+/// is short (~a dozen), so this rarely binds — it is a safety cap for
+/// repeat-dense loci, not the operating point (which the seed length sets).
+const MAX_CHAIN_RAW: usize = 512;
+/// Chain depth on the 2-bit packed-reference path (unchanged from the original).
+const MAX_CHAIN_PACKED: usize = 1024;
 
 #[inline]
-fn hash_at(s: &[u8], pos: usize) -> usize {
-    // Hash `HASH_LEN` bytes -> bucket. Any deterministic mix works (affects only
-    // which matches are found, never correctness). A short seed finds more (and
-    // shorter) matches; on the 2-bit-packed reference each byte is 4 bases, so a
-    // 4-byte seed already keys a 16-base match.
-    let v = u32::from_le_bytes(s[pos..pos + 4].try_into().unwrap());
-    (u64::from(v).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - HASH_BITS)) as usize
+fn hash_at(s: &[u8], pos: usize, seed_len: usize) -> usize {
+    // Hash `seed_len` bytes -> bucket. Any deterministic mix works (affects only
+    // which matches are found, never correctness). The 4-byte arm reproduces the
+    // original `u32`-seed hash exactly, so the packed reference stays byte-identical;
+    // the 12-byte arm keys the raw-ASCII path with two overlapping 8-byte loads.
+    let v: u64 = match seed_len {
+        4 => u64::from(u32::from_le_bytes(s[pos..pos + 4].try_into().unwrap())),
+        12 => {
+            // 12 distinct bytes: an 8-byte load over [0,8) and a 4-byte load over
+            // [8,12), mixed multiplicatively (distinct odd constants) so no byte
+            // cancels. Caller guarantees `pos + 12 <= n`.
+            let lo = u64::from_le_bytes(s[pos..pos + 8].try_into().unwrap());
+            let hi = u32::from_le_bytes(s[pos + 8..pos + 12].try_into().unwrap());
+            lo.wrapping_mul(0xFF51_AFD7_ED55_8CCD)
+                ^ u64::from(hi).wrapping_mul(0xC4CE_B9FE_1A85_EC53)
+        }
+        // Defensive fallback for any other seed length (production uses only 4 and
+        // 12). Folds `seed_len` bytes; any deterministic mix preserves correctness.
+        _ => {
+            let mut buf = [0u8; 16];
+            buf[..seed_len].copy_from_slice(&s[pos..pos + seed_len]);
+            (u128::from_le_bytes(buf).wrapping_mul(0x9E37_79B9_7F4A_7C15_C2B2_AE3D_27D4_EB4F) >> 64)
+                as u64
+        }
+    };
+    (v.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - HASH_BITS)) as usize
+}
+
+/// Count equal leading bytes of `s[a..]` and `s[b..]`, capped at `max`. This is
+/// the match-extension inner loop, hot on low-error long reads where the good
+/// candidate extends for tens to hundreds of bytes. Callers guarantee `a + max`
+/// and `b + max` are both in bounds (they derive `max` from `n - pos`), so the
+/// vectorized path may read `max` bytes from either offset without checking.
+#[inline]
+fn common_prefix(s: &[u8], a: usize, b: usize, max: usize) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if have_avx2() {
+            // SAFETY: `have_avx2()` confirmed the target feature, and the caller
+            // guarantees `a + max <= s.len()` and `b + max <= s.len()`.
+            return unsafe { common_prefix_avx2(s, a, b, max) };
+        }
+    }
+    common_prefix_scalar(s, a, b, max)
+}
+
+#[inline]
+fn common_prefix_scalar(s: &[u8], a: usize, b: usize, max: usize) -> usize {
+    let mut l = 0usize;
+    while l < max && s[a + l] == s[b + l] {
+        l += 1;
+    }
+    l
+}
+
+/// Cached `avx2` detection: the extension loop runs billions of times, so the
+/// per-call feature query is resolved once. `FQXV_LZMA_NO_SIMD` forces the scalar
+/// path for A/B measurement (output is identical either way).
+#[cfg(target_arch = "x86_64")]
+fn have_avx2() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var_os("FQXV_LZMA_NO_SIMD").is_none() && std::is_x86_feature_detected!("avx2")
+    })
+}
+
+/// AVX2 match extension: compares 32 bytes per step, then a scalar tail. Produces
+/// the exact same count as [`common_prefix_scalar`] — SIMD only makes it faster.
+///
+/// # Safety
+/// The caller must ensure the `avx2` feature is available and that `a + max` and
+/// `b + max` are within `s`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn common_prefix_avx2(s: &[u8], a: usize, b: usize, max: usize) -> usize {
+    use std::arch::x86_64::*;
+    let base = s.as_ptr();
+    let mut l = 0usize;
+    while l + 32 <= max {
+        // SAFETY: `l + 32 <= max` and the caller's bound give `a + l + 32 <=
+        // s.len()` and likewise for `b`, so both 32-byte loads stay in `s`.
+        let (va, vb) = unsafe {
+            (
+                _mm256_loadu_si256(base.add(a + l) as *const __m256i),
+                _mm256_loadu_si256(base.add(b + l) as *const __m256i),
+            )
+        };
+        // Pure register ops (no memory access): safe within this `avx2` fn.
+        let eq = _mm256_cmpeq_epi8(va, vb);
+        let mask = _mm256_movemask_epi8(eq) as u32;
+        if mask != 0xFFFF_FFFF {
+            // First differing byte = first zero bit of the equal-mask.
+            return l + (!mask).trailing_zeros() as usize;
+        }
+        l += 32;
+    }
+    while l < max {
+        // SAFETY: `l < max` keeps both indices within the caller's bound.
+        if unsafe { *base.add(a + l) != *base.add(b + l) } {
+            break;
+        }
+        l += 1;
+    }
+    l
 }
 
 /// Longest match for the suffix at `pos` among earlier positions on its chain.
 /// Returns `(len, dist)` with `dist` 1-based (`pos - candidate`), or `(0, 0)`.
+/// `seed_len`/`max_chain` are the per-call-site match-finder tuning (raw vs packed).
 #[inline]
-fn find_match(s: &[u8], pos: usize, head: &[u32], prev: &[u32], mask: usize) -> (usize, usize) {
+fn find_match(
+    s: &[u8],
+    pos: usize,
+    head: &[u32],
+    prev: &[u32],
+    mask: usize,
+    seed_len: usize,
+    max_chain: usize,
+) -> (usize, usize) {
     let n = s.len();
-    if pos + HASH_LEN > n {
+    if pos + seed_len > n {
         return (0, 0);
     }
     let max_len = (n - pos).min(MAX_MATCH);
-    let h = hash_at(s, pos) & mask;
+    let h = hash_at(s, pos, seed_len) & mask;
     let mut cand = head[h];
     let mut best_len = 0usize;
     let mut best_dist = 0usize;
     let mut chain = 0usize;
-    while cand != NIL && chain < MAX_CHAIN {
+    while cand != NIL && chain < max_chain {
         let c = cand as usize;
         if best_len == 0 || s[c + best_len] == s[pos + best_len] {
-            let mut l = 0usize;
-            while l < max_len && s[c + l] == s[pos + l] {
-                l += 1;
-            }
+            let l = common_prefix(s, c, pos, max_len);
             if l > best_len {
                 best_len = l;
                 best_dist = pos - c;
@@ -481,9 +600,9 @@ fn find_match(s: &[u8], pos: usize, head: &[u32], prev: &[u32], mask: usize) -> 
 }
 
 #[inline]
-fn insert(s: &[u8], pos: usize, head: &mut [u32], prev: &mut [u32], mask: usize) {
-    if pos + HASH_LEN <= s.len() {
-        let h = hash_at(s, pos) & mask;
+fn insert(s: &[u8], pos: usize, head: &mut [u32], prev: &mut [u32], mask: usize, seed_len: usize) {
+    if pos + seed_len <= s.len() {
+        let h = hash_at(s, pos, seed_len) & mask;
         prev[pos] = head[h];
         head[h] = pos as u32;
     }
@@ -500,11 +619,7 @@ fn rep_len_at(s: &[u8], pos: usize, d: u32) -> usize {
     let start = pos - back;
     let n = s.len();
     let max_len = (n - pos).min(MAX_MATCH);
-    let mut l = 0usize;
-    while l < max_len && s[start + l] == s[pos + l] {
-        l += 1;
-    }
-    l
+    common_prefix(s, start, pos, max_len)
 }
 
 // --- main encode / decode ----------------------------------------------------
@@ -520,7 +635,19 @@ const NORMAL_MIN: usize = 4;
 /// raw byte-domain core, exposed for callers (e.g. `fqxv-reorder`'s reference
 /// packer) that want the LZMA coder without the `(lens, seq)` framing [`encode`]
 /// adds. Reversed by [`decode_raw`].
+///
+/// Uses the packed-reference match-finder tuning (4-byte seed, 1024-deep chain),
+/// so a 2-bit-packed reference codes byte-identically to before the raw-sequence
+/// path widened its seed. The raw ASCII path takes the wider tuning via [`encode`].
 pub fn encode_raw(s: &[u8]) -> Vec<u8> {
+    encode_core(s, SEED_PACKED, MAX_CHAIN_PACKED)
+}
+
+/// Match-finder core shared by [`encode_raw`] (packed reference) and [`encode`]
+/// (raw ASCII sequence), parameterized by the seed width and chain depth each
+/// path wants — the two differ only in *which* matches the finder discovers, and
+/// decode is seed-agnostic, so the tunings interoperate freely. See [`SEED_RAW`].
+fn encode_core(s: &[u8], seed_len: usize, max_chain: usize) -> Vec<u8> {
     let n = s.len();
     let mut m = Models::new(LC);
     let mut enc = Encoder::new();
@@ -536,8 +663,8 @@ pub fn encode_raw(s: &[u8]) -> Vec<u8> {
         let prev_byte = if pos > 0 { s[pos - 1] } else { 0 };
         // Candidate normal match at `pos` (searches earlier positions only), then
         // insert `pos` so the lazy peek at `pos + 1` can see it.
-        let (mut mlen, mdist) = find_match(s, pos, &head, &prev, mask);
-        insert(s, pos, &mut head, &mut prev, mask);
+        let (mut mlen, mdist) = find_match(s, pos, &head, &prev, mask, seed_len, max_chain);
+        insert(s, pos, &mut head, &mut prev, mask, seed_len);
         let mut best_rep_len = 0usize;
         let mut best_rep_idx = 0usize;
         for (i, &d) in reps.iter().enumerate() {
@@ -570,7 +697,7 @@ pub fn encode_raw(s: &[u8]) -> Vec<u8> {
         // better match. Classic ~10-15% ratio win over pure greedy. (Reps are
         // near-free, so never defer them.)
         if !take_rep && mlen >= MIN_MATCH && pos + 1 < n {
-            let (nlen, _) = find_match(s, pos + 1, &head, &prev, mask);
+            let (nlen, _) = find_match(s, pos + 1, &head, &prev, mask, seed_len, max_chain);
             if nlen > mlen {
                 m.is_match[state].encode(&mut enc, 0);
                 let match_byte = {
@@ -614,7 +741,7 @@ pub fn encode_raw(s: &[u8]) -> Vec<u8> {
             state = state_after_rep(state);
             // `pos` already inserted; insert the rest of the covered positions.
             for k in 1..len {
-                insert(s, pos + k, &mut head, &mut prev, mask);
+                insert(s, pos + k, &mut head, &mut prev, mask, seed_len);
             }
             pos += len;
         } else if mlen >= MIN_MATCH {
@@ -627,7 +754,7 @@ pub fn encode_raw(s: &[u8]) -> Vec<u8> {
             reps = [dist0, reps[0], reps[1], reps[2]];
             state = state_after_match(state);
             for k in 1..len {
-                insert(s, pos + k, &mut head, &mut prev, mask);
+                insert(s, pos + k, &mut head, &mut prev, mask, seed_len);
             }
             pos += len;
         } else {
@@ -745,7 +872,10 @@ pub fn encode(lens: &[u32], seq: &[u8]) -> Result<Vec<u8>> {
     if sum != seq.len() {
         return Err(Error::Malformed("reflzma: length/seq disagreement"));
     }
-    let payload = encode_raw(seq);
+    // Raw ASCII sequence takes the wide match-finder tuning (12-byte seed): reads
+    // share long *exact* substrings whose earlier copies sit far back in the stream,
+    // and the collision-choked 4-byte seed could not reach them (see [`SEED_RAW`]).
+    let payload = encode_core(seq, SEED_RAW, MAX_CHAIN_RAW);
     let mut out = Vec::with_capacity(payload.len() + lens.len() * 2 + 16);
     write_varint(&mut out, lens.len() as u64);
     for &l in lens {
