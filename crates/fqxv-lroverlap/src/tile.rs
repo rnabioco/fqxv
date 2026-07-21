@@ -53,7 +53,7 @@ use crate::codec::{
     OP_CTXS, REF_TAIL, SUB_SYMS, align_for_coding, base_code, compute_offs, encode_ops,
     encode_subs, get_stream, put_stream,
 };
-use crate::{ChainOpts, EncodeOpts, Error, Index, Op, Repeat, find_overlaps};
+use crate::{ChainOpts, EncodeOpts, Error, Index, Op, Overlap, Repeat, find_overlaps};
 
 /// Format tag for a tiling sequence block. Distinct from the consensus codec's
 /// `LRO`/`LRR` so a mis-dispatched block fails closed rather than mis-decodes.
@@ -170,6 +170,73 @@ impl TileStreams {
         write_varint(&mut self.lit_lens, bases.len() as u64);
         self.literals.extend(bases.iter().map(|&b| base_code(b)));
     }
+
+    /// Emit one tile: its edit script (against `refwin`, the neighbour span the
+    /// tile was aligned over) followed by the per-segment manifest fields, in the
+    /// exact order [`serialize`] reads them back. `tile_len` is the query bases the
+    /// ops produce, `delta = id - neighbour_id >= 1`, `strand`/`rs` place the
+    /// neighbour. Shared by the greedy and best-of-N covers so both are byte-for-
+    /// byte identical for a given chosen `(refwin, ops, …)`.
+    fn push_tile(
+        &mut self,
+        refwin: &[u8],
+        ops: &[Op],
+        tile_len: usize,
+        delta: u64,
+        strand: bool,
+        rs: usize,
+    ) {
+        self.walk_ops(refwin, ops);
+        write_varint(&mut self.markers, delta);
+        write_varint(&mut self.tile_lens, tile_len as u64);
+        self.strands.push(u8::from(strand));
+        write_varint(&mut self.rs, rs as u64);
+    }
+}
+
+/// One aligned candidate reference for a tile at `pos`: the oriented neighbour
+/// window it was aligned against, its edit script, where it lands, and a coding
+/// cost used only to rank candidates against each other (never on decode).
+struct Cand {
+    /// Query position the tile ends at (`o.q_end` capped to the read length).
+    te: usize,
+    /// The neighbour span the ops are coded against (`reference[rs..re]`).
+    refwin: Vec<u8>,
+    /// The (trailing-Del-trimmed) edit script producing `read[pos..te]`.
+    ops: Vec<Op>,
+    /// Neighbour start offset the edit script begins at.
+    rs: usize,
+    /// `id - neighbour_id`, always `>= 1` (a tile references an earlier read).
+    delta: u64,
+    /// Whether the neighbour is reverse-complemented.
+    strand: bool,
+    /// Estimated coded bits for this tile: framing plus per-edit cost. Compared
+    /// amortised over the span (`cost_bits / span`) so a candidate is preferred
+    /// only when it is cheaper *per produced base* — balancing reach against
+    /// match quality without a hard span rule. Ranking only; decode never sees it.
+    cost_bits: u64,
+}
+
+/// Fixed per-tile framing charged in the best-of-N cost model: one manifest
+/// segment is ~5 bytes (marker + tile_len + strand + rs varints). Ranking only.
+const TILE_FRAME_BITS: u64 = 40;
+/// Bits an ONT edit (a substituted / inserted / deleted base) costs once
+/// entropy-coded, used to weight a candidate's edit distance. Derived from the
+/// measured ~1.14 b/base at ~13.5% divergence; only its ratio to
+/// [`TILE_FRAME_BITS`] matters, and only for ranking. Never affects decode.
+const TILE_EDIT_BITS: u64 = 8;
+
+/// The read-local context the cover functions share: which read is being tiled
+/// (`i`), the block's concatenated bases (`seq`) and per-read offsets (`offs`),
+/// the read slice itself (`read = seq[offs[i]..offs[i + 1]]`), and the alignment
+/// band. Passed by reference so a candidate reference read can be resolved from
+/// `seq`/`offs` without re-slicing the world through a long argument list.
+struct ReadCtx<'a> {
+    i: usize,
+    seq: &'a [u8],
+    offs: &'a [usize],
+    read: &'a [u8],
+    band: usize,
 }
 
 /// Build the non-ACGT exception list over the whole sequence buffer: for each
@@ -191,21 +258,23 @@ fn build_exceptions(seq: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Tile one read against its earlier-id overlapping neighbours, returning its
-/// stream contribution. Greedy max-reach cover: at each uncovered position pick
-/// the overlap that reaches furthest, code that span as an edit script, and store
-/// genuinely uncovered runs as literals. Pure function of `(i, seq, offs, idx,
-/// band)`, so the per-read work is order-free and thread-count invariant.
+/// stream contribution. At each uncovered position an overlap is chosen to code
+/// the next span as an edit script; genuinely uncovered runs are stored as
+/// literals. `max_refs <= 1` is the plain greedy max-reach cover (take the overlap
+/// that reaches furthest); `max_refs > 1` selects best-of-N (see [`cover_bestof`]).
+/// Pure function of `(i, seq, offs, idx, band, max_refs)`, so the per-read work is
+/// order-free and thread-count invariant.
 fn tile_one_read(
     i: usize,
     seq: &[u8],
     offs: &[usize],
     idx: Option<&Index>,
     band: usize,
+    max_refs: usize,
 ) -> TileStreams {
     let read = &seq[offs[i]..offs[i + 1]];
-    let len_i = read.len();
     let mut s = TileStreams::default();
-    if len_i == 0 {
+    if read.is_empty() {
         return s;
     }
     // No index (build failed, or nothing to seed against): whole read is literal.
@@ -221,6 +290,29 @@ fn tile_one_read(
     // q_start ties keep the score order, making the cover thread-independent.
     ovs.sort_by_key(|o| o.q_start);
 
+    let ctx = ReadCtx {
+        i,
+        seq,
+        offs,
+        read,
+        band,
+    };
+    if max_refs <= 1 {
+        cover_greedy(&ctx, &ovs, &mut s);
+    } else {
+        cover_bestof(&ctx, &ovs, max_refs, &mut s);
+    }
+    s
+}
+
+/// The plain greedy max-reach cover (`tile_max_refs <= 1`): at each uncovered
+/// position take the single overlap that reaches furthest and code that whole
+/// span. Kept as its own function so the default block is byte-for-byte identical
+/// to what shipped in #212 — [`TileStreams::push_tile`] emits the manifest in the
+/// same order the original inline code did.
+fn cover_greedy(ctx: &ReadCtx, ovs: &[Overlap], s: &mut TileStreams) {
+    let read = ctx.read;
+    let len_i = read.len();
     let mut pos = 0usize;
     while pos < len_i {
         // The overlap covering `pos` that reaches furthest → the longest tile.
@@ -231,34 +323,10 @@ fn tile_one_read(
         match best {
             Some(o) => {
                 let te = (o.q_end as usize).min(len_i);
-                let target = &seq[offs[o.target as usize]..offs[o.target as usize + 1]];
-                let reference = if o.strand {
-                    revcomp_acgt(target)
-                } else {
-                    target.to_vec()
-                };
-                // Map the query span into the neighbour's (query-oriented) frame.
-                let off = i64::from(o.t_start) - i64::from(o.q_start);
-                let rs = (pos as i64 + off).max(0) as usize;
-                let re = ((te as i64 + off).max(0) as usize + REF_TAIL).min(reference.len());
-                if rs < re {
-                    let mut ops = align_for_coding(&reference[rs..re], &read[pos..te], band).ops;
-                    // A trailing Del consumes only reference, never query, so it
-                    // carries nothing the decoder needs and would desync the
-                    // "produced == tile_len" termination — drop it (as the
-                    // consensus coder does for its per-read scripts).
-                    while matches!(ops.last(), Some(Op::Del(_))) {
-                        ops.pop();
-                    }
-                    s.walk_ops(&reference[rs..re], &ops);
-                    let delta = i as u64 - u64::from(o.target); // >= 1
-                    write_varint(&mut s.markers, delta);
-                    write_varint(&mut s.tile_lens, (te - pos) as u64);
-                    s.strands.push(u8::from(o.strand));
-                    write_varint(&mut s.rs, rs as u64);
-                } else {
+                match eval_candidate(ctx, o, pos) {
+                    Some(c) => s.push_tile(&c.refwin, &c.ops, te - pos, c.delta, c.strand, c.rs),
                     // The overlap's diagonal placed no usable neighbour span here.
-                    s.push_literal(&read[pos..te]);
+                    None => s.push_literal(&read[pos..te]),
                 }
                 pos = te;
             }
@@ -274,7 +342,138 @@ fn tile_one_read(
             }
         }
     }
-    s
+}
+
+/// Best-of-N cover (`tile_max_refs > 1`): at each uncovered position align the
+/// `max_refs` furthest-reaching covering overlaps and keep the tile whose edit
+/// script is cheapest *per produced base*. At ONT coverage many earlier reads span
+/// the same region with independent error patterns, so the min-cost reference
+/// agrees with the query at more positions — CoLoRd's anchor choice, applied per
+/// tile. Coverage never regresses versus greedy: the furthest-reaching overlap is
+/// always among the candidates, so the worst case is simply picking it.
+fn cover_bestof(ctx: &ReadCtx, ovs: &[Overlap], max_refs: usize, s: &mut TileStreams) {
+    let read = ctx.read;
+    let len_i = read.len();
+    let mut pos = 0usize;
+    while pos < len_i {
+        // Overlaps covering `pos`, furthest reach first with a total tie-break so
+        // the candidate set — and thus the block — is thread-count invariant.
+        let mut covering: Vec<&Overlap> = ovs
+            .iter()
+            .filter(|o| (o.q_start as usize) <= pos && (o.q_end as usize) > pos)
+            .collect();
+        if covering.is_empty() {
+            let next = ovs
+                .iter()
+                .filter_map(|o| ((o.q_start as usize) > pos).then_some(o.q_start as usize))
+                .min()
+                .unwrap_or(len_i);
+            s.push_literal(&read[pos..next]);
+            pos = next;
+            continue;
+        }
+        covering.sort_by(|a, b| {
+            b.q_end
+                .cmp(&a.q_end)
+                .then(a.q_start.cmp(&b.q_start))
+                .then(a.target.cmp(&b.target))
+                .then(a.strand.cmp(&b.strand))
+        });
+
+        // Align up to `max_refs` of them; keep the cheapest amortised tile. Ties
+        // keep the earlier (furthest-reaching) candidate, so selection is total.
+        let mut best: Option<Cand> = None;
+        for o in covering.iter().take(max_refs) {
+            let Some(c) = eval_candidate(ctx, o, pos) else {
+                continue;
+            };
+            let take = match &best {
+                None => true,
+                // Cheaper bits per produced base; cross-multiplied to stay integer
+                // (both spans are >= 1 since every candidate has `te > pos`).
+                Some(b) => {
+                    let lhs = c.cost_bits * (b.te - pos) as u64;
+                    let rhs = b.cost_bits * (c.te - pos) as u64;
+                    lhs < rhs
+                }
+            };
+            if take {
+                best = Some(c);
+            }
+        }
+
+        match best {
+            Some(c) => {
+                let te = c.te;
+                s.push_tile(&c.refwin, &c.ops, te - pos, c.delta, c.strand, c.rs);
+                pos = te;
+            }
+            None => {
+                // Every covering overlap's diagonal fell off the read — literal to
+                // the furthest reach, matching the greedy cover's rs>=re fallback.
+                let te = (covering[0].q_end as usize).min(len_i);
+                s.push_literal(&read[pos..te]);
+                pos = te;
+            }
+        }
+    }
+}
+
+/// Align the query span `read[pos..te]` (`te` the overlap's reach, capped to the
+/// read) against neighbour `o` and return the resulting tile with its ranking
+/// cost, or `None` when the overlap's diagonal places no usable neighbour span at
+/// `pos` (the caller then stores that span as a literal, as the greedy cover does
+/// on `rs >= re`). Pure and side-effect free, so it is safe to call speculatively
+/// on several candidates before committing to one.
+fn eval_candidate(ctx: &ReadCtx, o: &Overlap, pos: usize) -> Option<Cand> {
+    let &ReadCtx {
+        i,
+        seq,
+        offs,
+        read,
+        band,
+    } = ctx;
+    let te = (o.q_end as usize).min(read.len());
+    let target = &seq[offs[o.target as usize]..offs[o.target as usize + 1]];
+    let reference = if o.strand {
+        revcomp_acgt(target)
+    } else {
+        target.to_vec()
+    };
+    // Map the query span into the neighbour's (query-oriented) frame.
+    let off = i64::from(o.t_start) - i64::from(o.q_start);
+    let rs = (pos as i64 + off).max(0) as usize;
+    let re = ((te as i64 + off).max(0) as usize + REF_TAIL).min(reference.len());
+    if rs >= re {
+        return None;
+    }
+    let mut ops = align_for_coding(&reference[rs..re], &read[pos..te], band).ops;
+    // A trailing Del consumes only reference, never query, so it carries nothing
+    // the decoder needs and would desync the "produced == tile_len" termination —
+    // drop it (as the consensus coder does for its per-read scripts).
+    while matches!(ops.last(), Some(Op::Del(_))) {
+        ops.pop();
+    }
+    // Edit distance actually coded (subs + inserted + deleted bases) — the term
+    // that drives a tile's size; matches are near-free under the order-3 op model.
+    let dist: u64 = ops
+        .iter()
+        .map(|op| match op {
+            Op::Match(_) => 0,
+            Op::Sub(_) => 1,
+            Op::Ins(b) => b.len() as u64,
+            Op::Del(m) => u64::from(*m),
+        })
+        .sum();
+    Some(Cand {
+        te,
+        refwin: reference[rs..re].to_vec(),
+        ops,
+        rs,
+        delta: i as u64 - u64::from(o.target), // >= 1
+        strand: o.strand,
+        cost_bits: TILE_FRAME_BITS + dist * TILE_EDIT_BITS,
+    })
 }
 
 /// Append a range-coded blob as `[varint symbol_count][varint blob_len][blob]`,
@@ -336,9 +535,11 @@ fn serialize(
 
 /// Compress a block of long reads with the multi-reference tiler. `lens[r]` is the
 /// length of read `r`; `seq` is their bases concatenated in read order. Returns a
-/// self-contained block that [`tile_decode`] inverts exactly. `opts.sketch` and
-/// `opts.tile_band` select the overlap seeding and alignment band; both affect
-/// ratio and speed only — the block self-describes, so decode never re-sketches.
+/// self-contained block that [`tile_decode`] inverts exactly. `opts.sketch`,
+/// `opts.tile_band`, and `opts.tile_max_refs` select the overlap seeding, the
+/// alignment band, and how many candidate references each tile weighs; all three
+/// affect ratio and speed only — the block self-describes, so decode never
+/// re-sketches, re-aligns, or re-selects.
 ///
 /// # Errors
 /// Returns [`Error::Corrupt`] if `lens` does not sum to `seq.len()`, or if an
@@ -348,6 +549,7 @@ pub fn tile_encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8
     let offs = compute_offs(lens, seq.len())?;
     let total_bases: u64 = lens.iter().map(|&l| u64::from(l)).sum();
     let band = opts.tile_band;
+    let max_refs = opts.tile_max_refs.max(1);
 
     // A tile references *another read*, which the decoder has only rebuilt in
     // ACGT-placeholder space when it reaches this one — non-ACGT bytes are restored
@@ -365,7 +567,7 @@ pub fn tile_encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8
     // Tile each read in parallel; merge in id order for a thread-independent block.
     let parts: Vec<TileStreams> = (0..n)
         .into_par_iter()
-        .map(|i| tile_one_read(i, &norm, &offs, idx.as_ref(), band))
+        .map(|i| tile_one_read(i, &norm, &offs, idx.as_ref(), band, max_refs))
         .collect();
     let mut all = TileStreams::default();
     for p in &parts {
@@ -800,10 +1002,51 @@ mod tests {
         assert_eq!(a, b, "encode is deterministic");
     }
 
+    #[test]
+    fn bestof_refs_roundtrip_and_deterministic() {
+        // Best-of-N reference selection (tile_max_refs > 1) must stay lossless and
+        // thread-count invariant: it only changes *which* neighbour a tile picks,
+        // never how the decoder replays it.
+        let reads = overlapping_reads(6_000, 1_000, 90, 60, 123);
+        let (lens, seq) = flatten(&reads);
+        for refs in [2usize, 4, 8] {
+            for band in [256usize, 768] {
+                let opts = EncodeOpts {
+                    tile_max_refs: refs,
+                    tile_band: band,
+                    ..EncodeOpts::default()
+                };
+                let a = tile_encode(&lens, &seq, &opts).expect("encode a");
+                let b = tile_encode(&lens, &seq, &opts).expect("encode b");
+                assert_eq!(a, b, "best-of-{refs} band {band} is deterministic");
+                let (dl, ds) = tile_decode(&a).expect("decode");
+                assert_eq!(dl, lens, "best-of-{refs} lengths round-trip");
+                assert_eq!(ds, seq, "best-of-{refs} sequence round-trips exactly");
+            }
+        }
+    }
+
+    #[test]
+    fn bestof_refs_one_matches_default() {
+        // tile_max_refs = 1 (and 0, clamped up to 1) must reproduce the greedy
+        // max-reach cover byte-for-byte — the shipped #212 default is untouched.
+        let reads = overlapping_reads(5_000, 900, 70, 50, 77);
+        let (lens, seq) = flatten(&reads);
+        let base = tile_encode(&lens, &seq, &EncodeOpts::default()).expect("default");
+        for refs in [0usize, 1] {
+            let opts = EncodeOpts {
+                tile_max_refs: refs,
+                ..EncodeOpts::default()
+            };
+            let got = tile_encode(&lens, &seq, &opts).expect("encode");
+            assert_eq!(got, base, "tile_max_refs={refs} matches the greedy default");
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
 
-        /// Arbitrary read sets round-trip exactly, at both bands.
+        /// Arbitrary read sets round-trip exactly, across bands and reference fan-out.
         #[test]
         fn prop_roundtrip_arbitrary(
             seed in any::<u64>(),
@@ -812,10 +1055,11 @@ mod tests {
             depth in 1usize..40,
             err in 0u32..120,
             band in prop::sample::select(vec![64usize, 256, 768]),
+            refs in prop::sample::select(vec![1usize, 2, 4]),
         ) {
             let reads = overlapping_reads(glen, rlen.min(glen), depth, err, seed);
             let (lens, seq) = flatten(&reads);
-            let opts = EncodeOpts { tile_band: band, ..EncodeOpts::default() };
+            let opts = EncodeOpts { tile_band: band, tile_max_refs: refs, ..EncodeOpts::default() };
             let block = tile_encode(&lens, &seq, &opts).expect("encode");
             let (dl, ds) = tile_decode(&block).expect("decode");
             prop_assert_eq!(dl, lens);

@@ -63,6 +63,19 @@ pub struct Params {
     /// Sequencing platform to record. `None` (default) auto-detects it from the
     /// leading read names; `Some(_)` forces the recorded value.
     pub platform: Option<Platform>,
+    /// Alignment band half-width for the multi-reference tiler (Nanopore long-read
+    /// blocks only — the only path that runs it). Wider bands recover more of each
+    /// read's drift against its neighbour at more alignment time. Ratio/speed only;
+    /// the block self-describes, so decode is unaffected. Default 256 (the codec's
+    /// own default); the CLI raises it at the top effort levels.
+    pub tile_band: usize,
+    /// Best-of-N reference fan-out for the multi-reference tiler (Nanopore blocks
+    /// only). At ONT coverage many earlier reads overlap a span with independent
+    /// error patterns; trying `tile_max_refs` of them and keeping the cheapest edit
+    /// script is the dominant ONT sequence-ratio lever. Ratio/speed only. Default 1
+    /// (greedy single reference); the CLI raises it at the top effort levels, `--max`
+    /// to the CoLoRd-parity operating point.
+    pub tile_max_refs: usize,
 }
 
 impl Default for Params {
@@ -79,6 +92,8 @@ impl Default for Params {
             regenerate_names: false,
             threads: 0,
             platform: None,
+            tile_band: 256,
+            tile_max_refs: 1,
         }
     }
 }

@@ -359,6 +359,19 @@ fn tile_candidate_enabled() -> bool {
     std::env::var_os("FQXV_SEQ_NO_TILE").is_none()
 }
 
+/// A positive `usize` env override for tiler tuning, or `default` when unset or
+/// unparseable. `FQXV_TILE_BAND` (alignment band) and `FQXV_TILE_REFS` (best-of-N
+/// reference fan-out) let a run A/B the tiler's ratio/speed knobs against the
+/// shipped defaults without a rebuild — both feed [`fqxv_lroverlap::tile_encode`],
+/// which self-describes, so decode is unaffected. Zero-cost when unset.
+fn tile_env(var: &str, default: usize) -> usize {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&x| x >= 1)
+        .unwrap_or(default)
+}
+
 /// The optional tiling candidate: `None` (skipping the encode entirely) when the
 /// caller's `want` flag is false or `FQXV_SEQ_NO_TILE` is set, else the
 /// method-tagged stream. The tiler builds a per-block overlap index, so it takes
@@ -368,14 +381,19 @@ fn tile_candidate(
     seq: &[u8],
     platform: Platform,
     want: bool,
+    params: &Params,
 ) -> Result<Option<Vec<u8>>> {
     if !(want && tile_candidate_enabled()) {
         return Ok(None);
     }
-    let opts = fqxv_lroverlap::EncodeOpts {
+    let mut opts = fqxv_lroverlap::EncodeOpts {
         sketch: sketch_for(platform, SeedContext::PerBlock),
         ..Default::default()
     };
+    // Band and best-of-N fan-out come from the effort level the caller resolved
+    // (`--level`/`--max`); the env vars override for rebuild-free A/B measurement.
+    opts.tile_band = tile_env("FQXV_TILE_BAND", params.tile_band);
+    opts.tile_max_refs = tile_env("FQXV_TILE_REFS", params.tile_max_refs);
     let coded = fqxv_lroverlap::tile_encode(lens, seq, &opts)?;
     let mut out = Vec::with_capacity(coded.len() + 1);
     out.push(SEQ_METHOD_TILE);
@@ -457,7 +475,7 @@ pub(crate) fn encode_sequence_stream(
     })?;
     let order_k = order_k_stream(lens, seq, params)?;
     let lzma = lzma_candidate(lens, seq, lzma_wanted(platform))?;
-    let tile = tile_candidate(lens, seq, platform, tile_wanted(platform))?;
+    let tile = tile_candidate(lens, seq, platform, tile_wanted(platform), params)?;
     // `FQXV_DIAG_SEQ` reports the per-block contest (bytes and bits/base) so
     // seeding/consensus changes can be judged against the real keep-the-smaller
     // outcome, not a proxy. Off by default, zero-cost.

@@ -497,6 +497,24 @@ fn level_to_block(level: u8) -> usize {
     }
 }
 
+/// Map a 1-9 effort level to the multi-reference tiler's `(band, max_refs)`
+/// (Nanopore long reads only — the only path that runs the tiler). Best-of-N
+/// reference selection is the dominant ONT sequence-ratio lever, so it ramps with
+/// effort: the default levels keep the cheap single-reference cover (byte-identical
+/// to what ships without this knob), the upper levels turn on best-of-N, and
+/// `--max` (level 9) reaches the CoLoRd-parity operating point — measured
+/// band 768 / best-of-4 = ~0.89 b/base on `ecoli_ont`, below CoLoRd's ~0.91, at
+/// ~6× the tiler's alignment time. Above AVX2 the alignment is already vectorised,
+/// so the cost is purely the extra candidate alignments the user opted into.
+fn level_to_tile(level: u8) -> (usize, usize) {
+    match level {
+        0..=6 => (256, 1), // codec default: single reference, current ONT speed
+        7 => (256, 2),     // best-of-2: the cheap knee (~-14% for ~1.5× tiler time)
+        8 => (256, 4),     // best-of-4 (~-19%)
+        _ => (768, 4),     // level 9 / --max: wide band + best-of-4 → CoLoRd parity
+    }
+}
+
 /// Resolve the `--threads` budget to a concrete worker count: 0 means all
 /// available cores, and any explicit request is clamped to what physically
 /// exists so we never oversubscribe. Mirrors the library's compression pool
@@ -569,6 +587,7 @@ fn main() -> anyhow::Result<()> {
             // archives still round-trip in order regardless. `shuffle` additionally
             // opts into name regeneration (reorder-lossy) for single-end input.
             let reorders = order != ReadOrder::Preserve;
+            let (tile_band, tile_max_refs) = level_to_tile(level);
             let params = fqxv::Params {
                 seq_order: level_to_order(level),
                 seq_hash_order: level_to_hash(level).0,
@@ -588,6 +607,8 @@ fn main() -> anyhow::Result<()> {
                 regenerate_names: order == ReadOrder::Shuffle,
                 threads: cli.threads,
                 platform: platform.map(Into::into),
+                tile_band,
+                tile_max_refs,
             };
             warn_redundant_binning(&inputs, params.quality_binning);
             // `--estimate` samples the input and reports a projected ratio/size
