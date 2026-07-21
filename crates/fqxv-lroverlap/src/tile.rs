@@ -53,13 +53,22 @@ use crate::codec::{
     OP_CTXS, REF_TAIL, SUB_SYMS, align_for_coding, base_code, compute_offs, encode_ops,
     encode_subs, get_stream, put_stream,
 };
-use crate::{ChainOpts, EncodeOpts, Error, Index, Op, Repeat, apply, find_overlaps};
+use crate::{ChainOpts, EncodeOpts, Error, Index, Op, Repeat, find_overlaps};
 
 /// Format tag for a tiling sequence block. Distinct from the consensus codec's
 /// `LRO`/`LRR` so a mis-dispatched block fails closed rather than mis-decodes.
 const TILE_MAGIC: [u8; 3] = *b"LRT";
 /// Bitstream version. Bump on any layout change (nothing on disk is stable yet).
 const TILE_VERSION: u8 = 1;
+
+/// Ceiling on decoded bases per coded byte, used to reject a hostile `total_bases`
+/// header before it drives the `vec![0u8; total_bases]` output allocation (issue
+/// #142). The tiler's `literals` stream must seed every distinct base at ~2
+/// bits/base, so even a pathological all-identical-reads block stays well under
+/// this (~6 K observed worst case vs the ~6 bases/byte of real ONT); it only fails
+/// a crafted length. Deliberately far below `1 << 18` so the bound also caps peak
+/// decode memory (`~3 × total_bases`) on a large hostile input, not just u64::MAX.
+const MAX_BASES_PER_BYTE: usize = 1 << 14;
 
 /// One read's contribution to the block streams: the shared edit streams plus the
 /// per-segment manifest. Accumulated per read in parallel and merged in id order,
@@ -401,10 +410,25 @@ pub fn tile_decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
     }
     let n = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
     let total_bases = read_varint(src, &mut pos).ok_or(Error::Corrupt)? as usize;
+    // Reject a header whose declared base count could not possibly fit the coded
+    // block before it drives the `vec![0u8; total_bases]` output allocation — the
+    // #142 "bound the aggregate allocation against the input" rule. Deliberately
+    // loose (a real block decodes far below this), it only fails a hostile length.
+    if total_bases
+        > src
+            .len()
+            .saturating_mul(MAX_BASES_PER_BYTE)
+            .saturating_add(MAX_BASES_PER_BYTE)
+    {
+        return Err(Error::Corrupt);
+    }
 
     let lens_raw = get_stream(src, &mut pos)?;
     let mut lp = 0usize;
-    let mut lens = Vec::with_capacity(n);
+    // `Vec::new`, not `with_capacity(n)`: `n` is an unvalidated header varint, so a
+    // capacity hint would itself be the alloc bomb. The push loop is bounded by
+    // `lens_raw` (a real stream) exhausting into `Corrupt`.
+    let mut lens = Vec::new();
     for _ in 0..n {
         let l = read_varint(&lens_raw, &mut lp).ok_or(Error::Corrupt)?;
         lens.push(u32::try_from(l).map_err(|_| Error::Corrupt)?);
@@ -463,8 +487,14 @@ pub fn tile_decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
             let marker = read_varint(&markers, &mut mp).ok_or(Error::Corrupt)?;
             if marker == 0 {
                 let ll = read_varint(&lit_lens, &mut llp).ok_or(Error::Corrupt)? as usize;
-                let seg = literals.get(litp..litp + ll).ok_or(Error::Corrupt)?;
-                litp += ll;
+                // A segment can't produce more than the read's remaining bases; the
+                // bound keeps `litp + ll` from overflowing and caps the copy.
+                if ll > want - out_read.len() {
+                    return Err(Error::Corrupt);
+                }
+                let end = litp.checked_add(ll).ok_or(Error::Corrupt)?;
+                let seg = literals.get(litp..end).ok_or(Error::Corrupt)?;
+                litp = end;
                 out_read.extend(seg.iter().map(|&c| base_of_sym(c)));
                 continue;
             }
@@ -477,6 +507,13 @@ pub fn tile_decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
             let strand = *strands.get(sp).ok_or(Error::Corrupt)? != 0;
             sp += 1;
             let tile_len = read_varint(&tile_lens, &mut tlp).ok_or(Error::Corrupt)? as usize;
+            // A tile can't produce more than the read's remaining bases. This bounds
+            // the op-replay loop and the `ops`/output allocations below against a
+            // hostile length (an all-substitution stream would otherwise loop on the
+            // never-exhausting range decoder until it OOMs).
+            if tile_len > want - out_read.len() {
+                return Err(Error::Corrupt);
+            }
             let rs = read_varint(&rs_stream, &mut rsp).ok_or(Error::Corrupt)? as usize;
 
             let nb = &seq[offs[target]..offs[target + 1]];
@@ -487,12 +524,15 @@ pub fn tile_decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
             };
             let cs = neighbour.get(rs..).ok_or(Error::Corrupt)?;
 
-            // Replay the tile's ops until it has produced `tile_len` query bases,
-            // rebuilding the substitution / insertion contexts from the neighbour.
+            // Replay the tile's ops, applying each **directly** to `out_read` — no
+            // intermediate `Vec<Op>`, so a hostile `tile_len` cannot inflate an op
+            // vector (`~32 B/op`) to OOM. `tprod` counts the query bases the ops
+            // declare; it must land exactly on `tile_len`, and the bases actually
+            // appended must match (a clamped over-long match desyncs the two).
+            let tile_start = out_read.len();
             let mut tprod = 0usize;
             let mut ref_pos = 0usize;
             let mut last = 4u8;
-            let mut ops: Vec<Op> = Vec::new();
             while tprod < tile_len {
                 let code = op_models[op_ctx].decode(&mut op_dec) as u8;
                 op_ctx = ((op_ctx << 2) | code as usize) & (OP_CTXS - 1);
@@ -500,51 +540,56 @@ pub fn tile_decode(src: &[u8]) -> Result<(Vec<u32>, Vec<u8>), Error> {
                 match code {
                     0 => {
                         let m = read_varint(&runs, &mut runp).ok_or(Error::Corrupt)? as usize;
+                        // Copy the matched reference span, clamped to what the
+                        // neighbour holds (as `apply` does). A valid tile never
+                        // overruns; a corrupt one is caught by the length check.
+                        let start = ref_pos.min(cs.len());
+                        let end = ref_pos.saturating_add(m).min(cs.len());
+                        out_read.extend_from_slice(&cs[start..end]);
                         if m > 0 {
                             last = cs.get(ref_pos + m - 1).map_or(4, |&x| base_code(x));
                         }
                         tprod += m;
                         ref_pos += m;
-                        ops.push(Op::Match(m as u32));
                     }
                     1 => {
                         let rc = cs.get(ref_pos).map_or(4, |&x| base_code(x)) as usize;
                         let vc = sub_models[rc.min(SUB_SYMS - 1)].decode(&mut sub_dec);
                         subs_seen += 1;
+                        out_read.push(base_of_sym(vc as u8));
                         tprod += 1;
                         ref_pos += 1;
                         last = vc as u8;
-                        ops.push(Op::Sub(base_of_sym(vc as u8)));
                     }
                     2 => {
                         let k = read_varint(&indel_lens, &mut dp).ok_or(Error::Corrupt)? as usize;
-                        let mut bs: Vec<u8> = Vec::with_capacity(k);
+                        // An insertion can't produce more query bases than the tile
+                        // has left, which bounds this loop against a hostile length.
+                        if k > tile_len - tprod {
+                            return Err(Error::Corrupt);
+                        }
                         for _ in 0..k {
                             let vc =
                                 ins_models[(last as usize).min(SUB_SYMS - 1)].decode(&mut ins_dec);
                             last = vc as u8;
-                            bs.push(base_of_sym(vc as u8));
+                            out_read.push(base_of_sym(vc as u8));
                         }
                         ins_seen += k;
                         tprod += k;
-                        ops.push(Op::Ins(bs));
                     }
                     3 => {
-                        let m = read_varint(&indel_lens, &mut dp).ok_or(Error::Corrupt)? as u32;
-                        ref_pos += m as usize;
-                        ops.push(Op::Del(m));
+                        let m = read_varint(&indel_lens, &mut dp).ok_or(Error::Corrupt)? as usize;
+                        ref_pos = ref_pos.saturating_add(m);
                     }
                     _ => return Err(Error::Corrupt),
                 }
             }
-            if tprod != tile_len {
+            // The ops must have declared exactly `tile_len` query bases and appended
+            // exactly that many (a valid tile never clamps a match; a corrupt one
+            // desyncs one of these two counts).
+            if tprod != tile_len || out_read.len() - tile_start != tile_len {
                 return Err(Error::Corrupt);
             }
-            let tile = apply(cs, &ops);
-            if tile.len() != tile_len {
-                return Err(Error::Corrupt);
-            }
-            out_read.extend_from_slice(&tile);
         }
         if out_read.len() != want {
             return Err(Error::Corrupt);

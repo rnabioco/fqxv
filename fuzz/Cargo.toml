@@ -20,6 +20,7 @@ fqxv-tokenizer = { path = "../crates/fqxv-tokenizer" }
 fqxv-seq = { path = "../crates/fqxv-seq" }
 fqxv-fqzcomp = { path = "../crates/fqxv-fqzcomp" }
 fqxv-reorder = { path = "../crates/fqxv-reorder" }
+fqxv-lroverlap = { path = "../crates/fqxv-lroverlap" }
 
 [profile.release]
 debug = 1
@@ -65,6 +66,13 @@ bench = false
 [[bin]]
 name = "reorder"
 path = "fuzz_targets/reorder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lroverlap"
+path = "fuzz_targets/lroverlap.rs"
 test = false
 doc = false
 bench = false
