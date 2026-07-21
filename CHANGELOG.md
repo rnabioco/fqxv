@@ -46,6 +46,21 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Performance
 
+- **Nanopore compression is ~5.5x faster** — the raw-LZMA sequence candidate
+  (`SEQ_METHOD_LZMA`) is now skipped on high-error Nanopore, where it cannot win.
+  LZMA pays off only where reads share long *exact* substrings — ordinary-coverage
+  low-error PacBio HiFi (0.60 vs the overlap codec's 1.39 b/base); on Nanopore a
+  base error every ~10 bases chops those matches short, so it reliably *loses* to
+  the overlap/order-k codecs (2.2 vs 1.79 b/base) while costing the most encode
+  time of any candidate. Because it runs on the serial block-0 probe as well as
+  the fan-out blocks, coding-and-discarding it dominated the ONT wall-clock: on a
+  600 MB E. coli ONT run compress drops **1362s → 246s with byte-identical
+  output** (LZMA was ~82% of the time and changed nothing). The gate keys off the
+  detected platform, so PacBio still codes LZMA and keeps its win, and any
+  platform where the loss can't be ruled out up front (Unknown) still codes it —
+  the never-worse ratio guarantee is unchanged. `keep_smaller` continues to floor
+  every block regardless.
+
 - **Long-read compression is ~40% faster where the shared reference wins
   outright.** Making the whole-file gate exact meant coding both layouts for
   every block, which costs a second long-read assembly per block — on PacBio
