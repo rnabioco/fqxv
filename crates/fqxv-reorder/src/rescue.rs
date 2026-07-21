@@ -427,6 +427,8 @@ pub fn decode_clustered_rescue(src: &[u8]) -> Result<Vec<Vec<u8>>> {
 
     let mut contigs: Vec<Vec<Column>> = Vec::new();
     let mut last_off: Vec<usize> = Vec::new();
+    // Running total of reconstructed bases, bounded below (see the accumulation).
+    let mut out_bases = 0usize;
 
     for i in 0..n {
         let op = *ops.get(i).ok_or(Error::Malformed("op underrun"))?;
@@ -498,6 +500,15 @@ pub fn decode_clustered_rescue(src: &[u8]) -> Result<Vec<Vec<u8>>> {
             }
             _ => return Err(Error::Malformed("unknown op")),
         }
+        // Bound aggregate reconstructed output against the per-block ceiling: MATCH
+        // clones and CONTIG copies can otherwise expand a few KB of coded streams
+        // into unbounded output. See `decode_clustered` for the full rationale.
+        out_bases = out_bases
+            .checked_add(reads.last().map_or(0, Vec::len))
+            .filter(|&t| t <= MAX_DECODED_BASES)
+            .ok_or(Error::Malformed(
+                "reconstructed output exceeds decode limit",
+            ))?;
     }
     Ok(reads)
 }

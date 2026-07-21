@@ -15,16 +15,79 @@ use rayon::prelude::*;
 use crate::{Error, Result, Sketch};
 
 /// One minimizer occurrence within the read set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+///
+/// The read index and strand are packed into one `u32` — the read in the low 31
+/// bits, the reverse-complement-canonical strand in the high bit — so `Occ` is 16
+/// bytes rather than the 24 a separate `u32` + `bool` would take (the trailing
+/// `bool` pads the struct out to a third 8-byte word). `occs` is the dominant
+/// allocation of the whole overlap path — order a gigabyte on a large ONT block —
+/// so that saved third is real peak memory. Block read counts are far below
+/// `2^31`, so the high bit is always free. Read the fields via [`Occ::read`] and
+/// [`Occ::strand`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Occ {
     /// Hash of the canonical k-mer.
     pub hash: u64,
-    /// Index of the read carrying it.
-    pub read: u32,
+    /// Read index (low 31 bits) and strand (high bit); see [`Occ::read`] and
+    /// [`Occ::strand`].
+    read_strand: u32,
     /// Offset of the k-mer within that read.
     pub pos: u32,
+}
+
+/// High bit of `Occ::read_strand`: the reverse-complement-canonical strand flag.
+const OCC_STRAND_BIT: u32 = 1 << 31;
+/// Low 31 bits of `Occ::read_strand`: the read index.
+const OCC_READ_MASK: u32 = OCC_STRAND_BIT - 1;
+
+impl Occ {
+    /// Pack a read index and strand flag into an occurrence.
+    #[inline]
+    fn new(hash: u64, read: u32, pos: u32, strand: bool) -> Self {
+        debug_assert!(read <= OCC_READ_MASK, "read index must fit in 31 bits");
+        let read_strand = (read & OCC_READ_MASK) | if strand { OCC_STRAND_BIT } else { 0 };
+        Occ {
+            hash,
+            read_strand,
+            pos,
+        }
+    }
+
+    /// Index of the read carrying this occurrence.
+    #[must_use]
+    #[inline]
+    pub fn read(&self) -> u32 {
+        self.read_strand & OCC_READ_MASK
+    }
+
     /// True when the reverse-complement orientation was canonical here.
-    pub strand: bool,
+    #[must_use]
+    #[inline]
+    pub fn strand(&self) -> bool {
+        self.read_strand & OCC_STRAND_BIT != 0
+    }
+}
+
+impl Ord for Occ {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Preserve the previous *derived* order over (hash, read, pos, strand) so
+        // the sorted `occs` layout — and every archive derived from it — stays
+        // byte-identical despite the packing. `read_strand` must NOT be compared
+        // raw: the strand bit sits above the read bits, so a raw compare would
+        // order by strand before read.
+        self.hash
+            .cmp(&other.hash)
+            .then_with(|| self.read().cmp(&other.read()))
+            .then_with(|| self.pos.cmp(&other.pos))
+            .then_with(|| self.strand().cmp(&other.strand()))
+    }
+}
+
+impl PartialOrd for Occ {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// How aggressively to discard repetitive minimizers.
@@ -108,19 +171,14 @@ impl Index {
                 sketch
                     .seeds(s)
                     .into_iter()
-                    .map(|m| Occ {
-                        hash: m.hash,
-                        read: r as u32,
-                        pos: m.pos,
-                        strand: m.strand,
-                    })
+                    .map(|m| Occ::new(m.hash, r as u32, m.pos, m.strand))
                     .collect()
             })
             .collect();
 
         let mut occs: Vec<Occ> = per_read.into_iter().flatten().collect();
-        // Total order on the whole struct (derived Ord: hash, read, pos, strand)
-        // — so ties cannot depend on sort stability or thread count.
+        // Total order over (hash, read, pos, strand) via `Occ`'s manual `Ord` — so
+        // ties cannot depend on sort stability or thread count.
         occs.par_sort_unstable();
 
         // Repeat control. Count occurrences per distinct hash, then drop the
@@ -283,7 +341,7 @@ mod tests {
         let single = Sketch::ont().seeds(&r);
         for m in &single {
             let occ = idx.query(m.hash);
-            let reads: Vec<u32> = occ.iter().map(|o| o.read).collect();
+            let reads: Vec<u32> = occ.iter().map(|o| o.read()).collect();
             assert!(
                 reads.contains(&0) && reads.contains(&1),
                 "hash {} must occur in both copies",

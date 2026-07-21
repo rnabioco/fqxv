@@ -225,7 +225,7 @@ mod tests {
         let mut anchors: Vec<Anchor> = Vec::new();
         for m in sk.seeds(query) {
             for o in idx.query(m.hash) {
-                if o.read == 0 && o.strand == m.strand {
+                if o.read() == 0 && o.strand() == m.strand {
                     anchors.push(Anchor {
                         tpos: o.pos,
                         qpos: m.pos,
