@@ -13,7 +13,7 @@ Where each lever stands:
 | Quality base-context (long-read) | **shipped** — sequence-conditioned context-mixing took HiFi quality *below* CoLoRd |
 | Overlap sequence codec (`fqxv-lroverlap`) | **shipped** — auto-selected for long-read blocks, kept only when it beats order-k; a shared whole-file reference codes the HiFi sequence stream ~10× smaller. See [Wiring](#wiring-and-the-per-block-coverage-cap). |
 | Raw-LZMA sequence method | **shipped** — ordinary-coverage long reads (Revio WGS: seq 1.39 → 0.68 bits/base, archive 9.7× → 17×). |
-| Multi-reference tiling (Nanopore) | **shipped** — best-of-N references at `-l9`/`--max`; ONT seq 1.15 → 0.92 bits/base, total to CoLoRd parity. |
+| Multi-reference tiling + anchor-restricted coding (Nanopore) | **shipped** — best-of-N references at `-l9`/`--max`, align only inter-anchor gaps (#231); ONT seq 1.15 → 0.89 bits/base, total ahead of CoLoRd. |
 
 The rest of this note is the analysis that set those priorities; it is written
 against the pre-`lroverlap` baseline, so the "fqxv seq" rows below are the
@@ -91,7 +91,7 @@ archive. Each column above now comes from the same pair of runs.
 | tool | total | non-quality (seq+names) | qual | non-quality bits/base |
 | --- | --- | --- | --- | --- |
 | CoLoRd `-q org` | 197.9M | **31.4M** | 166.5M | 0.84 |
-| fqxv `-l9` (tiling) | 198.2M | **34.5M** (seq) | 163.7M | 0.92 |
+| fqxv `-l9` (tiling + anchor-gap) | **197.1M** | 33.4M (seq) | 163.7M | 0.89 |
 
 **`ecoli_hifi`** (SRR11434954 subset, 1.55G bases, mean Q≈27, ~300× — narrow
 high-Q, low error):
@@ -108,14 +108,14 @@ Two facts, confirmed on **both** platforms:
    CoLoRd's 684.3M** (~6% smaller) and ONT to **163.7M vs 166.5M** (~2% smaller).
    Quality is a *credit* against CoLoRd on both sets — enough to carry the HiFi
    lossless total ahead of CoLoRd (656.0M vs 697.7M), and on ONT to net the total
-   to within 0.2% once the sequence lever lands. Lever 1 has flipped in fqxv's
+   ahead of CoLoRd once the sequence lever lands. Lever 1 has flipped in fqxv's
    favor.
 2. **The sequence stream — once the whole gap — is now closed on high-coverage
    HiFi and near-closed on ONT.** HiFi Sequel II: the shared whole-file reference
    codes seq to **0.065 vs CoLoRd's 0.069** — a *credit* (see Lever 2). ONT: the
-   multi-reference tiling codec brings seq to **0.92 vs ~0.84** (34.5M vs 31.4M,
-   ~10% behind), small enough that the quality credit nets the total to parity
-   (3.05× each). The one regime the within-read model still loses badly is
+   multi-reference tiling codec plus anchor-restricted coding (#231, align only
+   inter-anchor gaps) brings seq to **0.89 vs ~0.84** (33.4M vs 31.4M, ~6% behind),
+   and the quality credit nets the total **ahead of CoLoRd** (3.06× vs 3.05×). The one regime the within-read model still loses badly is
    **ordinary-coverage HiFi** (Revio WGS): a real genome at typical depth carries
    exact cross-read matches the voted consensus can't reach, closed by the
    raw-LZMA method (seq **1.39 → 0.68 bits/base**, archive **9.7× → 17×**). All
@@ -321,9 +321,10 @@ fails closed — it has no access to the frame. See issue #168.
 ### Cost / benefit
 
 The benchmark settled the priority, and the levers delivered. On ONT the tiling
-codec took the sequence stream from 58.8M (the old within-read baseline) to 34.5M
-— against CoLoRd's 31.4M — so the once-decisive gap is down to ~3M, and the quality
-credit nets the total to parity. On HiFi the shared whole-file reference made
+codec plus anchor-restricted coding took the sequence stream from 58.8M (the old
+within-read baseline) to 33.4M — against CoLoRd's 31.4M — so the once-decisive gap
+is down to ~2M, and the quality credit nets the total ahead of CoLoRd. On HiFi the
+shared whole-file reference made
 sequence a *credit* (0.065 vs 0.069), and on ordinary-coverage HiFi the raw-LZMA
 method halved it (1.39 → 0.68 bits/base). The remaining ONT headroom is
 consensus/reference quality — coding against another erroneous read carries *both*
@@ -343,8 +344,9 @@ reads' errors — not the coverage available to it.
    Two more per-block sequence methods joined it (each kept only when smallest):
    **raw large-window LZMA** for ordinary-coverage long reads — the Revio WGS lever
    that took that archive from 9.7× to 17× — and **multi-reference tiling** for
-   Nanopore, coding each read against earlier raw reads (best-of-N at `-l9`/`--max`),
-   which brought ONT to CoLoRd parity. What remains is consensus *quality* on ONT —
+   Nanopore, coding each read against earlier raw reads (best-of-N at `-l9`/`--max`)
+   and aligning only inter-anchor gaps (#231), which brought ONT ahead of CoLoRd.
+   What remains is consensus *quality* on ONT —
    the draft consensus still sits above a raw read's error rate, which bounds how far
    tiling and the reference path can go.
 3. Quality base-context (rest of Lever 1) — **shipped**, and it overshot the

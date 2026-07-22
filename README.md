@@ -22,16 +22,17 @@ Best lossless ratio per platform, against the strongest alternative for that dat
 | Illumina GAIIx (full-range quality) | **11.6×** | SPRING 10.0× | 3.7× |
 | Illumina MiSeq (*E. coli* WGS) | **7.4×** | SPRING 7.3× | 2.9× |
 | PacBio HiFi (*E. coli*, ~300×) | **4.7×** | CoLoRd 4.4× | 2.3× |
-| Oxford Nanopore (MinION) | 3.05× | CoLoRd 3.05× | 1.9× |
+| Oxford Nanopore (MinION) | **3.06×** | CoLoRd 3.05× | 1.9× |
 
 The Illumina rows use `--order shuffle`, which reorders reads and renumbers names —
 the same trade SPRING's own mode makes, so the comparison is like-for-like; the
 Nanopore row uses `--max`. Fully order-preserving and default-effort numbers are in
 the [benchmarks](docs/benchmarks.md).
 
-fqxv now reaches **parity with CoLoRd on Nanopore** (3.05× each): its ONT *quality*
-stream is already the smaller of the two, and a new best-of-N tiling sequence codec
-(engaged at `-l9`/`--max`) closes the cross-read sequence gap that used to trail. On
+fqxv now **edges ahead of CoLoRd on Nanopore** (3.06× vs 3.05×): its ONT *quality*
+stream is already the smaller of the two, and a best-of-N tiling sequence codec with
+anchor-restricted coding (engaged at `-l9`/`--max`) closes the cross-read sequence
+gap that used to trail. On
 HiFi at ~300× fqxv leads on every stream; on a modern Revio WGS run at ordinary
 coverage, a new raw-LZMA sequence path nearly doubled fqxv's ratio (9.7× → 17×),
 landing just behind CoLoRd — see the [benchmarks](docs/benchmarks.md).
