@@ -401,6 +401,59 @@ fn tile_candidate(
     Ok(Some(out))
 }
 
+/// Whether to code the per-block overlap-**consensus** candidate
+/// ([`SEQ_METHOD_OVERLAP`]).
+///
+/// The overlap codec assembles a *voted consensus* from the block's own reads and
+/// codes each read against it. On low-error platforms that consensus is clean, so
+/// the candidate is competitive and is coded (and kept when it wins). On Nanopore
+/// (~10% error) the consensus is itself divergent, so the tiler — which codes each
+/// read against its raw neighbour reads rather than a vote — reliably beats it
+/// (1.207 vs 1.970 b/base measured, #221) and order-k floors the block regardless.
+/// The overlap candidate is then only ever coded and discarded there, at the cost
+/// of a full overlap search plus a consensus assembly — ~20-30% of ONT compress at
+/// the default level (#221). Skip it. This is the mirror image of [`tile_wanted`]
+/// (Nanopore-only): overlap runs on every platform *but* Nanopore, the tiler only
+/// on Nanopore, so exactly one of the two ever runs per block — the discarded
+/// candidate is never coded, not merely thrown away.
+fn overlap_wanted(platform: Platform) -> bool {
+    !matches!(platform, Platform::Nanopore)
+}
+
+/// Whether the overlap-consensus candidate is enabled at all.
+/// `FQXV_SEQ_NO_OVERLAP` disables it — for A/B measurement of the overlap lever, and
+/// for tests that must exercise a layout the overlap codec would otherwise win. Off
+/// by default (overlap on for non-Nanopore), zero-cost when unset.
+fn overlap_candidate_enabled() -> bool {
+    std::env::var_os("FQXV_SEQ_NO_OVERLAP").is_none()
+}
+
+/// The optional overlap-consensus candidate: `None` (skipping the encode entirely)
+/// when the caller's `want` flag is false or `FQXV_SEQ_NO_OVERLAP` is set, else the
+/// method-tagged [`SEQ_METHOD_OVERLAP`] stream. `want` is [`overlap_wanted`] of the
+/// block's platform — the overlap encode assembles a per-block consensus (a full
+/// overlap search plus voting), so on Nanopore where it cannot win we skip it rather
+/// than code-and-discard.
+fn overlap_candidate(
+    lens: &[u32],
+    seq: &[u8],
+    platform: Platform,
+    want: bool,
+) -> Result<Option<Vec<u8>>> {
+    if !(want && overlap_candidate_enabled()) {
+        return Ok(None);
+    }
+    let opts = fqxv_lroverlap::EncodeOpts {
+        sketch: sketch_for(platform, SeedContext::PerBlock),
+        ..Default::default()
+    };
+    let coded = fqxv_lroverlap::encode(lens, seq, &opts)?;
+    let mut out = Vec::with_capacity(coded.len() + 1);
+    out.push(SEQ_METHOD_OVERLAP);
+    out.extend_from_slice(&coded);
+    Ok(Some(out))
+}
+
 pub(crate) fn order_k_stream(lens: &[u32], seq: &[u8], params: &Params) -> Result<Vec<u8>> {
     let plain = fqxv_seq::encode(lens, seq, params.seq_order as usize)?;
 
@@ -457,39 +510,36 @@ pub(crate) fn encode_sequence_stream(
     // LZMA catches the cross-read *exact* matches a real genome at ordinary coverage
     // carries; and the tiler codes reads against earlier raw reads (the ONT lever,
     // Nanopore-only — the same platform that reaches this plain path post-#211).
-    // LZMA and tiling gate to disjoint platforms, so at most one of the two ever
-    // runs; the extra candidate is never a doubled cost.
-    let opts = fqxv_lroverlap::EncodeOpts {
-        sketch: sketch_for(platform, SeedContext::PerBlock),
-        ..Default::default()
-    };
+    // The overlap-consensus, LZMA, and tiling candidates each gate off the platform
+    // where they cannot win, and their gates are disjoint (overlap: not Nanopore;
+    // LZMA: not Nanopore; tiler: Nanopore only), so a Nanopore block codes only
+    // order-k + the tiler and every other platform codes only order-k + overlap
+    // (+ LZMA) — the discarded candidate is never coded, not merely thrown away.
+    //
     // Sequential, not a `rayon::join` fan, so the overlap assembly's working set
     // and the LZMA `prev` array are not resident at once — see the same rationale
     // in `encode_sequence_stream_shared`. Byte-identical (keep_smaller is
-    // order-independent); the overlap assembly parallelizes internally.
-    let overlap = fqxv_lroverlap::encode(lens, seq, &opts).map(|coded| {
-        let mut out = Vec::with_capacity(coded.len() + 1);
-        out.push(SEQ_METHOD_OVERLAP);
-        out.extend_from_slice(&coded);
-        out
-    })?;
+    // order-independent); each candidate parallelizes internally.
+    let overlap = overlap_candidate(lens, seq, platform, overlap_wanted(platform))?;
     let order_k = order_k_stream(lens, seq, params)?;
     let lzma = lzma_candidate(lens, seq, lzma_wanted(platform))?;
     let tile = tile_candidate(lens, seq, platform, tile_wanted(platform), params)?;
     // `FQXV_DIAG_SEQ` reports the per-block contest (bytes and bits/base) so
     // seeding/consensus changes can be judged against the real keep-the-smaller
-    // outcome, not a proxy. Off by default, zero-cost.
+    // outcome, not a proxy. Off by default, zero-cost. A gated-off candidate reports
+    // `usize::MAX` bytes (an astronomically large b/base), the "did not run" signal.
     if std::env::var_os("FQXV_DIAG_SEQ").is_some() {
         let bases: u64 = lens.iter().map(|&l| u64::from(l)).sum::<u64>().max(1);
         let bpb = |n: usize| (n as f64 * 8.0) / bases as f64;
+        let overlap_len = overlap.as_ref().map_or(usize::MAX, Vec::len);
         let lzma_len = lzma.as_ref().map_or(usize::MAX, Vec::len);
         let tile_len = tile.as_ref().map_or(usize::MAX, Vec::len);
         eprintln!(
             "[diag seq] {} reads, {} bases | overlap {} B ({:.3} b/base) | order-k {} B ({:.3} b/base) | lzma {} B ({:.3} b/base) | tile {} B ({:.3} b/base)",
             lens.len(),
             bases,
-            overlap.len(),
-            bpb(overlap.len()),
+            overlap_len,
+            bpb(overlap_len),
             order_k.len(),
             bpb(order_k.len()),
             lzma_len,
@@ -498,7 +548,11 @@ pub(crate) fn encode_sequence_stream(
             bpb(tile_len),
         );
     }
-    let mut plain = keep_smaller(overlap, order_k);
+    // order-k is the always-present floor; every other candidate can only shrink it.
+    let mut plain = order_k;
+    if let Some(o) = overlap {
+        plain = keep_smaller(o, plain);
+    }
     if let Some(l) = lzma {
         plain = keep_smaller(l, plain);
     }
