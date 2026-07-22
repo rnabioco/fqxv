@@ -13,6 +13,22 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ## [Unreleased]
 
+### Performance
+
+- **Lower peak memory on Nanopore compression — the whole-input buffer is gone.**
+  `compress_auto` routed every long-read input to a buffered path that held the
+  entire file in memory to build the whole-file shared reference (#168). #211
+  disabled that reference on high-error Nanopore, leaving the buffer as dead
+  weight there. Explicit-Nanopore single-end input now takes the streaming path
+  instead (one block in flight, not the whole file): heap-profiling put the buffer
+  at ~25% of peak, and on a 600 MB ONT file peak RSS drops **3.72 GB → 2.91 GB**
+  (−22%). The archive is **byte-identical** — streaming cuts blocks at the same
+  `MAX_BLOCK_SEQ_BYTES` budget and, with no shared reference, each Nanopore block
+  codes with the same plain per-block codec either way (verified by `cmp` and the
+  determinism round-trips). HiFi still buffers (its shared reference pays off); an
+  auto-detected ONT set without `--platform` also still buffers, since the
+  streaming path detects platform from read names (issue #225).
+  
 ### Changed
 
 - **Long-read compress is faster at identical output.** Two changes cut compress
