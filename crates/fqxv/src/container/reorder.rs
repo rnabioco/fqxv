@@ -127,6 +127,15 @@ pub(crate) fn encode_reordered<W: Write>(
     params: Params,
     group_size: u8,
 ) -> Result<Stats> {
+    // The whole-file reorder layout codes quality in its own stream partition and
+    // has no sequence-only variant yet, so the two modes are mutually exclusive.
+    // The CLI rejects the combination up front; this fails closed for library
+    // callers that set both.
+    if params.no_quality {
+        return Err(Error::Malformed(
+            "no_quality is not supported with the reorder layout",
+        ));
+    }
     // Long-read data: reorder buys nothing (the non-reorder deep-context path is
     // smaller on nanopore/PacBio) for ~10x the time and ~6x the memory. Fall back
     // to the non-reorder layout, keeping the requested effort level — its hashed

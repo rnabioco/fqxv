@@ -747,7 +747,14 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params, platform: Platform) 
                 // Hand the bases to the quality coder: on long reads it conditions
                 // quality on sequence (base + next + homopolymer run); on short
                 // reads it ignores them and codes the position context as before.
-                || fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning),
+                // In sequence-only mode quality is dropped, so the stream is empty.
+                || {
+                    if params.no_quality {
+                        Ok(Vec::new())
+                    } else {
+                        fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning)
+                    }
+                },
             )
         },
     );
@@ -769,7 +776,13 @@ pub(crate) fn compress_block_with_seq(
     let header_refs = b.header_refs();
     let (names_c, qual_c) = rayon::join(
         || fqxv_tokenizer::encode(&header_refs),
-        || fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning),
+        || {
+            if params.no_quality {
+                Ok(Vec::new())
+            } else {
+                fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning)
+            }
+        },
     );
     let (names_c, qual_c) = (names_c?, qual_c?);
     assemble_block_payload(b, &names_c, precoded_seq, &qual_c, params)
@@ -790,9 +803,15 @@ fn assemble_block_payload(
     // End-to-end round-trip check: digest the block's decoded content (post-binning
     // quality, so lossy archives verify against what they emit) and store it at the
     // head of the payload. Lossless is the common case and borrows without a copy.
-    let binned: Cow<[u8]> = match params.quality_binning {
-        QualityBinning::Lossless => Cow::Borrowed(&b.qual),
-        binning => Cow::Owned(b.qual.iter().map(|&q| binning.apply(q)).collect()),
+    // Sequence-only archives drop quality entirely, so its digest is over the empty
+    // slice — exactly what the decoder reconstructs from the empty quality stream.
+    let binned: Cow<[u8]> = if params.no_quality {
+        Cow::Borrowed(&[])
+    } else {
+        match params.quality_binning {
+            QualityBinning::Lossless => Cow::Borrowed(&b.qual),
+            binning => Cow::Owned(b.qual.iter().map(|&q| binning.apply(q)).collect()),
+        }
     };
     let digests = stream_digests(
         b.n_reads(),
@@ -906,11 +925,19 @@ pub(crate) fn decode_block_parts(
     // bases, so decode the sequence first and feed it in. Short-read quality is
     // sequence-blind, so keep decoding the two streams in parallel — the common
     // case pays nothing for this. Peek the quality header to tell them apart.
-    let seq_first = fqxv_fqzcomp::needs_sequence(qual_s);
+    // A sequence-only (`no_quality`) archive stores an empty quality stream: there
+    // is nothing to decode, so reconstruct empty quality and code only the sequence.
+    let no_qual = qual_s.is_empty();
+    let seq_first = !no_qual && fqxv_fqzcomp::needs_sequence(qual_s);
     let (names, (seq_r, qual_r)) = rayon::join(
         || fqxv_tokenizer::decode(names_s),
         || {
-            if seq_first {
+            if no_qual {
+                (
+                    decode_sequence_stream(seq_s, shared_ref),
+                    Ok((Vec::new(), Vec::new())),
+                )
+            } else if seq_first {
                 let seq_r = decode_sequence_stream(seq_s, shared_ref);
                 let qual_r = match &seq_r {
                     Ok((_, seq)) => fqxv_fqzcomp::decode_seq(qual_s, seq),
@@ -968,9 +995,31 @@ pub(crate) fn write_record(out: &mut Vec<u8>, name: &[u8], seq: &[u8], qual: &[u
     out.push(b'\n');
 }
 
+/// Write one FASTA record (`>name\nseq\n`) — the sequence-only (`no_quality`)
+/// reconstruction, which has no quality line and so no `+` separator.
+pub(crate) fn write_record_fasta(out: &mut Vec<u8>, name: &[u8], seq: &[u8]) {
+    out.push(b'>');
+    out.extend_from_slice(name);
+    out.push(b'\n');
+    out.extend_from_slice(seq);
+    out.push(b'\n');
+}
+
+/// Bounds-checked sequence slice for one read at `off..off+l`, the FASTA
+/// counterpart of [`read_slices`] (no quality buffer to slice in parallel).
+pub(crate) fn seq_slice(seq: &[u8], off: usize, l: usize) -> Result<&[u8]> {
+    let end = off
+        .checked_add(l)
+        .ok_or(Error::Malformed("read length overflow"))?;
+    seq.get(off..end).ok_or(Error::Malformed(
+        "sequence shorter than declared read lengths",
+    ))
+}
+
 pub(crate) fn decode_block(
     buf: &[u8],
     shared_ref: Option<&fqxv_lroverlap::Reference>,
+    no_quality: bool,
 ) -> Result<(u64, Vec<u8>)> {
     let (n_reads, names, lens, seq, qual) = decode_block_parts(buf, shared_ref)?;
     let mut out = Vec::with_capacity(seq.len() * 2 + qual.len());
@@ -979,8 +1028,12 @@ pub(crate) fn decode_block(
         let l = lens[i] as usize;
         // Checked slicing: a block whose per-read lengths overrun the decoded
         // sequence/quality buffers is malformed, not a reason to panic.
-        let (s, q) = read_slices(&seq, &qual, off, l)?;
-        write_record(&mut out, &names[i], s, q);
+        if no_quality {
+            write_record_fasta(&mut out, &names[i], seq_slice(&seq, off, l)?);
+        } else {
+            let (s, q) = read_slices(&seq, &qual, off, l)?;
+            write_record(&mut out, &names[i], s, q);
+        }
         off += l;
     }
     Ok((n_reads as u64, out))
@@ -1019,6 +1072,7 @@ pub(crate) fn decode_block_group(
     buf: &[u8],
     g: usize,
     shared_ref: Option<&fqxv_lroverlap::Reference>,
+    no_quality: bool,
 ) -> Result<(u64, Vec<Vec<u8>>)> {
     let (n_reads, names, lens, seq, qual) = decode_block_parts(buf, shared_ref)?;
     if !n_reads.is_multiple_of(g) {
@@ -1030,8 +1084,12 @@ pub(crate) fn decode_block_group(
     let mut off = 0usize;
     for i in 0..n_reads {
         let l = lens[i] as usize;
-        let (s, q) = read_slices(&seq, &qual, off, l)?;
-        write_record(&mut outs[i % g], &names[i], s, q);
+        if no_quality {
+            write_record_fasta(&mut outs[i % g], &names[i], seq_slice(&seq, off, l)?);
+        } else {
+            let (s, q) = read_slices(&seq, &qual, off, l)?;
+            write_record(&mut outs[i % g], &names[i], s, q);
+        }
         off += l;
     }
     Ok((n_reads as u64, outs))

@@ -33,6 +33,8 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
     // right after the header, and thread it into every block's sequence decode.
     let reference = read_reference_frame(&mut r, header.flags)?;
     let reference = reference.as_ref();
+    // Sequence-only archives store an empty quality stream and reconstruct FASTA.
+    let no_quality = header.required_features & crate::feature::NO_QUALITY != 0;
     let mut w = BufWriter::new(writer);
 
     debug!(
@@ -47,7 +49,7 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
         let decoded: Vec<Result<(u64, Vec<u8>)>> = pool.install(|| {
             raw_blocks
                 .par_iter()
-                .map(|b| decode_block(b, reference))
+                .map(|b| decode_block(b, reference, no_quality))
                 .collect()
         });
         for d in decoded {
@@ -64,12 +66,13 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
     Ok(stats)
 }
 
-/// A [`Write`] sink that folds a decoded interleaved-FASTQ stream into
+/// A [`Write`] sink that folds a decoded interleaved-FASTQ (or FASTA) stream into
 /// [`ContentStats`] on the fly. Fed by [`content_stats`] as the decompressor's
-/// output writer, it parses the four-line records incrementally — buffering only
-/// the current line — so a multi-GB archive is summarized without ever holding
-/// the decoded FASTQ in memory. Record lines cycle name → sequence → `+` →
-/// quality; only sequence and quality are inspected.
+/// output writer, it parses records incrementally — buffering only the current
+/// line — so a multi-GB archive is summarized without ever holding the decoded
+/// output in memory. FASTQ record lines cycle name → sequence → `+` → quality;
+/// a sequence-only (`no_quality`) archive emits FASTA (name → sequence), detected
+/// from the first header byte (`>` vs `@`). Only sequence and quality are inspected.
 #[derive(Default)]
 pub(crate) struct StatsSink {
     stats: ContentStats,
@@ -77,6 +80,9 @@ pub(crate) struct StatsSink {
     line: Vec<u8>,
     /// Which line of the current record we are on: 0 name, 1 seq, 2 `+`, 3 qual.
     line_no: u8,
+    /// Lines per record: 4 for FASTQ, 2 for FASTA. `0` until the first header line
+    /// picks it from the leading byte.
+    modulus: u8,
     /// Whether any read has been counted (so `min_len` starts from the first).
     seen: bool,
 }
@@ -88,6 +94,11 @@ impl StatsSink {
         let mut line = &self.line[..];
         if line.last() == Some(&b'\r') {
             line = &line[..line.len() - 1];
+        }
+        if self.modulus == 0 {
+            // First line of the stream is a record header: `>` marks FASTA
+            // (two-line, sequence-only) records, `@` marks four-line FASTQ.
+            self.modulus = if line.first() == Some(&b'>') { 2 } else { 4 };
         }
         match self.line_no {
             1 => {
@@ -124,7 +135,7 @@ impl StatsSink {
             _ => {} // name / `+` line: ignored
         }
         self.line.clear();
-        self.line_no = (self.line_no + 1) % 4;
+        self.line_no = (self.line_no + 1) % self.modulus;
     }
 }
 
@@ -196,6 +207,7 @@ pub fn decompress_split<R: Read, W: Write>(
 
     let reference = read_reference_frame(&mut r, header.flags)?;
     let reference = reference.as_ref();
+    let no_quality = header.required_features & crate::feature::NO_QUALITY != 0;
     debug!(
         threads = pool.current_num_threads(),
         batch,
@@ -209,7 +221,7 @@ pub fn decompress_split<R: Read, W: Write>(
         let decoded: Vec<Result<(u64, Vec<Vec<u8>>)>> = pool.install(|| {
             raw_blocks
                 .par_iter()
-                .map(|b| decode_block_group(b, g, reference))
+                .map(|b| decode_block_group(b, g, reference, no_quality))
                 .collect()
         });
         for d in decoded {
@@ -276,16 +288,17 @@ pub fn decompress_recover<R: Read + Seek, W: Write>(
     // its blocks then simply won't decode and are skipped like any other bad block.
     let reference = read_reference_frame(&mut r, header.flags)?;
     let reference = reference.as_ref();
+    let no_quality = header.required_features & crate::feature::NO_QUALITY != 0;
     // Prefer the footer's row-group index — it carries per-group read counts, so
     // losses can be tallied exactly. If the footer is unreadable (the common
     // truncated-tail case, which also loses the trailing blocks), fall back to
     // scanning for block sync markers: that needs no index and resynchronizes past
     // a corrupt length prefix or a bad block.
     let rec = match read_footer(&mut r) {
-        Ok(footer) => recover_via_footer(&mut r, &pool, &footer, writer, reference)?,
+        Ok(footer) => recover_via_footer(&mut r, &pool, &footer, writer, reference, no_quality)?,
         Err(footer_err) => {
             debug!(error = %footer_err, "footer unreadable; scanning for block markers");
-            recover_via_scan(&mut r, &pool, writer, reference)?
+            recover_via_scan(&mut r, &pool, writer, reference, no_quality)?
         }
     };
     info!(
@@ -305,6 +318,7 @@ fn recover_via_footer<R: Read + Seek, W: Write>(
     footer: &Footer,
     writer: W,
     reference: Option<&fqxv_lroverlap::Reference>,
+    no_quality: bool,
 ) -> Result<Recovery> {
     let mut rec = Recovery::default();
     let mut w = BufWriter::new(writer);
@@ -314,7 +328,7 @@ fn recover_via_footer<R: Read + Seek, W: Write>(
         // any failure — bad marker/CRC, truncation, or a decode error — drops just
         // this group.
         let outcome = match read_block(r, i as u64) {
-            Ok(Some(payload)) => pool.install(|| decode_block(&payload, reference)),
+            Ok(Some(payload)) => pool.install(|| decode_block(&payload, reference, no_quality)),
             Ok(None) => Err(Error::Malformed(
                 "row-group offset points at the terminator",
             )),
@@ -354,6 +368,7 @@ fn recover_via_scan<R: Read + Seek, W: Write>(
     pool: &rayon::ThreadPool,
     writer: W,
     reference: Option<&fqxv_lroverlap::Reference>,
+    no_quality: bool,
 ) -> Result<Recovery> {
     r.seek(SeekFrom::Start(HEADER_LEN as u64))?;
     let mut region = Vec::new();
@@ -370,7 +385,7 @@ fn recover_via_scan<R: Read + Seek, W: Write>(
         let m = pos + rel;
         match read_frame_at(&region, m) {
             Some((len, payload)) => {
-                match pool.install(|| decode_block(payload, reference)) {
+                match pool.install(|| decode_block(payload, reference, no_quality)) {
                     Ok((reads, fastq)) => {
                         w.write_all(&fastq)?;
                         rec.stats.reads += reads;

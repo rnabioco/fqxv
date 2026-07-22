@@ -74,7 +74,9 @@ pub const FORMAT_MAJOR: u8 = 1;
 /// skippable header extension record, or a new optional codec/mode gated by a
 /// [`feature`] bit. A reader tolerates any minor within its [`FORMAT_MAJOR`]; the
 /// value is informational (surfaced by `inspect`).
-pub const FORMAT_MINOR: u8 = 0;
+///
+/// `1` added the sequence-only (`no_quality`) mode, gated by [`feature::NO_QUALITY`].
+pub const FORMAT_MINOR: u8 = 1;
 
 /// Coarse capability bits an archive can require in its header `required_features`
 /// word. A reader that sees a set bit outside [`KNOWN_FEATURES`] refuses the
@@ -88,12 +90,19 @@ pub mod feature {
     /// (SPRING-style); a reader without that decode path cannot reconstruct the
     /// referenced sequence blocks.
     pub const GLOBAL_REFERENCE: u64 = 1 << 0;
+
+    /// The archive stores sequence only — quality was discarded at compress time
+    /// (the quality stream is empty in every block) and decode emits **FASTA**, not
+    /// FASTQ. An explicitly-lossy, opt-in mode: a reader without it would
+    /// reconstruct records with no quality line and mis-frame the output, so it
+    /// must refuse rather than mis-decode.
+    pub const NO_QUALITY: u64 = 1 << 1;
 }
 
 /// The union of every [`feature`] bit this build understands. A `required_features`
 /// word with any bit outside this mask is rejected by
 /// `read_header`.
-pub const KNOWN_FEATURES: u64 = feature::GLOBAL_REFERENCE;
+pub const KNOWN_FEATURES: u64 = feature::GLOBAL_REFERENCE | feature::NO_QUALITY;
 
 /// Errors returned by the archiver.
 #[derive(Debug, Error)]

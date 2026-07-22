@@ -157,10 +157,17 @@ pub(crate) fn write_header<W: Write>(
     // The block layout is always non-reorder — reorder (both keep-order modes)
     // uses the whole-file path, which writes its own header.
     debug_assert!(!params.reorder);
-    // The plain layout needs nothing beyond the base format for its major: any
-    // per-block codec choice (e.g. the long-read overlap codec) is recorded by the
-    // sequence stream's method byte and rejected per block on decode, not gated
-    // here. So the coarse feature word is empty.
+    // The plain layout needs nothing beyond the base format for its major, with one
+    // exception: sequence-only (`no_quality`) archives set the coarse
+    // `NO_QUALITY` feature bit so an older reader refuses them rather than
+    // reconstructing quality-less records into mis-framed FASTQ. Per-block codec
+    // choices (e.g. the long-read overlap codec) are still recorded by the sequence
+    // stream's method byte and rejected per block on decode, not gated here.
+    let required_features = if params.no_quality {
+        crate::feature::NO_QUALITY
+    } else {
+        0
+    };
     write_header_prefix(
         w,
         params.seq_order,
@@ -168,7 +175,7 @@ pub(crate) fn write_header<W: Write>(
         FLAG_PLUS_NORMALIZED,
         group_size,
         platform,
-        0,
+        required_features,
     )
 }
 
@@ -725,6 +732,15 @@ mod header_tests {
             read_header(&mut Cursor::new(&buf)),
             Err(Error::UnsupportedFeature(bits)) if bits == unknown
         ));
+    }
+
+    #[test]
+    fn accepts_no_quality_feature() {
+        // A current reader knows NO_QUALITY and must accept it, surfacing the bit;
+        // a reader without it in KNOWN_FEATURES refuses via the mechanism above.
+        let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, crate::feature::NO_QUALITY, &[]);
+        let h = read_header(&mut Cursor::new(&buf)).unwrap();
+        assert_ne!(h.required_features & crate::feature::NO_QUALITY, 0);
     }
 
     #[test]

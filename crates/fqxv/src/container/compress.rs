@@ -29,8 +29,16 @@ pub struct Params {
     /// Reads per block. Blocks are the unit of parallelism and random access;
     /// larger blocks give the order-k sequence model more data to train on.
     pub block_reads: usize,
-    /// Quality quantization (lossless by default).
+    /// Quality quantization (lossless by default). Ignored when [`Self::no_quality`]
+    /// is set — quality is not coded at all in that mode.
     pub quality_binning: QualityBinning,
+    /// Discard quality entirely: store names + sequence only, and reconstruct
+    /// **FASTA** on decompress. The single largest size lever (quality is the
+    /// majority of most archives) but explicitly lossy — the original FASTQ cannot
+    /// be recovered. Gated by [`crate::feature::NO_QUALITY`] so older readers refuse
+    /// the archive rather than mis-decode it. Not supported with [`Self::reorder`]
+    /// (the whole-file reorder layout keeps quality); rejected there.
+    pub no_quality: bool,
     /// Cluster reads (reverse-complement aware) and differentially code the
     /// sequence — captures cross-read duplicate redundancy. Works for grouped
     /// (paired / single-cell) input too; grouped reorder always preserves order.
@@ -86,6 +94,7 @@ impl Default for Params {
             seq_hash_bits: 0,
             block_reads: DEFAULT_BLOCK_READS,
             quality_binning: QualityBinning::Lossless,
+            no_quality: false,
             reorder: false,
             keep_order: false,
             rescue: true,
@@ -821,6 +830,12 @@ fn compress_longread_shared_ref<W: Write>(
     // here, reusing the pass-1 sequence) in order.
     let mut w = CrcWriter::new(BufWriter::new(writer));
     let flags = FLAG_PLUS_NORMALIZED | FLAG_GLOBAL_REFERENCE;
+    // Carry the sequence-only feature bit alongside the shared-reference bit so a
+    // long-read `no_quality` archive is gated the same way the plain layout is.
+    let mut required_features = crate::feature::GLOBAL_REFERENCE;
+    if params.no_quality {
+        required_features |= crate::feature::NO_QUALITY;
+    }
     write_header_prefix(
         &mut w,
         params.seq_order,
@@ -828,7 +843,7 @@ fn compress_longread_shared_ref<W: Write>(
         flags,
         group_size,
         platform,
-        crate::feature::GLOBAL_REFERENCE,
+        required_features,
     )?;
     write_framed(&mut w, &ref_frame)?;
     // Framed slice on disk is [4 len][4 crc][bytes]; blocks begin past it.
