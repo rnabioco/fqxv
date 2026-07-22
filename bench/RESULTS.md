@@ -8,6 +8,11 @@ on **both** Sequel II and Revio. Ratios are deterministic (thread-count
 independent); `rt=yes` means the round-trip content digest matched (lossless, or
 lossy-expected for the binned points). Reproduce with `bash submit_parallel.sh`.
 
+Re-run on `1b6eeb5` (post-v0.4.0). Every ratio and per-stream size below
+reproduced **byte-for-byte** from the v0.4.0 tables — the PRs since (#218 Python
+bindings, #222/#223) changed no output. What moved is long-read compress *speed*
+(see [Long-read compress speed](#long-read-compress-speed)).
+
 Two long-read sequence codecs landed since the 2026-07-20 run and move the
 numbers below: a **raw-LZMA** sequence method for ordinary-coverage long reads
 (#197/#205–208 — the PacBio Revio WGS lever) and a **multi-reference tiling**
@@ -89,6 +94,19 @@ is why one HiFi dataset was never enough: `ecoli_hifi` is 98% quality by bytes
 (300× coverage of a 4.6 Mb genome collapses the sequence stream), while Revio WGS
 at ordinary coverage is 72% sequence. The two datasets exercise opposite regimes,
 and the sequence lever only shows up on the second.
+
+## Long-read compress speed
+
+The long-read *ratios* are unchanged — this cycle's long-read work was pure speed
+and reproduced every archive byte-for-byte. What moved is compress throughput,
+which the ratio tables don't show. On the same 16-thread `rna`-partition cell,
+default-mode compress dropped from **438 s to 141 s (~3.1× faster) on the noisy
+ONT run** and from **493 s to 450 s (~9%) on `ecoli_hifi`**, at identical output:
+gating off the always-discarded overlap-consensus candidate on Nanopore (#223),
+de-packing the banded-DP traceback (#222), and skipping the redundant
+shared-reference assembly on Nanopore (#211). The `--max` ONT point is the
+opposite trade by design — best-of-4 tiling references spend ~795 s to reach the
+3.047× parity ratio, so the deep sequence lever is paid only when asked for.
 
 ## Lossy quality (fqxv binning)
 
