@@ -46,6 +46,24 @@ misreading it. A format major bump would be announced as a breaking change.
   thread-count invariant (`--threads 1` == `--threads 16`). Proptests pin the radix
   order to the comparison sort's and the presorted chain path to the sorting path.
   The levers mirror minimap2's own presorted chaining and `radix_sort_128x`. (#151)
+- **Per-block quality context quantizer, trialled and kept only when it wins
+  (HiFi/Revio).** The long-read quality coder used to build its recent-quality
+  context with one fixed quantization (`q1>>1`/`q2>>3`/`q3>>4`), which merges
+  adjacent Phred values — costly on HiFi/Revio, where quality is packed at the top
+  of the scale and neighbouring high-Q values need to be told apart. The encoder now
+  also builds a per-block quantizer from the block's quality histogram (the fqzcomp
+  `qtab` / CoLoRd platform-quantizer idea): full context resolution where quality
+  actually varies, equal-population folding elsewhere. Both quantizers code the
+  block and the **smaller** is kept, with the choice recorded in a self-describing
+  header mode byte (`MODE_SEQ_BINMIX_Q`) and the small table transmitted so decode is
+  unambiguous — so a block can only match or shrink (never-worse by construction).
+  Quality-stream savings, measured against a clean baseline: **PacBio HiFi (ecoli,
+  Sequel II) −1.17%**, **Revio amplicon −3.25%**, **Revio WGS −0.25%**; **Nanopore
+  0%** and **short reads 0% (byte-identical)** — neither is touched. A bounded
+  prefix probe decides whether the second full encode is worth coding, so the trial
+  costs ≈ +5% compress on Nanopore (where it never wins) and is paid in full only on
+  the skewed long-read data where it does. Lossless and thread-deterministic;
+  archives round-trip byte-for-byte and are identical regardless of thread count.
 
 - **Anchor-restricted long-read tile coding (CoLoRd-style).** The multi-reference
   ONT tiler used to re-align each tile with one banded DP over the whole
