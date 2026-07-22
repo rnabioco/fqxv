@@ -29,6 +29,25 @@ misreading it. A format major bump would be announced as a breaking change.
   recovered falls back to the whole-window DP; `FQXV_TILE_NO_ANCHORGAP=1` forces the
   DP everywhere for A/B. (#226)
 
+- **Anchor-restricted coding for the shared-reference consensus codec (HiFi).** The
+  same lever as #226, now on the non-tiler path the high-coverage HiFi/PacBio blocks
+  take: each read used to be re-aligned against its consensus with one banded DP over
+  the whole `read × consensus` window (`align_banded`, the dominant HiFi compress
+  self-cost). It now recovers the read↔consensus exact-k-mer chain, emits each anchor
+  as a free `Match` copy-run, and aligns only the short inter-anchor gaps and two
+  flanks — so alignment work scales with the read's divergence from its consensus,
+  not its length. On low-error HiFi the read shares nearly all of its k-mers with the
+  consensus, collapsing the DP area. About **1.23× faster** at-scale (16-thread)
+  full-file `ecoli_hifi` compress (313s → 254s, two trials), at an equal-or-slightly-better ratio
+  (−0.05% archive on the full file; byte-identical on a single-block subset, where the
+  anchor path emits the same equal-cost edit stream). Lossless and thread-deterministic
+  — the edit-op stream keeps the same semantics, so the decoder is unchanged and
+  archives still round-trip. A read whose chain is not recovered falls back to the
+  whole-window DP;
+  `FQXV_LRO_NO_ANCHORGAP=1` forces the DP everywhere for A/B. The `anchor_chain` /
+  `anchorgap_build` machinery is now shared by both coders (new `anchorgap` module).
+  (#220)
+
 - **Reorder drops the redundant v2 single-contig sequence candidate per block.** On
   the adaptive `rescue` path (`--order any`/`--max` default) each block coded both
   the v2 single-contig codec and the v3 literal-rescue codec and kept the smaller.
