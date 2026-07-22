@@ -68,6 +68,7 @@ mod index;
 mod layout;
 mod minimizer;
 mod overlap;
+mod radix;
 mod refine;
 mod script;
 mod tile;

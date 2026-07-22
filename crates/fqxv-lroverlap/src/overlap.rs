@@ -6,8 +6,31 @@
 
 use crate::{
     Index,
-    chain::{Anchor, ChainOpts, Chainer},
+    chain::{Anchor, Chain, ChainOpts, Chainer},
+    radix::radix_sort_u128,
 };
+
+/// Pack an anchor's group-and-position key into one `u128` whose **ascending**
+/// order is exactly the tuple order `(target, strand-same, tpos, qpos)` the old
+/// `Vec<(u32, bool, Anchor)>` sort produced — `strand-same` false (`0`) before
+/// true (`1`), matching `bool`'s `Ord`. Losslessly invertible (see [`unpack`]),
+/// so the buckets need carry only the key. A read index fits 31 bits (`Occ`),
+/// leaving the top bit of the 32-bit `target` field clear; `qpos`/`tpos` are full
+/// `u32`.
+#[inline]
+fn pack(target: u32, same: bool, tpos: u32, qpos: u32) -> u128 {
+    ((target as u128) << 65) | ((same as u128) << 64) | ((tpos as u128) << 32) | (qpos as u128)
+}
+
+/// Invert [`pack`]: recover `(target, same, tpos, qpos)`.
+#[inline]
+fn unpack(key: u128) -> (u32, bool, u32, u32) {
+    let target = (key >> 65) as u32;
+    let same = (key >> 64) & 1 == 1;
+    let tpos = (key >> 32) as u32;
+    let qpos = key as u32;
+    (target, same, tpos, qpos)
+}
 
 /// A confident overlap between a query read and a target read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,8 +91,11 @@ pub fn find_overlaps(
     let chainer = Chainer::new(ChainOpts { k, ..opts });
 
     // Group anchors by (target, same-orientation). Collected into a Vec and
-    // sorted rather than a hash map, so iteration order is never a factor.
-    let mut buckets: Vec<(u32, bool, Anchor)> = Vec::new();
+    // sorted rather than a hash map, so iteration order is never a factor. The
+    // group-and-position key packs into one `u128` whose ascending order is the
+    // grouping order, so the sort is a radix sort, not a comparison sort — the
+    // hot per-query sort at high coverage (see [`radix_sort_u128`]).
+    let mut buckets: Vec<u128> = Vec::new();
     for m in &mins {
         // Cap the per-minimizer fan-out. A minimizer shared by every read (the
         // amplicon case: one locus, ~150k near-identical copies) otherwise
@@ -96,23 +122,34 @@ pub fn find_overlaps(
                     None => continue,
                 }
             };
-            buckets.push((o.read(), same, Anchor { tpos, qpos: m.pos }));
+            buckets.push(pack(o.read(), same, tpos, m.pos));
         }
     }
-    // Total order: (target, orientation, anchor).
-    buckets.sort_unstable();
+    // Total order: (target, orientation, tpos, qpos) — exactly the packed key's
+    // ascending order, so this radix sort matches the old comparison sort.
+    radix_sort_u128(&mut buckets);
 
     let mut out = Vec::new();
+    // Reused across every group of this query: the per-group anchor list and the
+    // chainer's result buffer, cleared per group so no state leaks between them.
+    let mut anchors: Vec<Anchor> = Vec::new();
+    let mut chains: Vec<Chain> = Vec::new();
     let mut i = 0usize;
     while i < buckets.len() {
-        let (target, same, _) = buckets[i];
+        // Two keys share a (target, strand) group iff their top 33 bits match.
+        let group = buckets[i] >> 64;
+        let (target, same, _, _) = unpack(buckets[i]);
         let mut j = i;
-        let mut anchors = Vec::new();
-        while j < buckets.len() && buckets[j].0 == target && buckets[j].1 == same {
-            anchors.push(buckets[j].2);
+        anchors.clear();
+        while j < buckets.len() && buckets[j] >> 64 == group {
+            let (_, _, tpos, qpos) = unpack(buckets[j]);
+            anchors.push(Anchor { tpos, qpos });
             j += 1;
         }
-        for c in chainer.chain(&mut anchors) {
+        // Anchors are already `(tpos, qpos)`-sorted (the group is a contiguous
+        // run of the sorted keys), so skip the chainer's redundant re-sort.
+        chainer.chain_presorted_into(&mut anchors, &mut chains);
+        for c in &chains {
             out.push(Overlap {
                 target,
                 strand: !same,
@@ -144,6 +181,26 @@ pub fn find_overlaps(
 mod tests {
     use super::*;
     use crate::{Repeat, Sketch};
+    use proptest::prelude::*;
+
+    proptest! {
+        /// The packed key must invert exactly and sort exactly like the tuple it
+        /// replaced — otherwise anchors regroup and the archive changes. A read
+        /// index fits 31 bits, so restrict `target` accordingly.
+        #[test]
+        fn pack_is_invertible_and_order_preserving(
+            a in (0u32..(1 << 31), any::<bool>(), any::<u32>(), any::<u32>()),
+            b in (0u32..(1 << 31), any::<bool>(), any::<u32>(), any::<u32>()),
+        ) {
+            let (ka, kb) = (pack(a.0, a.1, a.2, a.3), pack(b.0, b.1, b.2, b.3));
+            prop_assert_eq!(unpack(ka), a);
+            prop_assert_eq!(unpack(kb), b);
+            // The old sort key: (target, same, Anchor{tpos, qpos}).
+            let ta = (a.0, a.1, Anchor { tpos: a.2, qpos: a.3 });
+            let tb = (b.0, b.1, Anchor { tpos: b.2, qpos: b.3 });
+            prop_assert_eq!(ka.cmp(&kb), ta.cmp(&tb));
+        }
+    }
 
     fn rand_seq(n: usize, seed: u32) -> Vec<u8> {
         let mut x = seed;

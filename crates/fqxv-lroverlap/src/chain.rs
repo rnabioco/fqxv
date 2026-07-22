@@ -14,6 +14,8 @@
 //! Anchors are sorted by a total order before the DP, and predecessor ties break
 //! on the smallest index, so the chain set is a pure function of the input.
 
+use std::cell::RefCell;
+
 /// A shared minimizer between a query read and a target read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Anchor {
@@ -173,91 +175,142 @@ impl Chainer {
     /// t_start)` so the order is total and thread-independent.
     #[must_use]
     pub fn chain(&self, anchors: &mut Vec<Anchor>) -> Vec<Chain> {
-        let opts = self.opts;
+        // `Anchor`'s derived `Ord` is exactly `(tpos, qpos)`, which is the order
+        // the DP needs; sort into it, then run the presorted path.
         anchors.sort_unstable();
-        anchors.dedup();
-        let n = anchors.len();
+        self.chain_presorted(anchors)
+    }
+
+    /// Chain anchors that are **already** in `(tpos, qpos)` ascending order.
+    ///
+    /// [`find_overlaps`](crate::find_overlaps) sorts a query's whole anchor set
+    /// once, by `(target, strand, tpos, qpos)`; each `(target, strand)` group it
+    /// then hands here is therefore already in `(tpos, qpos)` order — exactly what
+    /// [`chain`](Self::chain)'s internal sort would produce — so re-sorting every
+    /// group is pure waste (hundreds of sorts per query at high coverage). The
+    /// `dedup` is still applied here: a presorted group can still carry duplicate
+    /// anchors, and the DP must see each once.
+    ///
+    /// The result is byte-identical to [`chain`](Self::chain) on the same
+    /// anchors; the only difference is who performed the sort. Passing anchors
+    /// **not** in `(tpos, qpos)` order is a caller bug — debug builds assert it.
+    #[must_use]
+    pub fn chain_presorted(&self, anchors: &mut Vec<Anchor>) -> Vec<Chain> {
         let mut out = Vec::new();
+        self.chain_presorted_into(anchors, &mut out);
+        out
+    }
+
+    /// [`chain_presorted`](Self::chain_presorted) writing into a caller-owned
+    /// buffer, so [`find_overlaps`](crate::find_overlaps) can reuse one `Vec`
+    /// across a query's many groups instead of allocating a result per group.
+    pub(crate) fn chain_presorted_into(&self, anchors: &mut Vec<Anchor>, out: &mut Vec<Chain>) {
+        let opts = self.opts;
+        debug_assert!(
+            anchors.windows(2).all(|w| w[0] <= w[1]),
+            "chain_presorted requires anchors already sorted by (tpos, qpos)"
+        );
+        anchors.dedup();
+        out.clear();
+        let n = anchors.len();
         if n == 0 {
-            return out;
+            return;
         }
 
-        // f[i]: best score of a chain ending at anchor i. p[i]: its predecessor.
-        let mut f = vec![opts.k as i32; n];
-        let mut p = vec![usize::MAX; n];
+        // The per-anchor DP arrays and per-chain path buffer are reused across
+        // every group of every query on this thread. They are cleared and
+        // resized (never read stale), so the chain set stays a pure function of
+        // the input — the reuse is invisible to the result.
+        SCRATCH.with(|cell| {
+            let Scratch {
+                f,
+                p,
+                order,
+                used,
+                path,
+            } = &mut *cell.borrow_mut();
 
-        for i in 0..n {
-            let a = anchors[i];
-            let lo = i.saturating_sub(opts.lookback);
-            for j in (lo..i).rev() {
-                let b = anchors[j];
-                // Strictly colinear: both coordinates must advance.
-                if b.tpos >= a.tpos || b.qpos >= a.qpos {
+            // f[i]: best score of a chain ending at anchor i. p[i]: its predecessor.
+            f.clear();
+            f.resize(n, opts.k as i32);
+            p.clear();
+            p.resize(n, usize::MAX);
+
+            for i in 0..n {
+                let a = anchors[i];
+                let lo = i.saturating_sub(opts.lookback);
+                for j in (lo..i).rev() {
+                    let b = anchors[j];
+                    // Strictly colinear: both coordinates must advance.
+                    if b.tpos >= a.tpos || b.qpos >= a.qpos {
+                        continue;
+                    }
+                    let dt = a.tpos - b.tpos;
+                    let dq = a.qpos - b.qpos;
+                    if dt > opts.max_dist || dq > opts.max_dist {
+                        continue;
+                    }
+                    let gap = dt.abs_diff(dq);
+                    if gap > opts.max_gap {
+                        continue;
+                    }
+                    // Overlapping anchors contribute only the new bases they cover.
+                    let weight = dt.min(dq).min(opts.k) as i32;
+                    let score = f[j] + weight - self.gap_penalty(gap);
+                    // Strictly-greater keeps the SMALLEST predecessor index on a
+                    // tie, since j descends — a total order, so the DP cannot
+                    // depend on iteration or thread scheduling.
+                    if score > f[i] {
+                        f[i] = score;
+                        p[i] = j;
+                    }
+                }
+            }
+
+            // Backtrack from best-scoring anchors, each anchor used by one chain.
+            order.clear();
+            order.extend(0..n);
+            // Total order: score DESC, then index ASC.
+            order.sort_unstable_by(|&x, &y| f[y].cmp(&f[x]).then(x.cmp(&y)));
+            used.clear();
+            used.resize(n, false);
+
+            for &end in order.iter() {
+                if used[end] || f[end] < opts.min_score {
                     continue;
                 }
-                let dt = a.tpos - b.tpos;
-                let dq = a.qpos - b.qpos;
-                if dt > opts.max_dist || dq > opts.max_dist {
+                path.clear();
+                let mut cur = end;
+                loop {
+                    if used[cur] {
+                        // Ran into an existing chain; stop rather than steal it.
+                        break;
+                    }
+                    path.push(cur);
+                    match p[cur] {
+                        usize::MAX => break,
+                        prev => cur = prev,
+                    }
+                }
+                if (path.len() as u32) < opts.min_anchors {
                     continue;
                 }
-                let gap = dt.abs_diff(dq);
-                if gap > opts.max_gap {
-                    continue;
+                for &i in path.iter() {
+                    used[i] = true;
                 }
-                // Overlapping anchors contribute only the new bases they cover.
-                let weight = dt.min(dq).min(opts.k) as i32;
-                let score = f[j] + weight - self.gap_penalty(gap);
-                // Strictly-greater keeps the SMALLEST predecessor index on a tie,
-                // since j descends — a total order, so the DP cannot depend on
-                // iteration or thread scheduling.
-                if score > f[i] {
-                    f[i] = score;
-                    p[i] = j;
-                }
+                // `path` runs end -> start.
+                let first = anchors[*path.last().expect("non-empty")];
+                let last = anchors[path[0]];
+                out.push(Chain {
+                    score: f[end],
+                    n_anchors: path.len() as u32,
+                    q_start: first.qpos,
+                    q_end: last.qpos + opts.k,
+                    t_start: first.tpos,
+                    t_end: last.tpos + opts.k,
+                });
             }
-        }
-
-        // Backtrack from best-scoring anchors, each anchor used by one chain only.
-        let mut order: Vec<usize> = (0..n).collect();
-        // Total order: score DESC, then index ASC.
-        order.sort_unstable_by(|&x, &y| f[y].cmp(&f[x]).then(x.cmp(&y)));
-        let mut used = vec![false; n];
-
-        for &end in &order {
-            if used[end] || f[end] < opts.min_score {
-                continue;
-            }
-            let mut path = Vec::new();
-            let mut cur = end;
-            loop {
-                if used[cur] {
-                    // Ran into an existing chain; stop rather than steal its anchors.
-                    break;
-                }
-                path.push(cur);
-                match p[cur] {
-                    usize::MAX => break,
-                    prev => cur = prev,
-                }
-            }
-            if (path.len() as u32) < opts.min_anchors {
-                continue;
-            }
-            for &i in &path {
-                used[i] = true;
-            }
-            // `path` runs end -> start.
-            let first = anchors[*path.last().expect("non-empty")];
-            let last = anchors[path[0]];
-            out.push(Chain {
-                score: f[end],
-                n_anchors: path.len() as u32,
-                q_start: first.qpos,
-                q_end: last.qpos + opts.k,
-                t_start: first.tpos,
-                t_end: last.tpos + opts.k,
-            });
-        }
+        });
 
         out.sort_unstable_by(|a, b| {
             b.score
@@ -265,8 +318,32 @@ impl Chainer {
                 .then(a.q_start.cmp(&b.q_start))
                 .then(a.t_start.cmp(&b.t_start))
         });
-        out
     }
+}
+
+/// Reusable per-thread scratch for the chaining DP, cleared per group.
+#[derive(Default)]
+struct Scratch {
+    /// Best chain score ending at each anchor.
+    f: Vec<i32>,
+    /// Predecessor anchor of each anchor (`usize::MAX` = none).
+    p: Vec<usize>,
+    /// Anchor indices, sorted by score for backtracking.
+    order: Vec<usize>,
+    /// Whether each anchor is already claimed by a chain.
+    used: Vec<bool>,
+    /// The anchors on the chain currently being backtracked.
+    path: Vec<usize>,
+}
+
+thread_local! {
+    static SCRATCH: RefCell<Scratch> = const { RefCell::new(Scratch {
+        f: Vec::new(),
+        p: Vec::new(),
+        order: Vec::new(),
+        used: Vec::new(),
+        path: Vec::new(),
+    }) };
 }
 
 #[cfg(test)]
@@ -449,6 +526,30 @@ mod tests {
             let mut b: Vec<Anchor> = pairs.iter().map(|&(t, q)| Anchor { tpos: t, qpos: q }).collect();
             let reversed = chain(&mut b, opts());
             prop_assert_eq!(first, reversed);
+        }
+
+        /// The presorted fast path is byte-identical to the sorting path.
+        /// `find_overlaps` hands `chain_presorted` groups it already sorted by
+        /// `(target, strand, tpos, qpos)`; on any single group that is exactly
+        /// `(tpos, qpos)` order, which is what `chain` sorts into — so sorting
+        /// externally then calling `chain_presorted` MUST equal calling `chain`.
+        /// Any divergence would move overlaps and change the archive.
+        #[test]
+        fn presorted_matches_the_sorting_path(
+            pairs in proptest::collection::vec((0u32..5000, 0u32..5000), 0..200),
+        ) {
+            let chainer = Chainer::new(opts());
+            let mut sort_path: Vec<Anchor> =
+                pairs.iter().map(|&(t, q)| Anchor { tpos: t, qpos: q }).collect();
+            let expect = chainer.chain(&mut sort_path);
+
+            // Pre-sort exactly as the bucket sort leaves a group, then take the
+            // presorted path.
+            let mut pre: Vec<Anchor> =
+                pairs.iter().map(|&(t, q)| Anchor { tpos: t, qpos: q }).collect();
+            pre.sort_unstable();
+            let got = chainer.chain_presorted(&mut pre);
+            prop_assert_eq!(expect, got);
         }
 
         /// Never panics, and every chain is internally consistent.
