@@ -159,44 +159,86 @@ pub(crate) fn encode_reordered<W: Write>(
     // regardless of clustering, so the tradeoff differs and #196's inversion (which
     // is a single-end BGISEQ result) does not apply. Grouped reorder keeps its
     // existing unconditional layout.
-    //
-    // The cost is a second whole-file encode on the opt-in max-effort path. The
-    // plain candidate is coded from a one-time serialization of the buffered
-    // reads, which also feeds nothing else, so it is dropped as soon as the
-    // comparison is made.
     if group_size.max(1) != 1 {
         return encode_reordered_clustered(all, writer, params, group_size);
     }
-    let serialized = serialize_block(&all);
-    let mut reordered_buf = Vec::new();
-    let reordered_stats = encode_reordered_clustered(all, &mut reordered_buf, params, group_size)?;
 
+    // The decision is really "did clustering + the stored permutation beat plain
+    // order-k **on the sequence**". Quality is the largest stream and fqzcomp is a
+    // per-read context model, so clustered vs original order barely moves its coded
+    // size; names are tiny. So both candidates code their sequence + names +
+    // permutation now, the gate compares on THAT (quality excluded), and only the
+    // winner codes quality — once, in the order it emits. This drops the whole-file
+    // quality re-encode the loser used to pay: the bulk of the gate's cost, since
+    // it coded every stream of both layouts and threw one away.
+    let serialized = serialize_block(&all);
+
+    // Reorder candidate: cluster + code sequence/names/permutation, quality
+    // deferred. Owns the buffered reads and the thread pool both candidates share.
+    let prepared = prepare_reordered_clustered(all, params, group_size)?;
+
+    // Plain candidate: order-k sequence + names per block, quality deferred — coded
+    // in the reorder candidate's pool so the two never hold two pools at once. This
+    // reproduces exactly what `compress_buffered(&serialized, plain_params, ..)`
+    // would code for names/sequence (short-read → `compress_buffered_plain`), so
+    // the layout written below is byte-identical to that plain pass.
     let mut plain_params = params;
     plain_params.reorder = false;
-    let mut plain_buf = Vec::new();
-    let plain_stats = compress_buffered(&serialized, &mut plain_buf, plain_params, group_size)?;
-    drop(serialized);
+    let g = group_size.max(1) as usize;
+    let block_reads = (plain_params.block_reads.max(1) / g).max(1) * g;
+    let (chunks, gstart, _n) = parse_chunks(&serialized, g, &prepared.pool)?;
+    let plain_platform = resolve_platform_buf(plain_params.platform, &serialized);
+    let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
+    let plain_ns: Vec<(Vec<u8>, Vec<u8>)> = prepared.pool.install(|| {
+        ranges
+            .par_iter()
+            .map(|&(gs, ge)| -> Result<(Vec<u8>, Vec<u8>)> {
+                let blk = build_block(&serialized, &chunks, &gstart, gs, ge);
+                let names_c = fqxv_tokenizer::encode(&blk.header_refs())?;
+                let seq_c =
+                    encode_sequence_stream(&blk.lens, &blk.seq, &plain_params, plain_platform)?;
+                Ok((names_c, seq_c))
+            })
+            .collect::<Result<_>>()
+    })?;
+    let plain_bytes: usize = plain_ns.iter().map(|(nm, sq)| nm.len() + sq.len()).sum();
 
-    let mut writer = writer;
-    // Reorder is the challenger here (it adds the permutation and reshuffles the
-    // streams), so the plain layout is kept unless reorder is *strictly* smaller
-    // — `adopt_over(plain, 0, reordered)` (#203).
-    if adopt_over(plain_buf.len(), 0, reordered_buf.len()) {
+    // Decide on the non-quality (sequence + names + permutation) size. The reorder
+    // candidate's `gate_bytes` already carries the fixed costs it alone pays — the
+    // permutation, flip bitmap, name template and shared reference — so keep the
+    // plain layout unless reorder is *strictly* smaller. `adopt_over(plain, 0,
+    // reorder)` gives ties to the reorder challenger, matching the previous
+    // full-archive gate's `adopt_over(plain, 0, reordered)` (#203).
+    if adopt_over(plain_bytes, 0, prepared.gate_bytes) {
         info!(
-            reordered = reordered_buf.len(),
-            plain = plain_buf.len(),
-            "reorder does not pay off; using the preserve layout"
+            reordered = prepared.gate_bytes,
+            plain = plain_bytes,
+            "reorder does not pay off (sequence+names); using the preserve layout"
         );
-        writer.write_all(&plain_buf)?;
-        return Ok(plain_stats);
+        return write_plain_layout(
+            writer,
+            &serialized,
+            &chunks,
+            &gstart,
+            &ranges,
+            &plain_params,
+            group_size,
+            plain_platform,
+            &prepared.pool,
+            None,
+            Some(&plain_ns),
+        );
     }
     info!(
-        reordered = reordered_buf.len(),
-        plain = plain_buf.len(),
-        "reorder pays off; using the clustered layout"
+        reordered = prepared.gate_bytes,
+        plain = plain_bytes,
+        "reorder pays off (sequence+names); using the clustered layout"
     );
-    writer.write_all(&reordered_buf)?;
-    Ok(reordered_stats)
+    // Free the plain candidate's streams before quality is coded for the winner.
+    drop(plain_ns);
+    drop(chunks);
+    drop(serialized);
+    finish_reordered_clustered(prepared, writer)
 }
 
 /// Globally cluster the buffered reads (SPRING-style) and write the whole-file
@@ -218,12 +260,59 @@ pub(crate) fn encode_reordered<W: Write>(
 ///
 /// Wrapped by [`encode_reordered`], which keeps this only when it beats the plain
 /// layout.
+///
+/// Split into [`prepare_reordered_clustered`] (cluster + code sequence, names and
+/// permutation) and [`finish_reordered_clustered`] (code quality, write) so the
+/// never-worse gate can decide on the non-quality size and only the winner codes
+/// quality. This wrapper runs both back to back for the callers that always keep
+/// the clustered layout (grouped input, the forced-clustered test path).
 fn encode_reordered_clustered<W: Write>(
     all: RawBlock,
     writer: W,
     params: Params,
     group_size: u8,
 ) -> Result<Stats> {
+    let prepared = prepare_reordered_clustered(all, params, group_size)?;
+    finish_reordered_clustered(prepared, writer)
+}
+
+/// The clustered reorder state after everything except quality has been coded:
+/// enough to write the archive once quality is coded in the chosen order. Produced
+/// by [`prepare_reordered_clustered`] and consumed by [`finish_reordered_clustered`].
+/// `gate_bytes` is the total coded non-quality content (sequence blocks, name
+/// blocks, permutation, flip bitmap, name template, shared reference) — the size
+/// the never-worse gate compares against the plain candidate's names+sequence.
+struct ReorderPrepared {
+    all: RawBlock,
+    offs: Vec<usize>,
+    plan: fqxv_reorder::Plan,
+    ranges: Vec<(usize, usize)>,
+    keep_order: bool,
+    name_blocks: Vec<Vec<u8>>,
+    perm_c: Vec<u8>,
+    template: Option<fqxv_tokenizer::NameTemplate>,
+    flip_bits: Vec<u8>,
+    use_reference: bool,
+    seq_blocks: Vec<Vec<u8>>,
+    ref_payload: Vec<u8>,
+    n: usize,
+    g: u8,
+    platform: Platform,
+    params: Params,
+    pool: rayon::ThreadPool,
+    gate_bytes: usize,
+}
+
+/// Cluster the buffered reads and code every stream except quality — the sequence
+/// blocks (with the optional shared reference), the names (in the chosen order),
+/// and the permutation. Returns the state [`finish_reordered_clustered`] needs to
+/// write the archive, plus `gate_bytes` for the never-worse gate. See
+/// [`encode_reordered_clustered`] for the mode/`keep_order` semantics.
+fn prepare_reordered_clustered(
+    all: RawBlock,
+    params: Params,
+    group_size: u8,
+) -> Result<ReorderPrepared> {
     let g = group_size.max(1);
     let pool = build_pool(params.threads)?;
     let n = all.n_reads();
@@ -545,6 +634,68 @@ fn encode_reordered_clustered<W: Write>(
         }
     };
 
+    // Everything except quality is now coded. Total the coded non-quality content
+    // (sequence + names + the fixed costs reorder alone pays) for the never-worse
+    // gate, and hand the state to `finish_reordered_clustered`.
+    let platform = resolve_platform_block(params.platform, &all);
+    let tmpl_len = template
+        .as_ref()
+        .map(|t| t.to_bytes().len())
+        .unwrap_or_default();
+    let gate_bytes = perm_c.len()
+        + flip_bits.len()
+        + tmpl_len
+        + if use_reference { ref_payload.len() } else { 0 }
+        + seq_blocks.iter().map(Vec::len).sum::<usize>()
+        + name_blocks.iter().map(Vec::len).sum::<usize>();
+    Ok(ReorderPrepared {
+        all,
+        offs,
+        plan,
+        ranges,
+        keep_order,
+        name_blocks,
+        perm_c,
+        template,
+        flip_bits,
+        use_reference,
+        seq_blocks,
+        ref_payload,
+        n,
+        g,
+        platform,
+        params,
+        pool,
+        gate_bytes,
+    })
+}
+
+/// Code quality in the chosen order and write the clustered reorder archive from
+/// the [`ReorderPrepared`] state. This is the second half of
+/// [`encode_reordered_clustered`]; the never-worse gate calls it only for the
+/// candidate it keeps, so quality is coded exactly once.
+fn finish_reordered_clustered<W: Write>(prepared: ReorderPrepared, writer: W) -> Result<Stats> {
+    let ReorderPrepared {
+        all,
+        offs,
+        plan,
+        ranges,
+        keep_order,
+        name_blocks,
+        perm_c,
+        template,
+        flip_bits,
+        use_reference,
+        seq_blocks,
+        ref_payload,
+        n,
+        g,
+        platform,
+        params,
+        pool,
+        gate_bytes: _,
+    } = prepared;
+
     // Quality in the chosen order: original for keep_order; otherwise clustered,
     // reversed for flipped reads so bytes line up with the reverse-complemented
     // sequence.
@@ -584,7 +735,6 @@ fn encode_reordered_clustered<W: Write>(
     let nq_blocks: Vec<(Vec<u8>, Vec<u8>)> = name_blocks.into_iter().zip(qual_blocks).collect();
 
     // 7. Write: header, then n / flip / perm / seq blocks / name+qual blocks.
-    let platform = resolve_platform_block(params.platform, &all);
     let mut w = BufWriter::new(writer);
     let mut flags = FLAG_PLUS_NORMALIZED | FLAG_REORDERED | FLAG_GLOBAL_REORDER;
     if keep_order {

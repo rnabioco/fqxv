@@ -506,7 +506,7 @@ pub(crate) fn compress_buffered_plain<W: Write>(
     // determinism holds regardless of thread count.
     let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
     write_plain_layout(
-        writer, buf, &chunks, &gstart, &ranges, &params, group_size, platform, &pool, None,
+        writer, buf, &chunks, &gstart, &ranges, &params, group_size, platform, &pool, None, None,
     )
 }
 
@@ -515,10 +515,16 @@ pub(crate) fn compress_buffered_plain<W: Write>(
 /// `precoded_seq`, when present, supplies each block's already-coded sequence
 /// stream (indexed by block) and only names and quality are coded here. The
 /// long-read shared-reference path uses it to write the fallback layout without
-/// re-running the per-block overlap encode it already did in pass 1; passing
-/// `None` codes all three streams per block, the ordinary short-read path.
+/// re-running the per-block overlap encode it already did in pass 1.
+///
+/// `precoded_ns`, when present, supplies each block's already-coded **names AND
+/// sequence** streams and only quality is coded here. The single-end reorder
+/// never-worse gate uses it to write the plain candidate it decided to keep
+/// without re-coding names/sequence. It takes precedence over `precoded_seq`;
+/// passing both `None` codes all three streams per block, the ordinary short-read
+/// path.
 #[allow(clippy::too_many_arguments)]
-fn write_plain_layout<W: Write>(
+pub(crate) fn write_plain_layout<W: Write>(
     writer: W,
     buf: &[u8],
     chunks: &[ChunkParse],
@@ -529,6 +535,7 @@ fn write_plain_layout<W: Write>(
     platform: Platform,
     pool: &rayon::ThreadPool,
     precoded_seq: Option<&[Vec<u8>]>,
+    precoded_ns: Option<&[(Vec<u8>, Vec<u8>)]>,
 ) -> Result<Stats> {
     let mut w = CrcWriter::new(BufWriter::new(writer));
     write_header(&mut w, params, group_size, platform)?;
@@ -552,9 +559,12 @@ fn write_plain_layout<W: Write>(
                 .map(|bi| {
                     let (gs, ge) = ranges[bi];
                     let blk = build_block(buf, chunks, gstart, gs, ge);
-                    let payload = match precoded_seq {
-                        Some(seqs) => compress_block_with_seq(&blk, params, &seqs[bi]),
-                        None => compress_block(&blk, params, platform),
+                    let payload = match (precoded_ns, precoded_seq) {
+                        (Some(ns), _) => {
+                            compress_block_with_names_seq(&blk, params, &ns[bi].0, &ns[bi].1)
+                        }
+                        (None, Some(seqs)) => compress_block_with_seq(&blk, params, &seqs[bi]),
+                        (None, None) => compress_block(&blk, params, platform),
                     };
                     (blk, payload)
                 })
@@ -815,6 +825,7 @@ fn compress_longread_shared_ref<W: Write>(
                 platform,
                 &pool,
                 Some(&plain_seq),
+                None,
             );
         }
         let mut v = Vec::with_capacity(num_blocks);

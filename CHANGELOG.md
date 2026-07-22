@@ -26,6 +26,21 @@ misreading it. A format major bump would be announced as a breaking change.
   larger than v2 on any block — for one fewer per-block sequence encode
   (~1.08× faster single-thread `--max` on a 2M-read NovaSeq subset).
 
+- **Single-end reorder codes quality and names once, not twice.** The never-worse
+  gate on `--order any`/`--order shuffle`/`--max` used to code the whole file both
+  clustered and plain and keep the smaller *full* archive — coding the quality and
+  name streams a second time. The keep/skip decision is really "did clustering +
+  the permutation beat plain order-k *on the sequence*", so the gate now codes each
+  candidate's sequence + names + permutation, decides on that non-quality total,
+  and only the winning layout codes quality — once, in the order it emits (the
+  clustered encode is split into a prepare/finish pair; the plain candidate reuses
+  its coded names+sequence via a new `write_plain_layout` path). Output is
+  **byte-identical** to the previous build on the validation datasets
+  (NovaSeq/GAIIx/MiSeq/MGI, both `--order shuffle` and `--max`) and
+  thread-deterministic; it removes a redundant whole-file quality/name encode
+  (a small single-thread win, since quality coding is cheap next to the reorder
+  assembly and the still-required plain sequence coding).
+
 - **Lower peak memory on Nanopore compression — the whole-input buffer is gone.**
   `compress_auto` routed every long-read input to a buffered path that held the
   entire file in memory to build the whole-file shared reference (#168). #211

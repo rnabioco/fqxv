@@ -775,6 +775,23 @@ pub(crate) fn compress_block_with_seq(
     assemble_block_payload(b, &names_c, precoded_seq, &qual_c, params)
 }
 
+/// Code one non-reorder block reusing already-coded names AND sequence streams:
+/// only quality (fqzcomp) is coded here, and the supplied `names_c`/`seq_c` are
+/// bundled in as-is. Used by the single-end reorder never-worse gate, which codes
+/// each candidate's names+sequence to decide the winner on non-quality size, then
+/// codes quality exactly once — for the layout it keeps ([`assemble_block_payload`]
+/// makes the result byte-identical to a plain [`compress_block`] pass, since the
+/// names/seq bytes and the freshly coded quality are the same).
+pub(crate) fn compress_block_with_names_seq(
+    b: &RawBlock,
+    params: &Params,
+    names_c: &[u8],
+    seq_c: &[u8],
+) -> Result<Vec<u8>> {
+    let qual_c = fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning)?;
+    assemble_block_payload(b, names_c, seq_c, &qual_c, params)
+}
+
 /// Assemble a block payload from its three already-coded streams: prepend the
 /// per-stream decoded-content digests and `n_reads`, then each length-prefixed
 /// stream. Shared by the plain ([`compress_block`]) and shared-reference
