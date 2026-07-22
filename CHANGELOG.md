@@ -28,6 +28,20 @@ misreading it. A format major bump would be announced as a breaking change.
   determinism round-trips). HiFi still buffers (its shared reference pays off); an
   auto-detected ONT set without `--platform` also still buffers, since the
   streaming path detects platform from read names (issue #225).
+  
+### Changed
+
+- **Long-read compress is faster at identical output.** Two changes cut compress
+  time without moving any ratio or byte of the archive: the overlap-consensus
+  candidate that Nanopore always discarded is no longer built (#223, ~42% faster
+  ONT default), and the banded-DP traceback is de-packed to one byte per cell
+  (#222, ~25% faster ONT / ~13% faster HiFi). Combined, default-mode ONT compress
+  is ~2.3× faster than v0.4.0. A full benchmark rerun on this build reproduced
+  every ratio and per-stream size byte-for-byte.
+
+### Added
+
+- **Python bindings expose `estimate()` and `verify()`** (#218).
 
 ## [0.4.0] - 2026-07-21
 

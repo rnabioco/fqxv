@@ -122,6 +122,15 @@ Two facts hold on both platforms:
   ordinary-coverage HiFi (Revio WGS), which the raw-LZMA path below addresses.
   Each lever is described under [the sequence codecs](#the-sequence-codecs).
 
+**Compress speed.** The long-read codecs are the compute-heavy part of `fqxv`, and
+recent work cut that cost without touching the output: on a 16-thread node,
+default-mode compress of the noisy ONT run is now **~3× faster** (skipping an
+always-discarded consensus candidate and the redundant shared-reference assembly
+on Nanopore, and de-packing the alignment traceback), and HiFi is ~9% faster —
+same archives, same ratios. The deepest sequence lever (best-of-N tiling
+references) stays gated to `--max`, so the default stays fast and `--max` buys the
+extra ratio only when you ask for it.
+
 ### Lossy quality
 
 `--quality-bin ont` cuts the ONT quality stream by ~3.5× (mean |Δ| 3.35). Binning
