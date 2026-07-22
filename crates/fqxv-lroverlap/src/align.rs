@@ -56,21 +56,19 @@ fn max_band_for(n: usize) -> usize {
 }
 
 /// The traceback matrix stores one of three predecessors per cell (diag/up/left
-/// = 0/1/2), so two bits suffice. Packing four cells per byte quarters the only
-/// full-size allocation [`align_banded`] keeps after the score rows are rolled.
-/// Every cell is written at most once over a zero-initialized buffer, and each
-/// `align_banded` call owns its own buffer, so a masked store needs no ordering.
+/// = 0/1/2). One byte per cell: a plain store, no read-modify-write. The 2-bit
+/// packing this replaced quartered the buffer but forced an RMW on every one of
+/// the AVX2 fill's scattered per-cell stores (~26% of HiFi compress self-time,
+/// issue #220); the bands are small, so the 4× larger buffer is cheap.
 #[inline]
 fn tb_set(buf: &mut [u8], idx: usize, val: u8) {
-    let shift = (idx & 3) * 2;
-    let byte = &mut buf[idx >> 2];
-    *byte = (*byte & !(0b11 << shift)) | ((val & 0b11) << shift);
+    buf[idx] = val;
 }
 
-/// Read a two-bit traceback pointer written by [`tb_set`].
+/// Read a traceback pointer written by [`tb_set`].
 #[inline]
 fn tb_get(buf: &[u8], idx: usize) -> u8 {
-    (buf[idx >> 2] >> ((idx & 3) * 2)) & 0b11
+    buf[idx]
 }
 
 /// Align `refr` to `query` under unit edit costs, restricted to a diagonal band
@@ -155,10 +153,10 @@ pub fn align_banded(refr: &[u8], query: &[u8], band: usize) -> Alignment {
         Some(i * stride + (j - lo))
     };
 
-    // 2 bits/cell (0=diag 1=up(del) 2=left(ins)), four cells per byte. Packing
-    // four cells per byte quarters the only full-size allocation this call keeps
-    // once the score rows are rolled away by [`fill`].
-    let mut from = vec![0u8; ((n + 1) * stride).div_ceil(4)];
+    // One byte/cell (0=diag 1=up(del) 2=left(ins)) — a plain store, no RMW (see
+    // [`tb_set`]). This is the only full-size allocation this call keeps once the
+    // score rows are rolled away by [`fill`]; the bands are small.
+    let mut from = vec![0u8; (n + 1) * stride];
 
     // Fill the traceback matrix and return the corner distance `dp[n][m]`. The
     // recurrence, tie-break, and `from` layout are identical across every
@@ -635,7 +633,7 @@ mod tests {
         let band = raw_band.max(need) + 1;
         assert!(band <= max_band_for(n), "ceiling must not bind in tests");
         let stride = (2 * band + 1).min(m + 1);
-        let size = ((n + 1) * stride).div_ceil(4);
+        let size = (n + 1) * stride;
         (band, stride, size)
     }
 
