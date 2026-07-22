@@ -266,11 +266,24 @@ pub fn compress_auto<'a, R: Read + Send + 'a, W: Write>(
         "detected layout"
     );
 
-    // Single-end, short-read, non-reorder: stream the peeked prefix then the rest
-    // through the drive path (#112). The other layouts need the whole input —
-    // reorder for its global clustering, interleaved for spot regrouping, long-read
-    // for its whole-file shared reference — so complete the buffer.
-    if g == 1 && !params.reorder && !long_read {
+    // Single-end, non-reorder: stream the peeked prefix then the rest through the
+    // drive path (#112) instead of buffering the whole input. The other layouts
+    // need the whole input — reorder for its global clustering, interleaved for
+    // spot regrouping, long-read for its whole-file shared reference (#168) — so
+    // they complete the buffer.
+    //
+    // Explicit Nanopore is the exception among long reads: #211 disabled its
+    // whole-file shared reference (the consensus is too noisy to pay off), so the
+    // only reason to buffer is gone. Streaming produces a byte-identical archive —
+    // `compress_multi` cuts blocks at the same `MAX_BLOCK_SEQ_BYTES` budget as the
+    // buffered `block_ranges`, and with no shared reference each Nanopore block
+    // codes with the same plain per-block codec either way — while holding one
+    // block instead of the whole file (the ~25% peak-heap sink, #225). It must be
+    // *explicit* Nanopore: the streaming path detects platform from read names,
+    // which is `Unknown` for SRA-style names, so an auto-detected ONT set still
+    // takes the buffered path that content-classifies it.
+    let stream_ok = !long_read || params.platform == Some(Platform::Nanopore);
+    if g == 1 && !params.reorder && stream_ok {
         return compress(prefix.as_slice().chain(reader), writer, params);
     }
     if !eof {
