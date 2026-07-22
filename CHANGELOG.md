@@ -15,6 +15,17 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Performance
 
+- **Reorder drops the redundant v2 single-contig sequence candidate per block.** On
+  the adaptive `rescue` path (`--order any`/`--max` default) each block coded both
+  the v2 single-contig codec and the v3 literal-rescue codec and kept the smaller.
+  v3 generalizes v2 — it attaches the reads v2 strands as literals and otherwise
+  degenerates to the same coding — so it is the block-local floor on its own;
+  coding v2 too was near-redundant. v2 is now coded only under `--no-rescue` (its
+  intended fast single-contig path). Output is **byte-identical** on the validation
+  datasets (NovaSeq/GAIIx/MiSeq/MGI, `--order shuffle` and `--max`) — v3 was never
+  larger than v2 on any block — for one fewer per-block sequence encode
+  (~1.08× faster single-thread `--max` on a 2M-read NovaSeq subset).
+
 - **Lower peak memory on Nanopore compression — the whole-input buffer is gone.**
   `compress_auto` routed every long-read input to a buffered path that held the
   entire file in memory to build the whole-file shared reference (#168). #211

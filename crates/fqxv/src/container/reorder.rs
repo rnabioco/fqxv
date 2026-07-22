@@ -395,13 +395,17 @@ fn encode_reordered_clustered<W: Write>(
             .map(|&(s, e)| -> Result<BlockChoice> {
                 let refs: Vec<&[u8]> = (s..e).map(cl_read).collect();
                 let anch = &cl_anchors[s..e];
-                let mut block_local = fqxv_reorder::encode_clustered(&refs, anch, order)?;
-                if params.rescue {
-                    let v3 = fqxv_reorder::encode_clustered_rescue(&refs, anch, order)?;
-                    if v3.len() < block_local.len() {
-                        block_local = v3;
-                    }
-                }
+                // v3 (literal-rescue) generalizes v2 (single-contig): it attaches
+                // reads v2 would strand as literals and otherwise degenerates to the
+                // same coding, so on the adaptive `rescue` path it is the block-local
+                // floor on its own — coding v2 too is near-redundant. `--no-rescue`
+                // still uses v2 (the fast single-contig path is the whole point of
+                // that flag).
+                let block_local = if params.rescue {
+                    fqxv_reorder::encode_clustered_rescue(&refs, anch, order)?
+                } else {
+                    fqxv_reorder::encode_clustered(&refs, anch, order)?
+                };
                 let with_ref = match &global {
                     Some((reference, places, _)) => {
                         let v4 =
