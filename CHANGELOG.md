@@ -15,6 +15,38 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Performance
 
+- **Byte-identical speed in the long-read overlap search (chaining).** The minimizer
+  overlap search (`fqxv-lroverlap`) is the top self-cost of Nanopore compress, and a
+  query's per-anchor chaining dominates it (a fresh profile put `Chainer::chain` at
+  ~23% and `find_overlaps` at ~14% of ONT compress). Three output-preserving changes
+  strip wasted work without moving a single archive byte:
+  - **The chainer's redundant re-sort is dropped.** `find_overlaps` already sorts a
+    query's whole anchor set by `(target, strand, tpos, qpos)`, so each
+    `(target, strand)` group it hands the chainer arrives already in `(tpos, qpos)`
+    order — exactly what the chainer's own `sort_unstable` would produce. A new
+    `Chainer::chain_presorted` entry point skips that re-sort (it still dedups),
+    saving hundreds of sorts per read at high coverage.
+  - **The chaining DP's scratch buffers are reused.** The per-anchor score,
+    predecessor, order, and used arrays — plus the per-chain path — were
+    heap-allocated on every group (hundreds of small allocations per read). They are
+    now thread-local buffers, cleared and resized per group, never read stale — so
+    the chain set stays a pure function of the input.
+  - **The hot anchor-bucket sort is a radix sort.** Each anchor's group-and-position
+    key `(target, strand, tpos, qpos)` packs losslessly into a `u128` whose
+    ascending order is exactly the tuple order, so the per-query sort (~7% of ONT
+    compress) is now a deterministic LSD radix sort producing the identical total
+    order rather than a comparison sort.
+  About **15% faster single-thread** ONT compress (`ecoli_ont`/DRR205413,
+  559 s → 475 s), where chaining is the largest self-cost. At 16 threads long-read
+  compress is block-bound — a handful of large blocks gate the wall clock, not the
+  per-anchor work — so the gain is dataset-shaped: ~noise on ONT (few, large blocks)
+  but about **10% faster** on high-coverage HiFi (`ecoli_hifi`, `--platform pacbio`,
+  254 s → 228 s at 16 threads), where the many smaller blocks keep the cores fed.
+  Archives are **byte-identical** on ONT (default and `--max`) and HiFi, and
+  thread-count invariant (`--threads 1` == `--threads 16`). Proptests pin the radix
+  order to the comparison sort's and the presorted chain path to the sorting path.
+  The levers mirror minimap2's own presorted chaining and `radix_sort_128x`. (#151)
+
 - **Anchor-restricted long-read tile coding (CoLoRd-style).** The multi-reference
   ONT tiler used to re-align each tile with one banded DP over the whole
   `read × reference` window, re-deriving the exact-match stretches its own minimizer
