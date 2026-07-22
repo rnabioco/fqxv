@@ -249,23 +249,64 @@ fn bcode(b: u8) -> usize {
     }
 }
 
+/// Per-block quantizer for the three recent-quality context fields, indexed by the
+/// quality value on the encoder's `cv = byte - qmin` scale.
+///
+/// The three fields feed the coarse/mid/rich tiers at their fixed bit widths
+/// (`q1` 6 bits, `q2` 3 bits, `q3` 2 bits). [`QCtx::flat`] reproduces the original
+/// fixed `>>1`/`>>3`/`>>4` shifts exactly (byte-identical `MODE_SEQ_BINMIX`); a
+/// per-block quantizer table (built by the caller from the block's histogram)
+/// instead spends full resolution where quality actually varies — the fqzcomp
+/// `qtab` idea (`MODE_SEQ_BINMIX_Q`). Because encode trials both and keeps the
+/// smaller, the table can only match or shrink a block.
+pub(crate) struct QCtx {
+    g1: [u8; 256],
+    g2: [u8; 256],
+    g3: [u8; 256],
+}
+
+impl QCtx {
+    /// The original fixed shifts, as tables: `g1[cv]=cv>>1`, `g2[cv]=cv>>3`,
+    /// `g3[cv]=cv>>4`. [`keys`] masks each field, so this is byte-identical to the
+    /// pre-quantizer coder.
+    pub(crate) fn flat() -> Self {
+        let mut g1 = [0u8; 256];
+        let mut g2 = [0u8; 256];
+        let mut g3 = [0u8; 256];
+        for cv in 0..256usize {
+            g1[cv] = (cv >> 1) as u8;
+            g2[cv] = (cv >> 3) as u8;
+            g3[cv] = (cv >> 4) as u8;
+        }
+        QCtx { g1, g2, g3 }
+    }
+
+    /// Build a quantizer from explicit per-cv bucket tables (see
+    /// `crate::build_quant_ctx`).
+    pub(crate) fn from_tables(g1: [u8; 256], g2: [u8; 256], g3: [u8; 256]) -> Self {
+        QCtx { g1, g2, g3 }
+    }
+}
+
 /// Context keys (coarse 16b, mid 18b, rich 22b) from the base window and recent
 /// qualities — base identity and homopolymer runs, where long-read quality lives.
+/// The three recent-quality fields arrive already quantized (see [`QCtx`]); [`keys`]
+/// only masks them to their tier bit widths.
 #[inline]
 #[allow(clippy::too_many_arguments)] // a context-key builder over one feature per arg
 fn keys(
-    q1: u8,
-    q2: u8,
-    q3: u8,
+    qc1: u32,
+    qc2: u32,
+    qc3: u32,
     base: usize,
     next: usize,
     next2: usize,
     prevbase: usize,
     hp: usize,
 ) -> [u32; 3] {
-    let f1 = (q1 as u32 >> 1) & 0x3F;
-    let q2c = (q2 as u32 >> 3) & 0x7;
-    let q3c = (q3 as u32 >> 4) & 0x3;
+    let f1 = qc1 & 0x3F;
+    let q2c = qc2 & 0x7;
+    let q3c = qc3 & 0x3;
     let (b, nx, n2, pb) = (
         base as u32 & 3,
         next as u32 & 3,
@@ -279,7 +320,7 @@ fn keys(
     [coarse, mid, rich]
 }
 
-/// Encode per-read qualities with the binary-mixing coder.
+/// Encode per-read qualities with the binary-mixing coder under quantizer `qc`.
 pub(crate) fn encode(
     lens: &[u32],
     binned: &[u8],
@@ -287,6 +328,7 @@ pub(crate) fn encode(
     dense: &[u8; 256],
     qmin: u8,
     k: usize,
+    qc: &QCtx,
 ) -> Vec<u8> {
     let mut mx = BinMixer::new(k);
     let mut enc = Encoder::new();
@@ -307,9 +349,9 @@ pub(crate) fn encode(
             let next2 = sread.get(pos + 2).copied().unwrap_or(u8::MAX);
             run = if base == prev_base { run + 1 } else { 1 };
             let kk = keys(
-                q1,
-                q2,
-                q3,
+                qc.g1[q1 as usize] as u32,
+                qc.g2[q2 as usize] as u32,
+                qc.g3[q3 as usize] as u32,
                 bcode(base),
                 bcode(next),
                 bcode(next2),
@@ -327,7 +369,8 @@ pub(crate) fn encode(
     enc.finish()
 }
 
-/// Decode a binary-mixing payload into `quals`.
+/// Decode a binary-mixing payload into `quals` under quantizer `qc`.
+#[allow(clippy::too_many_arguments)] // parallel of `encode`, one arg per coder input
 pub(crate) fn decode(
     lens: &[u32],
     payload: &[u8],
@@ -335,6 +378,7 @@ pub(crate) fn decode(
     syms: &[u8],
     qmin: u8,
     k: usize,
+    qc: &QCtx,
     quals: &mut Vec<u8>,
 ) -> Result<()> {
     let mut mx = BinMixer::new(k);
@@ -355,9 +399,9 @@ pub(crate) fn decode(
             let next2 = sread.get(pos + 2).copied().unwrap_or(u8::MAX);
             run = if base == prev_base { run + 1 } else { 1 };
             let kk = keys(
-                q1,
-                q2,
-                q3,
+                qc.g1[q1 as usize] as u32,
+                qc.g2[q2 as usize] as u32,
+                qc.g3[q3 as usize] as u32,
                 bcode(base),
                 bcode(next),
                 bcode(next2),
@@ -410,10 +454,44 @@ mod tests {
             lens.push(l as u32);
         }
         let (syms, dense, qmin, k) = dense_of(&quals);
-        let payload = encode(&lens, &quals, &seq, &dense, qmin, k);
+        let qc = QCtx::flat();
+        let payload = encode(&lens, &quals, &seq, &dense, qmin, k, &qc);
         let mut out = Vec::new();
-        decode(&lens, &payload, &seq, &syms, qmin, k, &mut out).unwrap();
+        decode(&lens, &payload, &seq, &syms, qmin, k, &qc, &mut out).unwrap();
         assert_eq!(out, quals, "binmix round-trip must be lossless");
+    }
+
+    #[test]
+    fn roundtrip_binmix_tabled_quantizer() {
+        // A non-flat quantizer must round-trip identically to the flat one — the
+        // g-tables only relabel the context, never the coded symbol.
+        let bases = b"ACGTACGTAAAACCCCGGGGTTTTACGTTTTTAAAACGCG";
+        let (mut seq, mut quals, mut lens) = (Vec::new(), Vec::new(), Vec::new());
+        for r in 0..6u32 {
+            let l = 9 + r as usize;
+            for i in 0..l {
+                let bb = bases[(r as usize * 5 + i) % bases.len()];
+                seq.push(bb);
+                quals.push(33 + ((bcode(bb) * 9 + i * 2 + r as usize) % 42) as u8);
+            }
+            lens.push(l as u32);
+        }
+        let (syms, dense, qmin, k) = dense_of(&quals);
+        // A hand-built tabled quantizer (dense rank for q1, coarse for q2/q3).
+        let mut g1 = [0u8; 256];
+        let mut g2 = [0u8; 256];
+        let mut g3 = [0u8; 256];
+        for (i, &b) in syms.iter().enumerate() {
+            let cv = (b - qmin) as usize;
+            g1[cv] = i as u8;
+            g2[cv] = (i as u8) >> 2;
+            g3[cv] = (i as u8) >> 3;
+        }
+        let qc = QCtx::from_tables(g1, g2, g3);
+        let payload = encode(&lens, &quals, &seq, &dense, qmin, k, &qc);
+        let mut out = Vec::new();
+        decode(&lens, &payload, &seq, &syms, qmin, k, &qc, &mut out).unwrap();
+        assert_eq!(out, quals, "tabled-quantizer round-trip must be lossless");
     }
 
     #[test]
@@ -422,9 +500,10 @@ mod tests {
         let quals = vec![b'~'; 40];
         let lens = vec![40u32];
         let (syms, dense, qmin, k) = dense_of(&quals);
-        let payload = encode(&lens, &quals, &seq, &dense, qmin, k);
+        let qc = QCtx::flat();
+        let payload = encode(&lens, &quals, &seq, &dense, qmin, k, &qc);
         let mut out = Vec::new();
-        decode(&lens, &payload, &seq, &syms, qmin, k, &mut out).unwrap();
+        decode(&lens, &payload, &seq, &syms, qmin, k, &qc, &mut out).unwrap();
         assert_eq!(out, quals);
     }
 }
