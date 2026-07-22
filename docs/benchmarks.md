@@ -96,8 +96,8 @@ basecaller):
 
 | Tool | Total | Non-quality | Quality | Non-quality bits/base |
 | --- | ---: | ---: | ---: | ---: |
-| CoLoRd `-q org` | **197.9M** | **31.4M** | 166.5M | 0.84 |
-| `fqxv -l9` | 198.2M | 34.5M (seq) | **163.7M** | 0.92 |
+| CoLoRd `-q org` | 197.9M | **31.4M** | 166.5M | 0.84 |
+| `fqxv -l9` | **197.1M** | 33.4M (seq) | **163.7M** | 0.89 |
 
 **`ecoli_hifi`** (SRR11434954 subset, 1.55G bases, mean Q≈27, ~300×):
 
@@ -112,13 +112,14 @@ Two facts hold on both platforms:
   context-mixing quality coder codes the HiFi quality stream to **641.8M vs
   CoLoRd's 684.3M** (~6% smaller) and ONT to **163.7M vs 166.5M** (~2% smaller).
   On HiFi that quality win carries the **lossless total ahead of CoLoRd** (656.0M
-  vs 697.7M, **4.73× vs 4.44×** on the full file); on ONT the two totals are now
-  within 0.2% (198.2M vs 197.9M).
+  vs 697.7M, **4.73× vs 4.44×** on the full file); on ONT fqxv now edges ahead on
+  the **total** too — **197.1M vs 197.9M** (3.06× vs 3.05×).
 - **The sequence stream is no longer a blanket deficit.** On HiFi Sequel II it is a
   *credit* (12.6M vs 13.4M) — the same locus is read hundreds of times at ~300×,
   and fqxv now assembles one whole-file consensus and codes each read against it. On
-  ONT it is down to 34.5M vs 31.4M — ~10% behind on sequence, where the quality
-  credit nearly closes the total. The one regime it still trails materially is
+  ONT it is down to 33.4M vs 31.4M — ~6% behind on sequence (the anchor-restricted
+  coder aligns only inter-anchor gaps), which the quality credit now more than
+  closes. The one regime it still trails materially is
   ordinary-coverage HiFi (Revio WGS), which the raw-LZMA path below addresses.
   Each lever is described under [the sequence codecs](#the-sequence-codecs).
 
@@ -127,9 +128,11 @@ recent work cut that cost without touching the output: on a 16-thread node,
 default-mode compress of the noisy ONT run is now **~3× faster** (skipping an
 always-discarded consensus candidate and the redundant shared-reference assembly
 on Nanopore, and de-packing the alignment traceback), and HiFi is ~9% faster —
-same archives, same ratios. The deepest sequence lever (best-of-N tiling
-references) stays gated to `--max`, so the default stays fast and `--max` buys the
-extra ratio only when you ask for it.
+same archives, same ratios. On top of that the anchor-restricted tiler coder (#231)
+makes ONT another **1.54× faster at 16 threads** *and* smaller (it aligns only
+inter-anchor gaps). The deepest sequence lever (best-of-N tiling references) stays
+gated to `--max`, so the default stays fast and `--max` buys the extra ratio only
+when you ask for it.
 
 ### Lossy quality
 
@@ -163,12 +166,14 @@ different coverage/error regime:
   Gbase) it cuts the sequence stream from **1.391 to 0.683 bits/base**, taking the
   whole archive from **9.7× to 17×** — from the worst lossless result in the suite
   to a strong second behind CoLoRd (18.8×), now ahead of both zstd -19 and xz -9.
-- **Multi-reference tiling** — the Nanopore lever. Each read is coded against
-  earlier *raw* reads with best-of-N reference selection (engaged at `-l9`/`--max`),
-  which pays where a read sits closer to another single read than to a divergent
-  consensus — the ~10% ONT-error regime. It cuts ONT sequence from 1.150 (default,
-  single reference) to **0.915 bits/base**, bringing the ONT total to parity with
-  CoLoRd (3.05× each).
+- **Multi-reference tiling + anchor-restricted coding** — the Nanopore lever. Each
+  read is coded against earlier *raw* reads with best-of-N reference selection
+  (engaged at `-l9`/`--max`), which pays where a read sits closer to another single
+  read than to a divergent consensus — the ~10% ONT-error regime. Rather than
+  re-aligning the whole read, the coder seeds minimizers, chains them, and aligns
+  only the short inter-anchor gaps (CoLoRd-style) — both faster and tighter.
+  Together they cut `-l9` ONT sequence to **0.887 bits/base**, bringing the ONT
+  total **ahead of CoLoRd** (3.06× vs 3.05×).
 
 See [Long-read support](design/longread.md) for the full analysis.
 
