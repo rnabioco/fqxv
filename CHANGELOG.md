@@ -15,6 +15,28 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Performance
 
+- **Reorder compress: SIMD merge scan, malloc-free placement, incremental
+  `cast_vote`.** Three byte-identical, zero-ratio-cost speedups on the hot
+  short-read reorder assembly/merge phases (`--order any`/`shuffle`/`--max`).
+  (1) The overlap-merge successor scan now compares 16 bytes at a time
+  (`_mm_cmpeq_epi8` + movemask popcount, budget checked per block) behind a
+  runtime `is_x86_feature_detected!("sse2")` dispatch with a byte-identical
+  scalar fallback (no raised global baseline) — the count matches the scalar
+  loop exactly when within budget and exceeds it exactly when the scalar loop
+  would break, so `best_key` and the archive are unchanged. (2) `place_on_contig`
+  and the rescue assembler's `try_place`/`place` no longer allocate a
+  `Vec<usize>` of mismatch positions per candidate: candidates are scored with a
+  count-only pass and only the winner's positions are materialized (into a
+  caller-reused scratch buffer on the clustered path). (3) `cast_vote` updates
+  the per-column plurality in O(1) by comparing the just-incremented base against
+  the current winner (lowest-index tie rule preserved) instead of `max_by_key`
+  over all four counts. About **2% faster single-thread** (54.87 s → 53.83 s,
+  1.02× ± 0.00, on 1M-read NovaSeq `--order shuffle` compress); within noise at
+  `--threads 16` (1.00× ± 0.04), where the wall clock is dominated by the serial
+  assembly prelude. **Byte-identical** archives on the validation datasets
+  (NovaSeq/GAIIx/MiSeq/MGI, both `--order shuffle` and `--max`), and
+  thread-deterministic (`--threads 1` == `--threads 16`). (#219)
+
 - **Anchor-restricted long-read tile coding (CoLoRd-style).** The multi-reference
   ONT tiler used to re-align each tile with one banded DP over the whole
   `read × reference` window, re-deriving the exact-match stretches its own minimizer
