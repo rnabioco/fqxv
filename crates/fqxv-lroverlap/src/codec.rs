@@ -41,6 +41,7 @@ use rayon::prelude::*;
 use fqxv_bytes::{read_varint, write_varint};
 use fqxv_dna::{base_of_sym, is_acgt, revcomp_acgt};
 
+use crate::anchorgap::{anchor_chain, anchorgap_build};
 use crate::{
     Alignment, Anchored, ChainOpts, ConsensusOpts, Error, Index, LayoutOpts, MAX_BASES_PER_BYTE,
     Op, Repeat, Sketch, align_banded, apply, consensus, find_overlaps, layout, place_all,
@@ -541,6 +542,14 @@ fn code_against(
     let read_at = |r: usize| &seq[offs[r]..offs[r + 1]];
     let all_refs: Vec<&[u8]> = (0..n).map(read_at).collect();
 
+    // Anchor-restricted coding (#226) is the default; `FQXV_LRO_NO_ANCHORGAP=1`
+    // forces the whole-window banded DP everywhere for A/B (mirrors the tiler's
+    // `FQXV_TILE_NO_ANCHORGAP`). Even on the anchor path, a read whose reference
+    // shares too few exact k-mers to chain still falls back to the DP — the anchor
+    // path never *loses* coverage, it only avoids re-deriving the exact matches a
+    // recovered chain already proved. Read once here, not per read.
+    let anchorgap = std::env::var_os("FQXV_LRO_NO_ANCHORGAP").is_none();
+
     // ---- place every read on its best-scoring reference ----------------
     // One combined index over all consensi, queried once per read, rather than
     // one `place_against` pass per consensus (`consensi × reads` overlap searches
@@ -583,7 +592,26 @@ fn code_against(
                         return None;
                     }
                     let band = (a.drift as usize + opts.band_margin).min(opts.band_cap);
-                    Some((start, align_for_coding(&cs[start..end], &read, band).ops))
+                    let refwin = &cs[start..end];
+                    // Emit the read's shared exact-k-mer anchors against its
+                    // consensus as free copy-runs and align only the inter-anchor
+                    // gaps + flanks, instead of a whole-window banded DP. On HiFi
+                    // the read shares nearly all of its k-mers with a good
+                    // consensus, so the DP area collapses from O(read_len * band)
+                    // to the sum of the (tiny) gaps. `anchor_chain` returns `None`
+                    // for a read that shares too few k-mers to chain, and the DP
+                    // then codes it whole. Encoder-only — the decoder replays
+                    // whichever `Op` stream this produced.
+                    let ops = match anchorgap
+                        .then(|| anchor_chain(refwin, &read, sketch))
+                        .flatten()
+                    {
+                        Some(chain) => {
+                            anchorgap_build(refwin, &read, band, &chain, sketch.k as u32)
+                        }
+                        None => align_for_coding(refwin, &read, band).ops,
+                    };
+                    Some((start, ops))
                 })
                 .collect();
 

@@ -60,6 +60,7 @@
 #![deny(unsafe_code)]
 
 mod align;
+mod anchorgap;
 mod chain;
 mod codec;
 mod consensus;
