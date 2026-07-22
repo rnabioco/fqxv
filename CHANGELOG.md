@@ -15,6 +15,20 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Performance
 
+- **Anchor-restricted long-read tile coding (CoLoRd-style).** The multi-reference
+  ONT tiler used to re-align each tile with one banded DP over the whole
+  `read × reference` window, re-deriving the exact-match stretches its own minimizer
+  chain had already proven identical. It now walks that chain, emits each anchor as a
+  free `Match` copy-run, and runs the aligner only on the short inter-anchor gaps and
+  the two flanks — so alignment work scales with divergence, not read length. About
+  **2.5× faster** single-thread ONT tiler compress, with an aggregate ratio
+  improvement across the ONT corpus (most accessions smaller — e.g. DRR205413 −2.9%,
+  DRR351396 −2.8%, DRR424350 −2.6%; worst real-data case ≈ +0.3%). Lossless and
+  thread-deterministic; the edit-op stream keeps the same semantics, so the decoder
+  is unchanged and archives still round-trip byte-for-byte. A tile whose chain is not
+  recovered falls back to the whole-window DP; `FQXV_TILE_NO_ANCHORGAP=1` forces the
+  DP everywhere for A/B. (#226)
+
 - **Reorder drops the redundant v2 single-contig sequence candidate per block.** On
   the adaptive `rescue` path (`--order any`/`--max` default) each block coded both
   the v2 single-contig codec and the v3 literal-rescue codec and kept the smaller.

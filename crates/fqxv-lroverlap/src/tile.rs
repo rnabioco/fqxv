@@ -44,6 +44,8 @@
 //! non-ACGT byte from the exception list applied last (identical to
 //! [`crate::codec`]).
 
+use std::collections::HashMap;
+
 use rayon::prelude::*;
 
 use fqxv_bytes::{read_varint, write_varint};
@@ -54,7 +56,8 @@ use crate::codec::{
     encode_subs, get_stream, put_stream,
 };
 use crate::{
-    ChainOpts, EncodeOpts, Error, Index, MAX_BASES_PER_BYTE, Op, Overlap, Repeat, find_overlaps,
+    Anchor, ChainOpts, Chainer, EncodeOpts, Error, Index, MAX_BASES_PER_BYTE, Op, Overlap, Repeat,
+    ScriptOpts, Sketch, chain_span, find_overlaps, script_from_chain,
 };
 
 /// Format tag for a tiling sequence block. Distinct from the consensus codec's
@@ -219,6 +222,31 @@ const TILE_FRAME_BITS: u64 = 40;
 /// [`TILE_FRAME_BITS`] matters, and only for ranking. Never affects decode.
 const TILE_EDIT_BITS: u64 = 8;
 
+/// Whether a tile takes the anchor-restricted coder (#226) or the whole-window
+/// banded DP. Resolved once per block in [`tile_encode`] and threaded to each tile.
+///
+/// Anchor-restricted coding is the default (`anchorgap`); `FQXV_TILE_NO_ANCHORGAP=1`
+/// forces the DP everywhere for A/B. Even on `anchorgap`, a tile with no recovered
+/// chain still falls back to the DP — the anchor path never *loses* coverage, it
+/// only avoids re-deriving the exact matches the chain already proved.
+#[derive(Clone, Copy)]
+struct GateCfg {
+    /// Use the anchor-restricted coder where a chain is found (else always the DP).
+    anchorgap: bool,
+}
+
+impl GateCfg {
+    /// Anchor-restricted coding wherever a chain is recovered (the shipped default).
+    fn anchor() -> Self {
+        Self { anchorgap: true }
+    }
+
+    /// Force the whole-window DP for every tile (the baseline / escape hatch).
+    fn dp() -> Self {
+        Self { anchorgap: false }
+    }
+}
+
 /// The read-local context the cover functions share: which read is being tiled
 /// (`i`), the block's concatenated bases (`seq`) and per-read offsets (`offs`),
 /// the read slice itself (`read = seq[offs[i]..offs[i + 1]]`), and the alignment
@@ -230,6 +258,12 @@ struct ReadCtx<'a> {
     offs: &'a [usize],
     read: &'a [u8],
     band: usize,
+    /// The block's seeding sketch, used by the anchor-restricted coder to recover
+    /// the collinear anchor chain between a query span and its reference window.
+    sketch: Sketch,
+    /// Which coding path each tile takes: the anchor-restricted coder, or the
+    /// forced whole-window DP (`FQXV_TILE_NO_ANCHORGAP`).
+    gate: GateCfg,
 }
 
 /// Build the non-ACGT exception list over the whole sequence buffer: for each
@@ -264,6 +298,7 @@ fn tile_one_read(
     idx: Option<&Index>,
     band: usize,
     max_refs: usize,
+    gate: GateCfg,
 ) -> TileStreams {
     let read = &seq[offs[i]..offs[i + 1]];
     let mut s = TileStreams::default();
@@ -289,6 +324,8 @@ fn tile_one_read(
         offs,
         read,
         band,
+        sketch: idx.sketch(),
+        gate,
     };
     if max_refs <= 1 {
         cover_greedy(&ctx, &ovs, &mut s);
@@ -425,6 +462,8 @@ fn eval_candidate(ctx: &ReadCtx, o: &Overlap, pos: usize) -> Option<Cand> {
         offs,
         read,
         band,
+        sketch,
+        gate: GateCfg { anchorgap },
     } = ctx;
     let te = (o.q_end as usize).min(read.len());
     let target = &seq[offs[o.target as usize]..offs[o.target as usize + 1]];
@@ -440,7 +479,21 @@ fn eval_candidate(ctx: &ReadCtx, o: &Overlap, pos: usize) -> Option<Cand> {
     if rs >= re {
         return None;
     }
-    let mut ops = align_for_coding(&reference[rs..re], &read[pos..te], band).ops;
+    let refwin = &reference[rs..re];
+    let query = &read[pos..te];
+    // Anchor-restricted coding (CoLoRd-style): recover the collinear anchor chain
+    // (cheap — the coder needs it anyway) and emit its anchors as free copy-runs,
+    // aligning only the inter-anchor gaps and two flanks. When no chain is found —
+    // or when the DP is forced (`FQXV_TILE_NO_ANCHORGAP`) — align the whole window
+    // with the banded DP (the always-correct baseline). The decoder just replays
+    // whichever Op stream this produced.
+    let mut ops = match anchorgap
+        .then(|| anchor_chain(refwin, query, sketch))
+        .flatten()
+    {
+        Some(chain) => anchorgap_build(refwin, query, band, &chain, sketch.k as u32),
+        None => align_for_coding(refwin, query, band).ops,
+    };
     // A trailing Del consumes only reference, never query, so it carries nothing
     // the decoder needs and would desync the "produced == tile_len" termination —
     // drop it (as the consensus coder does for its per-read scripts).
@@ -460,13 +513,166 @@ fn eval_candidate(ctx: &ReadCtx, o: &Overlap, pos: usize) -> Option<Cand> {
         .sum();
     Some(Cand {
         te,
-        refwin: reference[rs..re].to_vec(),
+        refwin: refwin.to_vec(),
         ops,
         rs,
         delta: i as u64 - u64::from(o.target), // >= 1
         strand: o.strand,
         cost_bits: TILE_FRAME_BITS + dist * TILE_EDIT_BITS,
     })
+}
+
+/// Append `src` onto `dst`, merging a leading op into `dst`'s trailing one when
+/// they are the same kind — so the flank / chain / flank seams do not leave a
+/// `Match(3), Match(4)` pair the op model would code as two symbols. Mirrors the
+/// consensus/script codec's `compact`, keeping the produced stream tight.
+fn extend_ops(dst: &mut Vec<Op>, src: Vec<Op>) {
+    for op in src {
+        match (dst.last_mut(), op) {
+            (Some(Op::Match(a)), Op::Match(b)) => *a += b,
+            (Some(Op::Del(a)), Op::Del(b)) => *a += b,
+            (Some(Op::Ins(a)), Op::Ins(b)) => a.extend(b),
+            (_, op) => dst.push(op),
+        }
+    }
+}
+
+/// Recover the collinear exact-match anchor chain between the two same-orientation
+/// slices.
+///
+/// Returns the chain as a strictly non-overlapping, ascending anchor set (ready for
+/// [`script_from_chain`]), or `None` when the seeder recovers no chain (too short,
+/// or too few shared exact k-mers), in which case the caller aligns the whole
+/// window.
+///
+/// Every anchor is a genuine exact `k`-mer match: splitmix64 is injective over the
+/// `2k`-bit k-mer, so equal hash + equal strand between two same-orientation slices
+/// means the underlying k-mers are identical. That is [`script_from_chain`]'s
+/// "anchors are trusted" precondition, which its `debug_assert` also verifies.
+fn anchor_chain(refwin: &[u8], query: &[u8], sketch: Sketch) -> Option<Vec<Anchor>> {
+    let k = sketch.k as u32;
+    if refwin.len() < sketch.k || query.len() < sketch.k {
+        return None;
+    }
+
+    // Ref hash -> its (pos, strand) occurrences. Only looked up by key, never
+    // iterated into output, so the HashMap does not affect determinism.
+    let mut ref_by_hash: HashMap<u64, Vec<(u32, bool)>> = HashMap::new();
+    for m in sketch.seeds(refwin) {
+        ref_by_hash
+            .entry(m.hash)
+            .or_default()
+            .push((m.pos, m.strand));
+    }
+    // Anchor every query seed that hits a same-strand reference seed of equal hash.
+    let mut anchors: Vec<Anchor> = Vec::new();
+    for m in sketch.seeds(query) {
+        if let Some(hits) = ref_by_hash.get(&m.hash) {
+            for &(tpos, tstrand) in hits {
+                if tstrand == m.strand {
+                    anchors.push(Anchor { tpos, qpos: m.pos });
+                }
+            }
+        }
+    }
+    if anchors.is_empty() {
+        return None;
+    }
+
+    // Chain, keep the best chain, and restrict to the anchors that lie on it.
+    let chains = Chainer::new(ChainOpts {
+        k,
+        ..ChainOpts::default()
+    })
+    .chain(&mut anchors);
+    let c = chains.first().copied()?;
+    let mut span: Vec<Anchor> = anchors
+        .iter()
+        .copied()
+        .filter(|a| {
+            a.qpos >= c.q_start
+                && a.qpos + k <= c.q_end
+                && a.tpos >= c.t_start
+                && a.tpos + k <= c.t_end
+        })
+        .collect();
+    span.sort_unstable();
+    span.dedup();
+
+    // Keep a strictly non-overlapping subset (each anchor's `k`-window starts at or
+    // past the previous kept anchor's window end, on BOTH sequences). Dense
+    // minimizers make consecutive anchors overlap; `script_from_chain` silently
+    // *skips* an anchor that a previous one already consumed past, so its true
+    // coverage would end before `chain_span`'s last anchor — and the trailing flank,
+    // computed from `chain_span`, would then leave a gap and desync the decoder.
+    // Trimming to non-overlapping anchors makes `chain_span` the exact coverage
+    // `script_from_chain` produces. Dropping a redundant anchor never loses bases:
+    // the aligner recovers that span as an inter-anchor gap instead.
+    let mut on_chain: Vec<Anchor> = Vec::with_capacity(span.len());
+    let (mut pe_t, mut pe_q) = (0u32, 0u32);
+    for a in span {
+        if on_chain.is_empty() || (a.tpos >= pe_t && a.qpos >= pe_q) {
+            pe_t = a.tpos + k;
+            pe_q = a.qpos + k;
+            on_chain.push(a);
+        }
+    }
+    if on_chain.is_empty() {
+        return None;
+    }
+    Some(on_chain)
+}
+
+/// Assemble the anchor-restricted edit script for `query` against `refwin` from a
+/// recovered `on_chain` (see [`anchor_chain`]): emit each anchor span as a free
+/// [`Op::Match`] copy-run and run the banded aligner ONLY on the short inter-anchor
+/// gaps and the two flanks. Alignment work then scales with divergence rather than
+/// with `refwin.len()`, which is the whole point.
+///
+/// # Correctness of the composition
+///
+/// [`script_from_chain`]'s ops are authored *relative to the chain's first
+/// anchor* — applying them to `refwin[t_from..]` rebuilds `query[q_from..q_to]`.
+/// The leading flank is aligned over `refwin[..t_from]` → `query[..q_from]`, which
+/// consumes exactly `t_from` reference bases, so when the two op streams are
+/// concatenated a linear [`crate::apply`] walk arrives at reference offset
+/// `t_from` precisely as the chain ops expect. The trailing flank continues from
+/// `t_to`/`q_to` the same way. The result therefore replays to `query` exactly,
+/// with the same [`Op`] semantics the decoder already understands.
+fn anchorgap_build(
+    refwin: &[u8],
+    query: &[u8],
+    band: usize,
+    on_chain: &[Anchor],
+    k: u32,
+) -> Vec<Op> {
+    let (t_from, t_to, q_from, q_to) = chain_span(on_chain, k);
+    let t_from = (t_from as usize).min(refwin.len());
+    let t_to = (t_to as usize).min(refwin.len());
+    let q_from = (q_from as usize).min(query.len());
+    let q_to = (q_to as usize).min(query.len());
+
+    let mut ops: Vec<Op> = Vec::new();
+    // Leading flank: refwin[..t_from] -> query[..q_from].
+    if t_from > 0 || q_from > 0 {
+        extend_ops(
+            &mut ops,
+            align_for_coding(&refwin[..t_from], &query[..q_from], band).ops,
+        );
+    }
+    // Chain interior: anchors free, only the inter-anchor gaps aligned.
+    extend_ops(
+        &mut ops,
+        script_from_chain(refwin, query, on_chain, ScriptOpts { k, band }).0,
+    );
+    // Trailing flank: refwin[t_to..] -> query[q_to..].
+    if t_to < refwin.len() || q_to < query.len() {
+        extend_ops(
+            &mut ops,
+            align_for_coding(&refwin[t_to..], &query[q_to..], band).ops,
+        );
+    }
+    ops
 }
 
 /// Append a range-coded blob as `[varint symbol_count][varint blob_len][blob]`,
@@ -538,6 +744,33 @@ fn serialize(
 /// Returns [`Error::Corrupt`] if `lens` does not sum to `seq.len()`, or if an
 /// entropy-coder pass fails.
 pub fn tile_encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8>, Error> {
+    // Anchor-restricted tile coding (#226), the default: each tile is coded against
+    // its recovered anchor chain — anchors as free copy-runs, only the inter-anchor
+    // gaps and two flanks aligned — instead of one banded DP over the whole window
+    // (~2.5× faster ONT compress, and an aggregate ratio improvement across the ONT
+    // corpus). A tile with no recovered chain still takes the whole-window DP, so the
+    // path never loses coverage. `FQXV_TILE_NO_ANCHORGAP=1` forces the DP everywhere
+    // for A/B (mirrors `FQXV_SEQ_NO_LZMA`/`FQXV_SEQ_NO_OVERLAP`). Read once here (not
+    // per read); the block self-describes, so decode is unaffected by which path
+    // produced the edit scripts.
+    let gate = if std::env::var_os("FQXV_TILE_NO_ANCHORGAP").is_some() {
+        GateCfg::dp()
+    } else {
+        GateCfg::anchor()
+    };
+    tile_encode_with(lens, seq, opts, gate)
+}
+
+/// [`tile_encode`] with the coding path configured explicitly rather than from the
+/// environment, so tests can exercise both paths deterministically without a
+/// process-global env var: [`GateCfg::anchor`] uses the anchor-restricted coder
+/// wherever a chain is found, [`GateCfg::dp`] forces the whole-window DP.
+fn tile_encode_with(
+    lens: &[u32],
+    seq: &[u8],
+    opts: &EncodeOpts,
+    gate: GateCfg,
+) -> Result<Vec<u8>, Error> {
     let n = lens.len();
     let offs = compute_offs(lens, seq.len())?;
     let total_bases: u64 = lens.iter().map(|&l| u64::from(l)).sum();
@@ -560,7 +793,7 @@ pub fn tile_encode(lens: &[u32], seq: &[u8], opts: &EncodeOpts) -> Result<Vec<u8
     // Tile each read in parallel; merge in id order for a thread-independent block.
     let parts: Vec<TileStreams> = (0..n)
         .into_par_iter()
-        .map(|i| tile_one_read(i, &norm, &offs, idx.as_ref(), band, max_refs))
+        .map(|i| tile_one_read(i, &norm, &offs, idx.as_ref(), band, max_refs, gate))
         .collect();
     let mut all = TileStreams::default();
     for p in &parts {
@@ -867,12 +1100,117 @@ mod tests {
         (lens, seq)
     }
 
+    /// Round-trip through BOTH the default anchor-restricted coder (`tile_encode`,
+    /// #226) and the explicit whole-window DP path (`FQXV_TILE_NO_ANCHORGAP`), so
+    /// every generic round-trip test covers both regimes.
     fn roundtrip(reads: &[Vec<u8>], opts: &EncodeOpts) {
         let (lens, seq) = flatten(reads);
-        let block = tile_encode(&lens, &seq, opts).expect("encode");
-        let (dl, ds) = tile_decode(&block).expect("decode");
-        assert_eq!(dl, lens, "lengths round-trip");
-        assert_eq!(ds, seq, "sequence round-trips exactly");
+        for block in [
+            tile_encode(&lens, &seq, opts).expect("encode default"),
+            tile_encode_with(&lens, &seq, opts, GateCfg::dp()).expect("encode whole-window"),
+        ] {
+            let (dl, ds) = tile_decode(&block).expect("decode");
+            assert_eq!(dl, lens, "lengths round-trip");
+            assert_eq!(ds, seq, "sequence round-trips exactly");
+        }
+    }
+
+    /// Round-trip through the anchor-restricted coder (#226), asserting it is
+    /// deterministic and lossless.
+    fn roundtrip_anchorgap(reads: &[Vec<u8>], opts: &EncodeOpts) {
+        let (lens, seq) = flatten(reads);
+        let a = tile_encode_with(&lens, &seq, opts, GateCfg::anchor()).expect("encode a");
+        let b = tile_encode_with(&lens, &seq, opts, GateCfg::anchor()).expect("encode b");
+        assert_eq!(a, b, "anchorgap encode is deterministic");
+        let (dl, ds) = tile_decode(&a).expect("decode");
+        assert_eq!(dl, lens, "anchorgap lengths round-trip");
+        assert_eq!(ds, seq, "anchorgap sequence round-trips exactly");
+    }
+
+    #[test]
+    fn anchorgap_roundtrip_noisy_and_clean() {
+        // The overlapping ONT-class case the coder targets: dense coverage with
+        // ~8% substitution + indel noise, plus a clean copy, plus non-ACGT bytes.
+        for (glen, rlen, depth, err, seed) in [
+            (4_000, 900, 60, 80, 11),
+            (4_000, 800, 40, 0, 7),
+            (3_000, 700, 30, 40, 21),
+        ] {
+            let mut reads = overlapping_reads(glen, rlen, depth, err, seed);
+            for (k, r) in reads.iter_mut().enumerate() {
+                if k % 5 == 0 && r.len() > 12 {
+                    r[6] = b'N';
+                    r[11] = b'a';
+                }
+            }
+            for band in [64usize, 256, 768] {
+                roundtrip_anchorgap(
+                    &reads,
+                    &EncodeOpts {
+                        tile_band: band,
+                        ..EncodeOpts::default()
+                    },
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn anchorgap_roundtrip_edge_cases() {
+        // All-literal / tiny / zero-length reads must survive the anchorgap path
+        // exactly as the baseline does (they never reach a chain, so they take the
+        // whole-window fallback — still exact).
+        roundtrip_anchorgap(&[], &EncodeOpts::default());
+        roundtrip_anchorgap(&[rand_seq(500, 1)], &EncodeOpts::default());
+        roundtrip_anchorgap(
+            &[rand_seq(300, 2), Vec::new(), rand_seq(300, 3)],
+            &EncodeOpts::default(),
+        );
+    }
+
+    #[test]
+    fn no_chain_input_codes_identically_under_both_paths() {
+        // On input with no shared anchors (unrelated random reads), every tile's
+        // `anchor_chain` returns `None`, so the anchor-restricted coder takes the
+        // whole-window DP for every tile — the block must be byte-for-byte identical
+        // to forcing the DP. This pins the "no chain -> DP" fallback as exact.
+        let reads: Vec<Vec<u8>> = (0..8).map(|i| rand_seq(600, 500 + i)).collect();
+        let (lens, seq) = flatten(&reads);
+        for band in [64usize, 256, 768] {
+            let opts = EncodeOpts {
+                tile_band: band,
+                ..EncodeOpts::default()
+            };
+            let anchor = tile_encode_with(&lens, &seq, &opts, GateCfg::anchor()).expect("anchor");
+            let dp = tile_encode_with(&lens, &seq, &opts, GateCfg::dp()).expect("dp");
+            assert_eq!(
+                anchor, dp,
+                "with no recoverable chain the anchor path must equal the DP baseline"
+            );
+        }
+    }
+
+    #[test]
+    fn both_paths_are_lossless_and_thread_count_invariant() {
+        // The shipped anchor path and the `FQXV_TILE_NO_ANCHORGAP` DP path must each
+        // round-trip exactly and be byte-identical across encodes (determinism), on
+        // dense noisy overlapping reads that mix anchored tiles and aligned gaps.
+        let reads = overlapping_reads(6_000, 1_000, 90, 70, 909);
+        let (lens, seq) = flatten(&reads);
+        for band in [64usize, 768] {
+            let opts = EncodeOpts {
+                tile_band: band,
+                ..EncodeOpts::default()
+            };
+            for gate in [GateCfg::anchor(), GateCfg::dp()] {
+                let a = tile_encode_with(&lens, &seq, &opts, gate).expect("a");
+                let b = tile_encode_with(&lens, &seq, &opts, gate).expect("b");
+                assert_eq!(a, b, "encode is deterministic");
+                let (dl, ds) = tile_decode(&a).expect("decode");
+                assert_eq!(dl, lens, "lengths round-trip");
+                assert_eq!(ds, seq, "sequence round-trips exactly");
+            }
+        }
     }
 
     #[test]
@@ -1054,6 +1392,26 @@ mod tests {
             let (lens, seq) = flatten(&reads);
             let opts = EncodeOpts { tile_band: band, tile_max_refs: refs, ..EncodeOpts::default() };
             let block = tile_encode(&lens, &seq, &opts).expect("encode");
+            let (dl, ds) = tile_decode(&block).expect("decode");
+            prop_assert_eq!(dl, lens);
+            prop_assert_eq!(ds, seq);
+        }
+
+        /// The anchor-restricted coder (#226) round-trips exactly on arbitrary read
+        /// sets, across bands — the lossless bar for the prototype path.
+        #[test]
+        fn prop_roundtrip_anchorgap(
+            seed in any::<u64>(),
+            glen in 500usize..3_000,
+            rlen in 100usize..500,
+            depth in 1usize..40,
+            err in 0u32..120,
+            band in prop::sample::select(vec![64usize, 256, 768]),
+        ) {
+            let reads = overlapping_reads(glen, rlen.min(glen), depth, err, seed);
+            let (lens, seq) = flatten(&reads);
+            let opts = EncodeOpts { tile_band: band, ..EncodeOpts::default() };
+            let block = tile_encode_with(&lens, &seq, &opts, GateCfg::anchor()).expect("encode");
             let (dl, ds) = tile_decode(&block).expect("decode");
             prop_assert_eq!(dl, lens);
             prop_assert_eq!(ds, seq);
