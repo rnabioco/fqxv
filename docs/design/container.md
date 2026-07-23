@@ -132,6 +132,15 @@ for a whole fetched block) turn the fetched bytes back into reads. The reordered
 layout has no footer index, so `Index::read` rejects it — its streams are
 mutually dependent and cannot be projected.
 
+The Python `fqxv.remote` module surfaces this projection over HTTP `Range`
+requests: `RemoteArchive` fetches the footer tail with `parse_index_suffix`, then
+reads one column with `Index.stream_range` / `verify_stream` and `decode_*_bytes`
+(a custom async client can drive those primitives directly for concurrent fetches).
+Whole-archive **streaming** decode needs no index at all — it reads the blocks
+front-to-back and stops at the terminator frame — so it works over any forward byte
+stream: `fqxv decompress -` (pipe in `aws s3 cp s3://… -`, `curl`, …) on the CLI,
+and `fqxv.open(file_like)` / `fqxv.remote.stream(url)` in Python.
+
 ## Blocks and parallelism
 
 The compressor reads FASTQ into row groups and hands a batch to `rayon` to

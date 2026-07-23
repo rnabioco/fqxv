@@ -271,8 +271,16 @@ enum Command {
     ///
     /// Writes interleaved FASTQ by default; `--split` restores separate
     /// per-spot mate files and `-Z` streams to stdout.
+    ///
+    /// The input may be `-` for stdin: the archive is streamed and decoded on the
+    /// fly, so a remote archive is read by piping a transfer tool in — e.g.
+    /// `aws s3 cp s3://bkt/reads.fqxv - | fqxv decompress - -Z | bwa mem ref.fa -`
+    /// (or `curl`/`gsutil cat`) aligns reads as they arrive without staging the file
+    /// to disk, and the transfer tool handles all the auth, retries, and resume.
+    /// (`--recover` and `--split` still need a seekable file — a stream can't be
+    /// rewound.)
     Decompress {
-        /// Input `.fqxv` file.
+        /// Input `.fqxv` file, or `-` to stream from stdin.
         input: PathBuf,
         /// Interleaved FASTQ output file (`.gz` => BGZF).
         ///
@@ -751,8 +759,22 @@ fn main() -> anyhow::Result<()> {
             recover,
             force,
         } => {
-            let open_in =
-                || File::open(&input).with_context(|| format!("opening input {}", input.display()));
+            // Input is a local path or stdin (`-`). stdin streams the archive body
+            // straight into the decoder (`decompress` only needs `Read`) — the way
+            // to read from S3/HTTP is to pipe a transfer tool in (see `is_stdin`).
+            // A file is seekable, so `open_in` can reopen it (for the footer
+            // pre-check and the `--split` header peek); stdin can only be consumed
+            // once, so those paths are gated off below.
+            let stdin_input = is_stdin(&input);
+            let open_in = || -> anyhow::Result<Box<dyn Read + Send>> {
+                if stdin_input {
+                    Ok(Box::new(io::stdin()))
+                } else {
+                    Ok(Box::new(File::open(&input).with_context(|| {
+                        format!("opening input {}", input.display())
+                    })?))
+                }
+            };
             // Where the decoded FASTQ is headed, for the summary line. Computed
             // from borrows before `split`/`output` are consumed below.
             let dest = if let Some(prefix) = split.as_ref() {
@@ -766,11 +788,22 @@ fn main() -> anyhow::Result<()> {
             };
             let t0 = Instant::now();
             if recover {
+                // Recovery rescans for block-sync markers, which needs to seek —
+                // stdin can't be rewound. Write the stream to a file first if you
+                // need `--recover`.
+                if stdin_input {
+                    anyhow::bail!(
+                        "--recover needs a seekable file; stdin can't be rewound to rescan \
+                         for block boundaries — write the stream to a file first"
+                    );
+                }
                 // Recovery deliberately tolerates missing/corrupt blocks, so the
                 // completeness check below does not apply here.
                 let sp = progress::Spinner::start("recovering…", cli.quiet);
                 let (pending, mut sink) = open_sink(output.as_deref(), stdout, force)?;
-                let rec = fqxv::decompress_recover(open_in()?, &mut sink, cli.threads)?;
+                let archive = File::open(&input)
+                    .with_context(|| format!("opening input {}", input.display()))?;
+                let rec = fqxv::decompress_recover(archive, &mut sink, cli.threads)?;
                 sink.finish()?;
                 // Recovery's output is deliberately incomplete, but it is still a
                 // *finished* artifact — publish it only once the salvage is done,
@@ -802,11 +835,32 @@ fn main() -> anyhow::Result<()> {
                     "recovered"
                 );
             } else {
+                // A `--split` decode needs the group size before decoding (to open
+                // the output files), which means a header peek and then a second
+                // read from the start — impossible on a single-pass stream. Write
+                // the stream to a file, or decode interleaved (`-Z`) and split
+                // downstream.
+                if stdin_input && split.is_some() {
+                    anyhow::bail!(
+                        "--split can't read from stdin (it needs a second pass for the header); \
+                         write the stream to a file first, or decode interleaved with -Z"
+                    );
+                }
                 // Read the footer's authoritative read count first. For a truncated
                 // archive (which also lost its footer) this errors before any output
                 // is written; otherwise we compare it against what we actually
                 // decode so a silently short file is caught rather than trusted.
-                let expected = fqxv::expected_reads(open_in()?)?;
+                // stdin can't seek to the footer, so it skips this: the terminator
+                // frame marks a clean end and per-block CRCs catch a truncated
+                // stream (decode hits EOF before the terminator).
+                let expected = if stdin_input {
+                    None
+                } else {
+                    fqxv::expected_reads(
+                        File::open(&input)
+                            .with_context(|| format!("opening input {}", input.display()))?,
+                    )?
+                };
                 // Reads written drive the readout, measured against the footer's
                 // count. Archive bytes consumed would be the easier counter but a
                 // misleading one: decode pulls blocks in batches of `--threads`, so
@@ -1813,6 +1867,16 @@ fn warn_redundant_binning(inputs: &[PathBuf], binning: fqxv::QualityBinning) {
 
 fn open_input(path: &Path) -> anyhow::Result<Box<dyn Read + Send>> {
     decode_input(raw_input(path)?)
+}
+
+/// Whether the decompress input is stdin (`-`). A stream can only be read once and
+/// can't seek, so the caller streams it straight through the decoder. Remote inputs
+/// are handled by piping a transfer tool into stdin — e.g.
+/// `aws s3 cp s3://bucket/reads.fqxv - | fqxv decompress - -Z | bwa mem ref.fa -` —
+/// which keeps all the auth/retry/resume in the tool built for it and adds no HTTP
+/// dependency here.
+fn is_stdin(input: &Path) -> bool {
+    input.as_os_str() == "-"
 }
 
 /// The raw (still-compressed) input source: stdin for `-`, else the file.

@@ -13,6 +13,29 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ## [Unreleased]
 
+### Added
+
+- **`fqxv decompress -` reads from stdin,** streaming the archive straight into the
+  decoder (it only reads forward and stops at the terminator frame). This is how you
+  read a remote archive — pipe a transfer tool in, so all the auth, retries, and
+  resume stay in the tool built for it and fqxv gains no HTTP dependency:
+  `aws s3 cp s3://bucket/reads.fqxv - | fqxv decompress - -Z | bwa mem ref.fa -`
+  (or `curl` on a presigned URL, `gsutil cat`, …). A truncated stream still fails
+  (premature EOF) rather than yielding a short file. `--recover` and `--split` need
+  a seekable file (a stream can't be rewound) and refuse stdin with a clear message.
+- **Python: read archives over the network.** The `fqxv` wheel gains a
+  dependency-free `fqxv.remote` module (standard-library `urllib`). The streaming
+  entry points — `fqxv.open`, `decompress_to_*` — now accept **any file-like
+  object**, so a `boto3`/`urllib`/`httpx` response streams straight in
+  (`fqxv.open(s3.get_object(...)["Body"])`); `fqxv.remote.stream(url)` /
+  `download(url, dest)` wrap that for a URL. `fqxv.remote.RemoteArchive` adds
+  **column projection** over HTTP byte-range requests: fetch just the footer index
+  from the archive tail, then only the names (~1% of the file) or the sequence,
+  CRC-verified per stream. It rests on IO-free primitives —
+  `parse_index_suffix`, per-stream ranges/CRCs on `Index`, and
+  `decode_{names,sequences,qualities}_bytes` — that a custom async client can drive
+  directly for concurrent range fetches.
+
 ### Performance
 
 - **Skip the quality-quantizer probe on Nanopore.** The per-block quantizer trial
