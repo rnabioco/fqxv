@@ -21,7 +21,7 @@ Best lossless ratio per platform, against the strongest alternative for that dat
 | Illumina NovaSeq (binned quality) | **29.2×** | SPRING 25.3× | 5.0× |
 | Illumina GAIIx (full-range quality) | **11.6×** | SPRING 10.0× | 3.7× |
 | Illumina MiSeq (*E. coli* WGS) | **7.4×** | SPRING 7.3× | 2.9× |
-| PacBio HiFi (*E. coli*, ~300×) | **4.7×** | CoLoRd 4.4× | 2.3× |
+| PacBio HiFi (*E. coli*, ~300×) | **4.8×** | CoLoRd 4.4× | 2.3× |
 | Oxford Nanopore (MinION) | **3.06×** | CoLoRd 3.05× | 1.9× |
 
 The Illumina rows use `--order shuffle`, which reorders reads and renumbers names —

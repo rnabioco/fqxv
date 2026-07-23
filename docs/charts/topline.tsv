@@ -29,7 +29,7 @@ illumina_speed_novaseq	fqz_comp	other	105	105
 illumina_speed_novaseq	SPRING	other	70	70
 illumina_speed_novaseq	zstd -19	other	11	11
 illumina_speed_novaseq	xz -9	other	10	10
-longread_ratio	fqxv · HiFi	fqxv	4.73	4.73×
+longread_ratio	fqxv · HiFi	fqxv	4.77	4.77×
 longread_ratio	CoLoRd · HiFi	other	4.44	4.44×
 longread_ratio	fqxv · ONT	fqxv	3.06	3.06×
 longread_ratio	CoLoRd · ONT	other	3.05	3.05×

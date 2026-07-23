@@ -127,18 +127,18 @@ basecaller):
 | Tool | Total | Non-quality | Quality | Non-quality bits/base |
 | --- | ---: | ---: | ---: | ---: |
 | CoLoRd `-q org` | 697.7M | 13.4M | 684.3M | 0.069 |
-| `fqxv` | **656.0M** | **12.6M (seq)** | **641.8M** | **0.065** |
+| `fqxv` | **649.5M** | **12.3M (seq)** | **635.6M** | **0.064** |
 
 Two facts hold on both platforms:
 
 - **Quality beats CoLoRd on both platforms.** fqxv's binary-decomposition,
-  context-mixing quality coder codes the HiFi quality stream to **641.8M vs
-  CoLoRd's 684.3M** (~6% smaller) and ONT to **163.7M vs 166.5M** (~2% smaller).
-  On HiFi that quality win carries the **lossless total ahead of CoLoRd** (656.0M
-  vs 697.7M, **4.73× vs 4.44×** on the full file); on ONT fqxv now edges ahead on
+  context-mixing quality coder codes the HiFi quality stream to **635.6M vs
+  CoLoRd's 684.3M** (~7% smaller) and ONT to **163.7M vs 166.5M** (~2% smaller).
+  On HiFi that quality win carries the **lossless total ahead of CoLoRd** (649.5M
+  vs 697.7M, **4.77× vs 4.44×** on the full file); on ONT fqxv now edges ahead on
   the **total** too — **197.1M vs 197.9M** (3.06× vs 3.05×).
 - **The sequence stream is no longer a blanket deficit.** On HiFi Sequel II it is a
-  *credit* (12.6M vs 13.4M) — the same locus is read hundreds of times at ~300×,
+  *credit* (12.3M vs 13.4M) — the same locus is read hundreds of times at ~300×,
   and fqxv now assembles one whole-file consensus and codes each read against it. On
   ONT it is down to 33.4M vs 31.4M — ~6% behind on sequence (the anchor-restricted
   coder aligns only inter-anchor gaps), which the quality credit now more than
@@ -179,7 +179,7 @@ different coverage/error regime:
   stores it once in a framed region before the first block, and codes every block's
   reads against that frozen frame — so a read codes identically no matter which
   block holds it, and blocks stay independently decodable. On `ecoli_hifi` (120k
-  reads, 1.55 Gbase, ~300×) this puts the sequence stream at **0.065 bits/base**,
+  reads, 1.55 Gbase, ~300×) this puts the sequence stream at **0.064 bits/base**,
   past CoLoRd's 0.069 — a ~10× shrink over the within-read model. Storing the
   reference once instead of per block was the whole gap.
 - **Raw large-window LZMA** — the ordinary-coverage lever, and the biggest change
