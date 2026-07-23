@@ -141,9 +141,12 @@ more there than in the lossless totals above.
 | DRR174812  | NovaSeq6000 |       0.331 |
 | SRR453566  | GAIIx       |       0.509 |
 | SRR2627175 | MiSeq       |       0.538 |
-| DRR205413  | ONT-MinION  |       0.725 |
+| DRR205413  | ONT-MinION  |       0.721 |
 
 fqxv is ~2× smaller than the `.sra` on average (geomean 0.51). NovaSeq wins most
 (its quality is pre-binned, so the lossless point is already compact); ONT wins
 least, since the long-read sequence stream dominates that archive — though it
-improved from 0.825 to **0.725** this cycle as the tiling codec shrank that stream.
+improved from 0.825 to **0.721** as the tiling codec shrank that stream. Refreshed
+2026-07-23 at HEAD `b900125`; the short-read points are byte-stable across the
+last several release cycles. A grouped size chart of this table is on the
+[Benchmarks](../docs/benchmarks.md) page.

@@ -38,18 +38,21 @@ crash the process**:
   `rejects_huge_length_count`, `rejects_huge_total_length`,
   `decode_never_aborts_on_garbage` in both `fqxv-fqzcomp` and `fqxv-seq`.
   Mirrors the htscodecs fqzcomp 1-bp buffer-overrun fix (NEWS 1.5.2).
-- ✅ **`cargo-fuzz` harness over every decoder.** `fuzz/fuzz_targets/` has six
+- ✅ **`cargo-fuzz` harness over every decoder.** `fuzz/fuzz_targets/` has seven
   coverage-guided targets — `container`, `rans`, `tokenizer`, `seq`, `fqzcomp`,
-  `reorder` — each feeding arbitrary bytes straight to a decode entry point, the
-  invariant being that a decoder returns `Ok`/`Err` on *any* input and never
-  panics/aborts (release is `panic = "abort"`). This complements the in-tree
+  `reorder`, `lroverlap` — each feeding arbitrary bytes straight to a decode entry
+  point, the invariant being that a decoder returns `Ok`/`Err` on *any* input and
+  never panics/aborts (release is `panic = "abort"`). This complements the in-tree
   proptest corruption harness (`crates/fqxv/tests/corruption.rs`), which mutates
   valid encodings in normal CI. See `fuzz/README.md`.
 - ▶ **Extend the inline `decode_never_aborts_on_garbage` test to every codec.**
-  The fuzz targets already exercise `rans`/`tokenizer`/`reorder`/`container`, but
-  the cheap inline regression test still lives only in `fqxv-fqzcomp` and
-  `fqxv-seq`; mirror it in the others so a random-garbage smoke check runs without
-  the nightly fuzz toolchain.
+  Still open. The cheap inline random-garbage regression test lives in
+  `fqxv-fqzcomp` and `fqxv-seq` (and, for the packed sub-path only, `fqxv-reorder`'s
+  `refpack`); **`fqxv-rans`, `fqxv-tokenizer`, `fqxv-range`, and the top-level
+  `fqxv-reorder` decode path still lack it.** Mirror it in those so a random-garbage
+  smoke check runs without the nightly fuzz toolchain. (`fqxv-rans` has
+  `decode_survives_mutation`, which mutates valid encodings rather than feeding
+  arbitrary bytes — not equivalent.)
 - ○ **tokenizer/reorder speculative allocations** cap at `1<<20`/`1<<22`, so the
   worst case is ~96 MB rather than an abort — lower risk, but converting them to
   `try_reserve` would remove the last alloc-abort paths for consistency.
@@ -58,30 +61,45 @@ crash the process**:
 
 Round-trip tests over random data almost never generate these:
 
-- ▶ **Empty stream through compress *and* decompress** — htscodecs #99 was a
-  divide-by-zero (SIGFPE) on empty input. We have decode-empty tests; add
-  compress-empty for rans/range.
-- ▶ **Single distinct symbol / all-same-byte with 12-bit frequency** — htscodecs
-  1.5.2 fixed a SIMD mis-decode here. Directly exercises our "SIMD ≡ scalar"
-  invariant; add an explicit AVX2-vs-scalar proptest seeded with degenerate
-  distributions (all-same, 2-symbol at 4095/4096), not just uniform random.
+- ✅ **Empty stream through compress *and* decompress** — htscodecs #99 was a
+  divide-by-zero (SIGFPE) on empty input. `roundtrip_empty` in both `fqxv-rans`
+  and `fqxv-range` now encodes *and* decodes empty input (not just decode-empty).
+- ✅ **Single distinct symbol / all-same-byte with 12-bit frequency** — htscodecs
+  1.5.2 fixed a SIMD mis-decode here. `avx2_encode_matches_scalar_skewed`
+  (`fqxv-rans`) exercises the "SIMD ≡ scalar" invariant on degenerate cases:
+  all-same (`vec![b'Q'; 40_000]`, freq == TOTFREQ), a dominant symbol (freq >
+  2048), and a 2-symbol skew. Residual (▶): the AVX2-vs-scalar *proptests* are
+  still seeded with a small random alphabet, not degenerate distributions — a
+  proptest seeded with all-same / 2-symbol-at-4095/4096 would close the gap.
 - ▶ **Raw/CAT passthrough path**, if/when added — htscodecs #144 fell through
-  into the order-0 encoder *because the test suite omitted the raw path*.
-- ○ **Malformed frequency table** (doesn't sum to total) → decode must reject,
-  not read uninitialised entries (htscodecs NEWS 1.2.2).
-- ○ **1–2 byte inputs** and **block-boundary-straddling large inputs**
-  (htscodecs #128: >1.25 MiB output-sizing bug).
+  into the order-0 encoder *because the test suite omitted the raw path*. (No raw
+  path exists today; this fires only if one is added.)
+- ✅ **Malformed frequency table** (doesn't sum to total) → decode must reject.
+  `decode_rejects_malformed_freq_table_without_aborting` and
+  `from_freqs_rejects_malformed_tables` (`fqxv-rans`) assert `Err(Malformed)` on
+  sum ≠ TOTFREQ and over-cap tables.
+- ▶ **1–2 byte inputs** ✅ (`roundtrip_single_byte`, `roundtrip_short_and_odd_lengths`,
+  range `roundtrip_single`) but **block-boundary-straddling large inputs** remain
+  ○: tests cover the 32-state interleave boundary, not the htscodecs #128
+  >1.25 MiB output-sizing boundary specifically.
 - ○ **`output.len() <= bound(input)` property** for every encoder — guards the
   class of max-growth underestimates behind several htscodecs security fixes.
+  Not yet written (the nearest test asserts a compression *ratio* on favorable
+  data, not a worst-case growth bound).
 
 ## 3. Name tokenizer
 
 - ▶ **Names with bytes ≥ 0x80** — htscodecs #105 was a signed-char crash on
   `[0x80, 0x0a]`. Rust avoids the UB, but index/sign logic can still misbehave.
-- ▶ **Exactly 128 and 129 tokens** — htscodecs 1.5.2 overflowed writing a 129th.
-  We have `MAX_COL`; test a name that tokenizes to exactly the boundary.
-- ○ Empty name, single-char, all-numeric, all-hex; varying column counts
-  row-to-row (cold-start delta state).
+  Still open: the arbitrary-name generators sample only from `b"AB:._-0129 "`
+  (all < 0x80); the `0xFF` bytes in the corruption tests mutate *encoded* output,
+  not name input.
+- ▶ **Exactly `MAX_COL` and `MAX_COL`+1 tokens** — htscodecs 1.5.2 overflowed
+  writing a 129th token. `MAX_COL` here is **63** (not 128); no test constructs a
+  name that tokenizes to exactly the column-cap boundary. Still open.
+- ○ Empty name ✅, single-char ✅, all-numeric ✅, varying column counts row-to-row
+  ✅ (all in `roundtrip_varying_structure`); **all-hex** still missing (ties into
+  the hex-aware token class, §5).
 - ○ **UUID4 read-name corpus** (Nanopore) as a benchmark + roadmap: htscodecs
   #130/#131 show a transpose strategy beats the tokenizer for these; worth a
   hex-aware / leading-zero-preserving token class (see §5).
@@ -89,41 +107,60 @@ Round-trip tests over random data almost never generate these:
 ## 4. Sequence content & read reordering (SPRING / PgRC)
 
 - ▶ **Exact A/C/G/T/N count *and* N-position preservation across reorder** —
-  PgRC #6 drifted per-base counts because N-reads go to a separate subset. Our
-  strongest reorder guard: assert exact base composition and N positions survive.
-- ▶ **Compress-twice, byte-identical, independent of `--threads`** — SPRING #35
-  produced non-deterministic archives; this directly asserts our determinism
-  invariant.
-- ▶ **`--threads 0`** — SPRING #44 infinite-looped. We clamp (commit `93eb5ff`);
-  add a regression test at the CLI/container boundary.
-- ▶ **Mixed/variable read lengths across a block boundary** — PgRC #2 is
-  fixed-length-only (≤255 bp); variable length is the recurring top user ask and
-  something we support, so we should own the test.
-- ○ **RC palindromes and a read + its own reverse complement** — core of the
-  reorder engine; assert clustering doesn't corrupt orientation.
-- ○ **N↔quality coupling and IUPAC codes** — fqzcomp silently rewrites quality
-  for N bases and collapses non-ACGTN to N (both lossy). Test whether we
-  preserve base/quality independently and IUPAC losslessly, and document the
-  stance either way (relates to the `+`-normalization deviation).
-- ○ Structural fixtures: empty read; single read/single spot; all-N read;
-  511/512-bp boundary (SPRING switches algorithms >511 bp); line count not a
-  multiple of 4; seq/qual length mismatch → clean error.
+  PgRC #6 drifted per-base counts because N-reads go to a separate subset. Partly
+  covered: `reorder_free_preserves_records_as_a_set` /
+  `reorder_rescue_preserves_records_as_a_set` assert the full record *multiset*
+  survives (implying N positions), and `content_stats_and_metadata` asserts exact
+  base counts — but only on the *plain* path, and the reorder fixture has no N
+  bases. Still open: an explicit base-count + N-position assertion on an
+  N-containing input *through reorder*.
+- ✅ **Compress-twice, byte-identical, independent of `--threads`** — SPRING #35
+  produced non-deterministic archives. `archive_is_deterministic_across_threads`
+  (1 vs 4 threads, byte-identical), plus `reorder_paired_is_thread_count_deterministic`
+  and `merge_roundtrips_and_is_deterministic`.
+- ✅ **`--threads 0`** — SPRING #44 infinite-looped. We clamp (commit `93eb5ff`);
+  `resolve_threads_zero_is_all_cores_and_explicit_is_clamped` (`fqxv-cli`) is the
+  regression test.
+- ✅ **Mixed/variable read lengths across a block boundary** — PgRC #2 is
+  fixed-length-only (≤255 bp). `ragged_lengths_roundtrip_multiblock` (30 reads,
+  10–310 bp, `block_reads: 5`) and `paired_split_spans_multiple_blocks` own it.
+- ○ **RC palindromes and a read + its own reverse complement** — read + own
+  revcomp clustering is ✅ (`revcomp_duplicate_flips_to_match`); a true palindrome
+  (sequence == its own revcomp) is not exercised through clustering.
+- ○ **N↔quality coupling and IUPAC codes** — IUPAC losslessness is covered at the
+  codec level (round-trip proptests seeded with `RYKM` etc. in `fqxv-seq`,
+  `refpack`, `fqxv-lroverlap`), but there is no container-level IUPAC test, no
+  N↔quality independent-preservation test, and no test documenting the
+  collapse-to-N stance.
+- ○ Structural fixtures: empty read ✅ / all-N read ✅ (`handles_short_and_n_reads`);
+  single read/single spot ✅; line count not a multiple of 4 ✅
+  (`a_truncated_fastq_errors_in_both_order_modes`); seq/qual length mismatch →
+  clean error ✅ (`compensating_seq_qual_mismatch_is_rejected`). Still missing:
+  **511/512-bp boundary** (SPRING switches algorithms >511 bp).
 
 ## 5. Feature-request candidates (from upstream trackers)
 
-- **Selectable lossy quality tiers.** SPRING offers lossless / Illumina-8-bin /
-  QVZ / binary-threshold; we have `QualityBinning` (Bin8/4/2). A **binary
-  2-level threshold** mode is a common explicit ask.
+- ✅ **Selectable lossy quality tiers.** SPRING offers lossless / Illumina-8-bin /
+  QVZ / binary-threshold; we have `QualityBinning` (`Lossless`/`Bin8`/`Bin4`/`Bin2`
+  plus `BinOnt`/`BinHifi`). The **binary 2-level threshold** ask is shipped as
+  `Bin2` (`--quality-bin bin2`; fixed Q25 cutpoint — a user-selectable threshold
+  value would extend it).
 - **Hex-aware / UUID name tokenization.** htscodecs #131 (columnar by token
   type, leading-zero preservation) and #130 (transpose for UUID4). Adaptive:
   detect name style and switch strategy; regresses on Illumina if non-adaptive.
 - **fqzcomp READ1/READ2 + strand selectors.** CRAM 3.1 uses multiple parameter
   sets at higher levels and per-record strand/mate hints; ties into our
   interleaved-spots invariant and `--level` mapping.
-- **Archive introspection / partial decode.** SPRING #38/#42 show demand for
-  documented, inspectable internals and subset/random-access decode — extends
-  our existing `inspect`.
-- **Streaming (`-`) stdin/stdout.** Recurring cross-tool need; confirm/support.
+- **Archive introspection / partial decode.** *Partly shipped.* Introspection is
+  done (`fqxv info`, and the `FQXF` footer index gives per-stream
+  `(offset, length, crc32c)`); random-access column projection over HTTP `Range`
+  exists in the Python `fqxv.remote` API. Remaining: no CLI subcommand for
+  subset/row-range decode — partial decode is library/Python-only.
+- ✅ **Streaming (`-`) stdin/stdout.** Shipped in #242: decompress reads an archive
+  from stdin (`-`) and writes FASTQ to stdout (`-Z`/`-o -`); compress reads FASTQ
+  from stdin. Carve-outs enforced: `--split`/`--recover` from stdin are rejected
+  (no rewind), compress-from-stdin requires `-o`, and the archive itself is not
+  written to stdout (needs a seekable footer). Test: `stdin_stream.rs`.
 
 ## 6. Interop conformance
 
@@ -136,6 +173,11 @@ Round-trip tests over random data almost never generate these:
 
 ## 7. CLI
 
-- ○ `fqxv-cli` has **zero tests**. Add end-to-end round-trips over small FASTQ
-  fixtures (compress→decompress, byte-exact at FASTQ-content level), the
-  `--level` mapping, and error paths (bad input, `--threads 0`).
+- ✅ `fqxv-cli` now has integration tests (`crates/fqxv-cli/tests/`):
+  `batch.rs` (`info`/`verify`/`estimate` batch shapes, `--verify`, bad-input and
+  `--interleaved 0` error paths), `quality_bin.rs` (compress→decompress with
+  `--quality-bin`), and `stdin_stream.rs` (stdin round-trip + `--split`-from-stdin
+  rejection). Plus the `resolve_threads` unit test for `--threads 0`.
+- ▶ Remaining CLI gaps: no test exercises the **`--level` → order/block mapping**,
+  and no end-to-end CLI test drives `--threads 0` (only the `resolve_threads`
+  unit test does).
