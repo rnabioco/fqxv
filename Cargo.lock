@@ -427,6 +427,7 @@ name = "fqxv"
 version = "0.5.0"
 dependencies = [
  "fqxv-bytes",
+ "fqxv-dna",
  "fqxv-fqzcomp",
  "fqxv-lroverlap",
  "fqxv-range",
