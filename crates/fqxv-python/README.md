@@ -51,6 +51,10 @@ fqxv.verify("reads.fqxv")
 # Project the archive size/ratio from a FASTQ *without* compressing (gzip/BGZF ok)
 est = fqxv.estimate("reads.fastq.gz", level=5)  # also: quality_binning=, sample_reads=
 print(est.ratio, est.archive_bytes, est.exhausted)
+
+# Paired mates (or 10x R1/R2/I1/I2) compress into one archive — pass a list and
+# their sample sizes are summed. A str/bytes source stays a single input.
+est = fqxv.estimate(["R1.fastq.gz", "R2.fastq.gz"])
 ```
 
 Projection and `open_index` are unavailable for globally-reordered archives

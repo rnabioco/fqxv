@@ -151,6 +151,70 @@ def test_estimate_rejects_unknown_binning(fastq):
         fqxv.estimate(fastq, quality_binning="nonsense")
 
 
+def test_estimate_accepts_paired_sources(fastq):
+    """A list/tuple of mates estimates one archive: the per-stream sample sizes
+    sum, so a pair reports twice a single mate's reads and bytes."""
+    single = fqxv.estimate(fastq)
+    pair = fqxv.estimate([fastq, fastq])
+    assert pair.sample_reads == 2 * single.sample_reads
+    assert pair.sample_bases == 2 * single.sample_bases
+    assert pair.archive_bytes == 2 * single.archive_bytes
+    assert pair.exhausted
+    # A tuple is treated identically to a list.
+    assert fqxv.estimate((fastq, fastq)).archive_bytes == pair.archive_bytes
+    # bytes is a single source, not an iterable of sources.
+    data = pathlib.Path(fastq).read_bytes()
+    assert fqxv.estimate(data).sample_reads == single.sample_reads
+
+
+def test_estimate_rejects_empty_source_list():
+    with pytest.raises(ValueError):
+        fqxv.estimate([])
+
+
+@pytest.fixture(scope="session")
+def illumina_fastq(tmp_path_factory):
+    """Illumina-style names (colon-delimited instrument coordinates)."""
+    d = tmp_path_factory.mktemp("il")
+    p = d / "il.fastq"
+    p.write_text(
+        "".join(
+            f"@INST:1:FC:1:{i}:100:200 1:N:0:1\nACGTACGTACGTACGTACGT\n+\nIIIIIIIIIIIIIIIIIIII\n"
+            for i in range(400)
+        )
+    )
+    return str(p)
+
+
+@pytest.fixture(scope="session")
+def nanopore_fastq(tmp_path_factory):
+    """Nanopore-style names (UUID read id, runid= description tag)."""
+    d = tmp_path_factory.mktemp("nano")
+    p = d / "nano.fastq"
+
+    def rec(i):
+        seq = ("ACGTTGCAAGTC" * 30)[: 300 + i % 40]
+        qual = "".join(chr(33 + ((j * 7 + i) % 40)) for j in range(len(seq)))
+        uuid = f"{i:08x}-1234-5678-9abc-def012345678"
+        return f"@{uuid} runid=abc ch={i}\n{seq}\n+\n{qual}\n"
+
+    p.write_text("".join(rec(i) for i in range(400)))
+    return str(p)
+
+
+def test_estimate_reports_platform(illumina_fastq, nanopore_fastq):
+    assert fqxv.estimate(illumina_fastq).platform == "illumina"
+    assert fqxv.estimate(nanopore_fastq).platform == "nanopore"
+    # A matched pair keeps the shared platform.
+    assert fqxv.estimate([illumina_fastq, illumina_fastq]).platform == "illumina"
+
+
+def test_estimate_rejects_cross_platform_group(illumina_fastq, nanopore_fastq):
+    """An accidental Illumina + Nanopore group is an error, not a silent sum."""
+    with pytest.raises(fqxv.FqxvError, match="multiple platforms"):
+        fqxv.estimate([illumina_fastq, nanopore_fastq])
+
+
 def test_verify_passes_on_good_archive(archive):
     # Returns None on success; raises on failure.
     assert fqxv.verify(archive) is None

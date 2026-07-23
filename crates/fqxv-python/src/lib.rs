@@ -16,11 +16,11 @@ use flate2::read::MultiGzDecoder;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyIOError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyList, PyTuple};
 
 use fqxv_core::{
-    Index, Params, QualityBinning, Stream, SuffixParse, decode_block_contents, decode_names,
-    decode_quality, decode_quality_with_seq, decode_sequence, quality_needs_sequence,
+    Index, Params, Platform, QualityBinning, Stream, SuffixParse, decode_block_contents,
+    decode_names, decode_quality, decode_quality_with_seq, decode_sequence, quality_needs_sequence,
 };
 
 /// Map a stream name (`"names"`, `"sequence"`, `"quality"`, plus the obvious
@@ -821,6 +821,13 @@ impl PyEstimate {
     fn exhausted(&self) -> bool {
         self.inner.exhausted
     }
+    /// Platform resolved from the sample: `"illumina"`, `"nanopore"`, `"pacbio"`,
+    /// `"mgi"`, or `"unknown"`. For a grouped estimate this is the shared platform
+    /// (the group is rejected up front if its inputs disagree).
+    #[getter]
+    fn platform(&self) -> &'static str {
+        self.inner.platform.token()
+    }
     /// Uncompressed FASTQ bytes ÷ archive bytes. Scale-invariant; `0.0` if empty.
     #[getter]
     fn ratio(&self) -> f64 {
@@ -843,6 +850,12 @@ impl PyEstimate {
 /// real codecs at the given effort `level` and `quality_binning`. Reordering is
 /// not modelled, so for data the real run would reorder this is a conservative
 /// lower bound (the archive comes out this size or smaller).
+///
+/// `source` may also be a list/tuple of sources — paired mates (R1/R2), 10x
+/// R1/R2/I1/I2, or sharded lanes — which all compress into one archive. Each is
+/// sampled with a split of the `sample_reads` cap and the per-stream sizes summed,
+/// mirroring how the CLI estimates grouped inputs. Interleaving is not modelled, so
+/// this too is a conservative lower bound (interleaved mates only compress better).
 #[pyfunction]
 #[pyo3(signature = (source, *, level = 5, quality_binning = "lossless", sample_reads = 1_048_576, threads = 0))]
 fn estimate(
@@ -854,7 +867,6 @@ fn estimate(
     threads: usize,
 ) -> PyResult<PyEstimate> {
     let binning = parse_binning(quality_binning)?;
-    let reader = open_fastq(source)?;
     let (seq_hash_order, seq_hash_bits) = level_to_hash(level);
     let (tile_band, tile_max_refs) = level_to_tile(level);
     let params = Params {
@@ -868,10 +880,76 @@ fn estimate(
         tile_max_refs,
         ..Params::default()
     };
-    let est = py
-        .detach(move || fqxv_core::estimate(reader, params, sample_reads))
-        .map_err(map_err)?;
-    Ok(PyEstimate { inner: est })
+
+    // A list/tuple is a group of inputs feeding one archive (paired mates, etc.);
+    // anything else (str/PathLike/bytes) is a single source. `bytes` and `str` are
+    // themselves iterable, so gate on the concrete container types rather than
+    // iterability.
+    let sources: Vec<Bound<'_, PyAny>> =
+        if source.is_instance_of::<PyList>() || source.is_instance_of::<PyTuple>() {
+            source.try_iter()?.collect::<PyResult<Vec<_>>>()?
+        } else {
+            vec![source.clone()]
+        };
+    if sources.is_empty() {
+        return Err(PyValueError::new_err(
+            "estimate() requires at least one source",
+        ));
+    }
+    // Keep the aggregate sample ~one cap by splitting it across the grouped inputs,
+    // as the CLI's run_estimate does.
+    let per_input = (sample_reads / sources.len()).max(1);
+
+    let mut agg: Option<fqxv_core::Estimate> = None;
+    // Grouped inputs interleave into one archive, so they must be the same platform
+    // (a real compress detects one platform per archive). Reject an accidental
+    // cross-platform mix rather than summing two differently-calibrated estimates;
+    // an Unknown input (SRA-renamed, no content signal) is compatible with any.
+    let mut group_platform: Option<Platform> = None;
+    for src in &sources {
+        let reader = open_fastq(src)?;
+        let est = py
+            .detach(|| fqxv_core::estimate(reader, params, per_input))
+            .map_err(map_err)?;
+        if est.platform != Platform::Unknown {
+            match group_platform {
+                None => group_platform = Some(est.platform),
+                Some(p) if p != est.platform => {
+                    return Err(FqxvError::new_err(format!(
+                        "grouped sources span multiple platforms ({} and {}); \
+                         estimate a single archive's mates together, not different datasets",
+                        p.label(),
+                        est.platform.label(),
+                    )));
+                }
+                Some(_) => {}
+            }
+        }
+        agg = Some(match agg {
+            None => est,
+            Some(a) => fqxv_core::Estimate {
+                sample_reads: a.sample_reads + est.sample_reads,
+                sample_bases: a.sample_bases + est.sample_bases,
+                raw_bytes: a.raw_bytes + est.raw_bytes,
+                names_bytes: a.names_bytes + est.names_bytes,
+                seq_bytes: a.seq_bytes + est.seq_bytes,
+                qual_bytes: a.qual_bytes + est.qual_bytes,
+                archive_bytes: a.archive_bytes + est.archive_bytes,
+                // The aggregate is exact only if every input was fully consumed.
+                exhausted: a.exhausted && est.exhausted,
+                // The group's shared platform (consistency checked above); carry the
+                // first known one so an Unknown mate doesn't erase it.
+                platform: if a.platform != Platform::Unknown {
+                    a.platform
+                } else {
+                    est.platform
+                },
+            },
+        });
+    }
+    Ok(PyEstimate {
+        inner: agg.expect("sources is non-empty"),
+    })
 }
 
 /// Verify an archive's integrity — header, footer, and the parallel whole-file CRC
