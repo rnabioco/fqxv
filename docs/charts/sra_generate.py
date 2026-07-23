@@ -103,7 +103,8 @@ def spec_for(rows: list[dict], theme: dict) -> dict:
                 "sort": order,
                 # paddingInner separates the accession clusters; without it the
                 # three offset sub-bars space evenly and the grouping is lost.
-                "scale": {"paddingInner": 0.45, "paddingOuter": 0.25},
+                # Kept small so the groups sit close without merging.
+                "scale": {"paddingInner": 0.2, "paddingOuter": 0.15},
                 "axis": {
                     "title": None,
                     "labelColor": theme["text"],
