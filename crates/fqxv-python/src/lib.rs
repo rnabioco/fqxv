@@ -19,9 +19,25 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use fqxv_core::{
-    Index, Params, QualityBinning, Stream, decode_block_contents, decode_names, decode_quality,
-    decode_quality_with_seq, decode_sequence, quality_needs_sequence,
+    Index, Params, QualityBinning, Stream, SuffixParse, decode_block_contents, decode_names,
+    decode_quality, decode_quality_with_seq, decode_sequence, quality_needs_sequence,
 };
+
+/// Map a stream name (`"names"`, `"sequence"`, `"quality"`, plus the obvious
+/// abbreviations) onto a [`Stream`]. The Python remote client passes these strings
+/// so the projection primitives read the same as `read_names` / `read_sequences`.
+fn stream_of(name: &str) -> PyResult<Stream> {
+    Ok(match name {
+        "names" | "name" => Stream::Names,
+        "sequence" | "seq" => Stream::Sequence,
+        "quality" | "qual" => Stream::Quality,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown stream {other:?}; expected 'names', 'sequence', or 'quality'"
+            )));
+        }
+    })
+}
 
 create_exception!(
     fqxv,
@@ -76,6 +92,77 @@ fn open_source(obj: &Bound<'_, PyAny>) -> PyResult<SeekReader> {
     let file =
         File::open(&path).map_err(|e| PyIOError::new_err(format!("{}: {e}", path.display())))?;
     Ok(SeekReader::File(file))
+}
+
+/// A `Read` over a Python file-like object (anything with `.read(n) -> bytes`), so
+/// the streaming decoder can pull an archive straight from an HTTP response — an
+/// `http.client`/`urllib` reader, or `fqxv.remote.stream` — without buffering the
+/// whole file. The decode runs under `py.detach`, so each read re-acquires the GIL
+/// via `Python::attach`.
+struct PyReadable {
+    obj: Py<PyAny>,
+    /// Bytes a `read()` returned beyond the request; drained before the next call.
+    /// Well-behaved objects never overfill, but this keeps the `Read` contract if
+    /// one does.
+    leftover: Vec<u8>,
+}
+
+impl Read for PyReadable {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if !self.leftover.is_empty() {
+            let n = self.leftover.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.leftover[..n]);
+            self.leftover.drain(..n);
+            return Ok(n);
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        Python::attach(|py| {
+            let res = self
+                .obj
+                .call_method1(py, "read", (buf.len(),))
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let bound = res.bind(py);
+            let data: Vec<u8> = match bound.cast::<PyBytes>() {
+                Ok(b) => b.as_bytes().to_vec(),
+                Err(_) => bound
+                    .extract::<Vec<u8>>()
+                    .map_err(|_| io::Error::other("file-like .read() must return bytes"))?,
+            };
+            let n = data.len().min(buf.len());
+            buf[..n].copy_from_slice(&data[..n]);
+            if data.len() > n {
+                self.leftover.extend_from_slice(&data[n..]);
+            }
+            Ok(n)
+        })
+    }
+}
+
+/// Open a Python `source` for a **streaming** (forward-only) decode: `bytes`, a
+/// `str` / `os.PathLike` path, or a file-like object with `.read()` (e.g. an
+/// `http.client.HTTPResponse`). Unlike [`open_source`] this yields no `Seek`, so
+/// it suits only the streaming entry points (`open`, `decompress_*`); the
+/// index/projection paths still need a seekable source.
+fn open_read_source(obj: &Bound<'_, PyAny>) -> PyResult<Box<dyn Read + Send>> {
+    if let Ok(b) = obj.cast::<PyBytes>() {
+        return Ok(Box::new(Cursor::new(b.as_bytes().to_vec())));
+    }
+    if let Ok(path) = obj.extract::<PathBuf>() {
+        let file = File::open(&path)
+            .map_err(|e| PyIOError::new_err(format!("{}: {e}", path.display())))?;
+        return Ok(Box::new(file));
+    }
+    if obj.hasattr("read")? {
+        return Ok(Box::new(PyReadable {
+            obj: obj.clone().unbind(),
+            leftover: Vec::new(),
+        }));
+    }
+    Err(PyTypeError::new_err(
+        "source must be bytes, a str/os.PathLike path, or a file-like object with .read()",
+    ))
 }
 
 /// One decoded FASTQ record. `name` excludes the leading `@`; `sequence` and
@@ -241,30 +328,32 @@ struct PyGroupLoc {
     read_count: u32,
 }
 
-/// A parsed footer row-group index (plain layout only).
+/// A parsed footer row-group index (plain layout only). Wraps the core
+/// [`fqxv_core::Index`] so it can hand out per-stream byte ranges and CRCs — the
+/// primitives a remote client uses to fetch and verify one column with `Range`
+/// requests (see `fqxv.remote`).
 #[pyclass(name = "Index")]
 struct PyIndex {
-    total_reads: u64,
-    whole_file_crc: u32,
-    groups: Vec<PyGroupLoc>,
+    inner: Index,
 }
 
 #[pymethods]
 impl PyIndex {
     #[getter]
     fn total_reads(&self) -> u64 {
-        self.total_reads
+        self.inner.total_reads()
     }
     #[getter]
     fn whole_file_crc(&self) -> u32 {
-        self.whole_file_crc
+        self.inner.whole_file_crc()
     }
     #[getter]
     fn num_groups(&self) -> usize {
-        self.groups.len()
+        self.inner.groups().len()
     }
     fn groups(&self, py: Python<'_>) -> Vec<Py<PyGroupLoc>> {
-        self.groups
+        self.inner
+            .groups()
             .iter()
             .map(|g| {
                 Py::new(
@@ -278,11 +367,46 @@ impl PyIndex {
             .collect::<PyResult<Vec<_>>>()
             .expect("GroupLoc alloc")
     }
+
+    /// The `[start, end)` byte range of `stream` in row group `group` — issue one
+    /// `Range: bytes=start-(end-1)` GET for it, then [`PyIndex::verify_stream`] and
+    /// the matching `decode_*_bytes`.
+    fn stream_range(&self, group: usize, stream: &str) -> PyResult<(u64, u64)> {
+        let s = stream_of(stream)?;
+        let loc = self
+            .inner
+            .groups()
+            .get(group)
+            .ok_or_else(|| FqxvError::new_err("row-group index out of range"))?;
+        let r = loc.stream_range(s);
+        Ok((r.start, r.end))
+    }
+
+    /// The footer's CRC-32C for `stream` in `group` (a fetched column checks
+    /// against this — the block content digests cover the *decoded* streams and so
+    /// cannot verify a projected fetch of *coded* bytes).
+    fn stream_crc(&self, group: usize, stream: &str) -> PyResult<u32> {
+        let s = stream_of(stream)?;
+        let loc = self
+            .inner
+            .groups()
+            .get(group)
+            .ok_or_else(|| FqxvError::new_err("row-group index out of range"))?;
+        Ok(loc.stream_crc(s))
+    }
+
+    /// Verify a fetched coded stream against the index's CRC-32C, raising
+    /// `fqxv.FqxvError` if it was corrupted in transit or storage.
+    fn verify_stream(&self, group: usize, stream: &str, coded: &[u8]) -> PyResult<()> {
+        let s = stream_of(stream)?;
+        self.inner.verify_stream(group, s, coded).map_err(map_err)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Index(total_reads={}, num_groups={})",
-            self.total_reads,
-            self.groups.len()
+            self.inner.total_reads(),
+            self.inner.groups().len()
         )
     }
 }
@@ -382,11 +506,13 @@ fn to_bytes_list<'py>(py: Python<'py>, items: Vec<Vec<u8>>) -> Vec<Bound<'py, Py
     items.iter().map(|v| PyBytes::new(py, v)).collect()
 }
 
-/// Open an archive for streaming record iteration.
+/// Open an archive for streaming record iteration. `source` may be a path,
+/// `bytes`, or a file-like object with `.read()` — an HTTP response streams
+/// straight in (see `fqxv.remote.stream`).
 #[pyfunction]
 #[pyo3(signature = (source, *, threads = 0))]
 fn open(source: &Bound<'_, PyAny>, threads: usize) -> PyResult<PyReader> {
-    let reader = open_source(source)?;
+    let reader = open_read_source(source)?;
     Ok(PyReader {
         inner: fqxv_core::RecordReader::new(reader, threads),
     })
@@ -401,7 +527,7 @@ fn decompress_to_path(
     dest: PathBuf,
     threads: usize,
 ) -> PyResult<u64> {
-    let reader = open_source(source)?;
+    let reader = open_read_source(source)?;
     let file =
         File::create(&dest).map_err(|e| PyIOError::new_err(format!("{}: {e}", dest.display())))?;
     let stats = py
@@ -418,7 +544,7 @@ fn decompress_to_bytes<'py>(
     source: &Bound<'_, PyAny>,
     threads: usize,
 ) -> PyResult<Bound<'py, PyBytes>> {
-    let reader = open_source(source)?;
+    let reader = open_read_source(source)?;
     let out = py
         .detach(move || {
             let mut buf = Vec::new();
@@ -442,22 +568,76 @@ fn inspect(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<PyInfo> {
 #[pyfunction]
 fn open_index(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<PyIndex> {
     let mut reader = open_source(source)?;
-    let index = py
+    let inner = py
         .detach(move || Index::read(&mut reader))
         .map_err(map_err)?;
-    let groups = index
-        .groups()
-        .iter()
-        .map(|g| PyGroupLoc {
-            block_offset: g.block_offset,
-            read_count: g.read_count,
-        })
-        .collect();
-    Ok(PyIndex {
-        total_reads: index.total_reads(),
-        whole_file_crc: index.whole_file_crc(),
-        groups,
-    })
+    Ok(PyIndex { inner })
+}
+
+/// Parse the footer index from a fetched archive **tail** — the body of a
+/// `Range: bytes=-N` request — without any I/O. `suffix` is the final
+/// `len(suffix)` bytes of the archive and `file_len` its total size. Returns
+/// `(index, None)` when the tail reached the footer, or `(None, need_at_least)`
+/// when it fell short: refetch that many trailing bytes and call again (at most
+/// one extra round trip, since the second length is exact). This is the entry
+/// point `fqxv.remote` uses to read an archive over HTTP.
+#[pyfunction]
+fn parse_index_suffix(
+    py: Python<'_>,
+    suffix: &[u8],
+    file_len: u64,
+) -> PyResult<(Option<Py<PyIndex>>, Option<u64>)> {
+    match Index::from_suffix(suffix, file_len).map_err(map_err)? {
+        SuffixParse::Parsed(inner) => Ok((Some(Py::new(py, PyIndex { inner })?), None)),
+        SuffixParse::NeedAtLeast(n) => Ok((None, Some(n))),
+    }
+}
+
+/// Decode a fetched **names** column (coded bytes from one row group) into per-read
+/// name bytes. Verify it with [`PyIndex::verify_stream`] first.
+#[pyfunction]
+fn decode_names_bytes<'py>(py: Python<'py>, coded: &[u8]) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let names = decode_names(coded).map_err(map_err)?;
+    Ok(to_bytes_list(py, names))
+}
+
+/// Decode a fetched **sequence** column into per-read sequence bytes.
+#[pyfunction]
+fn decode_sequences_bytes<'py>(
+    py: Python<'py>,
+    coded: &[u8],
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let (lens, bases) = decode_sequence(coded).map_err(map_err)?;
+    let mut out = Vec::new();
+    slice_reads(&lens, &bases, &mut out);
+    Ok(to_bytes_list(py, out))
+}
+
+/// Decode a fetched **quality** column into per-read quality bytes. Long-read
+/// quality is coded against the sequence: when [`quality_needs_sequence_bytes`]
+/// is true, pass that group's concatenated decoded bases as `seq`.
+#[pyfunction]
+#[pyo3(signature = (coded, seq = None))]
+fn decode_qualities_bytes<'py>(
+    py: Python<'py>,
+    coded: &[u8],
+    seq: Option<&[u8]>,
+) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    let (lens, qual) = match seq {
+        Some(seq) => decode_quality_with_seq(coded, seq).map_err(map_err)?,
+        None => decode_quality(coded).map_err(map_err)?,
+    };
+    let mut out = Vec::new();
+    slice_reads(&lens, &qual, &mut out);
+    Ok(to_bytes_list(py, out))
+}
+
+/// Whether a fetched quality column is coded against the sequence (long-read
+/// blocks) and so needs the group's decoded bases handed to
+/// [`decode_qualities_bytes`].
+#[pyfunction]
+fn quality_needs_sequence_bytes(coded: &[u8]) -> bool {
+    quality_needs_sequence(coded)
 }
 
 /// Decode just the read names for the given row groups (or all). `list[bytes]`.
@@ -706,8 +886,10 @@ fn verify(py: Python<'_>, source: &Bound<'_, PyAny>, threads: usize) -> PyResult
         .map_err(map_err)
 }
 
+/// The compiled core module. Imported and re-exported by the `fqxv` Python
+/// package (`python/fqxv/__init__.py`), which adds `fqxv.remote` on top.
 #[pymodule]
-fn fqxv(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _fqxv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRecord>()?;
     m.add_class::<PyReader>()?;
     m.add_class::<PyInfo>()?;
@@ -726,5 +908,11 @@ fn fqxv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(read_block, m)?)?;
     m.add_function(wrap_pyfunction!(estimate, m)?)?;
     m.add_function(wrap_pyfunction!(verify, m)?)?;
+    // Random-access primitives for the remote (HTTP Range) reader.
+    m.add_function(wrap_pyfunction!(parse_index_suffix, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_names_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_sequences_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(decode_qualities_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(quality_needs_sequence_bytes, m)?)?;
     Ok(())
 }

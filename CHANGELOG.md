@@ -13,6 +13,29 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ## [Unreleased]
 
+### Added
+
+- **`fqxv decompress -` reads from stdin,** streaming the archive straight into the
+  decoder (it only reads forward and stops at the terminator frame). This is how you
+  read a remote archive — pipe a transfer tool in, so all the auth, retries, and
+  resume stay in the tool built for it and fqxv gains no HTTP dependency:
+  `aws s3 cp s3://bucket/reads.fqxv - | fqxv decompress - -Z | bwa mem ref.fa -`
+  (or `curl` on a presigned URL, `gsutil cat`, …). A truncated stream still fails
+  (premature EOF) rather than yielding a short file. `--recover` and `--split` need
+  a seekable file (a stream can't be rewound) and refuse stdin with a clear message.
+- **Python: read archives over the network.** The `fqxv` wheel gains a
+  dependency-free `fqxv.remote` module (standard-library `urllib`). The streaming
+  entry points — `fqxv.open`, `decompress_to_*` — now accept **any file-like
+  object**, so a `boto3`/`urllib`/`httpx` response streams straight in
+  (`fqxv.open(s3.get_object(...)["Body"])`); `fqxv.remote.stream(url)` /
+  `download(url, dest)` wrap that for a URL. `fqxv.remote.RemoteArchive` adds
+  **column projection** over HTTP byte-range requests: fetch just the footer index
+  from the archive tail, then only the names (~1% of the file) or the sequence,
+  CRC-verified per stream. It rests on IO-free primitives —
+  `parse_index_suffix`, per-stream ranges/CRCs on `Index`, and
+  `decode_{names,sequences,qualities}_bytes` — that a custom async client can drive
+  directly for concurrent range fetches.
+
 ### Performance
 
 - **Reorder compress: SIMD merge scan, malloc-free placement, incremental
@@ -36,6 +59,74 @@ misreading it. A format major bump would be announced as a breaking change.
   assembly prelude. **Byte-identical** archives on the validation datasets
   (NovaSeq/GAIIx/MiSeq/MGI, both `--order shuffle` and `--max`), and
   thread-deterministic (`--threads 1` == `--threads 16`). (#219)
+- **Skip the quality-quantizer probe on Nanopore.** The per-block quantizer trial
+  (`MODE_SEQ_BINMIX_Q`) only wins on skewed PacBio HiFi/Revio quality; on the flatter
+  Nanopore distribution it never does, yet the bounded prefix probe still ran and cost
+  ~5% of ONT compress for 0 bytes saved. `encode_seq` now takes a `try_quantizer` flag
+  and the container passes `false` on Nanopore, skipping the histogram build and the
+  probe entirely. **Output is byte-identical** (the kept stream was the baseline either
+  way); only ONT compress speed changes. HiFi/Revio still trial and keep the quantizer.
+
+### Internal
+
+- **Optimize the workspace codec crates in dev/test builds.** The `[profile.dev]`
+  `package."*"` override optimized external dependencies but not workspace members, so
+  the codec crates compiled at opt-level 0 for tests — and the test suite runs real
+  compression, so the long-read round-trip tests took 30–45 s each. Per-package
+  `opt-level = 2` overrides for the compute crates cut the CI test suite roughly 4–5×
+  with no behavior change (SIMD is runtime-detected; determinism holds across opt-levels).
+  The CLI stays at opt-level 0 to keep the edit-compile loop fast.
+
+- **Byte-identical speed in the long-read overlap search (chaining).** The minimizer
+  overlap search (`fqxv-lroverlap`) is the top self-cost of Nanopore compress, and a
+  overlap search (`fqxv-lroverlap`) is the top self-cost of Nanopore compress, and a
+  query's per-anchor chaining dominates it (a fresh profile put `Chainer::chain` at
+  ~23% and `find_overlaps` at ~14% of ONT compress). Three output-preserving changes
+  strip wasted work without moving a single archive byte:
+  - **The chainer's redundant re-sort is dropped.** `find_overlaps` already sorts a
+    query's whole anchor set by `(target, strand, tpos, qpos)`, so each
+    `(target, strand)` group it hands the chainer arrives already in `(tpos, qpos)`
+    order — exactly what the chainer's own `sort_unstable` would produce. A new
+    `Chainer::chain_presorted` entry point skips that re-sort (it still dedups),
+    saving hundreds of sorts per read at high coverage.
+  - **The chaining DP's scratch buffers are reused.** The per-anchor score,
+    predecessor, order, and used arrays — plus the per-chain path — were
+    heap-allocated on every group (hundreds of small allocations per read). They are
+    now thread-local buffers, cleared and resized per group, never read stale — so
+    the chain set stays a pure function of the input.
+  - **The hot anchor-bucket sort is a radix sort.** Each anchor's group-and-position
+    key `(target, strand, tpos, qpos)` packs losslessly into a `u128` whose
+    ascending order is exactly the tuple order, so the per-query sort (~7% of ONT
+    compress) is now a deterministic LSD radix sort producing the identical total
+    order rather than a comparison sort.
+  About **15% faster single-thread** ONT compress (`ecoli_ont`/DRR205413,
+  559 s → 475 s), where chaining is the largest self-cost. At 16 threads long-read
+  compress is block-bound — a handful of large blocks gate the wall clock, not the
+  per-anchor work — so the gain is dataset-shaped: ~noise on ONT (few, large blocks)
+  but about **10% faster** on high-coverage HiFi (`ecoli_hifi`, `--platform pacbio`,
+  254 s → 228 s at 16 threads), where the many smaller blocks keep the cores fed.
+  Archives are **byte-identical** on ONT (default and `--max`) and HiFi, and
+  thread-count invariant (`--threads 1` == `--threads 16`). Proptests pin the radix
+  order to the comparison sort's and the presorted chain path to the sorting path.
+  The levers mirror minimap2's own presorted chaining and `radix_sort_128x`. (#151)
+- **Per-block quality context quantizer, trialled and kept only when it wins
+  (HiFi/Revio).** The long-read quality coder used to build its recent-quality
+  context with one fixed quantization (`q1>>1`/`q2>>3`/`q3>>4`), which merges
+  adjacent Phred values — costly on HiFi/Revio, where quality is packed at the top
+  of the scale and neighbouring high-Q values need to be told apart. The encoder now
+  also builds a per-block quantizer from the block's quality histogram (the fqzcomp
+  `qtab` / CoLoRd platform-quantizer idea): full context resolution where quality
+  actually varies, equal-population folding elsewhere. Both quantizers code the
+  block and the **smaller** is kept, with the choice recorded in a self-describing
+  header mode byte (`MODE_SEQ_BINMIX_Q`) and the small table transmitted so decode is
+  unambiguous — so a block can only match or shrink (never-worse by construction).
+  Quality-stream savings, measured against a clean baseline: **PacBio HiFi (ecoli,
+  Sequel II) −1.17%**, **Revio amplicon −3.25%**, **Revio WGS −0.25%**; **Nanopore
+  0%** and **short reads 0% (byte-identical)** — neither is touched. A bounded
+  prefix probe decides whether the second full encode is worth coding, so the trial
+  costs ≈ +5% compress on Nanopore (where it never wins) and is paid in full only on
+  the skewed long-read data where it does. Lossless and thread-deterministic;
+  archives round-trip byte-for-byte and are identical regardless of thread count.
 
 - **Anchor-restricted long-read tile coding (CoLoRd-style).** The multi-reference
   ONT tiler used to re-align each tile with one banded DP over the whole
@@ -50,6 +141,25 @@ misreading it. A format major bump would be announced as a breaking change.
   is unchanged and archives still round-trip byte-for-byte. A tile whose chain is not
   recovered falls back to the whole-window DP; `FQXV_TILE_NO_ANCHORGAP=1` forces the
   DP everywhere for A/B. (#226)
+
+- **Anchor-restricted coding for the shared-reference consensus codec (HiFi).** The
+  same lever as #226, now on the non-tiler path the high-coverage HiFi/PacBio blocks
+  take: each read used to be re-aligned against its consensus with one banded DP over
+  the whole `read × consensus` window (`align_banded`, the dominant HiFi compress
+  self-cost). It now recovers the read↔consensus exact-k-mer chain, emits each anchor
+  as a free `Match` copy-run, and aligns only the short inter-anchor gaps and two
+  flanks — so alignment work scales with the read's divergence from its consensus,
+  not its length. On low-error HiFi the read shares nearly all of its k-mers with the
+  consensus, collapsing the DP area. About **1.23× faster** at-scale (16-thread)
+  full-file `ecoli_hifi` compress (313s → 254s, two trials), at an equal-or-slightly-better ratio
+  (−0.05% archive on the full file; byte-identical on a single-block subset, where the
+  anchor path emits the same equal-cost edit stream). Lossless and thread-deterministic
+  — the edit-op stream keeps the same semantics, so the decoder is unchanged and
+  archives still round-trip. A read whose chain is not recovered falls back to the
+  whole-window DP;
+  `FQXV_LRO_NO_ANCHORGAP=1` forces the DP everywhere for A/B. The `anchor_chain` /
+  `anchorgap_build` machinery is now shared by both coders (new `anchorgap` module).
+  (#220)
 
 - **Reorder drops the redundant v2 single-contig sequence candidate per block.** On
   the adaptive `rescue` path (`--order any`/`--max` default) each block coded both

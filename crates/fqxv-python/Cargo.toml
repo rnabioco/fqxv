@@ -12,9 +12,10 @@ authors.workspace = true
 publish = false
 
 [lib]
-# The produced module object and Python import name is `fqxv`; the crate name
+# The compiled extension is `fqxv._fqxv` (a private submodule); the pure-Python
+# `fqxv` package in `python/` re-exports it and adds `fqxv.remote`. The crate name
 # stays `fqxv-python` to avoid colliding with the `fqxv` library dependency.
-name = "fqxv"
+name = "_fqxv"
 crate-type = ["cdylib"]
 
 [dependencies]

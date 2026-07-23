@@ -228,6 +228,19 @@ const MODE_SEQ: u8 = 1;
 /// than the single-context coder. The **default** long-read quality mode; needs the
 /// decoded bases like `MODE_SEQ`.
 const MODE_SEQ_BINMIX: u8 = 3;
+/// Long-read binary-mixing quality model with a **per-block context quantizer**
+/// ([`binmix::QCtx`]): identical coder to [`MODE_SEQ_BINMIX`], but the three
+/// recent-quality context fields are quantized through a small table built from
+/// this block's quality histogram (transmitted in the header after `syms`) rather
+/// than the fixed `>>1`/`>>3`/`>>4` shifts. This spends full context resolution
+/// where quality actually varies — the fqzcomp `qtab` / CoLoRd platform-quantizer
+/// idea, which helps HiFi/Revio whose distinct high-quality values differ by one
+/// Phred step (the flat `q1>>1` merges adjacent values, this keeps them apart).
+///
+/// Chosen only when it codes a block **strictly smaller** than `MODE_SEQ_BINMIX`:
+/// [`encode_seq`] trials both and keeps the smaller, so a block can only match or
+/// shrink. Needs the decoded bases exactly like `MODE_SEQ_BINMIX`.
+const MODE_SEQ_BINMIX_Q: u8 = 4;
 
 /// Mean read length (bases) above which [`encode_seq`] selects `MODE_SEQ`. Long
 /// reads (HiFi ~15 kb, ONT ~10 kb) clear this comfortably; Illumina (≤250 bp)
@@ -465,7 +478,9 @@ fn dispatch_decode(
 /// selects the position context (`MODE_POS`); see [`encode_seq`] to let long
 /// reads condition quality on their bases.
 pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec<u8>> {
-    encode_seq(lens, quals, &[], binning)
+    // Sequence-blind (`seq = &[]`) ⇒ short-read `MODE_POS`, which never reaches the
+    // quantizer trial, so the flag is moot here.
+    encode_seq(lens, quals, &[], binning, false)
 }
 
 /// Encode per-read quality strings, optionally conditioning long reads on their
@@ -486,6 +501,13 @@ pub fn encode_seq(
     quals: &[u8],
     seq: &[u8],
     binning: QualityBinning,
+    // Whether to trial the per-block context quantizer (`MODE_SEQ_BINMIX_Q`). The
+    // quantizer only wins on skewed quality (PacBio HiFi/Revio); on the flatter
+    // Nanopore distribution it never does, so the caller passes `false` there to
+    // skip the histogram build + bounded probe entirely (0 bytes saved, pure cost —
+    // measured ~+5% ONT compress). The kept stream is byte-identical to the pre-#235
+    // `MODE_SEQ_BINMIX` baseline either way, so this only changes speed.
+    try_quantizer: bool,
 ) -> Result<Vec<u8>> {
     let total: usize = lens.iter().map(|&l| l as usize).sum();
     if total != quals.len() {
@@ -520,32 +542,223 @@ pub fn encode_seq(
     // original Phred scale (`cv = b - qmin`); only the coded symbol is the dense
     // index (`dv`).
     //
-    // Long reads take the binary-decomposition mixing coder (`binmix`,
-    // `MODE_SEQ_BINMIX`); short reads keep the position context (`MODE_POS`). The
-    // retired single-context `MODE_SEQ` stays decodable but is no longer emitted.
-    let (payload, mode) = if seq_mode {
-        // Long reads take the binary-decomposition mixing coder ([`binmix`]): it
-        // beats the single-context model on ratio and runs faster than it.
-        (
-            binmix::encode(lens, &binned, seq, &dense, qmin, k),
-            MODE_SEQ_BINMIX,
-        )
-    } else {
-        (
-            dispatch_encode(lens, &binned, None, &dense, qmin, k),
-            MODE_POS,
-        )
-    };
+    // Short reads keep the position context (`MODE_POS`). Long reads take the
+    // binary-decomposition mixing coder (`binmix`) and, on top of that, trial two
+    // context quantizers per block and keep the smaller (never-worse by
+    // construction — the same rule the sequence path uses):
+    //
+    // - `MODE_SEQ_BINMIX`   — the fixed `>>1`/`>>3`/`>>4` context shifts (baseline).
+    // - `MODE_SEQ_BINMIX_Q` — a per-block quantizer built from this block's quality
+    //   histogram (fqzcomp `qtab`). Its small table is transmitted in the header.
+    //
+    // The retired single-context `MODE_SEQ` stays decodable but is no longer emitted.
+    if seq_mode {
+        let flat = binmix::QCtx::flat();
+        let base_payload = binmix::encode(lens, &binned, seq, &dense, qmin, k, &flat);
+        let baseline =
+            assemble_quality_stream(binning, MODE_SEQ_BINMIX, k, &syms, &[], lens, &base_payload);
 
-    let mut out = Vec::with_capacity(16 + k + lens.len() + payload.len());
+        // On regimes where the quantizer never wins (Nanopore), skip the histogram
+        // build and the probe outright — the baseline is what would be kept anyway.
+        if !try_quantizer {
+            return Ok(baseline);
+        }
+
+        // The per-block context quantizer, built from the full histogram.
+        let (qc, qtable) = build_quant_ctx(&binned, &syms, qmin);
+
+        // Bound the trial cost. Coding a second full quality stream to keep the
+        // smaller doubles the (dominant) long-read quality-encode work, and the
+        // quantizer only wins on **skewed** quality — HiFi/Revio, where the top of
+        // the Phred scale is packed — never on the flatter Nanopore distribution
+        // (measured: 0 bytes saved, so the second full encode is pure waste there).
+        // So probe a bounded prefix under both quantizers first and only pay the
+        // second full encode when the quantizer wins the probe. Skipping keeps the
+        // baseline, so this stays never-worse *by construction*; the probe can only
+        // ever forgo a win it failed to predict, never enlarge a block.
+        if !quant_wins_probe(lens, &binned, seq, &dense, qmin, k, &flat, &qc) {
+            return Ok(baseline);
+        }
+
+        let q_payload = binmix::encode(lens, &binned, seq, &dense, qmin, k, &qc);
+        let quantized = assemble_quality_stream(
+            binning,
+            MODE_SEQ_BINMIX_Q,
+            k,
+            &syms,
+            &qtable,
+            lens,
+            &q_payload,
+        );
+
+        // Keep the smaller; a tie keeps the baseline (no table, no swap for no
+        // gain). Fixed candidate order + this tie-break make the choice
+        // thread-independent and byte-deterministic.
+        Ok(if quantized.len() < baseline.len() {
+            quantized
+        } else {
+            baseline
+        })
+    } else {
+        let payload = dispatch_encode(lens, &binned, None, &dense, qmin, k);
+        Ok(assemble_quality_stream(
+            binning,
+            MODE_POS,
+            k,
+            &syms,
+            &[],
+            lens,
+            &payload,
+        ))
+    }
+}
+
+/// Assemble a full quality stream: `version | binning | mode | k | syms[k] |
+/// qtable | lens | payload`. `qtable` is empty for every mode except
+/// [`MODE_SEQ_BINMIX_Q`], whose per-block context quantizer is transmitted here
+/// (after `syms`, before the length array) so the decoder can rebuild it.
+fn assemble_quality_stream(
+    binning: QualityBinning,
+    mode: u8,
+    k: usize,
+    syms: &[u8],
+    qtable: &[u8],
+    lens: &[u32],
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + k + qtable.len() + lens.len() + payload.len());
     out.push(FORMAT_VERSION);
     out.push(binning.tag());
     out.push(mode);
     out.push(k as u8);
-    out.extend_from_slice(&syms);
+    out.extend_from_slice(syms);
+    out.extend_from_slice(qtable);
     write_lens(&mut out, lens);
-    out.extend_from_slice(&payload);
-    Ok(out)
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Per-block context quantizer for the long-read binary-mixing coder
+/// ([`MODE_SEQ_BINMIX_Q`]).
+///
+/// Builds the three per-`cv` bucket tables ([`binmix::QCtx`]) that replace the
+/// fixed `>>1`/`>>3`/`>>4` context shifts, plus the compact table transmitted in
+/// the header so the decoder reconstructs the identical quantizer.
+///
+/// The `q1` field (6 bits, coarse tier) gets **full resolution**: for the small
+/// alphabets long-read quality uses (Revio's ~7 levels, HiFi's clustered high-Q
+/// values), each distinct value maps to its own bucket — the win the flat `q1>>1`
+/// throws away by merging adjacent Phred values. Alphabets past 64 symbols fold by
+/// equal population. The `q2`/`q3` fields (3/2 bits, mid/rich tiers) are
+/// equal-population folds of the marginal histogram, so each coarse bucket carries
+/// comparable mass (the fqzcomp `qtab` heuristic).
+///
+/// Returns `(quantizer, table)` where `table` is `2 * k` bytes: for each present
+/// symbol (in ascending value order) `[t1, (t2 << 3) | t3]`.
+fn build_quant_ctx(binned: &[u8], syms: &[u8], qmin: u8) -> (binmix::QCtx, Vec<u8>) {
+    let k = syms.len();
+    let mut cnt = [0u64; 256];
+    for &b in binned {
+        cnt[b as usize] += 1;
+    }
+    let total: u64 = cnt.iter().sum::<u64>().max(1);
+    let mut g1 = [0u8; 256];
+    let mut g2 = [0u8; 256];
+    let mut g3 = [0u8; 256];
+    let mut table = Vec::with_capacity(2 * k);
+    let mut cum = 0u64;
+    for (i, &b) in syms.iter().enumerate() {
+        // `cum` is the count of all lower-value symbols (equal-population boundary).
+        let t1 = if k <= 64 {
+            i as u8 // full resolution: distinct value -> distinct 6-bit bucket
+        } else {
+            ((cum * 64 / total).min(63)) as u8
+        };
+        let t2 = ((cum * 8 / total).min(7)) as u8;
+        let t3 = ((cum * 4 / total).min(3)) as u8;
+        let cv = (b - qmin) as usize;
+        g1[cv] = t1;
+        g2[cv] = t2;
+        g3[cv] = t3;
+        table.push(t1);
+        table.push((t2 << 3) | t3);
+        cum += cnt[b as usize];
+    }
+    (binmix::QCtx::from_tables(g1, g2, g3), table)
+}
+
+/// Leading whole-read bases to code under both quantizers when deciding whether
+/// the quantizer is worth a full second encode. The quantizer's structural edge on
+/// skewed HiFi/Revio quality shows up in the first few MiB; 8 MiB is a small slice
+/// of a 256 MiB block (so the probe costs a few percent) yet enough reads to be
+/// representative. Blocks at or below this size are trialled whole (the "probe"
+/// would be the entire block, so `keep_smaller` just decides directly).
+const QUANT_PROBE_BASES: usize = 8 << 20;
+
+/// Decide whether the per-block context quantizer is worth a full second encode,
+/// by coding a bounded leading prefix under both the flat and quantized contexts
+/// and checking whether the quantizer codes it strictly smaller.
+///
+/// This is a **cost gate only**: a `false` keeps the baseline stream (never-worse
+/// is preserved regardless), so a mis-prediction can only forgo a win, never
+/// enlarge a block. It exists so Nanopore — where the quantizer never wins — does
+/// not pay for a second full quality encode.
+#[allow(clippy::too_many_arguments)] // mirrors the coder's input list
+fn quant_wins_probe(
+    lens: &[u32],
+    binned: &[u8],
+    seq: &[u8],
+    dense: &[u8; 256],
+    qmin: u8,
+    k: usize,
+    flat: &binmix::QCtx,
+    qc: &binmix::QCtx,
+) -> bool {
+    let total = binned.len();
+    if total <= QUANT_PROBE_BASES {
+        // Small block: the probe would be the whole block, so skip it and let
+        // `keep_smaller` decide on the full encodes — cheaper than coding twice.
+        return true;
+    }
+    // Take leading whole reads until they cover at least the probe budget.
+    let mut nreads = 0usize;
+    let mut acc = 0usize;
+    for &l in lens {
+        acc += l as usize;
+        nreads += 1;
+        if acc >= QUANT_PROBE_BASES {
+            break;
+        }
+    }
+    let plens = &lens[..nreads];
+    let pq = &binned[..acc];
+    let ps = &seq[..acc];
+    let flat_probe = binmix::encode(plens, pq, ps, dense, qmin, k, flat);
+    let quant_probe = binmix::encode(plens, pq, ps, dense, qmin, k, qc);
+    quant_probe.len() < flat_probe.len()
+}
+
+/// Rebuild the [`MODE_SEQ_BINMIX_Q`] context quantizer from its transmitted table
+/// (`2 * k` bytes, see [`build_quant_ctx`]) and the present symbols.
+fn read_quant_ctx(table: &[u8], syms: &[u8], qmin: u8) -> Result<binmix::QCtx> {
+    let k = syms.len();
+    if table.len() != 2 * k {
+        return Err(Error::Malformed("quality quantizer table length mismatch"));
+    }
+    let mut g1 = [0u8; 256];
+    let mut g2 = [0u8; 256];
+    let mut g3 = [0u8; 256];
+    for (i, &b) in syms.iter().enumerate() {
+        let t1 = table[2 * i];
+        let packed = table[2 * i + 1];
+        let cv = (b - qmin) as usize;
+        // Masks are defensive; `keys` masks each field again, so an out-of-range
+        // byte can only mis-predict, never index out of bounds.
+        g1[cv] = t1 & 0x3F;
+        g2[cv] = (packed >> 3) & 0x7;
+        g3[cv] = packed & 0x3;
+    }
+    Ok(binmix::QCtx::from_tables(g1, g2, g3))
 }
 
 /// Whether a stream was coded in `MODE_SEQ` and so needs the block's decoded
@@ -556,7 +769,10 @@ pub fn encode_seq(
 pub fn needs_sequence(src: &[u8]) -> bool {
     // Header layout: version(0), binning tag(1), mode(2), ...
     src.first() == Some(&FORMAT_VERSION)
-        && matches!(src.get(2), Some(&MODE_SEQ) | Some(&MODE_SEQ_BINMIX))
+        && matches!(
+            src.get(2),
+            Some(&MODE_SEQ) | Some(&MODE_SEQ_BINMIX) | Some(&MODE_SEQ_BINMIX_Q)
+        )
 }
 
 /// Decode a sequence-blind stream produced by [`encode`], returning
@@ -582,7 +798,7 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     // Both sequence modes need the decoded bases; `MODE_POS` does not.
     let seq_mode = match mode {
         MODE_POS => false,
-        MODE_SEQ | MODE_SEQ_BINMIX => true,
+        MODE_SEQ | MODE_SEQ_BINMIX | MODE_SEQ_BINMIX_Q => true,
         _ => return Err(Error::Malformed("unknown quality context mode")),
     };
     let k = r.u8()? as usize;
@@ -591,6 +807,13 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     }
     let syms = r.take(k)?.to_vec();
     let qmin = syms[0];
+    // `MODE_SEQ_BINMIX_Q` transmits its per-block context quantizer here, after the
+    // symbol alphabet and before the length array (see `assemble_quality_stream`).
+    let qtable: Vec<u8> = if mode == MODE_SEQ_BINMIX_Q {
+        r.take(2 * k)?.to_vec()
+    } else {
+        Vec::new()
+    };
     let lens = read_lens(&mut r)?;
 
     // Checked sum: a malformed stream can declare lengths whose total wraps
@@ -630,7 +853,14 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
         .try_reserve(total)
         .map_err(|_| Error::Malformed("declared total length too large to allocate"))?;
     match mode {
-        MODE_SEQ_BINMIX => binmix::decode(&lens, payload, seq, &syms, qmin, k, &mut quals)?,
+        MODE_SEQ_BINMIX => {
+            let qc = binmix::QCtx::flat();
+            binmix::decode(&lens, payload, seq, &syms, qmin, k, &qc, &mut quals)?;
+        }
+        MODE_SEQ_BINMIX_Q => {
+            let qc = read_quant_ctx(&qtable, &syms, qmin)?;
+            binmix::decode(&lens, payload, seq, &syms, qmin, k, &qc, &mut quals)?;
+        }
         _ => {
             let mut dec = Decoder::new(payload);
             dispatch_decode(
@@ -807,7 +1037,7 @@ mod tests {
     fn roundtrip_seq_context_long_reads() {
         let (lens, seq, quals) = longread_fixture(40, 2000);
         // Long reads: encode_seq must pick MODE_SEQ and round-trip through decode_seq.
-        let enc = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("encode");
+        let enc = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("encode");
         assert!(needs_sequence(&enc), "long reads must select MODE_SEQ");
         let (out_lens, out_quals) = decode_seq(&enc, &seq).expect("decode");
         assert_eq!(out_lens, lens);
@@ -819,7 +1049,8 @@ mod tests {
         // The whole point: when quality tracks the base, conditioning on sequence
         // must code smaller than the sequence-blind position context.
         let (lens, seq, quals) = longread_fixture(40, 2000);
-        let with_seq = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("seq");
+        let with_seq =
+            encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("seq");
         let blind = encode(&lens, &quals, QualityBinning::Lossless).expect("blind");
         assert!(
             with_seq.len() < blind.len(),
@@ -830,11 +1061,90 @@ mod tests {
     }
 
     #[test]
+    fn quality_trial_keeps_smaller_and_roundtrips() {
+        // The per-block quantizer trial is never-worse by construction: the kept
+        // stream must be no larger than the pure baseline (MODE_SEQ_BINMIX) stream,
+        // and must round-trip whichever candidate wins.
+        let (lens, seq, quals) = longread_fixture(40, 2000);
+        let (syms, dense) = dense_alphabet(&quals).expect("alphabet");
+        let (qmin, k) = (syms[0], syms.len());
+
+        let flat = binmix::QCtx::flat();
+        let base_payload = binmix::encode(&lens, &quals, &seq, &dense, qmin, k, &flat);
+        let baseline = assemble_quality_stream(
+            QualityBinning::Lossless,
+            MODE_SEQ_BINMIX,
+            k,
+            &syms,
+            &[],
+            &lens,
+            &base_payload,
+        );
+
+        let kept = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("encode");
+        assert!(
+            kept.len() <= baseline.len(),
+            "kept stream ({} B) must not exceed the baseline ({} B)",
+            kept.len(),
+            baseline.len(),
+        );
+        assert!(
+            matches!(
+                kept.get(2),
+                Some(&MODE_SEQ_BINMIX) | Some(&MODE_SEQ_BINMIX_Q)
+            ),
+            "long reads must pick one of the two binmix modes"
+        );
+        let (out_lens, out_quals) = decode_seq(&kept, &seq).expect("decode");
+        assert_eq!(out_lens, lens);
+        assert_eq!(out_quals, quals);
+    }
+
+    #[test]
+    fn quality_trial_is_deterministic() {
+        // Encoding the same block twice must be byte-identical — the trial picks a
+        // fixed candidate order with a fixed tie-break, so it is order-free.
+        let (lens, seq, quals) = longread_fixture(24, 1800);
+        let a = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("a");
+        let b = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("b");
+        assert_eq!(a, b, "encode_seq must be deterministic");
+    }
+
+    #[test]
+    fn quant_mode_roundtrips_directly() {
+        // Exercise the MODE_SEQ_BINMIX_Q encode+decode path explicitly, so it is
+        // covered even when the trial happens not to select it on a fixture.
+        let (lens, seq, quals) = longread_fixture(30, 1500);
+        let (syms, dense) = dense_alphabet(&quals).expect("alphabet");
+        let (qmin, k) = (syms[0], syms.len());
+        let (qc, qtable) = build_quant_ctx(&quals, &syms, qmin);
+        let payload = binmix::encode(&lens, &quals, &seq, &dense, qmin, k, &qc);
+        let stream = assemble_quality_stream(
+            QualityBinning::Lossless,
+            MODE_SEQ_BINMIX_Q,
+            k,
+            &syms,
+            &qtable,
+            &lens,
+            &payload,
+        );
+        assert!(needs_sequence(&stream), "quant mode needs the sequence");
+        assert_eq!(stream.get(2), Some(&MODE_SEQ_BINMIX_Q));
+        let (out_lens, out_quals) = decode_seq(&stream, &seq).expect("decode");
+        assert_eq!(out_lens, lens);
+        assert_eq!(out_quals, quals);
+        // A stream truncated inside the quantizer table must be rejected cleanly,
+        // not panic: header is version|binning|mode|k|syms[k], then the 2*k table.
+        let cut = 4 + k + k; // stop partway through the 2*k-byte table
+        assert!(decode_seq(&stream[..cut], &seq).is_err());
+    }
+
+    #[test]
     fn seq_context_decode_requires_sequence() {
         // A MODE_SEQ stream cannot be decoded blind: the plain `decode` (empty
         // sequence) must reject it cleanly rather than produce wrong output.
         let (lens, seq, quals) = longread_fixture(20, 1000);
-        let enc = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("encode");
+        let enc = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("encode");
         assert!(matches!(decode(&enc), Err(Error::Malformed(_))));
         // A wrong-length sequence is rejected too.
         assert!(matches!(
@@ -856,7 +1166,8 @@ mod tests {
             quals.push(b'#' + ((x >> 16) % 4) as u8);
             seq.push(b"ACGT"[((x >> 20) % 4) as usize]);
         }
-        let with_seq = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("seq");
+        let with_seq =
+            encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("seq");
         let blind = encode(&lens, &quals, QualityBinning::Lossless).expect("blind");
         assert!(!needs_sequence(&with_seq), "short reads must stay MODE_POS");
         assert_eq!(with_seq, blind, "short-read output must be byte-identical");

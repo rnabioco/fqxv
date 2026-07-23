@@ -106,8 +106,8 @@ other, not against the lossless rows.
   quality *leads* CoLoRd on both platforms (a sequence-conditioned, context-mixed
   coder), and the sequence stream now closes the gap too: a whole-file overlap
   reference on high-coverage HiFi, raw-LZMA on ordinary-coverage HiFi, and
-  best-of-N tiling on Nanopore bring fqxv to **CoLoRd parity on ONT** and past it on
-  HiFi Sequel II. See [Long-read support](design/longread.md).
+  best-of-N tiling with anchor-restricted coding on Nanopore bring fqxv **past
+  CoLoRd on both ONT and HiFi Sequel II**. See [Long-read support](design/longread.md).
 - **Aligned reads with a reference on hand** → `CRAM` is purpose-built for that and
   reference-based; `fqxv` is for the raw, reference-free FASTQ.
 - **Maximum portability, no tooling** → `.fastq.gz`. Universally readable, but the

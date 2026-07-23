@@ -28,6 +28,8 @@ __pycache__/
 .pytest_cache/
 /crates/fqxv-python/dist
 *.egg-info/
+# `maturin develop` drops the compiled extension into the mixed-layout package dir.
+/crates/fqxv-python/python/fqxv/_fqxv*.so
 
 # editor/OS cruft
 .DS_Store

@@ -1,4 +1,4 @@
-# Benchmark results — 2026-07-21
+# Benchmark results — 2026-07-22
 
 Snapshot from the unified parallel harness (`submit_parallel.sh`) on the Bodhi
 `rna` partition: 9 datasets × platform-appropriate tools = 150 cells, each fanned
@@ -8,10 +8,13 @@ on **both** Sequel II and Revio. Ratios are deterministic (thread-count
 independent); `rt=yes` means the round-trip content digest matched (lossless, or
 lossy-expected for the binned points). Reproduce with `bash submit_parallel.sh`.
 
-Re-run on `1b6eeb5` (post-v0.4.0). Every ratio and per-stream size below
-reproduced **byte-for-byte** from the v0.4.0 tables — the PRs since (#218 Python
-bindings, #222/#223) changed no output. What moved is long-read compress *speed*
-(see [Long-read compress speed](#long-read-compress-speed)).
+Re-run on `2468cb2`. Every short-read ratio, and the ONT and Revio-WGS long-read
+ratios, reproduced **byte-for-byte** from the prior tables. What moved is **HiFi**:
+the anchor-restricted HiFi consensus coder (#234) shaved the sequence stream and
+the per-block quality quantizer (#235, trialled and kept only when smaller) shaved
+the quality stream, lifting `ecoli_hifi` **4.73× → 4.77×** and `hifi_revio_amplicon`
+21.79× → 21.80×. The same quality quantizer shrank the binned ONT stream, taking
+`ecoli_ont --quality-bin ont` **6.68× → 7.17×**.
 
 Two long-read sequence codecs landed since the 2026-07-20 run and move the
 numbers below: a **raw-LZMA** sequence method for ordinary-coverage long reads
@@ -48,27 +51,27 @@ the read names dominate the archive and the tokenizer is the whole game.
 
 ## Long-read, lossless
 
-Two changes reshaped this table since 2026-07-20. **HiFi Revio WGS — last cycle's
-single worst result — nearly doubled** (9.72× → **16.95×**), and **ONT reached
-parity with CoLoRd** (3.05× vs 3.05×, up from 2.83×). All rows round-trip
-losslessly.
+**HiFi Revio WGS — last cycle's single worst result — nearly doubled** (9.72× →
+**16.95×**) via the raw-LZMA sequence path, and **ONT now edges ahead of CoLoRd**
+(3.06× vs 3.05×) after multi-reference tiling plus the anchor-restricted tiler
+coder (#231, which aligns only inter-anchor gaps). All rows round-trip losslessly.
 
-| dataset             |     fqxv | fqxv9 |    colord | zstd19 |   xz9 | gzip |
-|---------------------|---------:|------:|----------:|-------:|------:|-----:|
-| hifi_revio_amplicon |**21.79** | 21.79 |     19.88 |  15.12 | 14.45 | 8.96 |
-| hifi_revio_wgs      |    16.95 | 16.95 | **18.76** |  13.02 | 12.75 | 9.28 |
-| ecoli_hifi          | **4.73** |  4.73 |      4.44 |   3.83 |  3.85 | 2.27 |
-| ecoli_ont           |     2.92 |  3.05 |      3.05 |   2.38 |  2.49 | 1.94 |
+| dataset             |     fqxv |  fqxv9 |    colord | zstd19 |   xz9 | gzip |
+|---------------------|---------:|-------:|----------:|-------:|------:|-----:|
+| hifi_revio_amplicon |**21.80** |  21.80 |     19.88 |  15.12 | 14.45 | 8.96 |
+| hifi_revio_wgs      |    16.95 |  16.95 | **18.76** |  13.02 | 12.75 | 9.28 |
+| ecoli_hifi          | **4.77** |   4.77 |      4.44 |   3.83 |  3.85 | 2.27 |
+| ecoli_ont           |     3.01 |**3.06**|      3.05 |   2.38 |  2.49 | 1.94 |
 
 The per-stream split (fqxv best lossless point, from `fqxv info`) shows where the
 two levers landed:
 
 | dataset             | seq (b/base) |  seq (bytes) | quality (bytes) | quality share |
 |---------------------|-------------:|-------------:|----------------:|--------------:|
-| ecoli_hifi          |        0.065 |   12,643,309 |     641,788,411 |       **98%** |
-| hifi_revio_amplicon |        0.083 |    6,299,312 |      49,187,324 |           84% |
-| hifi_revio_wgs      |    **0.683** |  115,329,481 |      44,876,883 |           28% |
-| ecoli_ont (`-l9`)   |        0.915 |   34,462,477 |     163,660,203 |           83% |
+| ecoli_hifi          |        0.064 |   12,286,488 |     635,629,989 |       **98%** |
+| hifi_revio_amplicon |        0.083 |    6,276,266 |      49,183,082 |           84% |
+| hifi_revio_wgs      |    **0.683** |  115,329,481 |      44,786,803 |           28% |
+| ecoli_ont (`-l9`)   |    **0.887** |   33,404,890 |     163,660,203 |           83% |
 
 **`hifi_revio_wgs` was the worst result in the suite** — 1.391 b/base of sequence
 (234.7M), an archive that barely cleared gzip and lost to zstd/xz. A real genome
@@ -78,18 +81,19 @@ large-window LZMA sequence method catches them and halves the stream to **0.683
 b/base (115.3M)**. The archive goes from second-worst-lossless to a strong second
 behind CoLoRd, now ahead of both zstd19 (13.02) and xz9 (12.75).
 
-**`ecoli_ont` reached CoLoRd parity.** The multi-reference tiling codec codes each
-read against earlier *raw* reads (best-of-4 references at `-l9`/`--max`), cutting
-ONT sequence from 1.150 b/base (default, single reference) to **0.915 b/base** —
-34.5M non-quality versus CoLoRd's 31.4M, ~10% behind on sequence alone. fqxv's
-quality coder makes up the rest: 163.7M versus CoLoRd's 166.5M (a 2.8M credit that
-nearly offsets the 3.1M sequence deficit), so the ONT total lands at **3.047×,
-within 0.15% of CoLoRd's 3.052×** (189.0M vs 188.7M). Default `fqxv` (single
-reference, no best-of-N) is 2.92×; the tiling depth is effort-gated so the extra
-assemblies are spent only when asked for.
+**`ecoli_ont` now beats CoLoRd.** The multi-reference tiling codec codes each read
+against earlier *raw* reads (best-of-4 references at `-l9`/`--max`), and the
+anchor-restricted coder (#231) then aligns only the inter-anchor gaps rather than
+re-deriving the whole read — together cutting `-l9` ONT sequence to **0.887 b/base
+(33.4M)** versus CoLoRd's 31.4M (now ~6% behind on sequence alone). fqxv's quality
+coder makes up the rest: 163.7M versus CoLoRd's 166.5M (a 2.8M credit), so the ONT
+total lands at **3.063×, ahead of CoLoRd's 3.052×** (188.0M vs 188.7M) — the whole
+archive is now smaller. The anchor coder also lifts default `fqxv` (2.92× → 3.01×,
+−2.9% archive) and makes ONT compress **1.54× faster at 16 threads**; the tiling
+depth is effort-gated so the deepest references are spent only at `-l9`/`--max`.
 
 **`ecoli_hifi` (Sequel II, ~300×) still leads CoLoRd on every stream** — sequence
-12.6M vs 13.4M, quality 641.8M vs 684.3M, total 656.0M vs 697.7M — at 4.73×. This
+12.3M vs 13.4M, quality 635.6M vs 684.3M, total 649.5M vs 697.7M — at 4.77×. This
 is why one HiFi dataset was never enough: `ecoli_hifi` is 98% quality by bytes
 (300× coverage of a 4.6 Mb genome collapses the sequence stream), while Revio WGS
 at ordinary coverage is 72% sequence. The two datasets exercise opposite regimes,
@@ -97,16 +101,17 @@ and the sequence lever only shows up on the second.
 
 ## Long-read compress speed
 
-The long-read *ratios* are unchanged — this cycle's long-read work was pure speed
-and reproduced every archive byte-for-byte. What moved is compress throughput,
-which the ratio tables don't show. On the same 16-thread `rna`-partition cell,
-default-mode compress dropped from **438 s to 141 s (~3.1× faster) on the noisy
-ONT run** and from **493 s to 450 s (~9%) on `ecoli_hifi`**, at identical output:
-gating off the always-discarded overlap-consensus candidate on Nanopore (#223),
-de-packing the banded-DP traceback (#222), and skipping the redundant
-shared-reference assembly on Nanopore (#211). The `--max` ONT point is the
-opposite trade by design — best-of-4 tiling references spend ~795 s to reach the
-3.047× parity ratio, so the deep sequence lever is paid only when asked for.
+Two waves of long-read work landed here. First, a set of **byte-identical**
+speedups — gating off the always-discarded overlap-consensus candidate on Nanopore
+(#223), de-packing the banded-DP traceback (#222), and skipping the redundant
+shared-reference assembly on Nanopore (#211): on the same 16-thread `rna`-partition
+cell, default-mode compress dropped from **438 s to 141 s (~3.1× faster) on the
+noisy ONT run** and from **493 s to 450 s (~9%) on `ecoli_hifi`**, at identical
+output. Then the **anchor-restricted tiler coder (#231)** — which aligns only
+inter-anchor gaps rather than re-deriving the whole read — made ONT another **1.54×
+faster at 16 threads** *and* smaller (the ratio gains in the table above). The
+`--max` ONT point spends best-of-4 tiling references for its best-ratio **3.063×**,
+now ahead of CoLoRd; the deep sequence lever is paid only when asked for.
 
 ## Lossy quality (fqxv binning)
 
@@ -117,12 +122,13 @@ read-reordering on top of binning.
 |------------------|-----:|-----:|-----:|-------------:|
 | rnaseq_novaseq   | 9.94 | 9.94 | 11.37|        33.98 |
 | rnaseq_fullrange |10.84 |14.49 | 15.37|        31.95 |
-| ecoli_ont (binont)| 6.68|   —  |   —  |            — |
+| ecoli_ont (binont)| 7.17|   —  |   —  |            — |
 
-`ecoli_ont --quality-bin ont` improved 5.83 → 6.68 as its sequence stream picked
-up the tiling codec. On the lossy long-read points the sequence stream dominates
-the archive, so the ONT sequence lever matters more there than in the lossless
-totals above.
+`ecoli_ont --quality-bin ont` improved 5.83 → 6.68 (the tiling codec on its
+sequence stream) → **7.17** this cycle, as the per-block quality quantizer (#235)
+shrank the binned quality stream from ~53M to 47M. On the lossy long-read points
+the sequence stream still dominates the archive, so the ONT sequence lever matters
+more there than in the lossless totals above.
 
 ## fqxv archive vs native NCBI `.sra` (lossless `max` regime)
 

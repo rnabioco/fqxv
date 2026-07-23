@@ -26,6 +26,25 @@ seqs = fqxv.read_sequences("reads.fqxv")        # list[bytes], skips quality
 ids = fqxv.read_names("reads.fqxv", groups=[0]) # just the first row group
 block0 = fqxv.read_block("reads.fqxv", 0)       # list[Record]
 
+# Read over the network (fqxv.remote, standard-library HTTP). Streaming decodes the
+# whole archive on the fly; projection fetches only the column you ask for via HTTP
+# byte-range requests.
+import fqxv.remote as remote
+for rec in remote.stream("https://host/reads.fqxv"):   # or a presigned S3 URL
+    ...                                                # streams; no full download
+arc = remote.open_index("https://host/reads.fqxv")     # 1 tail GET → footer index
+names = arc.names()                                    # ~1% of the file, CRC-checked
+print(arc.bytes_fetched, "of", arc.size)
+
+# Any file-like works, so an AWS SDK response streams straight in — no fqxv HTTP:
+import boto3
+body = boto3.client("s3").get_object(Bucket=b, Key=k)["Body"]
+for rec in fqxv.open(body):
+    ...
+# For concurrent async range fetches, drive fqxv.parse_index_suffix /
+# Index.stream_range / fqxv.decode_*_bytes with your own httpx/aiohttp session
+# (see fqxv.remote's module docstring).
+
 # Integrity check — raises fqxv.FqxvError on a corrupt archive
 fqxv.verify("reads.fqxv")
 

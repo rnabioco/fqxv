@@ -60,6 +60,7 @@
 #![deny(unsafe_code)]
 
 mod align;
+mod anchorgap;
 mod chain;
 mod codec;
 mod consensus;
@@ -67,6 +68,7 @@ mod index;
 mod layout;
 mod minimizer;
 mod overlap;
+mod radix;
 mod refine;
 mod script;
 mod tile;
