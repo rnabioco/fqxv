@@ -749,13 +749,15 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params, platform: Platform) 
                 // reads it ignores them and codes the position context as before.
                 // The per-block quantizer trial only pays on PacBio (skewed quality);
                 // gate it off on Nanopore so ONT doesn't pay the probe for 0 gain.
-                || fqxv_fqzcomp::encode_seq(
-                    &b.lens,
-                    &b.qual,
-                    &b.seq,
-                    params.quality_binning,
-                    !matches!(platform, Platform::Nanopore),
-                ),
+                || {
+                    fqxv_fqzcomp::encode_seq(
+                        &b.lens,
+                        &b.qual,
+                        &b.seq,
+                        params.quality_binning,
+                        !matches!(platform, Platform::Nanopore),
+                    )
+                },
             )
         },
     );

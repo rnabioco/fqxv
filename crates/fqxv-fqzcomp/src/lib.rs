@@ -1049,7 +1049,8 @@ mod tests {
         // The whole point: when quality tracks the base, conditioning on sequence
         // must code smaller than the sequence-blind position context.
         let (lens, seq, quals) = longread_fixture(40, 2000);
-        let with_seq = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("seq");
+        let with_seq =
+            encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("seq");
         let blind = encode(&lens, &quals, QualityBinning::Lossless).expect("blind");
         assert!(
             with_seq.len() < blind.len(),
@@ -1165,7 +1166,8 @@ mod tests {
             quals.push(b'#' + ((x >> 16) % 4) as u8);
             seq.push(b"ACGT"[((x >> 20) % 4) as usize]);
         }
-        let with_seq = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("seq");
+        let with_seq =
+            encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("seq");
         let blind = encode(&lens, &quals, QualityBinning::Lossless).expect("blind");
         assert!(!needs_sequence(&with_seq), "short reads must stay MODE_POS");
         assert_eq!(with_seq, blind, "short-read output must be byte-identical");
