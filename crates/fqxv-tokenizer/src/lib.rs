@@ -1037,4 +1037,55 @@ mod tests {
             "expected the aggregate cap, got {err:?}"
         );
     }
+
+    proptest::proptest! {
+        /// Arbitrary bytes fed straight to `decode` must never panic or abort —
+        /// only return Ok/Err. Unlike `decode_survives_mutation` (which perturbs
+        /// VALID encodings), this feeds pure garbage, which reaches header/length
+        /// paths a mutation of a valid stream rarely does. Guards htscodecs-style
+        /// crashes on adversarial name streams.
+        #[test]
+        fn decode_never_aborts_on_garbage(bytes in proptest::collection::vec(0u8..=255, 0..256)) {
+            let _ = decode(&bytes);
+        }
+    }
+
+    /// Names containing bytes >= 0x80 must round-trip byte-exactly. Guards
+    /// htscodecs #105, a signed-char crash on the input `[0x80, 0x0a]`: the
+    /// existing arbitrary-name generators only sample bytes < 0x80, so the
+    /// high-bit path is otherwise untested.
+    #[test]
+    fn roundtrip_high_bit_name_bytes() {
+        roundtrip(&[
+            &[0x80u8, 0x0a],                  // the htscodecs #105 crasher
+            &[0xffu8],                        // all bits set
+            b"read\x80\xa5\xffname",          // high-bit bytes among ASCII
+            &[0x00u8, 0x80, 0x7f, 0xff, 0x0a], // mix of low, boundary, and high
+            b"plain",                         // an ordinary name alongside them
+        ]);
+    }
+
+    /// Token-count boundary at `MAX_COL`. Guards the htscodecs 1.5.2 overflow when
+    /// writing the token past the column cap. A name of single-character
+    /// alternating letter/digit runs tokenizes to one column per character (each
+    /// character flips digit/non-digit, so no runs merge), letting us hit exactly
+    /// `MAX_COL`, `MAX_COL + 1`, and one past. Encode must not panic/overflow at
+    /// the boundary, and each name must recover byte-exactly.
+    #[test]
+    fn roundtrip_at_max_col_boundary() {
+        // `n` alternating single-char tokens: "a1a1a1…".
+        let name_of = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|i| if i % 2 == 0 { b'a' } else { b'1' })
+                .collect()
+        };
+        // Sanity: the construction really yields `n` tokens (columns).
+        assert_eq!(tokenize(&name_of(MAX_COL)).len(), MAX_COL);
+        assert_eq!(tokenize(&name_of(MAX_COL + 1)).len(), MAX_COL + 1);
+
+        for &n in &[MAX_COL - 1, MAX_COL, MAX_COL + 1] {
+            let name = name_of(n);
+            roundtrip(&[name.as_slice()]);
+        }
+    }
 }
