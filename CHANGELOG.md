@@ -11,7 +11,7 @@ tolerates newer minors, and additive features are gated behind required-feature
 bits, so a reader that predates a feature refuses the archive outright rather than
 misreading it. A format major bump would be announced as a breaking change.
 
-## [Unreleased]
+## [0.5.0] - 2026-07-23
 
 ### Added
 
@@ -729,6 +729,7 @@ of FASTQ. Codecs are clean-room implementations from specs and papers
   SPRING and fqz_comp do). Name, sequence, and quality are otherwise preserved
   exactly; this is the one documented deviation from byte-losslessness.
 
+[0.5.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.0
 [0.4.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.4.0
 [0.3.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.3.0
 [0.2.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.2.0
