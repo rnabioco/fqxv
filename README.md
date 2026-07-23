@@ -42,6 +42,12 @@ landing just behind CoLoRd — see the [benchmarks](docs/benchmarks.md).
 
 Pure Rust, no external or C compressor.
 
+Beyond ratio, fqxv is the only reference-free FASTQ archiver that both streams
+forward off a pipe (`… | fqxv decompress -`) and supports seekable per-stream
+random access — see the [format comparison](docs/format-comparison.md) for how it
+stacks up against gzip/zstd, SPRING, CoLoRd, CRAM, and SRA on determinism,
+losslessness, integrity, and remote access.
+
 ## Install
 
 Until `fqxv` lands on [bioconda](https://bioconda.github.io/), install from source
