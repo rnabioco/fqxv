@@ -1,5 +1,8 @@
 # 🗜️ fqxv
 
+[![PyPI](https://img.shields.io/pypi/v/fqxv)](https://pypi.org/project/fqxv/)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+
 A Rust toolkit for archiving FASTQ, built as a workspace of
 one-crate-per-algorithm codecs plus a container format and CLI.
 
