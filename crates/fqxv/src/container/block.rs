@@ -747,7 +747,15 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params, platform: Platform) 
                 // Hand the bases to the quality coder: on long reads it conditions
                 // quality on sequence (base + next + homopolymer run); on short
                 // reads it ignores them and codes the position context as before.
-                || fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning),
+                // The per-block quantizer trial only pays on PacBio (skewed quality);
+                // gate it off on Nanopore so ONT doesn't pay the probe for 0 gain.
+                || fqxv_fqzcomp::encode_seq(
+                    &b.lens,
+                    &b.qual,
+                    &b.seq,
+                    params.quality_binning,
+                    !matches!(platform, Platform::Nanopore),
+                ),
             )
         },
     );
@@ -769,7 +777,9 @@ pub(crate) fn compress_block_with_seq(
     let header_refs = b.header_refs();
     let (names_c, qual_c) = rayon::join(
         || fqxv_tokenizer::encode(&header_refs),
-        || fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning),
+        // The shared-reference path is non-Nanopore (issue #211), so the quantizer
+        // trial is worth running here.
+        || fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning, true),
     );
     let (names_c, qual_c) = (names_c?, qual_c?);
     assemble_block_payload(b, &names_c, precoded_seq, &qual_c, params)
@@ -788,7 +798,9 @@ pub(crate) fn compress_block_with_names_seq(
     names_c: &[u8],
     seq_c: &[u8],
 ) -> Result<Vec<u8>> {
-    let qual_c = fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning)?;
+    // Reorder never-worse gate ⇒ short reads (reorder auto-disables above the
+    // long-read length threshold), which take `MODE_POS` and never reach the trial.
+    let qual_c = fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning, true)?;
     assemble_block_payload(b, names_c, seq_c, &qual_c, params)
 }
 
