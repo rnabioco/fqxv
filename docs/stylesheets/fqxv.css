@@ -167,10 +167,13 @@
 
 /* ===================== Theme-aware benchmark charts ====================== */
 /* The topline bar charts (docs/charts/generate.py) ship as paired
-   *.dark.svg / *.light.svg. Show the one matching the active palette so they
-   track the in-site toggle. Keyed on [data-md-color-scheme] (set by the toggle)
-   rather than a <picture media="prefers-color-scheme"> — which would follow the
-   OS theme and desync from the switch. slate (dark) is the default palette. */
+   *.dark.svg / *.light.svg. Center each chart and show only the variant
+   matching the active palette so they track the in-site toggle. Keyed on
+   [data-md-color-scheme] (set by the toggle) rather than a
+   <picture media="prefers-color-scheme"> — which would follow the OS theme and
+   desync from the switch. slate (dark) is the default palette. */
+.md-typeset img[src$=".dark.svg"],
+.md-typeset img[src$=".light.svg"] { display: block; margin-inline: auto; }
 .md-typeset img[src$=".light.svg"] { display: none; }
 [data-md-color-scheme="default"] .md-typeset img[src$=".dark.svg"]  { display: none; }
-[data-md-color-scheme="default"] .md-typeset img[src$=".light.svg"] { display: inline; }
+[data-md-color-scheme="default"] .md-typeset img[src$=".light.svg"] { display: block; }
