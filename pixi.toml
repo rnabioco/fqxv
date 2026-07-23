@@ -27,11 +27,17 @@ fonts-conda-ecosystem = "*"
 [pypi-dependencies]
 # Pinned to match the docs CI (.github/workflows/docs.yml).
 zensical = "==0.0.50"
+# Compiles the Vega-Lite chart specs to static SVG (pure-Python wheel, no
+# browser). Used only by the `charts` task; the site build never runs it.
+vl-convert-python = "*"
 
 [tasks]
 release = "cargo build --profile release"
 # Render every docs/tapes/*.tape to a GIF in docs/images/ (builds fqxv first).
 tapes = { cmd = "docs/tapes/generate.sh", depends-on = ["release"] }
+# Render the topline benchmark bar charts from docs/charts/topline.tsv to
+# light/dark SVGs in docs/images/. Outputs are committed, like the tape GIFs.
+charts = "python docs/charts/generate.py"
 docs-serve = "zensical serve"
 docs-build = "zensical build"
 
