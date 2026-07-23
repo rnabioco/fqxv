@@ -11,6 +11,21 @@ tolerates newer minors, and additive features are gated behind required-feature
 bits, so a reader that predates a feature refuses the archive outright rather than
 misreading it. A format major bump would be announced as a breaking change.
 
+## [0.5.1] - 2026-07-23
+
+### Performance
+
+- **`fqxv compress --estimate` is now 15–60× faster** — always subsecond on a
+  block-sized sample. It predicts the archive from the sample's measured *entropy*
+  (what the real entropy coders converge to) instead of coding it: static order-k
+  sequence entropy, a k-mer duplication sketch that captures long-read cross-read
+  redundancy, order-1 quality entropy, and the real tokenizer for names — each
+  scaled by a small per-platform calibration factor. The measurement passes run in
+  parallel across read chunks, and the sample is capped by read count for short
+  reads and by one block of bases for long reads (so the sketch sees a real block's
+  coverage). Predicted archive size stays within ~1% of the previous coding-based
+  estimate across Illumina, PacBio HiFi, and Nanopore.
+
 ## [0.5.0] - 2026-07-23
 
 ### Added
@@ -729,6 +744,7 @@ of FASTQ. Codecs are clean-room implementations from specs and papers
   SPRING and fqz_comp do). Name, sequence, and quality are otherwise preserved
   exactly; this is the one documented deviation from byte-losslessness.
 
+[0.5.1]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.1
 [0.5.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.0
 [0.4.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.4.0
 [0.3.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.3.0
