@@ -1,0 +1,35 @@
+# Source of truth for the topline benchmark bar charts (docs/charts/generate.py).
+# Hand-curated from docs/benchmarks.md — keep in sync when those tables change.
+# Columns:
+#   chart  — which figure the row belongs to
+#   label  — the bar's category label (tool, or tool + platform)
+#   group  — fqxv | other  (drives the accent-vs-muted color)
+#   value  — the number the bar length encodes (sorted descending per chart)
+#   vlabel — the text drawn at the end of the bar
+chart	label	group	value	vlabel
+illumina_ratio_novaseq	fqxv --order shuffle	fqxv	23.9	23.9×
+illumina_ratio_novaseq	SPRING	other	21.9	21.9×
+illumina_ratio_novaseq	fqxv --max	fqxv	20.2	20.2×
+illumina_ratio_novaseq	fqxv	fqxv	9.8	9.8×
+illumina_ratio_novaseq	fqz_comp	other	9.6	9.6×
+illumina_ratio_novaseq	zstd -19	other	9.4	9.4×
+illumina_ratio_novaseq	xz -9	other	8.9	8.9×
+illumina_ratio_novaseq	gzip	other	5.0	5.0×
+illumina_ratio_gaiix	fqxv --order shuffle	fqxv	10.25	10.25×
+illumina_ratio_gaiix	SPRING	other	9.81	9.81×
+illumina_ratio_gaiix	fqxv --max	fqxv	9.71	9.71×
+illumina_ratio_gaiix	fqxv	fqxv	7.12	7.12×
+illumina_ratio_gaiix	fqz_comp	other	7.05	7.05×
+illumina_ratio_gaiix	xz -9	other	6.07	6.07×
+illumina_ratio_gaiix	zstd -19	other	5.87	5.87×
+illumina_ratio_gaiix	gzip	other	3.52	3.52×
+illumina_speed_novaseq	gzip	other	374	374
+illumina_speed_novaseq	fqxv	fqxv	123	123
+illumina_speed_novaseq	fqz_comp	other	105	105
+illumina_speed_novaseq	SPRING	other	70	70
+illumina_speed_novaseq	zstd -19	other	11	11
+illumina_speed_novaseq	xz -9	other	10	10
+longread_ratio	fqxv · HiFi	fqxv	4.73	4.73×
+longread_ratio	CoLoRd · HiFi	other	4.44	4.44×
+longread_ratio	fqxv · ONT	fqxv	3.06	3.06×
+longread_ratio	CoLoRd · ONT	other	3.05	3.05×
