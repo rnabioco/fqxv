@@ -717,5 +717,20 @@ mod tests {
             proptest::prop_assert_eq!(sorted, expect);
             proptest::prop_assert_eq!(p.flip.len(), reads.len());
         }
+
+        // Arbitrary bytes fed to the top-level decode entry points must never
+        // panic or abort — only Ok/Err. Each of these reads per-read lengths,
+        // block counts, and reference offsets from the stream, so all must
+        // reject a corrupt value cleanly. Input length is capped small so the
+        // smoke check stays fast and can't trip the length-declared allocation
+        // bombs the container layer bounds (see fuzz/README.md).
+        #[test]
+        fn decode_never_aborts_on_garbage(bytes in proptest::collection::vec(0u8..=255, 0..256)) {
+            let _ = decode_clustered_auto(&bytes);
+            let _ = GlobalReference::decode(&bytes);
+            let _ = GlobalReference::decode_blocked(&bytes);
+            let _ = GlobalReference::decode_lzma(&bytes);
+            let _ = GlobalReference::decode_packed(&bytes);
+        }
     }
 }
