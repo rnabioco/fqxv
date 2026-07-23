@@ -200,6 +200,25 @@ different coverage/error regime:
 
 See [Long-read support](design/longread.md) for the full analysis.
 
+## Storage vs the native NCBI `.sra`
+
+Most public FASTQ ships as NCBI's `.sra` — itself a compressed columnar store
+(2-bit-packed bases, a quality model, spot/name columns). So for anyone pulling
+from SRA/ENA the honest question is not "fqxv vs gzip" but "is a lossless `.fqxv`
+worth keeping instead of the `.sra` I'd otherwise store?" It is: `fqxv --max`
+(fully lossless) is smaller than the native `.sra` on every platform — **~2× on
+average** (geomean 0.51 of the `.sra` size).
+
+![fqxv vs native .sra — archive size by run](images/sra_vs_native.dark.png)
+![fqxv vs native .sra — archive size by run](images/sra_vs_native.light.png)
+
+*Storage per run in each format (smaller is better): the raw `.fastq` you
+download, the native `.sra` NCBI ships, and the lossless `fqxv --max` archive.
+Both mates counted; `.sra` sizes from `sracha info`. NovaSeq wins most (its
+quality is pre-binned, so the lossless point is already compact); ONT wins least
+(its long-read sequence stream dominates the archive). Refreshed 2026-07-23 —
+regenerate with `bench/scripts/sra_compare.sh`.*
+
 ## Round-trip fidelity (alignment level)
 
 A compression ratio only counts if the reads survive intact. Beyond `fqxv`'s

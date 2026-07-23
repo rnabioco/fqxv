@@ -35,9 +35,10 @@ vl-convert-python = "*"
 release = "cargo build --profile release"
 # Render every docs/tapes/*.tape to a GIF in docs/images/ (builds fqxv first).
 tapes = { cmd = "docs/tapes/generate.sh", depends-on = ["release"] }
-# Render the topline benchmark bar charts from docs/charts/topline.tsv to
-# light/dark SVGs in docs/images/. Outputs are committed, like the tape GIFs.
-charts = "python docs/charts/generate.py"
+# Render the committed benchmark charts to light/dark PNGs in docs/images/
+# (like the tape GIFs): the topline field comparison (docs/charts/topline.tsv)
+# and the fqxv-vs-native-.sra size chart (docs/charts/sra.tsv).
+charts = "python docs/charts/generate.py && python docs/charts/sra_generate.py"
 docs-serve = "zensical serve"
 docs-build = "zensical build"
 
