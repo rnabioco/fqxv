@@ -1057,11 +1057,11 @@ mod tests {
     #[test]
     fn roundtrip_high_bit_name_bytes() {
         roundtrip(&[
-            &[0x80u8, 0x0a],                  // the htscodecs #105 crasher
-            &[0xffu8],                        // all bits set
-            b"read\x80\xa5\xffname",          // high-bit bytes among ASCII
+            &[0x80u8, 0x0a],                   // the htscodecs #105 crasher
+            &[0xffu8],                         // all bits set
+            b"read\x80\xa5\xffname",           // high-bit bytes among ASCII
             &[0x00u8, 0x80, 0x7f, 0xff, 0x0a], // mix of low, boundary, and high
-            b"plain",                         // an ordinary name alongside them
+            b"plain",                          // an ordinary name alongside them
         ]);
     }
 
