@@ -332,5 +332,21 @@ mod tests {
         fn roundtrip_full_alphabet(data in proptest::collection::vec(0usize..256, 0..3000)) {
             roundtrip::<256>(&data);
         }
+
+        /// Arbitrary bytes — never a valid encoding — must never panic or abort
+        /// the decoder; a `Decoder` built over garbage and driven through a
+        /// bounded number of `SimpleModel` decodes only ever yields (meaningless)
+        /// in-range symbols. `next_byte` reads past the buffer as zeros, so there
+        /// is no length header and no allocation to bound; the guard is that the
+        /// coder never overruns, divides by zero, or indexes out of range.
+        #[test]
+        fn decode_never_aborts_on_garbage(bytes in proptest::collection::vec(0u8..=255, 0..256)) {
+            let mut dec = Decoder::new(&bytes);
+            let mut m = SimpleModel::<64>::new();
+            for _ in 0..1000 {
+                let sym = m.decode(&mut dec);
+                proptest::prop_assert!(sym < 64);
+            }
+        }
     }
 }

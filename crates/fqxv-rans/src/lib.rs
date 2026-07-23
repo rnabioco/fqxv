@@ -574,5 +574,33 @@ mod tests {
             // What a caller legitimately expects back: the data we encoded.
             let _ = decode_bounded(&corrupt(enc, &subs, wipe, trunc), data.len());
         }
+
+        /// Pure arbitrary bytes — never a valid encoding — must never panic or
+        /// abort the decoder; only Ok/Err. Uses `decode_bounded`, not `decode`:
+        /// the random 8-byte output-length header at `src[1..9]` is itself
+        /// arbitrary, and plain `decode` is documented to obey it and allocate
+        /// whatever it says (`decode_survives_mutation` above hit 15.6 GB that
+        /// way). The bound is what makes feeding garbage safe. The two order-tag
+        /// overrides force both the order-0 (vectorized on this CPU) and order-1
+        /// decode paths even when the random first byte would miss one.
+        #[test]
+        fn decode_never_aborts_on_garbage(bytes in proptest::collection::vec(0u8..=255, 0..256)) {
+            const CAP: usize = 1 << 16;
+            let _ = decode_bounded(&bytes, CAP);
+
+            let mut order0 = bytes.clone();
+            match order0.first_mut() {
+                Some(b) => *b = 0,
+                None => order0.push(0),
+            }
+            let _ = decode_bounded(&order0, CAP);
+
+            let mut order1 = bytes.clone();
+            match order1.first_mut() {
+                Some(b) => *b = 1,
+                None => order1.push(1),
+            }
+            let _ = decode_bounded(&order1, CAP);
+        }
     }
 }
