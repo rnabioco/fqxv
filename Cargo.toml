@@ -82,6 +82,32 @@ codegen-units = 1
 [profile.dev.package."*"]
 opt-level = 2
 
+# The `*` glob above optimizes external deps but NOT workspace members, so our own
+# codec crates compiled at opt-level 0 for tests — and the test suite *is* real
+# compression (banded-DP alignment, rANS, consensus, range coding), so the long-read
+# round-trip tests ran 30-45s each unoptimized. Optimize just the compute crates in
+# dev/test builds (the CLI stays at opt-level 0 to keep the edit-compile loop fast).
+# Behavior is unchanged — SIMD is runtime-detected and determinism holds across
+# opt-levels; only wall-clock moves.
+[profile.dev.package.fqxv-dna]
+opt-level = 2
+[profile.dev.package.fqxv-rans]
+opt-level = 2
+[profile.dev.package.fqxv-range]
+opt-level = 2
+[profile.dev.package.fqxv-fqzcomp]
+opt-level = 2
+[profile.dev.package.fqxv-tokenizer]
+opt-level = 2
+[profile.dev.package.fqxv-seq]
+opt-level = 2
+[profile.dev.package.fqxv-reorder]
+opt-level = 2
+[profile.dev.package.fqxv-lroverlap]
+opt-level = 2
+[profile.dev.package.fqxv]
+opt-level = 2
+
 # `cargo bench` uses [profile.bench], which does NOT inherit [profile.release]
 # by default. Pin it so microbenchmarks measure the same codegen (fat LTO,
 # single codegen unit) that ships. strip=false keeps symbols for criterion.

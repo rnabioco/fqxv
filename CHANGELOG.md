@@ -15,7 +15,26 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Performance
 
+- **Skip the quality-quantizer probe on Nanopore.** The per-block quantizer trial
+  (`MODE_SEQ_BINMIX_Q`) only wins on skewed PacBio HiFi/Revio quality; on the flatter
+  Nanopore distribution it never does, yet the bounded prefix probe still ran and cost
+  ~5% of ONT compress for 0 bytes saved. `encode_seq` now takes a `try_quantizer` flag
+  and the container passes `false` on Nanopore, skipping the histogram build and the
+  probe entirely. **Output is byte-identical** (the kept stream was the baseline either
+  way); only ONT compress speed changes. HiFi/Revio still trial and keep the quantizer.
+
+### Internal
+
+- **Optimize the workspace codec crates in dev/test builds.** The `[profile.dev]`
+  `package."*"` override optimized external dependencies but not workspace members, so
+  the codec crates compiled at opt-level 0 for tests — and the test suite runs real
+  compression, so the long-read round-trip tests took 30–45 s each. Per-package
+  `opt-level = 2` overrides for the compute crates cut the CI test suite roughly 4–5×
+  with no behavior change (SIMD is runtime-detected; determinism holds across opt-levels).
+  The CLI stays at opt-level 0 to keep the edit-compile loop fast.
+
 - **Byte-identical speed in the long-read overlap search (chaining).** The minimizer
+  overlap search (`fqxv-lroverlap`) is the top self-cost of Nanopore compress, and a
   overlap search (`fqxv-lroverlap`) is the top self-cost of Nanopore compress, and a
   query's per-anchor chaining dominates it (a fresh profile put `Chainer::chain` at
   ~23% and `find_overlaps` at ~14% of ONT compress). Three output-preserving changes

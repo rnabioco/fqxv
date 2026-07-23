@@ -478,7 +478,9 @@ fn dispatch_decode(
 /// selects the position context (`MODE_POS`); see [`encode_seq`] to let long
 /// reads condition quality on their bases.
 pub fn encode(lens: &[u32], quals: &[u8], binning: QualityBinning) -> Result<Vec<u8>> {
-    encode_seq(lens, quals, &[], binning)
+    // Sequence-blind (`seq = &[]`) ⇒ short-read `MODE_POS`, which never reaches the
+    // quantizer trial, so the flag is moot here.
+    encode_seq(lens, quals, &[], binning, false)
 }
 
 /// Encode per-read quality strings, optionally conditioning long reads on their
@@ -499,6 +501,13 @@ pub fn encode_seq(
     quals: &[u8],
     seq: &[u8],
     binning: QualityBinning,
+    // Whether to trial the per-block context quantizer (`MODE_SEQ_BINMIX_Q`). The
+    // quantizer only wins on skewed quality (PacBio HiFi/Revio); on the flatter
+    // Nanopore distribution it never does, so the caller passes `false` there to
+    // skip the histogram build + bounded probe entirely (0 bytes saved, pure cost —
+    // measured ~+5% ONT compress). The kept stream is byte-identical to the pre-#235
+    // `MODE_SEQ_BINMIX` baseline either way, so this only changes speed.
+    try_quantizer: bool,
 ) -> Result<Vec<u8>> {
     let total: usize = lens.iter().map(|&l| l as usize).sum();
     if total != quals.len() {
@@ -548,6 +557,12 @@ pub fn encode_seq(
         let base_payload = binmix::encode(lens, &binned, seq, &dense, qmin, k, &flat);
         let baseline =
             assemble_quality_stream(binning, MODE_SEQ_BINMIX, k, &syms, &[], lens, &base_payload);
+
+        // On regimes where the quantizer never wins (Nanopore), skip the histogram
+        // build and the probe outright — the baseline is what would be kept anyway.
+        if !try_quantizer {
+            return Ok(baseline);
+        }
 
         // The per-block context quantizer, built from the full histogram.
         let (qc, qtable) = build_quant_ctx(&binned, &syms, qmin);
@@ -1022,7 +1037,7 @@ mod tests {
     fn roundtrip_seq_context_long_reads() {
         let (lens, seq, quals) = longread_fixture(40, 2000);
         // Long reads: encode_seq must pick MODE_SEQ and round-trip through decode_seq.
-        let enc = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("encode");
+        let enc = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("encode");
         assert!(needs_sequence(&enc), "long reads must select MODE_SEQ");
         let (out_lens, out_quals) = decode_seq(&enc, &seq).expect("decode");
         assert_eq!(out_lens, lens);
@@ -1034,7 +1049,8 @@ mod tests {
         // The whole point: when quality tracks the base, conditioning on sequence
         // must code smaller than the sequence-blind position context.
         let (lens, seq, quals) = longread_fixture(40, 2000);
-        let with_seq = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("seq");
+        let with_seq =
+            encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("seq");
         let blind = encode(&lens, &quals, QualityBinning::Lossless).expect("blind");
         assert!(
             with_seq.len() < blind.len(),
@@ -1065,7 +1081,7 @@ mod tests {
             &base_payload,
         );
 
-        let kept = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("encode");
+        let kept = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("encode");
         assert!(
             kept.len() <= baseline.len(),
             "kept stream ({} B) must not exceed the baseline ({} B)",
@@ -1089,8 +1105,8 @@ mod tests {
         // Encoding the same block twice must be byte-identical — the trial picks a
         // fixed candidate order with a fixed tie-break, so it is order-free.
         let (lens, seq, quals) = longread_fixture(24, 1800);
-        let a = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("a");
-        let b = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("b");
+        let a = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("a");
+        let b = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("b");
         assert_eq!(a, b, "encode_seq must be deterministic");
     }
 
@@ -1128,7 +1144,7 @@ mod tests {
         // A MODE_SEQ stream cannot be decoded blind: the plain `decode` (empty
         // sequence) must reject it cleanly rather than produce wrong output.
         let (lens, seq, quals) = longread_fixture(20, 1000);
-        let enc = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("encode");
+        let enc = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("encode");
         assert!(matches!(decode(&enc), Err(Error::Malformed(_))));
         // A wrong-length sequence is rejected too.
         assert!(matches!(
@@ -1150,7 +1166,8 @@ mod tests {
             quals.push(b'#' + ((x >> 16) % 4) as u8);
             seq.push(b"ACGT"[((x >> 20) % 4) as usize]);
         }
-        let with_seq = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless).expect("seq");
+        let with_seq =
+            encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("seq");
         let blind = encode(&lens, &quals, QualityBinning::Lossless).expect("blind");
         assert!(!needs_sequence(&with_seq), "short reads must stay MODE_POS");
         assert_eq!(with_seq, blind, "short-read output must be byte-identical");
