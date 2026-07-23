@@ -17,7 +17,7 @@ fqxv decompress <INPUT> (-o <OUTPUT> | --split <PREFIX> | -Z)
 
 | Argument | Description |
 | --- | --- |
-| `<INPUT>` | Input `.fqxv` file. |
+| `<INPUT>` | Input `.fqxv` file, or `-` to stream from stdin (see [Reading a remote archive](#reading-a-remote-archive)). |
 
 ## Options
 
@@ -57,6 +57,37 @@ fqxv decompress sample.fqxv --split out
 fqxv decompress sample.fqxv --split out --no-gzip --mate-style num
 #   -> out_1.fastq, out_2.fastq
 ```
+
+## Reading a remote archive
+
+`decompress` reads `-` from stdin and decodes it as it arrives (it only reads
+forward and stops at the archive's terminator frame), so an archive in S3 or behind
+a URL is read by piping a transfer tool into it. The tool owns the download — auth,
+retries, resume, multipart — and fqxv just decodes the stream; no fqxv network
+dependency, no temp file:
+
+```bash
+# S3 with the AWS CLI — uses your normal credentials (IAM instance/task role,
+# SSO, env vars, or ~/.aws profile); no fqxv-specific config
+aws s3 cp s3://my-bucket/reads.fqxv - | fqxv decompress - -Z | bwa mem -p ref.fa -
+
+# a presigned S3 URL, or any HTTP(S) endpoint
+curl -fsSL "https://my-bucket.s3.amazonaws.com/reads.fqxv?X-Amz-Signature=…" \
+  | fqxv decompress - -Z | bowtie2 --interleaved - -x idx
+
+# Google Cloud Storage
+gsutil cat gs://my-bucket/reads.fqxv | fqxv decompress - -o reads.fastq
+```
+
+A truncated transfer is caught (the decode hits EOF before the terminator frame and
+errors) rather than yielding a silent short prefix. `--recover` and `--split` need a
+seekable file — a stream can't be rewound — so download to a file first for those,
+or decode interleaved (`-Z`) and split downstream.
+
+For programmatic access, the Python bindings read a remote archive without the CLI —
+whole-file streaming (`fqxv.open(response)` / `fqxv.remote.stream(url)`) or fetching
+just one column over HTTP range requests (`fqxv.remote.RemoteArchive`). See the
+[Python bindings](../python/index.md).
 
 ## Notes
 
