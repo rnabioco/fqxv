@@ -150,6 +150,16 @@ misreading it. A format major bump would be announced as a breaking change.
 
 ### Added
 
+- **Sequence-only archives (`--no-quality`).** A new opt-in mode discards quality
+  scores entirely and stores just names + sequence, then reconstructs **FASTA** on
+  decompress (`>name`/sequence, no `+`/quality lines). Quality is the majority of a
+  typical FASTQ archive — 71–97% on full-range and long-read data — so this is by
+  far the cheapest archive fqxv can write; on a random-quality 50k×150 bp sample it
+  was 73% smaller than lossless. Explicitly lossy: the original FASTQ cannot be
+  recovered. The archive sets a new `NO_QUALITY` required-feature bit (format bumped
+  to minor 1.1) so a reader that predates the mode refuses it rather than
+  mis-decoding. Not available with `--order any`/`--max` (the reorder layout keeps
+  quality); supersedes `--quality-bin`.
 - **Python bindings expose `estimate()` and `verify()`** (#218).
 
 ## [0.4.0] - 2026-07-21

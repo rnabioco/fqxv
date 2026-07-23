@@ -438,9 +438,9 @@ fn grouped_block_rejects_partial_spot() {
     let payload = &archive[start..start + payload_len];
 
     // g that divides the count still decodes; g = 2 does not divide 3 and errors.
-    assert!(decode_block_group(payload, 1, None).is_ok());
-    assert!(decode_block_group(payload, 3, None).is_ok());
-    let err = decode_block_group(payload, 2, None).unwrap_err();
+    assert!(decode_block_group(payload, 1, None, false).is_ok());
+    assert!(decode_block_group(payload, 3, None, false).is_ok());
+    let err = decode_block_group(payload, 2, None, false).unwrap_err();
     assert!(
         matches!(err, Error::Malformed(_)),
         "partial-spot block must be rejected, got {err:?}"
@@ -2776,5 +2776,83 @@ fn index_rejects_reorder_layout() {
     )
     .unwrap();
     let err = Index::read(io::Cursor::new(&archive)).unwrap_err();
+    assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
+}
+
+/// Sequence-only (`no_quality`) mode discards quality and reconstructs FASTA:
+/// `>name`/sequence records with no `+`/quality lines. Names and bases are
+/// preserved exactly; the archive sets the `NO_QUALITY` feature bit and is smaller
+/// than the lossless one because the quality stream is gone.
+#[test]
+fn no_quality_roundtrip_emits_fasta() {
+    let params = Params {
+        no_quality: true,
+        ..Params::default()
+    };
+    let archive = compress_bytes(SAMPLE, params);
+
+    // The feature bit is set so an older reader would refuse rather than mis-decode.
+    let header = read_header(&mut io::Cursor::new(&archive)).unwrap();
+    assert_ne!(header.required_features & crate::feature::NO_QUALITY, 0);
+
+    let mut out = Vec::new();
+    decompress(&archive[..], &mut out, 1).expect("no_quality archive decodes");
+    let expected: &[u8] = b"\
+>SRR1.1 INST:1:FC:1:1101:1000:2000 length=8\n\
+ACGTACGT\n\
+>SRR1.2 INST:1:FC:1:1101:1005:2050 length=8\n\
+NNGGCCTA\n";
+    assert_eq!(
+        out, expected,
+        "no_quality output must be FASTA (name+seq only)"
+    );
+
+    // Dropping quality can only shrink the archive.
+    let lossless = compress_bytes(SAMPLE, Params::default());
+    assert!(
+        archive.len() < lossless.len(),
+        "no_quality ({}) should be smaller than lossless ({})",
+        archive.len(),
+        lossless.len()
+    );
+
+    // The whole-file structural + content round-trip check must pass too.
+    verify_roundtrip(io::Cursor::new(&archive), 1).expect("no_quality archive verifies");
+}
+
+/// Grouped (paired) sequence-only archives de-interleave into per-mate FASTA.
+#[test]
+fn no_quality_grouped_split_fasta() {
+    let r1: &[u8] = b"@spot1/1\nACGTACGT\n+\nIIIIIIII\n@spot2/1\nGGGGCCCC\n+\nJJJJJJJJ\n";
+    let r2: &[u8] = b"@spot1/2\nTTTTAAAA\n+\nKKKKKKKK\n@spot2/2\nCCCCGGGG\n+\nLLLLLLLL\n";
+    let readers: Vec<Box<dyn io::Read + Send>> = vec![Box::new(r1), Box::new(r2)];
+    let mut archive = Vec::new();
+    compress_multi(
+        readers,
+        &mut archive,
+        Params {
+            no_quality: true,
+            ..Params::default()
+        },
+    )
+    .unwrap();
+
+    let (mut m1, mut m2) = (Vec::new(), Vec::new());
+    decompress_split(&archive[..], &mut [&mut m1, &mut m2], 1).unwrap();
+    assert_eq!(m1, b">spot1/1\nACGTACGT\n>spot2/1\nGGGGCCCC\n");
+    assert_eq!(m2, b">spot1/2\nTTTTAAAA\n>spot2/2\nCCCCGGGG\n");
+}
+
+/// `no_quality` is mutually exclusive with the whole-file reorder layout, which
+/// codes quality in its own partition. The library fails closed for a caller that
+/// sets both (the CLI rejects it up front).
+#[test]
+fn no_quality_rejects_reorder() {
+    let params = Params {
+        no_quality: true,
+        reorder: true,
+        ..Params::default()
+    };
+    let err = compress(SAMPLE, &mut Vec::new(), params).unwrap_err();
     assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
 }

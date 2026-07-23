@@ -210,6 +210,14 @@ enum Command {
         /// smaller quality stream at the cost of exact fidelity.
         #[arg(long, value_enum, default_value_t = QualityBin::Lossless, help_heading = "Advanced")]
         quality_bin: QualityBin,
+        /// Discard quality scores entirely: store sequence only (output is FASTA).
+        ///
+        /// The cheapest archive — quality is the majority of most FASTQ files — but
+        /// explicitly lossy: `decompress` reconstructs FASTA (`>name`/sequence), and
+        /// the original FASTQ cannot be recovered. Supersedes `--quality-bin`. Not
+        /// available with `--order any`/`--max` (reordering keeps quality).
+        #[arg(long, conflicts_with = "max")]
+        no_quality: bool,
         /// Read-order guarantee: `preserve` (default) or `any`.
         ///
         /// `preserve` restores the original order on decompress. `any` allows
@@ -566,6 +574,7 @@ fn main() -> anyhow::Result<()> {
             no_rescue,
             keep_order,
             quality_bin,
+            no_quality,
             platform,
             estimate,
             verify,
@@ -587,6 +596,22 @@ fn main() -> anyhow::Result<()> {
             // archives still round-trip in order regardless. `shuffle` additionally
             // opts into name regeneration (reorder-lossy) for single-end input.
             let reorders = order != ReadOrder::Preserve;
+            // Sequence-only mode drops the quality stream and emits FASTA; the
+            // whole-file reorder layout codes quality in its own partition and has
+            // no sequence-only variant yet, so the two are mutually exclusive.
+            // `--max` is already blocked by clap; catch `--order any/shuffle` here.
+            if no_quality && reorders {
+                anyhow::bail!(
+                    "--no-quality cannot be combined with --order any/--max: reordering \
+                     keeps quality (sequence-only reorder is not yet supported)"
+                );
+            }
+            // Quality binning is meaningless once quality is discarded.
+            if no_quality && quality_bin != QualityBin::Lossless {
+                eprintln!(
+                    "warning: --quality-bin is ignored with --no-quality (quality is discarded)"
+                );
+            }
             let (tile_band, tile_max_refs) = level_to_tile(level);
             let params = fqxv::Params {
                 seq_order: level_to_order(level),
@@ -600,7 +625,12 @@ fn main() -> anyhow::Result<()> {
                 block_reads: block_reads
                     .filter(|&n| n > 0)
                     .unwrap_or(level_to_block(level)),
-                quality_binning: quality_bin.into(),
+                quality_binning: if no_quality {
+                    fqxv::QualityBinning::Lossless
+                } else {
+                    quality_bin.into()
+                },
+                no_quality,
                 reorder: reorders,
                 keep_order: keep_order && reorders,
                 rescue: !no_rescue && reorders,
@@ -1194,6 +1224,24 @@ fn info_tsv_row(fi: &FileInfo) -> String {
 }
 
 /// Build the [`InfoReport`] JSON shape for one archive.
+/// Human label for an archive's quality fidelity. Sequence-only (`no_quality`)
+/// archives discarded quality entirely (the binning tag is moot there), so report
+/// the mode; otherwise describe the binning level.
+fn quality_label(info: &fqxv::Info) -> &'static str {
+    if info.required_features & fqxv::feature::NO_QUALITY != 0 {
+        return "discarded (sequence-only, FASTA)";
+    }
+    match info.quality_binning {
+        0 => "lossless",
+        1 => "lossy (Illumina 8-bin)",
+        2 => "lossy (Illumina 4-bin, RTA4)",
+        3 => "lossy (2-bin, custom)",
+        4 => "lossy (Nanopore 4-bin)",
+        5 => "lossy (PacBio HiFi 5-bin)",
+        _ => "unknown",
+    }
+}
+
 fn info_json_report(fi: &FileInfo) -> InfoReport {
     let info = &fi.info;
     let content = &fi.content;
@@ -1211,15 +1259,7 @@ fn info_json_report(fi: &FileInfo) -> InfoReport {
         2 => "paired".to_string(),
         g => format!("grouped x{g} (single-cell)"),
     };
-    let quality = match info.quality_binning {
-        0 => "lossless",
-        1 => "lossy (Illumina 8-bin)",
-        2 => "lossy (Illumina 4-bin, RTA4)",
-        3 => "lossy (2-bin, custom)",
-        4 => "lossy (Nanopore 4-bin)",
-        5 => "lossy (PacBio HiFi 5-bin)",
-        _ => "unknown",
-    };
+    let quality = quality_label(info);
     let spots = (info.group_size > 1).then(|| info.reads / info.group_size.max(1) as u64);
     let bytes_per_read = (info.reads > 0).then(|| total as f64 / info.reads as f64);
 
@@ -1303,15 +1343,7 @@ fn print_info_human(fi: &FileInfo) {
         2 => "paired".to_string(),
         g => format!("grouped x{g} (single-cell)"),
     };
-    let quality = match info.quality_binning {
-        0 => "lossless",
-        1 => "lossy (Illumina 8-bin)",
-        2 => "lossy (Illumina 4-bin, RTA4)",
-        3 => "lossy (2-bin, custom)",
-        4 => "lossy (Nanopore 4-bin)",
-        5 => "lossy (PacBio HiFi 5-bin)",
-        _ => "unknown",
-    };
+    let quality = quality_label(info);
     let spots = (info.group_size > 1).then(|| info.reads / info.group_size.max(1) as u64);
     let bytes_per_read = (info.reads > 0).then(|| total as f64 / info.reads as f64);
 
