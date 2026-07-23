@@ -25,24 +25,42 @@ verified round-trips, random access, integrity) that the others do not make.
 
 ## Capability matrix
 
-| | Reference-free | Lossless seq+qual | Preserves order + names | Deterministic[^det] | Random access[^ra] | Integrity + recovery[^crc] | Long-read overlap |
-| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`fqxv`** | ✓ | ✓ | ✓ (default / `--max`) | **✓** | ✓ | ✓ | ✓ |
-| `gzip` (`.fastq.gz`) | ✓ | ✓[^blind] | ✓[^blind] | ✓ | — | CRC only | — |
-| `zstd` / `xz` | ✓ | ✓[^blind] | ✓[^blind] | ✓ | —[^xz] | checksum only | — |
-| `fqz_comp` | ✓ | configurable[^fqz] | ✓ | — | — | — | — |
-| `SPRING` | ✓ | ✓ (reordered) | **✗ (reorders)** | — | — | — | — |
-| `CoLoRd` | ✓ | ✓ (`-q org`) | ✓ | — | — | — | ✓ |
-| `CRAM` | **✗ (needs reference)** | configurable | ✓ | — | ✓ | ✓ | n/a (aligned) |
+| | Reference-free | Lossless seq+qual | Preserves order + names | Deterministic[^det] | Forward streaming[^stream] | Seekable random access[^ra] | Integrity + recovery[^crc] | Long-read overlap |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`fqxv`** | ✓ | ✓ | ✓ (default / `--max`) | **✓** | ✓ | ✓ | ✓ | ✓ |
+| `gzip` (`.fastq.gz`) | ✓ | ✓[^blind] | ✓[^blind] | ✓ | ✓ | — | CRC only | — |
+| `zstd` / `xz` | ✓ | ✓[^blind] | ✓[^blind] | ✓ | ✓ | —[^xz] | checksum only | — |
+| `fqz_comp` | ✓ | configurable[^fqz] | ✓ | — | ✓ | — | — | — |
+| `SPRING` | ✓ | ✓ (reordered) | **✗ (reorders)** | — | ✗[^spring] | — | — | — |
+| `CoLoRd` | ✓ | ✓ (`-q org`) | ✓ | — | ✗ | — | — | ✓ |
+| `CRAM` | **✗ (needs reference)** | configurable | ✓ | — | ✗[^seekonly] | ✓ | ✓ | n/a (aligned) |
+| `SRA` / VDB | ✓ | **✗ (`.sralite`; not byte-exact)**[^sra] | ✓[^sra] | — | ✗[^seekonly] | ✓ | ✓ | n/a |
 
 [^det]: **Deterministic** = the archive is byte-identical regardless of thread
     count. `fqxv` guarantees this end to end (fixed, thread-independent block
     boundaries); the others either run single-threaded, or do not promise
     bit-reproducible output across thread counts.
-[^ra]: **Random access** = seek to a read group or project a single stream (e.g.
-    just the read names) without decoding the whole archive. `fqxv` carries a
-    footer row-group index and per-stream CRCs, so a remote client can fetch one
-    stream with a range request.
+[^stream]: **Forward streaming** = decode as a single forward pass over a
+    *non-seekable* pipe (e.g. `aws s3 cp s3://bkt/reads.fqxv - | fqxv decompress -`),
+    with no local copy and constant memory — the first records come out before the
+    last byte arrives. General byte compressors stream this way too, but cannot
+    project a FASTQ stream. `SPRING`/`CoLoRd` need scratch disk and multiple passes;
+    `CRAM`/`SRA` are random-access database formats that require a *seekable* source
+    (a full download or many Range seeks), so they cannot decode off a forward pipe.
+[^ra]: **Seekable random access** = seek to a read group or project a single stream
+    (e.g. just the read names) with a range request, given a *seekable* source, without
+    decoding the whole archive. `fqxv` carries a footer row-group index and per-stream
+    CRCs; `CRAM` (`.crai`) and `SRA`/VDB (columnar) also index for random access.
+[^seekonly]: Random-access only: needs a seekable backing store (a local file or HTTP
+    Range) plus an index, and cannot decode incrementally off a forward pipe. SRA's
+    recommended workflow (`prefetch`) downloads the whole archive before decoding.
+[^sra]: NCBI's repository format (VDB), consumed through the SRA Toolkit. Distributed
+    in a full-quality **Normalized** form (`.sra`) and a **Lite** form (`.sralite`) that
+    collapses quality to a single value per read; neither guarantees byte-exact FASTQ
+    round-trip. A different category — the archive NCBI distributes, not a tool you run
+    on your own FASTQ.
+[^spring]: `SPRING` compresses in a multi-pass pipeline that needs a scratch directory
+    (~10–30% of input, more when lossy), so it cannot stream from a pipe.
 [^crc]: **Integrity + recovery** = a checksum on every coded payload *and* the
     ability to resynchronize to intact blocks when the index or a length prefix is
     corrupt. `fqxv` carries a CRC-32C per payload plus `BLOCK_MAGIC` sync markers
@@ -69,10 +87,14 @@ Three guarantees in the matrix are `fqxv`'s alone among the FASTQ tools here:
   content (names, sequence, post-binning quality), checked after decode, and
   `compress --verify` round-trips the whole archive before it is written. A codec
   bug that produced CRC-valid but wrong bytes is caught at runtime.
-- **Random access and integrity in the container.** The footer row-group index +
-  per-stream CRCs allow projecting a single stream with one range request; the
-  per-payload CRC-32C plus `BLOCK_MAGIC` sync markers detect, localize, and recover
-  from corruption rather than failing the whole file.
+- **Remote access — both flavors — and integrity in the container.** `fqxv` is the
+  only tool here that both *streams forward* off a non-seekable pipe (decode as bytes
+  arrive, `… | fqxv decompress -`, constant memory) and offers *seekable* per-stream
+  random access (the footer row-group index + per-stream CRCs project a single stream
+  with one range request). `CRAM` and `SRA` provide the seekable half only, and only
+  from a seekable source; the rest offer neither. The per-payload CRC-32C plus
+  `BLOCK_MAGIC` sync markers additionally detect, localize, and recover from corruption
+  rather than failing the whole file.
 
 It also spans **both** short- and long-read levers in one format: read reordering
 for short-read cross-read redundancy (SPRING-class) and the `fqxv-lroverlap`
@@ -99,6 +121,11 @@ other, not against the lossless rows.
 - **Reproducible, fully lossless archive you can seek into** → `fqxv` (default for
   speed, `--max` for the best fully-lossless ratio). The only option here that is
   deterministic *and* offers per-stream random access.
+- **Stream or project straight from object storage (S3/HTTP)** → `fqxv`. It decodes
+  off a pipe (`aws s3 cp … - | fqxv decompress -`) and can fetch a single stream with a
+  Range request. `CRAM` and `SRA` support remote random access too, but only from a
+  seekable source (or a full local copy) and in a different category — reference-based
+  alignments or NCBI's columnar repository.
 - **Smallest lossless short-read archive** → `fqxv --order shuffle` or `SPRING`;
   `fqxv --order shuffle` is smaller on both benchmark sets under the same
   reorder+renumber rules.
