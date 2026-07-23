@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
-"""Render the topline benchmark bar charts as static SVGs.
+"""Render the topline benchmark bar charts as static PNGs.
 
 Reads the committed source of truth ``docs/charts/topline.tsv`` and writes one
-light and one dark SVG per chart into ``docs/images/`` (e.g.
-``illumina_ratio_novaseq.light.svg`` / ``.dark.svg``). The Markdown references
+light and one dark PNG per chart into ``docs/images/`` (e.g.
+``illumina_ratio_novaseq.light.png`` / ``.dark.png``). The Markdown references
 both variants and ``docs/stylesheets/fqxv.css`` shows the one matching the
-active ``data-md-color-scheme`` (see the plan), so the charts track the site's
-light/dark toggle.
+active ``data-md-color-scheme``, so the charts track the site's light/dark
+toggle.
+
+PNG rather than SVG on purpose: an ``<img>``-embedded SVG's ``<text>`` is
+re-rendered by the browser with its own font, whose metrics differ from the
+renderer's, so long axis labels overflow the left margin and clip. Rasterizing
+bakes text to pixels — WYSIWYG.
 
 Aesthetic: the ruff benchmark look — simple horizontal bars, sorted, one accent
 (fqxv teal) with the rest of the field in a flat muted gray, the value drawn at
 the end of each bar, and no gridlines/axes/title chrome.
 
 Pure Python: stdlib ``csv`` for the data and ``vl-convert-python`` to compile a
-Vega-Lite spec to SVG (no browser, no page JS). Run via ``pixi run charts``.
+Vega-Lite spec to PNG (no browser, no page JS). Run via ``pixi run charts``.
 """
 
 from __future__ import annotations
@@ -137,9 +142,14 @@ def main() -> None:
     charts = load_charts()
     for chart, rows in charts.items():
         for name, theme in THEMES.items():
-            svg = vlc.vegalite_to_svg(json.dumps(spec_for(rows, theme)))
-            dest = OUT / f"{chart}.{name}.svg"
-            dest.write_text(svg)
+            # PNG, not SVG: the axis labels are laid out with vl-convert's font
+            # metrics, but a browser re-renders an <img>-embedded SVG's <text>
+            # with its own (wider) font, overflowing the left margin and clipping
+            # long labels. Rasterizing bakes text to pixels — WYSIWYG. scale=2
+            # keeps it crisp on hi-dpi displays; CSS caps width at the column.
+            png = vlc.vegalite_to_png(json.dumps(spec_for(rows, theme)), scale=2)
+            dest = OUT / f"{chart}.{name}.png"
+            dest.write_bytes(png)
             print(f"wrote {dest.relative_to(REPO)}")
 
 
