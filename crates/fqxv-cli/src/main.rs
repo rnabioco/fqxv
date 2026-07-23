@@ -2026,10 +2026,9 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
-/// Cap on the number of reads coded for `--estimate`. One default-level block is
-/// `1 << 20` reads; a sample this size codes in well under a second and warms the
-/// context models the same way a real block does, so the sample's ratio tracks
-/// the full run. Split across inputs so grouped input still samples ~one block.
+/// Requested read cap for `--estimate`, split across grouped inputs. `fqxv::estimate`
+/// further caps the sample (by count for short reads, by one block of bases for long
+/// reads), so this is an upper bound; a whole default-level block is `1 << 20` reads.
 const ESTIMATE_SAMPLE_READS: usize = 1 << 20;
 
 /// One input's estimate: the coded sample sizes, the on-disk bytes the sample
