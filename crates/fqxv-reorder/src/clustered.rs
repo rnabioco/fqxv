@@ -25,6 +25,8 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
     let mut contig: Vec<Column> = Vec::new();
     let mut ref_anchor: u32 = 0;
     let mut prev_off: usize = 0;
+    // Reused across reads so per-read placement is malloc-free (see `place_on_contig`).
+    let mut mism: Vec<usize> = Vec::new();
 
     for (i, &cur) in reads.iter().enumerate() {
         if i > 0 && cur == reads[i - 1] {
@@ -32,10 +34,10 @@ pub fn encode_clustered(reads: &[&[u8]], anchors: &[u32], seq_order: usize) -> R
             continue;
         }
         // Place `cur` on the contig (shared-minimizer anchor, small indel-rescue
-        // window). See `place_on_contig`.
-        let placed = place_on_contig(&contig, cur, anchors[i], ref_anchor);
+        // window). See `place_on_contig`; mismatch positions land in `mism`.
+        let placed = place_on_contig(&contig, cur, anchors[i], ref_anchor, &mut mism);
         match placed {
-            Some((off, overlap, mism)) => {
+            Some((off, overlap)) => {
                 ops.push(OP_CONTIG);
                 write_varint(&mut offdelta, zigzag(off as i64 - prev_off as i64));
                 write_varint(&mut slen, cur.len() as u64);
@@ -152,6 +154,7 @@ pub fn op_stats(reads: &[&[u8]], anchors: &[u32]) -> OpStats {
     let mut st = OpStats::default();
     let mut contig: Vec<Column> = Vec::new();
     let mut ref_anchor: u32 = 0;
+    let mut mism: Vec<usize> = Vec::new();
     for (i, &cur) in reads.iter().enumerate() {
         st.reads += 1;
         st.total_bases += cur.len() as u64;
@@ -160,8 +163,8 @@ pub fn op_stats(reads: &[&[u8]], anchors: &[u32]) -> OpStats {
             st.match_bases += cur.len() as u64;
             continue;
         }
-        match place_on_contig(&contig, cur, anchors[i], ref_anchor) {
-            Some((off, overlap, mism)) => {
+        match place_on_contig(&contig, cur, anchors[i], ref_anchor, &mut mism) {
+            Some((off, overlap)) => {
                 st.contigs += 1;
                 st.contig_mismatches += mism.len() as u64;
                 st.contig_overlap_bases += overlap as u64;

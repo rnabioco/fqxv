@@ -25,6 +25,89 @@ pub(crate) fn uf_find(parent: &mut [u32], mut x: u32) -> u32 {
     x
 }
 
+/// Count byte mismatches between equal-length `a` and `b`, stopping early once
+/// the count exceeds `budget`. The result equals the exact mismatch count
+/// whenever it is `<= budget`, and is *some* value `> budget` otherwise — which is
+/// all the merge successor scan observes: it either rejects the overlap on
+/// `mism > budget`, or ranks an accepted overlap by its exact (`<= budget`) count.
+/// Dispatches to a 16-byte SSE2 path at runtime with a byte-identical scalar
+/// fallback, mirroring the `fqxv-rans` backend-selection idiom (no raised global
+/// baseline: SSE2 is checked via `is_x86_feature_detected!`).
+#[inline]
+pub(crate) fn count_mismatches(a: &[u8], b: &[u8], budget: usize) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("sse2") {
+            // SAFETY: guarded by the runtime SSE2 feature check above.
+            return unsafe { count_mismatches_sse2(a, b, budget) };
+        }
+    }
+    count_mismatches_scalar(a, b, budget)
+}
+
+/// Scalar reference for [`count_mismatches`] — the exact loop the SIMD path must
+/// reproduce (identical count when `<= budget`, identical `> budget` verdict).
+#[inline]
+pub(crate) fn count_mismatches_scalar(a: &[u8], b: &[u8], budget: usize) -> usize {
+    debug_assert_eq!(a.len(), b.len());
+    let mut mism = 0usize;
+    for t in 0..a.len() {
+        if a[t] != b[t] {
+            mism += 1;
+            if mism > budget {
+                break;
+            }
+        }
+    }
+    mism
+}
+
+/// 16-byte-at-a-time SSE2 implementation of [`count_mismatches`]. Compares 16
+/// bytes with `_mm_cmpeq_epi8`, turns the equality mask into a mismatch popcount,
+/// and checks the budget every block. It yields the identical count for any
+/// accepted overlap (`<= budget`) and a `> budget` value exactly when the scalar
+/// loop would break — so `best_key`, and the archive, stay byte-for-byte
+/// unchanged. A `<= 15`-byte tail is finished one byte at a time.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+pub(crate) fn count_mismatches_sse2(a: &[u8], b: &[u8], budget: usize) -> usize {
+    use std::arch::x86_64::*;
+    debug_assert_eq!(a.len(), b.len());
+    let len = a.len();
+    let (pa, pb) = (a.as_ptr(), b.as_ptr());
+    let mut mism = 0usize;
+    let mut i = 0usize;
+    while i + 16 <= len {
+        // SAFETY: `i + 16 <= len`, so 16 bytes from `pa`/`pb` at offset `i` are in
+        // bounds; `_mm_loadu_si128` is an unaligned load. Every intrinsic here
+        // needs only SSE2, guaranteed by `#[target_feature(enable = "sse2")]`.
+        let neq = unsafe {
+            let va = _mm_loadu_si128(pa.add(i).cast());
+            let vb = _mm_loadu_si128(pb.add(i).cast());
+            let eq = _mm_cmpeq_epi8(va, vb);
+            // One mask bit per byte, set = equal; invert (low 16 bits) for the
+            // mismatching bytes, then popcount.
+            (!(_mm_movemask_epi8(eq) as u32)) & 0xFFFF
+        };
+        mism += neq.count_ones() as usize;
+        if mism > budget {
+            return mism;
+        }
+        i += 16;
+    }
+    while i < len {
+        // SAFETY: `i < len` bounds both single-byte reads.
+        if unsafe { *pa.add(i) != *pb.add(i) } {
+            mism += 1;
+            if mism > budget {
+                return mism;
+            }
+        }
+        i += 1;
+    }
+    mism
+}
+
 /// Tunable thresholds for [`merge_reference_with`]. [`MergeConfig::default`]
 /// reproduces [`merge_reference`] byte-for-byte, so sweeping these is a pure
 /// encoder-side experiment — the decoder never sees the reference shape.
@@ -224,15 +307,7 @@ pub fn merge_reference_with(
                             continue;
                         }
                         let budget = ovl / cfg.mism_div;
-                        let mut mism = 0usize;
-                        for t in 0..ovl {
-                            if a[s + t] != b[t] {
-                                mism += 1;
-                                if mism > budget {
-                                    break;
-                                }
-                            }
-                        }
+                        let mism = count_mismatches(&a[s..s + ovl], &b[..ovl], budget);
                         if mism > budget {
                             continue;
                         }
@@ -369,4 +444,103 @@ pub fn merge_reference_with(
         offs: new_offs,
     };
     (merged, new_places)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact (non-early-out) mismatch count — the ground truth the budgeted
+    /// scan must reproduce whenever the true count is `<= budget`.
+    fn full_count(a: &[u8], b: &[u8]) -> usize {
+        a.iter().zip(b).filter(|(x, y)| x != y).count()
+    }
+
+    /// Assert the budgeted-scan contract for one input: the result equals the
+    /// exact count when that is `<= budget`, and is `> budget` otherwise — for the
+    /// scalar reference, the runtime dispatcher, and (on x86_64) the SSE2 path.
+    fn assert_contract(a: &[u8], b: &[u8], budget: usize) {
+        let full = full_count(a, b);
+        let scalar = count_mismatches_scalar(a, b, budget);
+        let dispatch = count_mismatches(a, b, budget);
+        if full <= budget {
+            assert_eq!(scalar, full, "scalar count wrong (a={a:?} b={b:?})");
+            assert_eq!(dispatch, full, "dispatch count wrong (a={a:?} b={b:?})");
+        } else {
+            assert!(scalar > budget, "scalar should exceed budget");
+            assert!(dispatch > budget, "dispatch should exceed budget");
+        }
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("sse2") {
+            // SAFETY: guarded by the runtime SSE2 check.
+            let simd = unsafe { count_mismatches_sse2(a, b, budget) };
+            if full <= budget {
+                assert_eq!(simd, full, "sse2 count wrong (a={a:?} b={b:?})");
+            } else {
+                assert!(simd > budget, "sse2 should exceed budget");
+            }
+        }
+    }
+
+    #[test]
+    fn scan_boundary_cases() {
+        // Exercise the 16-byte block boundary, the tail, all-match, all-mismatch,
+        // and budget = 0 explicitly.
+        assert_contract(b"", b"", 0);
+        assert_contract(b"ACGT", b"ACGT", 0);
+        assert_contract(b"ACGT", b"TGCA", 0);
+        let a: Vec<u8> = (0..40).map(|i| b"ACGT"[i % 4]).collect();
+        let mut b = a.clone();
+        for &pos in &[0usize, 15, 16, 17, 31, 32, 39] {
+            b[pos] ^= 1; // flip a few bytes across block boundaries
+        }
+        for budget in 0..=a.len() {
+            assert_contract(&a, &b, budget);
+        }
+    }
+
+    proptest::proptest! {
+        /// The SSE2 scan and the dispatcher reproduce the scalar reference exactly
+        /// (identical count when accepted, identical `> budget` verdict) on random
+        /// inputs spanning the 16-byte block boundary and its tail.
+        #[test]
+        fn scan_matches_scalar(
+            pairs in proptest::collection::vec(
+                (proptest::sample::select(b"ACGT".to_vec()),
+                 proptest::sample::select(b"ACGT".to_vec())),
+                0..48usize),
+            budget in 0..64usize,
+        ) {
+            let a: Vec<u8> = pairs.iter().map(|&(x, _)| x).collect();
+            let b: Vec<u8> = pairs.iter().map(|&(_, y)| y).collect();
+            assert_contract(&a, &b, budget.min(a.len()));
+        }
+    }
+
+    /// `merge_reference` refines an assembly whose merged block still round-trips
+    /// through the v4 block codec — the end-to-end guarantee that the SIMD scan,
+    /// the incremental `cast_vote`, and the scratch-buffer placements are all
+    /// byte-faithful. Also checks the merge is deterministic across runs.
+    #[test]
+    fn merge_roundtrips_and_is_deterministic() {
+        // Overlapping sliding windows over a base string → contigs that chain.
+        let genome: Vec<u8> = (0..600).map(|i| b"ACGTAC"[i % 6]).collect();
+        let reads: Vec<Vec<u8>> = (0..genome.len() - 80)
+            .step_by(4)
+            .map(|s| genome[s..s + 80].to_vec())
+            .collect();
+        let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+        let anchors = vec![0u32; refs.len()];
+
+        let (reference, places) = assemble_global(&refs, &anchors);
+        let (merged, mplaces) = merge_reference(&refs, &reference, &places);
+        // Deterministic: a second identical merge yields the same bytes/offsets.
+        let (merged2, _) = merge_reference(&refs, &reference, &places);
+        assert_eq!(merged.seq, merged2.seq);
+        assert_eq!(merged.offs, merged2.offs);
+
+        let block = encode_global_block(&refs, &mplaces, &merged).unwrap();
+        let decoded = decode_global_block(&block, &merged).unwrap();
+        assert_eq!(decoded, reads, "v4 block did not round-trip after merge");
+    }
 }

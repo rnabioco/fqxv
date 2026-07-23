@@ -42,8 +42,10 @@ pub(crate) struct Assembler {
 }
 
 /// Acceptance test: can `cur` sit on `contig` at `off`? Returns
-/// `(overlap, mismatch_positions)` when it is cheaper than a literal.
-pub(crate) fn try_place(contig: &[Column], cur: &[u8], off: usize) -> Option<(usize, Vec<usize>)> {
+/// `(overlap, mismatch_count)` when it is cheaper than a literal. Counting only
+/// (no allocation) — [`Assembler::place`] materializes the winner's mismatch
+/// positions once, so scoring every candidate stays malloc-free.
+pub(crate) fn try_place(contig: &[Column], cur: &[u8], off: usize) -> Option<(usize, usize)> {
     if off > contig.len() {
         return None;
     }
@@ -51,11 +53,11 @@ pub(crate) fn try_place(contig: &[Column], cur: &[u8], off: usize) -> Option<(us
     if overlap == 0 || overlap < MIN_CONTIG_OVERLAP.min(cur.len()) {
         return None;
     }
-    let mism: Vec<usize> = (0..overlap)
+    let mism = (0..overlap)
         .filter(|&j| cur[j] != contig[off + j].base)
-        .collect();
+        .count();
     let novel_n = cur.len() - overlap;
-    (mism.len() <= overlap / 4 && novel_n + mism.len() * 2 < cur.len()).then_some((overlap, mism))
+    (mism <= overlap / 4 && novel_n + mism * 2 < cur.len()).then_some((overlap, mism))
 }
 
 /// Cheapest gapped answer to "would one small indel have saved this read?".
@@ -260,23 +262,31 @@ impl Assembler {
     }
 
     pub(crate) fn place(&self, cur: &[u8], anchor: u32) -> Option<Placement> {
-        let mut best: Option<Placement> = None;
+        let mut best: Option<(usize, usize, usize)> = None; // (ci, off, overlap)
         let mut best_key = (usize::MAX, usize::MAX, usize::MAX);
         for (ci, off) in self.candidates(cur, anchor) {
             if let Some((overlap, mism)) = try_place(&self.contigs[ci], cur, off) {
-                let key = (mism.len(), self.contigs.len() - 1 - ci, off);
+                let key = (mism, self.contigs.len() - 1 - ci, off);
                 if key < best_key {
                     best_key = key;
-                    best = Some(Placement {
-                        ci,
-                        off,
-                        overlap,
-                        mism,
-                    });
+                    best = Some((ci, off, overlap));
                 }
             }
         }
-        best
+        // Only the winner needs its mismatch positions — recompute them once,
+        // instead of allocating a `Vec` for every candidate that passed the test.
+        best.map(|(ci, off, overlap)| {
+            let contig = &self.contigs[ci];
+            let mism: Vec<usize> = (0..overlap)
+                .filter(|&j| cur[j] != contig[off + j].base)
+                .collect();
+            Placement {
+                ci,
+                off,
+                overlap,
+                mism,
+            }
+        })
     }
 
     /// Fold a placed read into contig `ci`'s consensus, extending it and
