@@ -24,8 +24,8 @@ regardless of thread count):
 
 ## NovaSeq 6000, binned quality (DRR174812) — 4M reads, 572 Mbase
 
-![NovaSeq compression ratio — fqxv vs the field](images/illumina_ratio_novaseq.dark.svg)
-![NovaSeq compression ratio — fqxv vs the field](images/illumina_ratio_novaseq.light.svg)
+![NovaSeq compression ratio — fqxv vs the field](images/illumina_ratio_novaseq.dark.png)
+![NovaSeq compression ratio — fqxv vs the field](images/illumina_ratio_novaseq.light.png)
 
 *Compression ratio (higher is better); fqxv modes in teal. Full numbers below.*
 
@@ -40,8 +40,8 @@ regardless of thread count):
 | xz -9 | 8.9× | 10 MB/s | 321 MB/s | yes | — |
 | gzip | 5.0× | 374 MB/s | 194 MB/s | yes | — |
 
-![NovaSeq compress throughput — fqxv vs the field](images/illumina_speed_novaseq.dark.svg)
-![NovaSeq compress throughput — fqxv vs the field](images/illumina_speed_novaseq.light.svg)
+![NovaSeq compress throughput — fqxv vs the field](images/illumina_speed_novaseq.dark.png)
+![NovaSeq compress throughput — fqxv vs the field](images/illumina_speed_novaseq.light.png)
 
 *Compress throughput in MB/s at the default operating point (higher is faster);
 fqxv default in teal. Only gzip — far weaker on ratio — compresses faster, and
@@ -49,8 +49,8 @@ fqxv is ~10× faster than zstd -19 / xz -9 while beating them on ratio.*
 
 ## GAIIx, full-range quality (SRR453566) — 4M reads, 385 Mbase
 
-![GAIIx compression ratio — fqxv vs the field](images/illumina_ratio_gaiix.dark.svg)
-![GAIIx compression ratio — fqxv vs the field](images/illumina_ratio_gaiix.light.svg)
+![GAIIx compression ratio — fqxv vs the field](images/illumina_ratio_gaiix.dark.png)
+![GAIIx compression ratio — fqxv vs the field](images/illumina_ratio_gaiix.light.png)
 
 *Compression ratio (higher is better); fqxv modes in teal. Full numbers below.*
 
@@ -108,8 +108,8 @@ overhead, so CoLoRd's non-quality column is an *upper bound* on its sequence
 stream, while fqxv's is the sequence stream alone. Sizes are decimal MB
 (bytes ÷ 10⁶); bits/base is over the true base count.
 
-![Long-read compression ratio — fqxv vs CoLoRd](images/longread_ratio.dark.svg)
-![Long-read compression ratio — fqxv vs CoLoRd](images/longread_ratio.light.svg)
+![Long-read compression ratio — fqxv vs CoLoRd](images/longread_ratio.dark.png)
+![Long-read compression ratio — fqxv vs CoLoRd](images/longread_ratio.light.png)
 
 *Whole-file lossless ratio vs CoLoRd `-q org` (higher is better); fqxv in teal.
 fqxv now edges ahead on both platforms. Per-stream breakdown below.*
