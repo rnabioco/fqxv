@@ -99,15 +99,15 @@ high-Q, low error):
 | tool | total | non-quality (seq+names) | qual | non-quality bits/base |
 | --- | --- | --- | --- | --- |
 | CoLoRd `-q org` | 697.7M | **13.4M** | 684.3M | 0.069 |
-| fqxv (shared ref) | 656.0M | **12.6M** (seq) | 641.8M | 0.065 |
+| fqxv (shared ref) | 649.5M | **12.3M** (seq) | 635.6M | 0.064 |
 
 Two facts, confirmed on **both** platforms:
 
 1. **Quality leads on both platforms.** fqxv's binary-decomposition
-   context-mixing quality coder codes the HiFi quality stream to **641.8M vs
-   CoLoRd's 684.3M** (~6% smaller) and ONT to **163.7M vs 166.5M** (~2% smaller).
+   context-mixing quality coder codes the HiFi quality stream to **635.6M vs
+   CoLoRd's 684.3M** (~7% smaller) and ONT to **163.7M vs 166.5M** (~2% smaller).
    Quality is a *credit* against CoLoRd on both sets — enough to carry the HiFi
-   lossless total ahead of CoLoRd (656.0M vs 697.7M), and on ONT to net the total
+   lossless total ahead of CoLoRd (649.5M vs 697.7M), and on ONT to net the total
    ahead of CoLoRd once the sequence lever lands. Lever 1 has flipped in fqxv's
    favor.
 2. **The sequence stream — once the whole gap — is now closed on high-coverage
@@ -294,7 +294,7 @@ file (120k reads, 1.55 Gbase, 6 blocks at ~52×) put the sequence stream at 0.10
 bits/base — 6.1× smaller than the 0.653 fallback (total archive 4.04×) — but
 above CoLoRd's whole-file 0.068, the gap being coverage per reference. That is
 what the shared whole-file reference below closes: the same archive now measures
-**0.065 bits/base at a 4.73× total, past CoLoRd's 0.068**.
+**0.064 bits/base at a 4.77× total, past CoLoRd's 0.068**.
 
 **Shared whole-file reference (implemented).** The gap *is* reference
 duplication: each block re-stored the same assembled genome, so a ~300× file kept
