@@ -63,6 +63,11 @@ pub struct Estimate {
     /// True when the whole input fit inside the sample, so these numbers are the
     /// actual full-file compression rather than an extrapolation base.
     pub exhausted: bool,
+    /// Platform resolved from the sample (names, or content when SRA-renamed).
+    /// `Unknown` for an empty input or names matching no convention. A caller
+    /// estimating grouped inputs (paired mates) can compare this across the group
+    /// to reject an accidental cross-platform mix before summing.
+    pub platform: Platform,
 }
 
 impl Estimate {
@@ -193,6 +198,7 @@ pub fn estimate<R: Read>(reader: R, params: Params, sample_reads: usize) -> Resu
             qual_bytes: 0,
             archive_bytes: 0,
             exhausted: true,
+            platform: Platform::Unknown,
         });
     }
 
@@ -247,6 +253,7 @@ pub fn estimate<R: Read>(reader: R, params: Params, sample_reads: usize) -> Resu
         qual_bytes,
         archive_bytes,
         exhausted,
+        platform,
     })
 }
 

@@ -2074,6 +2074,28 @@ fn run_estimate(
         });
     }
 
+    // Grouped inputs interleave into one archive, so they must be the same platform
+    // (a real `compress` detects one platform for the whole archive). Reject an
+    // accidental cross-platform mix — e.g. an Illumina file paired with a Nanopore
+    // one — rather than summing two differently-calibrated estimates. An input whose
+    // platform is Unknown (SRA-renamed, no content signal) is compatible with any.
+    if inputs.len() > 1 {
+        let mut known = parts
+            .iter()
+            .map(|p| p.est.platform)
+            .filter(|&pf| pf != fqxv::Platform::Unknown);
+        if let Some(first) = known.next()
+            && let Some(other) = known.find(|&pf| pf != first)
+        {
+            anyhow::bail!(
+                "grouped inputs span multiple platforms ({} and {}); \
+                 estimate a single archive's mates together, not different datasets",
+                first.label(),
+                other.label(),
+            );
+        }
+    }
+
     // Aggregate the sample, and project each input's whole-file contribution by
     // the fraction of its bytes the sample consumed (an exhausted input needs no
     // projection — its sample *is* the whole file).
