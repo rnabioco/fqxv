@@ -445,6 +445,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fqxv-align"
+version = "0.5.1"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "fqxv-bytes"
 version = "0.5.1"
 dependencies = [
@@ -493,6 +500,7 @@ dependencies = [
 name = "fqxv-lroverlap"
 version = "0.5.1"
 dependencies = [
+ "fqxv-align",
  "fqxv-bytes",
  "fqxv-dna",
  "fqxv-range",

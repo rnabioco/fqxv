@@ -1,0 +1,24 @@
+[package]
+name = "fqxv-align"
+description = "Edit-distance sequence alignment (banded DP and wavefront) for the fqxv FASTQ toolkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+# No runtime dependencies, deliberately. This crate is a leaf so that consumers
+# outside fqxv can take the alignment primitives without inheriting the
+# long-read codec's dependency cone (`fqxv-bytes`/`dna`/`rans`/`range`/`seq`,
+# `rayon`, `thiserror`). The only non-`std` code is the AVX2 backend in
+# `align`, which uses `std::arch` intrinsics.
+
+[dev-dependencies]
+proptest.workspace = true

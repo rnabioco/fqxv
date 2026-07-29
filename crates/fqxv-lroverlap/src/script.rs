@@ -10,10 +10,7 @@
 //! That is what keeps a 14 kb read at 18% error affordable — the quadratic DP
 //! only ever runs over tens of bases.
 
-use crate::{
-    Anchor,
-    align::{Op, align_banded},
-};
+use crate::{Anchor, Op, align_banded};
 
 /// How to turn a chain into a script.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -153,7 +150,7 @@ pub fn chain_span(anchors: &[Anchor], k: u32) -> (u32, u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::align::apply;
+    use crate::apply;
     use crate::{ChainOpts, Chainer, Index, Repeat, SeedScheme, Sketch};
     use proptest::prelude::*;
 

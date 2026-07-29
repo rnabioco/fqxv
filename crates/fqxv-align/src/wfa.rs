@@ -13,10 +13,17 @@
 //! alignment **score** `s` (the number of edits). On low-divergence data — a HiFi
 //! read against its consensus at ~0.5% error, a 13 kb read needing only ~60–70
 //! edits — that is a different complexity class, and it degrades gracefully
-//! toward the DP as divergence rises rather than hitting a band cap. This module
-//! is a **standalone prototype** to measure that trade-off; it is not wired into
-//! the codec's compress path, and it deliberately finds a different (equal-cost)
-//! path than the DP, so its output is not byte-identical to `align_banded`.
+//! toward the DP as divergence rises rather than hitting a band cap.
+//!
+//! It began as a standalone prototype to measure that trade-off, and the docs
+//! said so long after it stopped being true: `fqxv-lroverlap`'s consensus
+//! builder votes reads onto the draft through [`wfa_align_opt`], and that runs
+//! on the compress path (`build_reference` -> `consensus`). Treat it as live
+//! code.
+//!
+//! It deliberately finds a different (equal-cost) path than the DP, so its
+//! output is not byte-identical to [`crate::align_banded`] — only the distances
+//! agree.
 //!
 //! ## The recurrence
 //!

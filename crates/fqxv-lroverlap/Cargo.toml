@@ -19,6 +19,7 @@ workspace = true
 # `min_canonical`, the v2/v3 codecs — into the long-read dependency and force its
 # internals into a public API they were not designed for.
 [dependencies]
+fqxv-align.workspace = true
 fqxv-bytes.workspace = true
 fqxv-dna.workspace = true
 fqxv-rans.workspace = true
