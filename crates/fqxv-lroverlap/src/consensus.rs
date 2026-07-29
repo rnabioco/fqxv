@@ -48,11 +48,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use rayon::prelude::*;
 
-use crate::{
-    ChainOpts, Contig, Sketch,
-    align::{Op, align_banded},
-    place_against, wfa_align_opt,
-};
+use crate::{ChainOpts, Contig, Op, Sketch, align_banded, place_against, wfa_align_opt};
 
 /// How much of the draft's end to index when placing the next tiling read.
 ///

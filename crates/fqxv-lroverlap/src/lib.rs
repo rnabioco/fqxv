@@ -54,12 +54,11 @@
 //! is split into a fixed number of chunks combined in chunk order; and chain DP
 //! ties break on the smallest predecessor index.
 
-// `deny` rather than `forbid`: the crate is unsafe-free except for the AVX2
-// alignment backend in `align`, which opts back in at three narrowly annotated
-// sites (`#[allow(unsafe_code)]`) and is proptested byte-identical to scalar.
-#![deny(unsafe_code)]
+// `forbid` now that the alignment primitives live in `fqxv-align`: the AVX2
+// backend was the crate's only `unsafe`, and it moved with them. Nothing here
+// opts back in, so the stronger lint is the accurate one.
+#![forbid(unsafe_code)]
 
-mod align;
 mod anchorgap;
 mod chain;
 mod codec;
@@ -72,9 +71,11 @@ mod radix;
 mod refine;
 mod script;
 mod tile;
-mod wfa;
 
-pub use align::{Alignment, Op, align_banded, apply};
+// Re-exported from the leaf `fqxv-align` crate, which these modules were
+// extracted into. Kept at this path so the crate's public surface is unchanged.
+pub use fqxv_align::{Alignment, Op, align_banded, apply, wfa_align, wfa_align_opt, wfa_cells};
+
 pub use chain::{Anchor, Chain, ChainOpts, Chainer};
 pub use codec::{
     EncodeOpts, Reference, build_reference, decode, decode_against, encode, encode_against,
@@ -87,7 +88,6 @@ pub use overlap::{Overlap, find_overlaps};
 pub use refine::{Anchored, place_against, place_all};
 pub use script::{ScriptOpts, chain_span, script_from_chain};
 pub use tile::{tile_decode, tile_encode};
-pub use wfa::{wfa_align, wfa_align_opt, wfa_cells};
 
 /// Ceiling on decoded bases per coded byte, used to reject a hostile `total_bases`
 /// header before it drives a `vec![0u8; total_bases]` output allocation (issue
