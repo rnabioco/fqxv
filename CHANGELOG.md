@@ -11,6 +11,35 @@ tolerates newer minors, and additive features are gated behind required-feature
 bits, so a reader that predates a feature refuses the archive outright rather than
 misreading it. A format major bump would be announced as a breaking change.
 
+## [0.5.2] - 2026-07-29
+
+### Added
+
+- **`fqxv.estimate()` accepts paired-end (and other grouped) inputs.** Pass a list
+  or tuple of sources — paired mates, 10x R1/R2/I1/I2, sharded lanes — and each is
+  sampled with a split of the `sample_reads` cap, with the per-stream sizes summed
+  into one aggregate `Estimate`, matching `fqxv compress … --estimate` byte for
+  byte. Single-source behavior is unchanged. `Estimate` also gains a `platform`
+  field (`"illumina"`, `"nanopore"`, `"pacbio"`, `"mgi"`, `"unknown"`).
+- **Cross-platform guard on grouped estimates.** A group whose inputs resolve to
+  two different *known* platforms is now a hard error in both the Python API and
+  the CLI's `--estimate`, instead of silently summing two differently-calibrated
+  numbers. An `Unknown` input (SRA-renamed, no content signal) stays compatible
+  with anything, so real SRA data never trips a false positive.
+
+### Changed
+
+- **New `fqxv-align` crate.** The two edit-distance alignment implementations —
+  banded Needleman-Wunsch (AVX2 + scalar) and the wavefront aligner — moved out of
+  `fqxv-lroverlap` into a zero-dependency leaf crate, so an external consumer can
+  reach them without pulling in the whole long-read codec cone. The move is a pure
+  rename: `fqxv-lroverlap` re-exports all seven public names at their existing
+  paths, and its public surface is unchanged. `fqxv-lroverlap` is now
+  `#![forbid(unsafe_code)]`, since the AVX2 backend that motivated the weaker
+  `deny` has left the crate.
+- Dependency bumps: `noodles-bgzf` 0.48 → 0.49, `clap` 4.6.2 → 4.6.3,
+  `xxhash-rust` 0.8.17 → 0.8.18, `serde_json` 1.0.150 → 1.0.151.
+
 ## [0.5.1] - 2026-07-23
 
 ### Performance
@@ -744,6 +773,7 @@ of FASTQ. Codecs are clean-room implementations from specs and papers
   SPRING and fqz_comp do). Name, sequence, and quality are otherwise preserved
   exactly; this is the one documented deviation from byte-losslessness.
 
+[0.5.2]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.2
 [0.5.1]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.1
 [0.5.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.0
 [0.4.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.4.0
