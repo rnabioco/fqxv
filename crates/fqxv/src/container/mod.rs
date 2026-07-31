@@ -96,21 +96,25 @@
 //!   [4] seq_len   (LE)  [ ] seq     (fqxv-seq)
 //!   [4] qual_len  (LE)  [ ] qual    (fqxv-fqzcomp)
 //!
-//! `--reorder` uses a distinct whole-file, globally-clustered layout (flag bit3),
+//! Read reordering (`--order any` / `--order shuffle` / `--max` on the CLI) uses a
+//! distinct whole-file, globally-clustered layout (flag bit3),
 //! SPRING-style: all reads are clustered in one pass, then the clustered sequence
 //! and the names/quality are each coded in independent moderate blocks that fan
 //! out across cores. Clustering is global, so block size is free to be moderate
-//! for parallelism without hurting ratio. Both `--reorder` modes share this one
-//! path — with `--keep-order` (flag bit2) names/quality are coded in ORIGINAL
-//! order and a permutation restores it; without it they are coded in CLUSTERED
-//! order and no permutation is written. Grouped (paired / single-cell, `G > 1`)
+//! for parallelism without hurting ratio. Both reorder modes share this one
+//! path — with order preserved (flag bit2, `--order any`) names/quality are coded
+//! in ORIGINAL order and a permutation restores it; with order discarded
+//! (`--order shuffle`) they are coded in CLUSTERED order and no permutation is
+//! written. Grouped (paired / single-cell, `G > 1`)
 //! input reorders too: the reads are clustered ignoring mate structure, but the
 //! permutation reconstructs the original spot interleaving, so `keep_order` is
 //! forced on and the archive de-interleaves cleanly on `decompress_split`.
 //! Layout after the header:
-//! `[8] n  [ ] flip  [ ] perm  [ ] template  [4] n_blocks  [seq block]*n
-//!  [ [names][qual] ]*n  [ ] output_digest`
+//! `[8] n  [ ] flip  [ ] perm  [ ] template  [ ] reference?  [4] n_blocks
+//!  [seq block]*n  [ [names][qual] ]*n  [ ] output_digest`
 //! (each `[ ]` is a `[u32 len][u32 crc32c][bytes]` frame, CRC-verified on decode;
+//! the `reference` frame is present iff flags bit5 FLAG_GLOBAL_REFERENCE is set —
+//! it is the shared frozen reference the v4 sequence blocks position against;
 //! `perm` is empty without keep-order, `template` is empty unless regenerating
 //! names). The trailing `output_digest` frame holds an xxh3-64 over the reads in
 //! output order (the reorder analog of the per-block content digest), verified

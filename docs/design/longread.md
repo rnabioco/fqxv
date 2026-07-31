@@ -11,7 +11,7 @@ Where each lever stands:
 | --- | --- |
 | Quality binning (`--quality-bin ont` / `hifi`) | **shipped** — usable from the CLI |
 | Quality base-context (long-read) | **shipped** — sequence-conditioned context-mixing took HiFi quality *below* CoLoRd |
-| Overlap sequence codec (`fqxv-lroverlap`) | **shipped** — auto-selected for long-read blocks, kept only when it beats order-k; a shared whole-file reference codes the HiFi sequence stream ~10× smaller. See [Wiring](#wiring-and-the-per-block-coverage-cap). |
+| Overlap sequence codec (`fqxv-lroverlap`) | **shipped** — auto-selected for long-read blocks (not Nanopore, where tiling replaces it), kept only when it beats order-k; a shared whole-file reference codes the HiFi sequence stream ~10× smaller. See [Wiring](#wiring-and-the-per-block-coverage-cap). |
 | Raw-LZMA sequence method | **shipped** — ordinary-coverage long reads (Revio WGS: seq 1.39 → 0.68 bits/base, archive 9.7× → 17×). |
 | Multi-reference tiling + anchor-restricted coding (Nanopore) | **shipped** — best-of-N references at `-l9`/`--max`, align only inter-anchor gaps (#231); ONT seq 1.15 → 0.89 bits/base, total ahead of CoLoRd. |
 
@@ -184,6 +184,15 @@ outputs). Two variants, in increasing cost:
   must plumb the block's seq stream into the quality codec (both directions).
   A cross-cutting but well-bounded change.
 
+**Shipped as** a separate long-read context selected by a mode byte on the quality
+stream, so the short-read context above is untouched and short-read output stays
+byte-identical. It went further than the proposal: rather than spending the freed
+bits on more quality history, the long-read context drops position and delta
+entirely for `q1 | q2 | current base | next base | homopolymer run-length`, and the
+coder decomposes each symbol into binary decisions with context mixing. That is
+what took HiFi quality below CoLoRd (see the tables above). The per-block context
+quantizer is trialled on top and kept only when it codes strictly smaller.
+
 **Binning — shipped.** `QualityBinning::Bin4/Bin8/Bin2` are Illumina-calibrated
 (HiSeq / NovaSeq cutpoints, absolute Phred). On HiFi's narrow high-Q band they
 collapse almost everything into the top bin. CoLoRd ships platform-specific
@@ -276,12 +285,27 @@ consensus (0.0025).
 
 ### Wiring and the per-block coverage cap
 
-`fqxv-lroverlap` is wired into the container. The block
-sequence stream carries a leading method byte; long-read blocks (mean length
-over 500 bp) code with both the overlap codec and the order-k model and keep the
-smaller, so the overlap path never regresses a block. Selection is automatic —
-no CLI flag — and the archive round-trips exactly (per-block content digest plus
-`compress --verify`) and is byte-identical across thread counts.
+`fqxv-lroverlap` is wired into the container. The block sequence stream carries a
+leading [method byte](container.md#sequence-method-bytes); a long-read block (mean
+length over 500 bp) codes several candidates and keeps the **smallest**:
+
+| candidate | method | coded when |
+| --- | --- | --- |
+| order-k context model | `0` | always — the floor |
+| overlap-consensus, block-local | `1` | every platform *but* Nanopore |
+| overlap against the shared whole-file reference | `2` | the shared-reference layout only (see below) |
+| raw large-window LZMA | `3` | every platform *but* Nanopore |
+| multi-reference tiling | `4` | Nanopore only |
+
+Order-k is always among them, so no long-read codec can regress a block. The
+platform gates are not merely "throw the loser away": a candidate that cannot win
+on a platform is never *coded* there, which is what keeps the never-worse rule from
+costing encode time. They are disjoint by construction — the overlap-consensus and
+tiling gates are mirror images, so exactly one of the two runs per block. Selection
+is automatic (no CLI flag), the archive round-trips exactly (per-block content
+digest plus `compress --verify`), and it is byte-identical across thread counts.
+The choice is per block, so a file of mixed lengths codes each block with whichever
+fits.
 
 **The wired codec runs per block, and that caps its coverage.** Each 256 MiB
 block self-assembles its own reference — which is what preserves blocked
@@ -306,17 +330,28 @@ block's reads against that frozen frame (sequence method byte 2,
 immutable frame, a read codes identically regardless of which block holds it —
 **no block-boundary penalty** — so blocks stay 256 MiB, `rayon`-parallel, and
 independently decodable given the shared frame. A whole-file never-worse gate
-adopts the layout only when `reference frame + Σ chosen sequence` beats the plain
-order-k total; otherwise no frame is written and the archive is the plain layout,
-so it can only ever shrink. This is the same pattern the reorder path uses for its
+adopts the layout only when `reference frame + Σ reference-coded sequence` beats
+**the plain layout it would otherwise fall back to** — the per-block sum of the
+smaller of the overlap codec and order-k, not the order-k total alone, which is a
+weaker bar than the fallback actually reaches and let a frame that loses to the
+per-block overlap codec get adopted anyway (#184). Ties do not adopt: an
+equal-sized archive plus a reference frame is pure overhead. Otherwise no frame is
+written and the archive is the plain layout, so it can only ever shrink. This is the same pattern the reorder path uses for its
 global reference, and it removes the redundant reference copies without touching
-the near-optimal per-read edit term. Measured on `hifi_40k` (516 Mbase, 2 blocks,
+the near-optimal per-read edit term. **Nanopore skips this path entirely** (#211):
+at ~10% error the whole-file consensus is itself divergent, the gate rejected it
+every time, and building it cost a second full assembly per file — so explicit
+Nanopore goes straight to the per-block layout above, where the tiler is the
+candidate that pays. Measured on `hifi_40k` (516 Mbase, 2 blocks,
 default order-11) the sequence stream drops **0.102 → 0.084 bits/base (−18%)**,
 storing the ~5 Mb consensus once (a 1.26 MB frame) instead of per block; the win
 widens with block count on deeper files. The compress path must **buffer** the
-input for this (the streaming single-end path keeps the per-block method-1
-fallback), and random-access single-stream projection of a shared-reference block
-fails closed — it has no access to the frame. See issue #168.
+input for this, which is why long-read input is buffered rather than streamed —
+with the exception of explicitly-declared Nanopore, which skips the shared
+reference and so streams one block at a time (byte-identically, since the block
+cuts and the per-block codec are the same either way). Random-access single-stream
+projection of a shared-reference block fails closed: it has no access to the frame.
+See issues #168 and #211.
 
 ### Cost / benefit
 

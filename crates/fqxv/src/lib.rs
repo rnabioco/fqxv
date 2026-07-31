@@ -83,7 +83,7 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 ///   codec is chosen per block: the order-k context model for short reads, the
 ///   cross-read overlap-assembly codec (`fqxv-lroverlap`) for long reads.
 ///
-/// See `container.rs` for the full layout.
+/// See `container/mod.rs` for the full layout.
 pub const FORMAT_MAJOR: u8 = 1;
 
 /// On-disk format minor version. A reader tolerates any minor within its

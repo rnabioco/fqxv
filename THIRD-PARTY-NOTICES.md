@@ -43,6 +43,27 @@ reference implementations we cross-checked against for correctness.
   consensus graph). Referenced for context only; not reimplemented from, and no
   source used.
 
+## LZ compression (`fqxv-seq::lzma`)
+
+- LZMA (Igor Pavlov, 7-Zip / LZMA SDK, public domain) — the *design* behind the
+  clean-room LZ byte coder used for the long-range sequence path: adaptive
+  bit-models, a 12-state machine, context literals with matched-byte prediction, a
+  length coder, position-slot + aligned distance coding, and rep0–3 short codes.
+  Not a port of liblzma or xz; the bit-models, match finder, parse, and stream
+  layout are local, built only on this project's own range coder.
+
+## Sequence alignment (`fqxv-align`)
+
+- Wavefront alignment (Marco-Sola, Moure, Moreto & Espinosa, *Bioinformatics*
+  2021) — the recurrences behind `wfa_align` / `wfa_align_opt`, whose work scales
+  with alignment score rather than sequence length. Implemented from the paper;
+  the reference implementation **WFA2-lib**
+  (https://github.com/smarco/WFA2-lib, MIT) was consulted for behavior only, and
+  no source was translated.
+- Banded Needleman–Wunsch (Needleman & Wunsch 1970; Sellers 1974 edit-distance
+  formulation) — `align_banded`, the predictable-cost reference the wavefront
+  path is checked against. Textbook dynamic programming, implemented directly.
+
 None of the implemented-from references above impose obligations beyond
 attribution; all are permissive (BSD 3-Clause / MIT) or public domain. This
 project is licensed MIT OR Apache-2.0.

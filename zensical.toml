@@ -30,6 +30,7 @@ nav = [
   ] },
   { "Benchmarks" = "benchmarks.md" },
   { "Format comparison" = "format-comparison.md" },
+  { "Changelog" = "changelog.md" },
   { "Acknowledgments" = "acknowledgments.md" },
 ]
 

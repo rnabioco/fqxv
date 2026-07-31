@@ -51,7 +51,8 @@ fqxv decompress sample.fqxv -Z | bowtie2 --interleaved - -x idx
 # split a paired / single-cell archive back into its files (BGZF by default)
 fqxv decompress sample.fqxv --split out
 #   -> out_R1.fastq.gz, out_R2.fastq.gz   (paired)
-#   -> out_R1.fastq.gz ... out_R4.fastq.gz (single-cell R1/R2/I1/I2)
+#   -> out_R1/_R2/_I1/_I2.fastq.gz        (single-cell, recorded slot labels)
+#   -> out_R1.fastq.gz ... out_R4.fastq.gz (no labels recorded: positional)
 
 # plain, numbered mate files
 fqxv decompress sample.fqxv --split out --no-gzip --mate-style num

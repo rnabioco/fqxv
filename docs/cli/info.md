@@ -7,7 +7,7 @@ Print container metadata and per-stream compressed sizes for a `.fqxv` archive.
 ## Usage
 
 ```bash
-fqxv info <INPUT> [--stats] [--tsv | --json]
+fqxv info <INPUTS>... [--stats] [--tsv | --json]
 ```
 
 By default `info` prints a human-readable report of two tables (metadata and
@@ -15,13 +15,22 @@ per-stream sizes) from the header and footer index alone — it does not decode 
 payload. Pass `--tsv` or `--json` for machine-readable output; the two are
 mutually exclusive.
 
+Give several files, or a directory (scanned recursively for `*.fqxv`), to report
+a batch — see [Reporting a batch](#reporting-a-batch).
+
+## Arguments
+
+| Argument | Description |
+| --- | --- |
+| `<INPUTS>...` | Input `.fqxv` file(s), or a directory scanned for `*.fqxv`. |
+
 ## Options
 
 | Option | Description |
 | --- | --- |
 | `-s, --stats` | Also report content statistics — read-length spread, base composition, GC%, and the quality distribution. This decodes the whole archive, so it costs a full decompress. |
-| `--tsv` | Emit a single machine-readable TSV line instead of the human report. |
-| `--json` | Emit a JSON object instead of the human report. |
+| `--tsv` | Emit a single machine-readable TSV line instead of the human report (a batch prepends a `file` column and prints one row per archive). |
+| `--json` | Emit a JSON object instead of the human report (a batch emits an array of them). |
 | `--threads <N>` | Worker threads (0 = all cores); only relevant with `--stats`. |
 
 ## Example
@@ -130,11 +139,30 @@ default header/footer-only read.
 fqxv info sample.fqxv --stats
 ```
 
+## Reporting a batch
+
+Several inputs — or a directory, scanned recursively for `*.fqxv` — report one
+entry per archive. The human output prints each archive's tables under its
+filename; the machine-readable forms stay keyed by file, so a batch is directly
+loadable:
+
+```bash
+fqxv info archives/ --tsv
+```
+
+```text
+file	file_size	reads	blocks	group_size	seq_order	quality_binning	reordered	names_bytes	seq_bytes	qual_bytes	platform	format_version	whole_file_crc
+archives/reads.fqxv	43564	400	1	1	11	0	0	6577	10492	26310	illumina	256	d27290bb
+archives/sample.fqxv	79192	800	1	2	11	0	0	7488	20669	50840	illumina	256	249666e0
+```
+
+`--json` emits an array of the same per-file objects.
+
 ## Fields
 
 | Field | Meaning |
 | --- | --- |
-| `layout` | `single-end`, `paired`, or `grouped xG (single-cell)`. |
+| `layout` | `single-end`, `paired`, or `grouped xG (single-cell)`, followed by the group size in the human report. |
 | `reads` / `spots` | Total reads; spots = reads / group size (paired/grouped only). |
 | `blocks` | Number of independently-coded blocks. |
 | `platform` | Sequencing platform (`Illumina`, `Oxford Nanopore`, `PacBio`, `MGI/BGI`, or `unknown`), detected from read names at compress time. Override with `compress --platform`. |
@@ -144,5 +172,5 @@ fqxv info sample.fqxv --stats
 | `read order` | For reordered archives, whether the original order is restored. |
 | `plus line` | Whether the `+` line was normalized. |
 | `format` | On-disk container format version, `vMAJOR.MINOR` (currently `v1.0`). |
-| `whole-file crc` | Stored whole-file CRC-32C (hex); the value `verify` recomputes. |
+| `whole-file crc` | Stored whole-file CRC-32C (hex); the value `verify` recomputes. Shown as `—` (and omitted from `--json`) for a globally reordered archive, which carries per-frame CRCs instead. |
 | `names` / `sequence` / `quality` | Compressed bytes per stream, with share of the three-stream total. |

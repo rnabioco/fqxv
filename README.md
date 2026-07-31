@@ -5,6 +5,7 @@
 
 A Rust toolkit for archiving FASTQ, built as a workspace of
 one-crate-per-algorithm codecs plus a container format and CLI.
+[Documentation](https://rnabioco.github.io/fqxv/).
 
 ![fqxv compress and decompress demo](docs/images/readme.gif)
 
@@ -21,6 +22,7 @@ than misreading. Compatibility fails loudly, never silently. Every archive is
 ## Results
 
 Best lossless ratio per platform, against the strongest alternative for that data
+— whole-file runs, from [`bench/RESULTS.md`](bench/RESULTS.md)
 ([full benchmarks](docs/benchmarks.md)):
 
 | Platform | fqxv | best alternative | gzip |
@@ -34,15 +36,18 @@ Best lossless ratio per platform, against the strongest alternative for that dat
 The Illumina rows use `--order shuffle`, which reorders reads and renumbers names —
 the same trade SPRING's own mode makes, so the comparison is like-for-like; the
 Nanopore row uses `--max`. Fully order-preserving and default-effort numbers are in
-the [benchmarks](docs/benchmarks.md).
+the [benchmarks](docs/benchmarks.md); those tables measure 4M-read subsets, so they
+report lower ratios than the whole-file runs above. The full per-dataset matrix is
+in [`bench/RESULTS.md`](bench/RESULTS.md), including the hardest MGI/BGISEQ case,
+where SPRING is still smaller.
 
 fqxv now **edges ahead of CoLoRd on Nanopore** (3.06× vs 3.05×): its ONT *quality*
 stream is already the smaller of the two, and a best-of-N tiling sequence codec with
 anchor-restricted coding (engaged at `-l9`/`--max`) closes the cross-read sequence
-gap that used to trail. On
-HiFi at ~300× fqxv leads on every stream; on a modern Revio WGS run at ordinary
-coverage, a new raw-LZMA sequence path nearly doubled fqxv's ratio (9.7× → 17×),
-landing just behind CoLoRd — see the [benchmarks](docs/benchmarks.md).
+gap that used to trail. On HiFi at ~300× fqxv leads on every stream; on a modern
+Revio WGS run at ordinary coverage, a new raw-LZMA sequence path nearly doubled
+fqxv's ratio (9.7× → 17×), landing just behind CoLoRd — see the
+[benchmarks](docs/benchmarks.md).
 
 Pure Rust, no external or C compressor.
 
@@ -54,14 +59,32 @@ losslessness, integrity, and remote access.
 
 ## Install
 
-Until `fqxv` lands on [bioconda](https://bioconda.github.io/), install from source
-with Cargo (Rust 1.95+):
+Every release attaches a static `fqxv` binary (Linux x86-64/arm64, macOS
+Intel/Apple silicon, Windows x86-64) plus a `SHA256SUMS.txt` to its
+[GitHub Release](https://github.com/rnabioco/fqxv/releases):
+
+```bash
+VER=v0.5.2   # the latest release tag
+curl -LO https://github.com/rnabioco/fqxv/releases/download/$VER/fqxv-$VER-x86_64-unknown-linux-musl.tar.gz
+tar xzf fqxv-$VER-x86_64-unknown-linux-musl.tar.gz && mv fqxv ~/.local/bin/
+```
+
+Until `fqxv` lands on [bioconda](https://bioconda.github.io/), the alternative is
+to build from source with Cargo (Rust 1.95+):
 
 ```bash
 cargo install --git https://github.com/rnabioco/fqxv fqxv-cli
 ```
 
-This builds the `fqxv` binary.
+Either way you get the `fqxv` binary. A read-only Python package reads `.fqxv`
+archives directly (compression stays in the CLI):
+
+```bash
+uv pip install fqxv
+```
+
+See [Installation](https://rnabioco.github.io/fqxv/getting-started/installation/)
+for the full asset list and the crate-level dependencies.
 
 ## Usage
 

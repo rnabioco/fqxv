@@ -1,12 +1,16 @@
 //! Read-only Python bindings for the `fqxv` FASTQ archiver.
 //!
-//! Exposes three things: a streaming record iterator ([`open`] → [`Reader`]),
-//! whole-archive convenience ([`decompress_to_path`], [`decompress_to_bytes`],
-//! [`inspect`]), and column projection / random access over the footer index
-//! ([`open_index`], [`read_names`], [`read_sequences`], [`read_qualities`],
-//! [`read_block`]). Every entry point accepts a filesystem path (`str` /
-//! `os.PathLike`) or in-memory `bytes`.
-#![allow(missing_docs)] // PyO3 glue; user-facing docs live in the .pyi / Python layer.
+//! Exposes: a streaming record iterator ([`open`] → [`Reader`]); whole-archive
+//! convenience ([`decompress_to_path`], [`decompress_to_bytes`], [`inspect`],
+//! [`estimate`], [`verify`]); column projection / random access over the footer
+//! index ([`open_index`], [`read_names`], [`read_sequences`], [`read_qualities`],
+//! [`read_block`]); and the IO-free primitives the `fqxv.remote` module drives
+//! over HTTP range requests ([`parse_index_suffix`], `decode_*_bytes`).
+//!
+//! Every entry point accepts a filesystem path (`str` / `os.PathLike`) or
+//! in-memory `bytes`; the streaming ones additionally accept any file-like object
+//! with `.read()`, since they never seek.
+#![allow(missing_docs)] // PyO3 glue; the user-facing docs are docs/python/index.md.
 
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
@@ -365,7 +369,7 @@ impl PyIndex {
     fn num_groups(&self) -> usize {
         self.inner.groups().len()
     }
-    fn groups(&self, py: Python<'_>) -> Vec<Py<PyGroupLoc>> {
+    fn groups(&self, py: Python<'_>) -> PyResult<Vec<Py<PyGroupLoc>>> {
         self.inner
             .groups()
             .iter()
@@ -378,8 +382,7 @@ impl PyIndex {
                     },
                 )
             })
-            .collect::<PyResult<Vec<_>>>()
-            .expect("GroupLoc alloc")
+            .collect()
     }
 
     /// The `[start, end)` byte range of `stream` in row group `group` — issue one

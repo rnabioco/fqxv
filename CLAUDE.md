@@ -67,11 +67,14 @@ ones. Build understanding bottom-up:
 - **`fqxv-rans`** — rANS Nx16 entropy coder (CRAM 3.1). 32 interleaved states;
   order-0/order-1 models. Backends live behind one API and are chosen at runtime
   via `is_x86_feature_detected!`: **scalar** (all orders, the correctness
-  reference) and **AVX2** (order-0 decode only). SSE4.2 and vectorized
-  order-1/encode are unimplemented — `Backend` reports the detected CPU tier but
-  anything past AVX2 order-0 decode runs the scalar path. **Every backend must
-  produce byte-identical output.** The `bench` feature exposes internal entry
-  points for microbenchmarks only.
+  reference), **AVX2**, and **AVX-512** — the two vector backends cover order-0
+  *both* encode and decode (`avx2.rs`, `avx512.rs`), widest path wins. Order-1 is
+  scalar only, and `Backend::Sse42` is a reported CPU tier with no SSE module
+  behind it, so it runs scalar too. **Every backend must produce byte-identical
+  output** — the cross-backend tests also decode each backend's stream with the
+  others, and they self-skip when the CPU lacks the feature, so a green run on a
+  non-AVX-512 machine has not actually exercised that path. The `bench` feature
+  exposes internal entry points for microbenchmarks only.
 - **`fqxv-range`** — serial binary range coder + adaptive bit models. The
   arithmetic-coding primitive that `fqxv-fqzcomp` and `fqxv-seq` build on.
 - **`fqxv-fqzcomp`** (→ range) — quality-score context model; owns
@@ -86,8 +89,15 @@ ones. Build understanding bottom-up:
   (minimizer clustering, reverse-complement aware) for cross-read redundancy.
   `lib.rs` holds only the crate-common core (`Error`, `IntMap`, decode limits);
   the codec lives in sibling modules (`plan`, `column`, `clustered`, `rescue`,
-  `global`, `merge`, plus `refpack`/`reflzma`) re-exported flat from the root.
-- **`fqxv-lroverlap`** (→ dna, rans, range, seq) — long-read cross-read overlap codec
+  `global`, `merge`, plus `refpack`) re-exported flat from the root.
+- **`fqxv-align`** — leaf crate of edit-distance alignment primitives, extracted
+  from `fqxv-lroverlap` (#252): `align_banded` (banded Needleman-Wunsch, AVX2
+  anti-diagonal backend + scalar fallback) and `wfa_align`/`wfa_align_opt`
+  (clean-room wavefront, work scales with score not length; `_opt` abandons a pair
+  once the score passes a cap). Same unit-edit cost model, so distances agree —
+  but the two pick different equal-cost paths, so their edit scripts are *not*
+  byte-identical. No dependencies.
+- **`fqxv-lroverlap`** (→ align, dna, rans, range, seq) — long-read cross-read overlap codec
   (minimizers → overlaps → layout → consensus → per-read banded edit script →
   rANS). `encode`/`decode` are the container's sequence path for long-read blocks
   (auto-selected, kept only when it beats order-k). Sibling of `fqxv-reorder`;
@@ -96,6 +106,10 @@ ones. Build understanding bottom-up:
   `compress`/`compress_multi`/`decompress`/`decompress_split`/`inspect`. This is
   where the on-disk layout lives (`src/container/`).
 - **`fqxv-cli`** — thin clap front-end over the `fqxv` library (`fqxv` binary).
+- **`fqxv-python`** — read-only PyO3 bindings published to PyPI as `fqxv`
+  (maturin mixed layout, abi3 wheels). Wraps decode, `inspect`/`estimate`/`verify`,
+  and the footer-index projection primitives that `fqxv.remote` drives over HTTP
+  range requests. Compression stays in the CLI. Not part of the codec DAG.
 
 The container (`crates/fqxv/src/container/`) is a variable-length header followed
 by independent, parallel-codable blocks. The header is a 21-byte fixed prefix, a

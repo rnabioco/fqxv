@@ -11,12 +11,77 @@ Status legend: ✅ done · ▶ recommended next · ○ backlog.
 
 ## What already exists
 
-Every codec crate has inline `#[test]` round-trips plus one `proptest!` block;
-`fqxv/src/container/` has integration coverage (pairing, interleaving,
-single-cell, reorder modes, `+`-normalization, truncation). All decoders return
-`Result` and guard header/length reads with `Malformed`. The gaps below are
-where round-trip-only testing structurally can't reach: malformed input,
-degenerate distributions, and cross-tool edge cases.
+Every codec crate has inline `#[test]` round-trips plus at least one `proptest!`
+block; `fqxv/src/container/tests.rs` has integration coverage (pairing,
+interleaving, single-cell, reorder modes, `+`-normalization, truncation), and
+`crates/fqxv/tests/` adds a corruption harness and the golden-archive fixtures
+below. All decoders return `Result` and guard header/length reads with
+`Malformed`. CI (`.github/workflows/ci.yml`) runs check, nextest, doctests, fmt,
+clippy, an MSRV-1.95 check, the Python bindings, and the cross-release `compat`
+job. The gaps below are where round-trip-only testing structurally can't reach:
+malformed input, degenerate distributions, and cross-tool edge cases.
+
+## 0. Cross-release compatibility (what self-comparison can't reach)
+
+**Every other test in this document compares a build against itself.** The
+round-trips, the proptests, the fuzz targets, the thread-determinism
+byte-comparisons, the accession corpus: each one encodes and then decodes with the
+same binary. All of them are therefore invariant to any change that moves the
+encoder and the decoder together — and that is precisely the change that breaks
+archives already on disk. Reordering context-model initialization in `fqxv-seq`,
+altering rANS frequency normalization, repacking a fqzcomp context: each
+round-trips perfectly, passes the whole suite, and leaves every existing `.fqxv`
+either rejected or silently misdecoded. Two mechanisms close that hole.
+
+- ✅ **Golden archive fixtures.** `crates/fqxv/tests/fixtures/` holds small
+  `.fqxv` files written by an earlier release, with `manifest.tsv` recording what
+  each must decode to (byte length + CRC-32C of the decoded stream; the expected
+  plaintext is *not* checked in). `crates/fqxv/tests/golden.rs` decodes every one
+  and compares, and separately re-runs `inspect` on each — the header/footer
+  parsing path that random access and the remote/`Range` clients share, which a
+  decode-only check would not cover. One fixture per on-disk layout and per
+  sequence codec, since a fixture with too thin an input falls back to plain
+  order-k and pins nothing new:
+
+  | fixture | what it pins |
+  | --- | --- |
+  | `plain_se` | plain layout, order-k sequence codec — the default path |
+  | `paired_labels` | `G=2` interleaving, and the header extension region (non-critical tag `0x01`, member labels) |
+  | `reorder` | the whole-file global-cluster reorder layout, with its own header and framing |
+  | `longread` | the long-read cross-read overlap codec (a sequence method byte other than `0`) |
+
+  A second test pins that set by name, so dropping a fixture cannot quietly leave
+  a layout uncovered while the suite still passes. **Regenerating the fixtures is
+  almost always the wrong response to a failure** — it makes the red go away and
+  ships the regression; regenerate (`cargo run --release -p fqxv --example
+  make_fixtures -- crates/fqxv/tests/fixtures`) only when adding a fixture or when
+  a format change was made deliberately and gated per the
+  [evolution policy](container.md#versioning-and-evolution-policy), and keep the
+  old fixtures either way. The fixtures also seed the `container` fuzz target's
+  corpus, which otherwise has to guess the magic and a valid header CRC before it
+  reaches any decode path.
+- ✅ **`compat` CI job.** The only job that puts two *different* builds of fqxv in
+  the same room: it downloads the newest published release's static Linux CLI,
+  builds the PR's, generates a seeded FASTQ corpus in-job (sampled from one
+  synthetic reference so the reorder path has real depth redundancy), and makes
+  the two exchange archives both ways.
+    - **Backward** (release writes, PR reads) is the format's central promise and
+      a hard failure: the decoded FASTQ must be byte-identical. Cases: default,
+      paired, and `--order any --keep-order` (skipped if the old binary predates
+      those flags, so a new flag can't read as a compatibility break).
+    - **Forward** (PR writes, release reads) is *not* a promise — the format may
+      move forward. Exactly two outcomes pass: the old binary succeeds with
+      byte-identical output, or it exits non-zero with a recognizable refusal
+      (`unsupported` / `upgrade fqxv`, i.e. one of the `Unsupported*` errors).
+      Succeeding with *different* bytes is silent corruption and fails; so does a
+      crash or a bare non-zero exit, which leaves a user unable to tell "your fqxv
+      is too old" from "your archive is broken".
+    - A repo with no published release asset skips cleanly rather than turning a
+      green PR red.
+
+  Between them: the fixtures catch a codec that changed under an archive's feet,
+  and `compat` catches an end-to-end CLI-level break against the actual last
+  release, including the *quality* of the refusal when the format does move.
 
 ## 1. Decoder robustness on untrusted input (highest priority)
 
@@ -45,14 +110,16 @@ crash the process**:
   never panics/aborts (release is `panic = "abort"`). This complements the in-tree
   proptest corruption harness (`crates/fqxv/tests/corruption.rs`), which mutates
   valid encodings in normal CI. See `fuzz/README.md`.
-- ▶ **Extend the inline `decode_never_aborts_on_garbage` test to every codec.**
-  Still open. The cheap inline random-garbage regression test lives in
-  `fqxv-fqzcomp` and `fqxv-seq` (and, for the packed sub-path only, `fqxv-reorder`'s
-  `refpack`); **`fqxv-rans`, `fqxv-tokenizer`, `fqxv-range`, and the top-level
-  `fqxv-reorder` decode path still lack it.** Mirror it in those so a random-garbage
-  smoke check runs without the nightly fuzz toolchain. (`fqxv-rans` has
-  `decode_survives_mutation`, which mutates valid encodings rather than feeding
-  arbitrary bytes — not equivalent.)
+- ✅ **Inline `decode_never_aborts_on_garbage` in every codec crate.** The cheap
+  random-garbage regression test — arbitrary bytes straight to a decode entry
+  point, asserting only that it returns — now runs without the nightly fuzz
+  toolchain in `fqxv-rans`, `fqxv-range`, `fqxv-fqzcomp`, `fqxv-tokenizer`,
+  `fqxv-seq`, and `fqxv-reorder` (the latter covering `decode_clustered_auto` and
+  every `GlobalReference` method, not just the packed sub-path). Residual (▶):
+  `fqxv-lroverlap` has no top-level equivalent — its `arbitrary_bytes_never_panic`
+  / `odd_anchor_sets_never_panic` proptests cover the minimizer and edit-script
+  layers, and the `lroverlap` fuzz target covers the decoder, but the inline
+  smoke check over `decode`/`tile_decode` is missing.
 - ○ **tokenizer/reorder speculative allocations** cap at `1<<20`/`1<<22`, so the
   worst case is ~96 MB rather than an abort — lower risk, but converting them to
   `try_reserve` would remove the last alloc-abort paths for consistency.
