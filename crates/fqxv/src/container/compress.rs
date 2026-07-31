@@ -329,11 +329,27 @@ pub fn compress_interleaved<R: Read + Send, W: Write>(
     compress_buffered(&buf, writer, params, g)
 }
 
+/// Confirm members 1..G are also spent once member 0 hits EOF. The interleaving
+/// loops only ever touch a member after member 0, so a *short* member 0 ends the
+/// archive early and drops the surplus reads from the longer files into a
+/// well-formed, plausible-looking archive — the one unequal-count direction that
+/// fails silently rather than loudly.
+fn members_at_eof<R: BufRead>(fqs: &mut [R]) -> Result<()> {
+    let (mut def, mut seq, mut qual) = (Vec::new(), Vec::new(), Vec::new());
+    for fq in fqs.iter_mut().skip(1) {
+        if read_raw_record(fq, &mut def, &mut seq, &mut qual)? {
+            return Err(Error::Malformed("inputs have unequal read counts"));
+        }
+    }
+    Ok(())
+}
+
 /// Compress `G >= 1` per-spot read files (paired mates, single-cell R1/R2/I1/I2,
 /// …) into one `.fqxv` stream, interleaving them.
 ///
-/// Readers are consumed in lockstep; unequal read counts are an error. Restore
-/// with [`decompress_split`], or stream interleaved with [`decompress`].
+/// Readers are consumed in lockstep; unequal read counts are an error, whichever
+/// member runs out first. Restore with [`decompress_split`], or stream
+/// interleaved with [`decompress`].
 #[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, inputs = readers.len(), threads = params.threads))]
 pub fn compress_multi<'a, W: Write>(
     readers: Vec<Box<dyn Read + Send + 'a>>,
@@ -364,6 +380,7 @@ pub fn compress_multi<'a, W: Write>(
             for j in 0..g {
                 if !read_raw_record(&mut fqs[j], &mut defs[j], &mut seqs[j], &mut quals[j])? {
                     if j == 0 {
+                        members_at_eof(&mut fqs)?;
                         return encode_reordered(all, writer, params, g as u8);
                     }
                     return Err(Error::Malformed("inputs have unequal read counts"));
@@ -385,6 +402,7 @@ pub fn compress_multi<'a, W: Write>(
     for j in 0..g {
         if !read_raw_record(&mut fqs[j], &mut defs[j], &mut seqs[j], &mut quals[j])? {
             if j == 0 {
+                members_at_eof(&mut fqs)?;
                 break; // empty input
             }
             return Err(Error::Malformed("inputs have unequal read counts"));
@@ -409,6 +427,7 @@ pub fn compress_multi<'a, W: Write>(
             for j in 0..g {
                 if !read_raw_record(&mut fqs[j], &mut defs[j], &mut seqs[j], &mut quals[j])? {
                     if j == 0 {
+                        members_at_eof(&mut fqs)?;
                         return Ok(b.n_reads());
                     }
                     return Err(Error::Malformed("inputs have unequal read counts"));
