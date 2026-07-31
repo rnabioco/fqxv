@@ -909,7 +909,7 @@ fn estimate(
     for src in &sources {
         let reader = open_fastq(src)?;
         let est = py
-            .detach(|| fqxv_core::estimate(reader, params, per_input))
+            .detach(|| fqxv_core::estimate(reader, params.clone(), per_input))
             .map_err(map_err)?;
         if est.platform != Platform::Unknown {
             match group_platform {

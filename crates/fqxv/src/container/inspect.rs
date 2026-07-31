@@ -396,6 +396,12 @@ pub struct Info {
     /// This is the value `verify` recomputes and checks; reporting it lets a user
     /// record the expected checksum without a full pass.
     pub whole_file_crc: Option<u32>,
+    /// Original per-slot labels for the interleaved members (`["R1", "R2"]`,
+    /// `["2", "4"]`, …), when the archive recorded them. Empty for an archive
+    /// written before the tag existed, or one compressed from inputs whose slots
+    /// weren't identifiable, in which case consumers name members positionally.
+    /// Length equals `group_size` whenever it is non-empty.
+    pub member_labels: Vec<String>,
 }
 
 /// Highest Phred quality value tracked in [`ContentStats::qual_hist`]. Raw
@@ -503,6 +509,7 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
         platform: Platform::from_code(header.platform),
         format_version: (u16::from(header.major) << 8) | u16::from(header.minor),
         required_features: header.required_features,
+        member_labels: header.member_labels,
         ..Info::default()
     })
 }
@@ -543,6 +550,7 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         platform: Platform::from_code(header.platform),
         format_version: (u16::from(header.major) << 8) | u16::from(header.minor),
         required_features: header.required_features,
+        member_labels: header.member_labels,
         ..Info::default()
     };
     // Whole-file global-cluster layout: [u64 n][flip][perm][name template]

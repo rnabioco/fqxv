@@ -285,7 +285,7 @@ pub fn decompress_recover<R: Read + Seek, W: Write>(
         Ok(footer) => recover_via_footer(&mut r, &pool, &footer, writer, reference)?,
         Err(footer_err) => {
             debug!(error = %footer_err, "footer unreadable; scanning for block markers");
-            recover_via_scan(&mut r, &pool, writer, reference)?
+            recover_via_scan(&mut r, &pool, writer, reference, header.header_len)?
         }
     };
     info!(
@@ -354,8 +354,12 @@ fn recover_via_scan<R: Read + Seek, W: Write>(
     pool: &rayon::ThreadPool,
     writer: W,
     reference: Option<&fqxv_lroverlap::Reference>,
+    header_len: u64,
 ) -> Result<Recovery> {
-    r.seek(SeekFrom::Start(HEADER_LEN as u64))?;
+    // The archive's own header length, not the ext-empty constant: a header that
+    // carries an extension region is longer, and starting the scan short of the
+    // block region would put a stray header byte in front of the first frame.
+    r.seek(SeekFrom::Start(header_len))?;
     let mut region = Vec::new();
     r.read_to_end(&mut region)?;
 

@@ -312,9 +312,10 @@ enum Command {
         force: bool,
         /// Labeling for `--split` outputs: `r` (`_R1`) or `num` (`_1`).
         ///
-        /// `r` gives `_R1`,`_R2`,… (Illumina convention, the default); `num`
-        /// gives `_1`,`_2`,….
-        #[arg(long, value_enum, default_value_t = MateStyle::R, requires = "split", help_heading = "Advanced")]
+        /// `auto` (default) restores the slot labels the archive recorded, falling
+        /// back to `_R1`,`_R2`,…; `r` forces `_R1`,`_R2`,… and `num` forces
+        /// `_1`,`_2`,… regardless of what was recorded.
+        #[arg(long, value_enum, default_value_t = MateStyle::Auto, requires = "split", help_heading = "Advanced")]
         mate_style: MateStyle,
         /// Write plain `.fastq` for `--split` (default is `.fastq.gz`).
         ///
@@ -416,7 +417,9 @@ enum EstimateFormat {
 /// Labeling for the per-mate files produced by `decompress --split`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum MateStyle {
-    /// `_R1`, `_R2`, … — the Illumina convention (default).
+    /// Reuse the slot labels the archive recorded, else `_R1`, `_R2`, … (default).
+    Auto,
+    /// `_R1`, `_R2`, … — the Illumina convention.
     R,
     /// `_1`, `_2`, … — bare member numbers.
     Num,
@@ -617,6 +620,10 @@ fn main() -> anyhow::Result<()> {
                 platform: platform.map(Into::into),
                 tile_band,
                 tile_max_refs,
+                // Record which slot each input came from, so `--split` can restore
+                // the original per-slot names instead of renumbering positionally.
+                // Empty unless every input yields a distinct slot token.
+                member_labels: member_labels_for(&inputs),
             };
             warn_redundant_binning(&inputs, params.quality_binning);
             // `--estimate` samples the input and reports a projected ratio/size
@@ -880,10 +887,16 @@ fn main() -> anyhow::Result<()> {
                 // Commits are deferred until after the completeness check below, so
                 // a truncated archive leaves nothing at the destination names.
                 let (stats, pending) = if let Some(prefix) = split {
-                    let g = fqxv::peek(open_in()?)?.group_size as usize;
+                    let peeked = fqxv::peek(open_in()?)?;
+                    let g = peeked.group_size as usize;
+                    let labels = peeked.member_labels;
                     let (pending, sinks): (Vec<_>, Vec<FastqSink>) = (1..=g)
                         .map(|i| {
-                            open_fastq_file(&split_path(&prefix, i, mate_style, !no_gzip), force)
+                            let stored = labels.get(i - 1).map(String::as_str);
+                            open_fastq_file(
+                                &split_path(&prefix, i, mate_style, stored, !no_gzip),
+                                force,
+                            )
                         })
                         .collect::<anyhow::Result<Vec<_>>>()?
                         .into_iter()
@@ -2059,7 +2072,7 @@ fn run_estimate(
     let mut parts = Vec::with_capacity(inputs.len());
     for path in inputs {
         let (reader, counter) = open_input_counted(path)?;
-        let est = fqxv::estimate(reader, params, per_input)
+        let est = fqxv::estimate(reader, params.clone(), per_input)
             .with_context(|| format!("estimating {}", path.display()))?;
         let consumed = counter.load(Ordering::Relaxed);
         let disk = if path.as_os_str() == "-" {
@@ -2431,14 +2444,80 @@ fn open_fastq_file(path: &Path, force: bool) -> anyhow::Result<(output::AtomicOu
 }
 
 /// Build the path for member `i` (1-based) of a `--split` decode: `<prefix>` plus a
-/// mate label (`_R1` or `_1`, per `style`) and a `.fastq`/`.fastq.gz` extension.
-fn split_path(prefix: &Path, i: usize, style: MateStyle, gzip: bool) -> PathBuf {
+/// mate label and a `.fastq`/`.fastq.gz` extension.
+///
+/// `stored` is the archive's recorded label for this member, if it has one.
+/// [`MateStyle::Auto`] prefers it so a compress/decompress round-trip returns the
+/// slot names the input actually had — a run whose slots are empty over part of
+/// the run produces files numbered by original slot with gaps (`_2` and `_4`, no
+/// `_1`/`_3`), and positional naming would silently renumber them to `_1`/`_2`.
+/// The explicit styles ignore it and number positionally.
+fn split_path(
+    prefix: &Path,
+    i: usize,
+    style: MateStyle,
+    stored: Option<&str>,
+    gzip: bool,
+) -> PathBuf {
     let label = match style {
+        MateStyle::Auto => match stored {
+            Some(s) => s.to_string(),
+            None => format!("R{i}"),
+        },
         MateStyle::R => format!("R{i}"),
         MateStyle::Num => i.to_string(),
     };
     let ext = if gzip { "fastq.gz" } else { "fastq" };
     PathBuf::from(format!("{}_{}.{}", prefix.display(), label, ext))
+}
+
+/// Extract the per-slot label from an input file name — the `R1`/`I2`/`2` token a
+/// FASTQ file carries just before its extension (`sample_R1.fastq.gz` -> `R1`,
+/// `SRR000001_2.fastq` -> `2`). Returns `None` when the name has no such token, so
+/// the caller can decline to record labels rather than invent them.
+fn slot_label_of(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    // Strip the extensions the archive's own naming uses, longest first.
+    let stem = name
+        .strip_suffix(".fastq.gz")
+        .or_else(|| name.strip_suffix(".fq.gz"))
+        .or_else(|| name.strip_suffix(".fastq"))
+        .or_else(|| name.strip_suffix(".fq"))
+        .unwrap_or(name);
+    let tok = stem.rsplit('_').next()?;
+    if tok.is_empty() || tok.len() > 15 || tok == stem {
+        return None;
+    }
+    // `R1`/`I2`-style or a bare slot number; anything else is part of the sample
+    // name, not a slot, and must not be mistaken for one.
+    let (head, digits) =
+        tok.split_at(tok.len() - tok.chars().rev().take_while(|c| c.is_ascii_digit()).count());
+    if digits.is_empty() || !matches!(head, "" | "R" | "I" | "r" | "i") {
+        return None;
+    }
+    Some(tok.to_string())
+}
+
+/// Per-slot labels for a grouped compress, or empty when they can't all be
+/// derived. All-or-nothing on purpose: a half-labeled archive would name some
+/// members from the input and others positionally, which is more confusing than
+/// naming them all positionally. Duplicates are rejected for the same reason —
+/// two members sharing a label would collide on `--split`.
+fn member_labels_for(inputs: &[PathBuf]) -> Vec<String> {
+    if inputs.len() < 2 {
+        return Vec::new();
+    }
+    let labels: Vec<String> = inputs.iter().filter_map(|p| slot_label_of(p)).collect();
+    if labels.len() != inputs.len() {
+        return Vec::new();
+    }
+    let mut seen: Vec<&str> = labels.iter().map(String::as_str).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    if seen.len() != labels.len() {
+        return Vec::new();
+    }
+    labels
 }
 
 /// Derive the default archive name from the first input: strip a gzip suffix and a
@@ -2487,6 +2566,67 @@ mod tests {
     #[test]
     fn detects_bgzf_header() {
         assert!(is_bgzf(&BGZF_HEADER));
+    }
+
+    #[test]
+    fn derives_slot_labels_from_file_names() {
+        for (name, want) in [
+            ("sample_R1.fastq.gz", Some("R1")),
+            ("sample_R2.fq", Some("R2")),
+            ("SRR000001_2.fastq", Some("2")),
+            ("SRR000001_4.fastq.gz", Some("4")),
+            ("x_I1.fq.gz", Some("I1")),
+            // No separator, so no slot token — the whole stem is the sample name.
+            ("reads.fastq", None),
+            // A trailing word is part of the name, not a slot.
+            ("sample_trimmed.fastq", None),
+            // A bare stem with nothing after the separator.
+            ("sample_.fastq", None),
+        ] {
+            assert_eq!(
+                slot_label_of(Path::new(name)).as_deref(),
+                want,
+                "name={name}"
+            );
+        }
+    }
+
+    /// All-or-nothing: one unlabelable input means no labels at all, and duplicate
+    /// labels are refused because two members would collide on `--split`.
+    #[test]
+    fn member_labels_are_all_or_nothing() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(
+            member_labels_for(&[p("a_R1.fastq"), p("a_R2.fastq")]),
+            vec!["R1".to_string(), "R2".to_string()]
+        );
+        assert!(member_labels_for(&[p("a_R1.fastq"), p("plain.fastq")]).is_empty());
+        assert!(member_labels_for(&[p("a_R1.fastq"), p("b_R1.fastq")]).is_empty());
+        // Single-end records nothing — there is no slot ambiguity to preserve.
+        assert!(member_labels_for(&[p("a_R1.fastq")]).is_empty());
+    }
+
+    #[test]
+    fn split_path_prefers_stored_labels_only_in_auto() {
+        let pre = Path::new("out");
+        assert_eq!(
+            split_path(pre, 1, MateStyle::Auto, Some("2"), false),
+            PathBuf::from("out_2.fastq")
+        );
+        // No stored label: fall back to the positional Illumina convention.
+        assert_eq!(
+            split_path(pre, 1, MateStyle::Auto, None, false),
+            PathBuf::from("out_R1.fastq")
+        );
+        // Explicit styles ignore what was stored.
+        assert_eq!(
+            split_path(pre, 1, MateStyle::R, Some("2"), false),
+            PathBuf::from("out_R1.fastq")
+        );
+        assert_eq!(
+            split_path(pre, 1, MateStyle::Num, Some("R7"), true),
+            PathBuf::from("out_1.fastq.gz")
+        );
     }
 
     #[test]
