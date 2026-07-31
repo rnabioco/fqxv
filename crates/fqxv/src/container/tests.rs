@@ -582,6 +582,74 @@ fn mismatched_member_labels_are_dropped_not_fatal() {
     }
 }
 
+/// The streaming parser has to agree with the parallel one about what a record
+/// is. A header line followed by EOF used to read back as a zero-length record,
+/// so a truncated input was silently repaired into a valid archive; a garbage
+/// third line was accepted for the same reason (only the seq/qual lengths were
+/// compared). Both reach the streaming parser through `compress_multi`, which is
+/// the multi-file path and does not go through `parse_chunk`.
+#[test]
+fn streaming_parser_rejects_malformed_records() {
+    let good = b"@b1\nACGT\n+\nIIII\n@b2\nACGT\n+\nIIII\n".to_vec();
+    for bad in [
+        b"@a1\nACGT\n+\nIIII\n@a2\n".to_vec(), // truncated: header then EOF
+        b"@a1\nACGT\nJUNK\nIIII\n".to_vec(),   // '+' separator replaced by garbage
+    ] {
+        let readers: Vec<Box<dyn Read + Send>> = vec![
+            Box::new(&bad[..]) as Box<dyn Read + Send>,
+            Box::new(&good[..]),
+        ];
+        let err = compress_multi(readers, &mut Vec::new(), Params::default());
+        assert!(
+            matches!(err, Err(Error::Malformed(_))),
+            "expected an error, got {err:?}"
+        );
+    }
+}
+
+/// A trailing partial spot has to be rejected by *both* layouts. The plain path
+/// caught it in `parse_chunks`, but the reorder path had no equivalent check on
+/// the `compress_auto` entry point, so `--order any` on a mate-named stream with
+/// an odd record count silently recorded `group_size = 2` over an un-spot-aligned
+/// stream and split it into mismatched files.
+#[test]
+fn odd_record_count_rejected_by_both_layouts() {
+    // 2 complete spots + 1 orphan, with mate names so detection promotes to G=2.
+    let mut input = Vec::new();
+    for i in 0..2 {
+        input.extend_from_slice(format!("@sp.{i}/1\nACGT\n+\nIIII\n").as_bytes());
+        input.extend_from_slice(format!("@sp.{i}/2\nACGT\n+\nIIII\n").as_bytes());
+    }
+    input.extend_from_slice(b"@sp.2/1\nACGT\n+\nIIII\n");
+
+    for reorder in [false, true] {
+        let params = Params {
+            reorder,
+            ..Params::default()
+        };
+        let err = compress_interleaved(&input[..], &mut Vec::new(), params, 2);
+        assert!(
+            matches!(err, Err(Error::Malformed(_))),
+            "compress_interleaved reorder={reorder}: expected an error, got {err:?}"
+        );
+    }
+}
+
+/// A zero-length record whose trailing newline is absent (`@n\n\n+\n`) is still a
+/// complete record — the '+' line is present, and both lengths are 0. `parse_chunk`
+/// accepts it, so the streaming parser must too; the new '+' check keys off the
+/// separator line rather than a trailing-byte count precisely so these two stay
+/// aligned.
+#[test]
+fn streaming_parser_accepts_zero_length_record_at_eof() {
+    let input = b"@r1\nACGT\n+\nIIII\n@r2\n\n+\n".to_vec();
+    let mut archive = Vec::new();
+    compress(&input[..], &mut archive, Params::default()).expect("compress");
+    let mut out = Vec::new();
+    decompress(&archive[..], &mut out, 1).unwrap();
+    assert_eq!(out, b"@r1\nACGT\n+\nIIII\n@r2\n\n+\n\n".to_vec());
+}
+
 #[test]
 fn unequal_mate_counts_error() {
     let r1 = make_reads("a", 2);
@@ -590,6 +658,99 @@ fn unequal_mate_counts_error() {
         vec![Box::new(&r1[..]) as Box<dyn Read + Send>, Box::new(&r2[..])];
     let err = compress_multi(readers, &mut Vec::new(), Params::default());
     assert!(matches!(err, Err(Error::Malformed(_))));
+}
+
+/// The other direction: member 0 is the *shortest*. Both interleaving loops end
+/// on member 0's EOF, so without an explicit end-of-input check the surplus reads
+/// in the longer members are silently dropped and the archive still reports
+/// success. Ragged per-slot inputs are normal for runs whose read slots are empty
+/// over part of the run, so this direction has to fail as loudly as the other.
+#[test]
+fn short_first_mate_errors_rather_than_truncating() {
+    for reorder in [false, true] {
+        let params = Params {
+            reorder,
+            ..Params::default()
+        };
+        let r1 = make_reads("a", 1);
+        let r2 = make_reads("b", 2);
+        let readers: Vec<Box<dyn Read + Send>> =
+            vec![Box::new(&r1[..]) as Box<dyn Read + Send>, Box::new(&r2[..])];
+        let err = compress_multi(readers, &mut Vec::new(), params);
+        assert!(
+            matches!(err, Err(Error::Malformed(_))),
+            "reorder={reorder}: expected an error, got {err:?}"
+        );
+    }
+}
+
+/// An empty member 0 must not swallow non-empty later members either — that path
+/// leaves the priming loop before a single spot is read.
+#[test]
+fn empty_first_mate_errors() {
+    let r1 = make_reads("a", 0);
+    let r2 = make_reads("b", 2);
+    let readers: Vec<Box<dyn Read + Send>> =
+        vec![Box::new(&r1[..]) as Box<dyn Read + Send>, Box::new(&r2[..])];
+    let err = compress_multi(readers, &mut Vec::new(), Params::default());
+    assert!(matches!(err, Err(Error::Malformed(_))), "got {err:?}");
+}
+
+/// Three inputs of differing fixed lengths — the 10x barcode/cDNA/sample-index
+/// shape (26/55/8 bp). G=3 is neither auto-detected nor special-cased anywhere,
+/// so it needs its own round-trip alongside the G=2 and G=4 cases.
+#[test]
+fn three_file_single_cell_roundtrip() {
+    let files: Vec<Vec<u8>> = [(26usize, "bc"), (55, "cdna"), (8, "idx")]
+        .iter()
+        .map(|(len, tag)| {
+            let mut buf = Vec::new();
+            for i in 0..40 {
+                let seq: String = std::iter::repeat_n('A', *len).collect();
+                let qual: String = std::iter::repeat_n('I', *len).collect();
+                buf.extend_from_slice(format!("@{tag}.{i}\n{seq}\n+\n{qual}\n").as_bytes());
+            }
+            buf
+        })
+        .collect();
+    let readers: Vec<Box<dyn Read + Send>> = files
+        .iter()
+        .map(|f| Box::new(&f[..]) as Box<dyn Read + Send>)
+        .collect();
+    let mut archive = Vec::new();
+    let stats = compress_multi(readers, &mut archive, Params::default()).unwrap();
+    assert_eq!(stats.group_size, 3);
+
+    let mut outs: Vec<Vec<u8>> = vec![Vec::new(); 3];
+    decompress_split(&archive[..], &mut outs, 1).unwrap();
+    assert_eq!(outs, files);
+}
+
+/// A zero-length read (empty sequence and quality) is a real slot shape, not a
+/// malformed record: runs store read slots that are empty for part of the run.
+/// Every sequence path has to carry it through unchanged.
+#[test]
+fn zero_length_reads_roundtrip() {
+    let mut input = Vec::new();
+    for i in 0..40 {
+        if i % 5 == 0 {
+            input.extend_from_slice(format!("@r.{i}\n\n+\n\n").as_bytes());
+        } else {
+            let seq: String = std::iter::repeat_n('A', 60).collect();
+            let qual: String = std::iter::repeat_n('I', 60).collect();
+            input.extend_from_slice(format!("@r.{i}\n{seq}\n+\n{qual}\n").as_bytes());
+        }
+    }
+    for reorder in [false, true] {
+        let params = Params {
+            reorder,
+            ..Params::default()
+        };
+        let archive = compress_bytes(&input, params);
+        let mut out = Vec::new();
+        decompress(&archive[..], &mut out, 1).unwrap();
+        assert_eq!(out, input, "reorder={reorder}");
+    }
 }
 
 #[test]
