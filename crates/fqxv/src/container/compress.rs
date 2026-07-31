@@ -318,13 +318,7 @@ pub fn compress_interleaved<R: Read + Send, W: Write>(
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
     if params.reorder {
-        let all = buffer_records(&buf)?;
-        if all.n_reads() % g as usize != 0 {
-            return Err(Error::Malformed(
-                "interleaved stream ended mid-spot (record count not a multiple of group size)",
-            ));
-        }
-        return encode_reordered(all, writer, params, g);
+        return encode_reordered(buffer_records(&buf)?, writer, params, g);
     }
     compress_buffered(&buf, writer, params, g)
 }

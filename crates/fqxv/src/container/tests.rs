@@ -516,6 +516,34 @@ fn auto_leaves_single_end_ungrouped() {
     assert_eq!(out, single);
 }
 
+/// A trailing partial spot has to be rejected by *both* layouts. The plain path
+/// caught it in `parse_chunks`, but the reorder path had no equivalent check on
+/// the `compress_auto` entry point, so `--order any` on a mate-named stream with
+/// an odd record count silently recorded `group_size = 2` over an un-spot-aligned
+/// stream and split it into mismatched files.
+#[test]
+fn odd_record_count_rejected_by_both_layouts() {
+    // 2 complete spots + 1 orphan, with mate names so detection promotes to G=2.
+    let mut input = Vec::new();
+    for i in 0..2 {
+        input.extend_from_slice(format!("@sp.{i}/1\nACGT\n+\nIIII\n").as_bytes());
+        input.extend_from_slice(format!("@sp.{i}/2\nACGT\n+\nIIII\n").as_bytes());
+    }
+    input.extend_from_slice(b"@sp.2/1\nACGT\n+\nIIII\n");
+
+    for reorder in [false, true] {
+        let params = Params {
+            reorder,
+            ..Params::default()
+        };
+        let err = compress_interleaved(&input[..], &mut Vec::new(), params, 2);
+        assert!(
+            matches!(err, Err(Error::Malformed(_))),
+            "compress_interleaved reorder={reorder}: expected an error, got {err:?}"
+        );
+    }
+}
+
 #[test]
 fn unequal_mate_counts_error() {
     let r1 = make_reads("a", 2);
