@@ -127,6 +127,19 @@ pub(crate) fn encode_reordered<W: Write>(
     params: Params,
     group_size: u8,
 ) -> Result<Stats> {
+    // Whole spots only, same rule the plain layout enforces in `parse_chunks`. The
+    // check belongs here rather than at the call sites: this is the one choke point
+    // every reorder entry point passes through, and having it at only some of them
+    // is what let `--order any` accept a trailing partial spot that the default
+    // layout rejects. Grouped `compress_multi` reads in lockstep so it satisfies
+    // this by construction; the buffered single-stream paths do not.
+    let g = group_size.max(1) as usize;
+    if g > 1 && !all.n_reads().is_multiple_of(g) {
+        return Err(Error::Malformed(
+            "interleaved stream ended mid-spot (record count not a multiple of group size)",
+        ));
+    }
+
     // Long-read data: reorder buys nothing (the non-reorder deep-context path is
     // smaller on nanopore/PacBio) for ~10x the time and ~6x the memory. Fall back
     // to the non-reorder layout, keeping the requested effort level — its hashed
