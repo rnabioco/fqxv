@@ -32,12 +32,28 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 
 /// The container format **major** version this build writes.
 ///
-/// **Nothing on disk is stable yet (alpha):** the format may change incompatibly
-/// before a first stable release freezes it. A reader refuses an archive whose
-/// major differs from its own (wire-incompatible) but tolerates a newer
-/// [`FORMAT_MINOR`] within its major — minor bumps only add backward-compatible
-/// things. (The "v2/v3/v4" you see elsewhere are the per-block *sequence codec*
-/// versions, independent of this container version.)
+/// **The on-disk format is stable at 1.0.** An archive written by any format-1.x
+/// release stays readable by later ones. A reader refuses an archive whose major
+/// differs from its own (wire-incompatible) but tolerates a newer
+/// [`FORMAT_MINOR`] within its major, since minor bumps only add things an older
+/// reader can either skip or refuse deliberately.
+///
+/// This version is **independent of the crate version**: the crate is pre-1.0 and
+/// its Rust API may still change, while the bytes on disk are covered by the
+/// guarantee above. `fqxv --version` reports the former, `fqxv info` the latter.
+///
+/// A major bump is a last resort, not a planned step. The additive mechanisms —
+/// 63 free [`feature`] bits, a 64 KiB extension region with 127 free non-critical
+/// and 128 free critical tags, and 251 unused sequence method-byte values — are
+/// meant to carry foreseeable evolution without one. Should a format 2 ever
+/// happen, readers will keep a format-1 read path rather than orphan existing
+/// archives. See `docs/design/container.md` for the full evolution policy: which
+/// mechanism a given change belongs in, and the rule that any change to the block
+/// payload's stream layout or the footer's shape must set a [`feature`] bit so an
+/// older reader refuses at the header instead of mis-reading the body.
+///
+/// (The "v2/v3/v4" you see elsewhere are the per-block *sequence codec* versions,
+/// independent of this container version.)
 ///
 /// The v1 container:
 /// - appends a footer index (`[u32 n_row_groups]`, per-group
@@ -131,6 +147,11 @@ pub enum Error {
     /// doesn't recognize (see the header extension region). The payload is the tag.
     #[error("fqxv archive has an unsupported critical header extension (tag {0:#x}); upgrade fqxv")]
     UnsupportedExtension(u8),
+    /// The header set one or more layout flag bits outside this build's known set.
+    /// Every flag changes how the archive is read, so an unknown one is refused
+    /// rather than ignored. The payload is the set of unknown bits.
+    #[error("fqxv archive uses unsupported header flags (bits {0:#x}); upgrade fqxv")]
+    UnsupportedFlags(u8),
     /// A stream was tagged with a codec method byte this build can't decode (e.g.
     /// a sequence codec added in a newer minor). Localized to the stream and method.
     #[error("unsupported fqxv {stream} codec method {method}; upgrade fqxv")]

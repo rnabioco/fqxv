@@ -8,8 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 format library and CLI. All codecs are **clean-room** implementations from specs
 and papers (CRAM 3.1 codecs spec, fqzcomp/SPRING/PgRC2), never translated from C
 — see `THIRD-PARTY-NOTICES.md`. The on-disk container format is `1.0`
-(`FORMAT_MAJOR`.`FORMAT_MINOR` in `crates/fqxv/src/lib.rs`): a reader refuses a
-differing major and tolerates a newer minor (backward-compatible additions).
+(`FORMAT_MAJOR`.`FORMAT_MINOR` in `crates/fqxv/src/lib.rs`), a number independent
+of the crate version (0.5.x): a reader refuses a differing major and tolerates a
+newer minor (backward-compatible additions).
 
 ## Commands
 
@@ -93,15 +94,20 @@ ones. Build understanding bottom-up:
   never depends on it.
 - **`fqxv`** — the `.fqxv` container format; composes all codec crates into
   `compress`/`compress_multi`/`decompress`/`decompress_split`/`inspect`. This is
-  where the on-disk layout lives (`src/container.rs`).
+  where the on-disk layout lives (`src/container/`).
 - **`fqxv-cli`** — thin clap front-end over the `fqxv` library (`fqxv` binary).
 
-The container (`crates/fqxv/src/container.rs`) is a 10-byte header followed by
-independent, parallel-codable blocks. Each block splits FASTQ into three streams
-handled by three codecs: **names** (tokenizer), **sequence** (order-k seq,
+The container (`crates/fqxv/src/container/`) is a variable-length header followed
+by independent, parallel-codable blocks. The header is a 21-byte fixed prefix, a
+TLV extension region (`ext_len` bytes — no longer always empty: tag `0x01` carries
+per-member slot labels), and a 4-byte CRC, so anything positioned after it must use
+the header's actual length, never a hardcoded 25. Each block splits FASTQ into three
+streams handled by three codecs: **names** (tokenizer), **sequence** (order-k seq,
 reorder, or the long-read overlap codec — a leading method byte per block picks
 one), **quality** (fqzcomp). The exact byte layout is documented in the module doc
-comment at the top of `container.rs` — read it before touching the format.
+comment at the top of `container/mod.rs` — read it before touching the format; the
+evolution policy (what warrants a minor bump vs a feature bit vs a major bump) is in
+`docs/design/container.md`.
 
 ## Invariants to preserve
 

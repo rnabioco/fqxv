@@ -12,7 +12,7 @@ Status legend: ✅ done · ▶ recommended next · ○ backlog.
 ## What already exists
 
 Every codec crate has inline `#[test]` round-trips plus one `proptest!` block;
-`fqxv/src/container.rs` has integration coverage (pairing, interleaving,
+`fqxv/src/container/` has integration coverage (pairing, interleaving,
 single-cell, reorder modes, `+`-normalization, truncation). All decoders return
 `Result` and guard header/length reads with `Malformed`. The gaps below are
 where round-trip-only testing structurally can't reach: malformed input,

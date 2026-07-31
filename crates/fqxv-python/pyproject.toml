@@ -10,7 +10,7 @@ license = { text = "MIT OR Apache-2.0" }
 readme = "README.md"
 keywords = ["fastq", "compression", "bioinformatics", "genomics"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Programming Language :: Rust",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Bio-Informatics",

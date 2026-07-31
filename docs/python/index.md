@@ -72,7 +72,14 @@ print(info.reads, info.blocks, info.format_version, info.platform)
 `inspect()` returns an `Info` with `reads`, `blocks`, `group_size`,
 `reordered`, `keep_order`, `regenerated_names`, `plus_normalized`,
 `format_version`, `seq_order`, `quality_binning`, `names_bytes`,
-`sequence_bytes`, `quality_bytes`, `platform`, and `whole_file_crc`.
+`sequence_bytes`, `quality_bytes`, `platform`, `whole_file_crc`,
+`required_features`, and `member_labels`.
+
+`format_version` is the **container format** version packed as
+`(major << 8) | minor` — `256` for format 1.0 — and is independent of the
+`fqxv` package version. `member_labels` holds the original per-slot labels
+(`["R1", "R2"]`, `["2", "4"]`, …) when the archive recorded them, and is empty
+otherwise.
 
 ## Column projection & random access
 

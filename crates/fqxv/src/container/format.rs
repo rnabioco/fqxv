@@ -115,6 +115,27 @@ pub(crate) const FLAG_GLOBAL_REFERENCE: u8 = 0x20;
 // Bits 0x40 and 0x80 are free: the platform tag that used to occupy bits 5-7
 // now has its own header byte (see `HEADER_PREFIX_LEN`).
 
+/// The union of every flag bit this build understands.
+///
+/// A flag changes how the archive is laid out or how its bytes are to be read, and
+/// every existing flag is consulted somewhere in decode. An unknown bit therefore
+/// means the writer intended something this reader will not do — so refuse rather
+/// than ignore it, the same way [`crate::KNOWN_FEATURES`] gates the feature word.
+/// Without this, a future bit whose meaning is purely semantic (say, "the original
+/// `+` line is stored") would be silently dropped and the archive decoded under
+/// the old interpretation, with every CRC and content digest still matching.
+///
+/// The two mechanisms are not redundant: `required_features` is the right place
+/// for a capability a reader must *have*, while this is a backstop for the bits
+/// that sit next to the ones a reader already acts on. A new flag should normally
+/// come with a feature bit as well; this makes forgetting that fail closed.
+pub(crate) const KNOWN_FLAGS: u8 = FLAG_PLUS_NORMALIZED
+    | FLAG_REORDERED
+    | FLAG_KEEP_ORDER
+    | FLAG_GLOBAL_REORDER
+    | FLAG_REGEN_NAMES
+    | FLAG_GLOBAL_REFERENCE;
+
 /// Write the fixed header prefix (see [`HEADER_PREFIX_LEN`]), then the extension
 /// region `ext`, then a CRC-32C over prefix+extension — so a flipped
 /// header byte is caught on read instead of silently altering decode. Shared by
@@ -387,6 +408,7 @@ pub(crate) fn read_framed<R: Read>(r: &mut R, what: &str) -> Result<Vec<u8>> {
 
 // --- header / block framing --------------------------------------------------
 
+#[derive(Debug)]
 pub(crate) struct Header {
     /// On-disk format major/minor. `major` always equals [`FORMAT_MAJOR`] for a
     /// readable archive (a differing major is refused); `minor` may be newer than
@@ -467,6 +489,13 @@ pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
         return Err(Error::Corrupt {
             what: "header".to_string(),
         });
+    }
+    // Now that the CRC has ruled out bit-rot, an unknown flag bit is a deliberate
+    // signal from a newer writer rather than a flipped byte — refuse it, since
+    // every flag we do know changes how the archive is read (see `KNOWN_FLAGS`).
+    let unknown_flags = prefix[16] & !KNOWN_FLAGS;
+    if unknown_flags != 0 {
+        return Err(Error::UnsupportedFlags(unknown_flags));
     }
     // Walk the TLV records: an unknown *critical* tag is fatal; unknown
     // non-critical tags are skipped. Known tags are decoded here.
@@ -560,6 +589,7 @@ fn check_header_extensions(mut ext: &[u8], group_size: u8) -> Result<Vec<String>
 /// rereading the whole archive; `whole_file_crc` covers every byte from the header
 /// through `total_reads` and is checked only by the whole-archive verify/recover
 /// path.
+#[derive(Debug)]
 pub(crate) struct Footer {
     /// `(byte offset of the row group's frame marker, its read count)`.
     pub(crate) groups: Vec<(u64, u32)>,
@@ -634,11 +664,23 @@ pub(crate) fn parse_footer_body(body: &[u8], footer_offset: u64) -> Result<Foote
     let mut c = Cursor::new(covered);
     let n_groups = c.u32()? as usize;
     // `covered` = [4 n_groups][FOOTER_GROUP_BYTES*n_groups][8 total_reads][4
-    // whole_file_crc]; the CRC just passed already implies a self-consistent
-    // length, but bound the allocation independently in case of a hash collision.
-    let max_groups = covered.len().saturating_sub(4 + 8 + CRC_LEN) / FOOTER_GROUP_BYTES;
-    if n_groups > max_groups {
-        return Err(Error::Malformed("footer group count exceeds footer size"));
+    // whole_file_crc]. Require that length *exactly*, not merely that it is large
+    // enough: the per-group record size is a compile-time constant carried nowhere
+    // on disk, so a footer whose real stride differs — a newer writer that added a
+    // fourth per-group stream, say — would otherwise CRC-check fine and then be
+    // walked at the wrong stride, yielding offsets that can pass the range checks
+    // below and be reported as fact. An exact size turns that into one honest error
+    // here instead of a plausible-looking wrong index. It also bounds the
+    // allocation independently of the CRC.
+    //
+    // Consequence, and it is deliberate: the footer cannot grow within format
+    // major 1. Any change to its shape must set a `required_features` bit so an
+    // older reader refuses at the header, long before it seeks here.
+    let expected = 4 + FOOTER_GROUP_BYTES * n_groups + 8 + CRC_LEN;
+    if covered.len() != expected {
+        return Err(Error::Malformed(
+            "footer size does not match its row-group count",
+        ));
     }
     let mut groups = Vec::with_capacity(n_groups);
     let mut stream_locs = Vec::with_capacity(n_groups);

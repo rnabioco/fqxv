@@ -141,3 +141,215 @@ jobs:
         env:
           FQXV_BIN: target/debug/fqxv
         run: python -m pytest crates/fqxv-python/tests/ -v
+
+  compat:
+    name: Format compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # Every other job builds the PR and tests what it just built, so nothing here
+    # can catch the one failure mode that matters most to an *archival* format: an
+    # archive written by a released fqxv that a later fqxv can no longer read.
+    # This job is the only one that puts two different builds of fqxv in the same
+    # room — the newest published release's CLI and this PR's — and makes them
+    # exchange archives in both directions.
+    steps:
+      - uses: actions/checkout@v7
+      # `.cargo/config.toml` links with lld; install it for the build step.
+      - run: sudo apt-get update && sudo apt-get install -y lld
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # release.yml attaches one archive per target, named
+      # `fqxv-<tag>-<target>.<ext>`. x86_64-unknown-linux-musl is the static
+      # Linux build: it runs on the CI image with no glibc/loader concerns and no
+      # extraction of anything but the `fqxv` binary itself.
+      #
+      # A missing release is NOT a failure: the very first release, a repo fork
+      # with no releases, or a release whose asset upload failed all land here and
+      # must skip cleanly rather than turn a green PR red for reasons unrelated to
+      # the PR. Every later step is gated on `available`.
+      - name: Download the latest release's Linux CLI
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p prev
+          if ! gh release download \
+                --pattern 'fqxv-*-x86_64-unknown-linux-musl.tar.gz' \
+                --dir prev --clobber; then
+            echo "::notice::No published release carries an x86_64 Linux CLI asset (first release, private/forked repo, or a failed asset upload). Skipping the cross-release compatibility checks."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tar xzf prev/fqxv-*-x86_64-unknown-linux-musl.tar.gz -C prev
+          chmod +x prev/fqxv
+          tag="$(gh release view --json tagName -q .tagName)"
+          echo "Previous release: $tag"
+          prev/fqxv --version
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Build this PR's CLI
+        if: steps.prev.outputs.available == 'true'
+        run: cargo build -p fqxv-cli
+
+      # Deterministic, seeded, and generated in-job so no fixture has to be kept
+      # in sync with it. Reads are sampled from one synthetic reference so the
+      # depth redundancy the reorder path exists to exploit is actually present.
+      - name: Generate a deterministic FASTQ corpus
+        if: steps.prev.outputs.available == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          python3 - <<'PY'
+          import random
+
+          rnd = random.Random(20260731)
+          REF = "".join(rnd.choice("ACGT") for _ in range(200_000))
+          COMP = str.maketrans("ACGT", "TGCA")
+
+          def rc(s):
+              return s.translate(COMP)[::-1]
+
+          def rec(name, seq):
+              qual = "".join(rnd.choice("+5:=BFI") for _ in range(len(seq)))
+              return f"@{name}\n{seq}\n+\n{qual}\n"
+
+          N, L, INSERT = 4000, 100, 300
+          single, r1, r2, inter = [], [], [], []
+          for i in range(N):
+              p = rnd.randrange(0, len(REF) - INSERT)
+              single.append(rec(f"read{i}", REF[p : p + L]))
+              a = rec(f"spot{i}/1", REF[p : p + L])
+              b = rec(f"spot{i}/2", rc(REF[p + INSERT - L : p + INSERT]))
+              r1.append(a)
+              r2.append(b)
+              inter += [a, b]
+
+          for path, chunks in (
+              ("data/single.fastq", single),
+              ("data/r1.fastq", r1),
+              ("data/r2.fastq", r2),
+              # What `decompress -o` writes for a 2-file (paired) archive.
+              ("data/paired.fastq", inter),
+          ):
+              with open(path, "w") as fh:
+                  fh.write("".join(chunks))
+          PY
+          wc -l data/*.fastq
+
+      # ------------------------------------------------------------------
+      # BACKWARD: old writes, new reads. This is the format's central promise
+      # — an archive on someone's disk from a year ago must still decode — so a
+      # failure here is a hard failure. If this ever goes red, the fix is to
+      # restore the ability to read the old layout, not to relax the test.
+      # ------------------------------------------------------------------
+      - name: Backward compatibility (${{ steps.prev.outputs.tag }} writes, this PR reads)
+        if: steps.prev.outputs.available == 'true'
+        run: |
+          set -uo pipefail
+          OLD=prev/fqxv
+          NEW=target/debug/fqxv
+          TAG='${{ steps.prev.outputs.tag }}'
+          fail=0
+
+          # Only drive the old binary with flags it actually has: a flag added
+          # after the last release would otherwise fail as "unrecognized
+          # argument" and read as a compatibility break.
+          old_has() { "$OLD" compress --help 2>/dev/null | grep -q -- "$1"; }
+
+          backward() {
+            name=$1; expected=$2; shift 2
+            arc="back-$name.fqxv"; out="back-$name.fastq"
+            echo "::group::backward: $name"
+            if ! "$OLD" compress "$@" -o "$arc"; then
+              echo "::error::[$name] $TAG could not compress its own input (not a compatibility failure; check the case)"
+              fail=1; echo "::endgroup::"; return
+            fi
+            if ! "$NEW" decompress "$arc" -o "$out"; then
+              echo "::error::[$name] BACKWARD COMPATIBILITY BROKEN: this build cannot decode an archive written by $TAG"
+              fail=1; echo "::endgroup::"; return
+            fi
+            if ! cmp -s "$expected" "$out"; then
+              echo "::error::[$name] BACKWARD COMPATIBILITY BROKEN: this build decoded a $TAG archive to different bytes"
+              cmp "$expected" "$out" | head -3
+              fail=1; echo "::endgroup::"; return
+            fi
+            echo "ok: $TAG -> this build round-tripped byte-identically"
+            echo "::endgroup::"
+          }
+
+          backward default data/single.fastq data/single.fastq
+          backward paired  data/paired.fastq data/r1.fastq data/r2.fastq
+          # `--keep-order` pins the restored read order, so a reordered archive is
+          # still comparable byte-for-byte against the input.
+          if old_has --order && old_has --keep-order; then
+            backward reorder data/single.fastq data/single.fastq --order any --keep-order
+          else
+            echo "::notice::$TAG has no --order/--keep-order; skipping the backward reorder case"
+          fi
+
+          exit "$fail"
+
+      # ------------------------------------------------------------------
+      # FORWARD: new writes, old reads. Unlike the backward direction this is NOT
+      # a promise — the format is allowed to move forward, and an old fqxv is
+      # allowed to refuse a newer archive. What is never allowed is being *wrong
+      # quietly*. So exactly two outcomes pass:
+      #
+      #   1. the old binary succeeds and the FASTQ is byte-identical
+      #      (the format did not change in a way it cares about), or
+      #   2. the old binary exits non-zero with a recognizable refusal — its
+      #      stderr says "unsupported" / "upgrade fqxv" (fqxv::Error::Unsupported*
+      #      in crates/fqxv/src/lib.rs).
+      #
+      # Everything else fails the job: a success with different bytes is silent
+      # data corruption, and a crash or a bare non-zero exit with no message is a
+      # user who cannot tell "your fqxv is too old" from "your archive is broken".
+      # Bumping FORMAT_MAJOR is fine here; doing it without a clear error is not.
+      # ------------------------------------------------------------------
+      - name: Forward compatibility (this PR writes, ${{ steps.prev.outputs.tag }} reads)
+        if: steps.prev.outputs.available == 'true'
+        run: |
+          set -uo pipefail
+          OLD=prev/fqxv
+          NEW=target/debug/fqxv
+          TAG='${{ steps.prev.outputs.tag }}'
+          fail=0
+
+          forward() {
+            name=$1; expected=$2; shift 2
+            arc="fwd-$name.fqxv"; out="fwd-$name.fastq"; err="fwd-$name.stderr"
+            echo "::group::forward: $name"
+            if ! "$NEW" compress "$@" -o "$arc"; then
+              echo "::error::[$name] this build could not compress its own input"
+              fail=1; echo "::endgroup::"; return
+            fi
+            if "$OLD" decompress "$arc" -o "$out" 2>"$err"; then
+              if cmp -s "$expected" "$out"; then
+                echo "ok: $TAG still reads this build's archives byte-identically"
+              else
+                echo "::error::[$name] SILENT FORMAT CHANGE: $TAG accepted this build's archive and returned DIFFERENT bytes. A format change must make old readers fail loudly, never hand back wrong data."
+                cmp "$expected" "$out" | head -3
+                fail=1
+              fi
+            else
+              rc=$?
+              if grep -qiE 'upgrade fqxv|unsupported' "$err"; then
+                echo "ok: the format moved forward and $TAG refused it clearly (exit $rc):"
+                sed -n '1,3p' "$err"
+              else
+                echo "::error::[$name] $TAG failed to read this build's archive (exit $rc) with no recognizable refusal. A newer format must surface as an \"unsupported ... upgrade fqxv\" error, not a crash or a bare failure."
+                sed -n '1,10p' "$err"
+                fail=1
+              fi
+            fi
+            echo "::endgroup::"
+          }
+
+          forward default data/single.fastq data/single.fastq
+          forward paired  data/paired.fastq data/r1.fastq data/r2.fastq
+          forward reorder data/single.fastq data/single.fastq --order any --keep-order
+
+          exit "$fail"

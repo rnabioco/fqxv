@@ -69,7 +69,7 @@ past the magic + checksum. Seed it with real archives to make it effective:
 
 ```bash
 mkdir -p fuzz/corpus/container
-cp *.fqxv fuzz/corpus/container/          # the sample archives in the repo root
+cp crates/fqxv/tests/fixtures/*.fqxv fuzz/corpus/container/   # the golden fixtures
 ```
 
 The codec targets carry no CRC, so coverage feedback reaches their internals from

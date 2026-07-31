@@ -35,9 +35,11 @@
 //!     region), verified on read so a flipped version/features/flags/binning-tag/
 //!     group-size/platform byte is caught rather than silently changing decode.
 //!     Present in both layouts. The block region (or the reference frame below, if
-//!     present) begins right after this; seek/scan start offsets use the actual
-//!     header length (prefix + ext_len + 4), which equals the ext-empty HEADER_LEN
-//!     for a 1.0-written archive.
+//!     present) begins right after this; seek/scan start offsets MUST use the
+//!     archive's actual header length (prefix + ext_len + 4), never the ext-empty
+//!     HEADER_LEN constant -- an archive carrying member labels has a longer
+//!     header, and the minor version does not tell you which, so the extension
+//!     region is parsed unconditionally.
 //! optional whole-file reference frame (plain layout only, present iff the flags
 //!   bit5 FLAG_GLOBAL_REFERENCE and the GLOBAL_REFERENCE feature bit are set):
 //!   [4] len (LE)  [4] CRC-32C  [len] reference bytes -- a single framed

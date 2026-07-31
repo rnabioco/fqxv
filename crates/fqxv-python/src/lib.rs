@@ -2,7 +2,7 @@
 //!
 //! Exposes three things: a streaming record iterator ([`open`] → [`Reader`]),
 //! whole-archive convenience ([`decompress_to_path`], [`decompress_to_bytes`],
-//! [`inspect`]), and column projection / random access over the v3 footer index
+//! [`inspect`]), and column projection / random access over the footer index
 //! ([`open_index`], [`read_names`], [`read_sequences`], [`read_qualities`],
 //! [`read_block`]). Every entry point accepts a filesystem path (`str` /
 //! `os.PathLike`) or in-memory `bytes`.
@@ -304,6 +304,20 @@ impl PyInfo {
     #[getter]
     fn whole_file_crc(&self) -> Option<u32> {
         self.inner.whole_file_crc
+    }
+    /// Original per-slot labels for the interleaved members (`["R1", "R2"]`,
+    /// `["2", "4"]`, …), or empty when the archive recorded none. This is what
+    /// `--mate-style auto` restores on split, so without it a Python caller has no
+    /// way to see which slot each member came from.
+    #[getter]
+    fn member_labels(&self) -> Vec<String> {
+        self.inner.member_labels.clone()
+    }
+    /// The header's `required_features` word — capability bits a reader must
+    /// understand to decode the archive at all.
+    #[getter]
+    fn required_features(&self) -> u64 {
+        self.inner.required_features
     }
     fn __repr__(&self) -> String {
         // `format_version` is packed `(major << 8) | minor`; show it as `major.minor`.
