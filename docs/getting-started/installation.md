@@ -14,7 +14,7 @@ Release](https://github.com/rnabioco/fqxv/releases), plus a `SHA256SUMS.txt`:
 | `fqxv-vX.Y.Z-x86_64-pc-windows-msvc.zip` | Windows x86-64 |
 
 ```bash
-VER=v0.5.2   # the latest release tag
+VER=v0.6.0   # the latest release tag
 curl -LO https://github.com/rnabioco/fqxv/releases/download/$VER/fqxv-$VER-x86_64-unknown-linux-musl.tar.gz
 tar xzf fqxv-$VER-x86_64-unknown-linux-musl.tar.gz
 mv fqxv ~/.local/bin/

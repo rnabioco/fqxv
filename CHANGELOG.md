@@ -16,7 +16,7 @@ misreading. Compatibility fails loudly, never silently. A format major bump woul
 be announced as a breaking change; see the
 [evolution policy](docs/design/container.md#versioning-and-evolution-policy).
 
-## [Unreleased]
+## [0.6.0] - 2026-07-31
 
 ### Added
 
@@ -36,6 +36,8 @@ be announced as a breaking change; see the
   (a hard failure if that breaks), then does the reverse and requires the old binary
   to either reproduce the bytes exactly or refuse loudly — a silent success with
   different output fails the job.
+- **The changelog is on the documentation site.** Included verbatim from this file,
+  so the two cannot drift.
 - **A documented format evolution policy** (`docs/design/container.md`): which
   mechanism a given change belongs in, the rule that any change to the footer's
   shape or the block payload's stream layout must be gated by a `required_features`
@@ -78,6 +80,16 @@ be announced as a breaking change; see the
 
 ### Fixed
 
+- **`--estimate`'s help text described the wrong mechanism.** It claimed to code the
+  leading reads with the real codecs; it measures the sample's empirical entropy and
+  projects from that, which is why it is so much faster than a real run. The
+  documentation was right and the shipped `--help` string was not. A documentation
+  audit against the actual CLI, bindings, and codecs corrected this and a good deal
+  more — the `fqxv info` sample output was internally impossible, `-v` was
+  documented as debug when it is info, batch mode over several archives or a
+  directory was undocumented, and the container layout diagram omitted the
+  whole-file reference frame that sits between the header and the first block.
+- **`fqxv.Index.groups()` no longer panics** on an allocation failure; it raises.
 - **Unequal input read counts are rejected in both directions.** `compress_multi`
   treated member 0's EOF as a clean end of input, so a *short* member 0 ended the
   archive early and silently dropped the surplus reads from the longer members —
@@ -867,7 +879,7 @@ of FASTQ. Codecs are clean-room implementations from specs and papers
   SPRING and fqz_comp do). Name, sequence, and quality are otherwise preserved
   exactly; this is the one documented deviation from byte-losslessness.
 
-[Unreleased]: https://github.com/rnabioco/fqxv/compare/v0.5.2...HEAD
+[0.6.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.6.0
 [0.5.2]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.2
 [0.5.1]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.1
 [0.5.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.0
