@@ -3011,3 +3011,132 @@ fn index_rejects_reorder_layout() {
     let err = Index::read(io::Cursor::new(&archive)).unwrap_err();
     assert!(matches!(err, Error::Malformed(_)), "got {err:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Forward-compatibility guards.
+//
+// The header's declared extension points — the feature word, the critical bit on
+// an extension tag, and the per-stream method byte — all refuse an archive they
+// can't fully honor. These three tests cover the parts of the layout that are
+// *not* declared extension points, where a structural convention lives in a
+// constant rather than on disk. Each one used to accept a future writer's archive
+// and get it wrong; the guards make them fail closed instead. See the evolution
+// policy in `docs/design/container.md`.
+// ---------------------------------------------------------------------------
+
+/// A payload carrying a fourth stream decoded its first three and dropped the rest
+/// in silence — and the content digests, which cover only the streams that were
+/// read, still matched, so the archive looked perfectly healthy. Refuse instead.
+#[test]
+fn block_payload_with_trailing_bytes_is_refused() {
+    // 3 digests, n_reads, then three empty length-prefixed streams. The guard sits
+    // ahead of any codec call, so the stream contents are irrelevant here.
+    let mut payload = vec![0u8; 24];
+    payload.extend_from_slice(&0u32.to_le_bytes()); // n_reads
+    for _ in 0..3 {
+        payload.extend_from_slice(&0u32.to_le_bytes());
+    }
+    let clean = block::decode_block_parts(&payload, None);
+    assert!(
+        !matches!(&clean, Err(Error::Malformed(m)) if m.contains("trailing bytes")),
+        "a well-formed three-stream payload must not trip the guard: {clean:?}"
+    );
+
+    for tail in [
+        // A fourth length-prefixed stream, i.e. what a future minor would add.
+        vec![4, 0, 0, 0, b'a', b'b', b'c', b'd'],
+        // Unframed trailing bytes.
+        vec![0xde, 0xad],
+    ] {
+        let mut forged = payload.clone();
+        forged.extend_from_slice(&tail);
+        let err = block::decode_block_parts(&forged, None).unwrap_err();
+        assert!(
+            matches!(&err, Error::Malformed(m) if m.contains("trailing bytes")),
+            "expected the trailing-bytes guard, got {err:?}"
+        );
+    }
+}
+
+/// The footer's per-group record size is a constant carried nowhere on disk, so a
+/// footer written at a different stride used to CRC-check fine and then be walked
+/// wrong — `info` reported a 1,000-read archive as 46,048 reads. Require the body
+/// length to match the group count exactly.
+#[test]
+fn footer_size_must_match_its_group_count() {
+    /// Build a footer body for one row group, optionally at a wrong stride or with
+    /// a trailing field, sealing both CRCs the way a real writer would.
+    fn body(extra_per_group: usize, tail: &[u8]) -> Vec<u8> {
+        let off = HEADER_LEN as u64;
+        let mut b = 1u32.to_le_bytes().to_vec(); // n_groups
+        b.extend_from_slice(&off.to_le_bytes());
+        b.extend_from_slice(&1u32.to_le_bytes()); // read_count
+        for _ in 0..3 + extra_per_group {
+            b.extend_from_slice(&off.to_le_bytes()); // stream offset
+            b.extend_from_slice(&0u32.to_le_bytes()); // len
+            b.extend_from_slice(&0u32.to_le_bytes()); // crc
+        }
+        b.extend_from_slice(&1u64.to_le_bytes()); // total_reads
+        b.extend_from_slice(tail);
+        b.extend_from_slice(&0u32.to_le_bytes()); // whole_file_crc
+        let crc = crc32c(&b);
+        b.extend_from_slice(&crc.to_le_bytes());
+        b
+    }
+
+    // The footer offset must sit past the single group's block for the range
+    // checks to pass; anything beyond HEADER_LEN does.
+    let footer_offset = HEADER_LEN as u64 + 4096;
+    let ok = format::parse_footer_body(&body(0, &[]), footer_offset);
+    assert!(ok.is_ok(), "a well-formed footer must still parse: {ok:?}");
+
+    for (what, forged) in [
+        ("a fourth per-group stream triple", body(1, &[])),
+        (
+            "a new field appended to the body",
+            body(0, &1u64.to_le_bytes()),
+        ),
+    ] {
+        let err = format::parse_footer_body(&forged, footer_offset).unwrap_err();
+        assert!(
+            matches!(&err, Error::Malformed(m) if m.contains("row-group count")),
+            "expected the footer-size guard for {what}, got {err:?}"
+        );
+    }
+}
+
+/// Every flag bit changes how the archive is read, so an unknown one means the
+/// writer intended something this reader will not do. The two free bits used to be
+/// ignored silently, decoding the archive under the old interpretation.
+#[test]
+fn unknown_header_flag_bits_are_refused() {
+    let build = |flags: u8| {
+        let mut out = Vec::new();
+        format::write_header_prefix(
+            &mut out,
+            &format::HeaderPrefix {
+                seq_order: 3,
+                binning: 0,
+                flags,
+                group_size: 1,
+                platform: Platform::Illumina,
+                required_features: 0,
+            },
+            &[],
+        )
+        .unwrap();
+        out
+    };
+    for bit in [0x40u8, 0x80] {
+        let buf = build(format::FLAG_PLUS_NORMALIZED | bit);
+        let err = format::read_header(&mut io::Cursor::new(&buf)).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedFlags(b) if b == bit),
+            "flag bit {bit:#x}: expected UnsupportedFlags, got {err:?}"
+        );
+    }
+    // Every bit we do know must still be accepted, or the mask is wrong.
+    let buf = build(format::KNOWN_FLAGS);
+    let h = format::read_header(&mut io::Cursor::new(&buf)).expect("KNOWN_FLAGS must parse");
+    assert_eq!(h.flags, format::KNOWN_FLAGS);
+}

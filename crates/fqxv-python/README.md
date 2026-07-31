@@ -57,6 +57,10 @@ print(est.ratio, est.archive_bytes, est.exhausted)
 est = fqxv.estimate(["R1.fastq.gz", "R2.fastq.gz"])
 ```
 
+The on-disk `.fqxv` format is stable at 1.0 (a version independent of this
+package's), so archives written today stay readable by later releases — and an
+archive this build cannot read is refused with an error, never misread.
+
 Projection and `open_index` are unavailable for globally-reordered archives
 (`--order shuffle`), whose streams are mutually dependent; use `fqxv.open()` to
 iterate those. Everything here is read-only: `verify` and `estimate` only

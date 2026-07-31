@@ -8,9 +8,13 @@ block-based container.
 !!! success "The on-disk format is stable at 1.0"
 
     Archives written today stay readable by later releases. A reader accepts its
-    own format major version and tolerates newer minors, and additive features are
-    gated behind feature bits that an older reader refuses outright rather than
-    misreading — so compatibility fails loudly, never silently.
+    own format major version and tolerates newer minors, skips additions it can
+    safely ignore (a non-critical header extension record), and refuses the ones it
+    cannot — a required-feature bit at header-read, or a per-block codec it does not
+    know when it reaches that block — with an "upgrade fqxv" error rather than
+    misreading. Compatibility fails loudly, never silently. The format version is independent of the crate version: the format is
+    at 1.0 while the crates are still 0.x. See the
+    [evolution policy](design/container.md#versioning-and-evolution-policy).
 
     Every archive is deterministic (byte-identical regardless of thread count) and
     carries per-block and per-stream checksums; `compress --verify` re-decodes a

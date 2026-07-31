@@ -106,9 +106,14 @@ is the check to run before deleting the source FASTQ.
 ## Estimating compression
 
 `--estimate` tells you how well an input will compress **before** committing to a
-full run. It codes a bounded sample of the leading reads (about one block, up to
-~1M reads) with the real codecs at the chosen `--level`/`--quality-bin`, then
-projects the whole-file archive and prints the result — no archive is written:
+full run. It takes a bounded sample of the leading reads (about one block, up to
+~1M reads) and predicts the archive **without coding it**: the real codecs are
+entropy coders, so a histogram pass measures directly what they converge to —
+static order-k sequence entropy (blended with a k-mer duplication sketch on the
+long-read path), order-1 quality entropy, and the real tokenizer for names, each
+scaled by a small per-platform calibration factor. It then projects the whole-file
+archive at the chosen `--level`/`--quality-bin` and prints the result — no archive
+is written:
 
 ```text
 reads.fastq.gz (436.93 MB)  →  estimated fqxv ~216.87 MB  (50% smaller, ~2.01x)

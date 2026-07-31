@@ -5,11 +5,105 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The on-disk `.fqxv` format is **stable at 1.0**. Archives written by a 1.x release
-remain readable by later ones: a reader accepts its own format major version and
-tolerates newer minors, and additive features are gated behind required-feature
-bits, so a reader that predates a feature refuses the archive outright rather than
-misreading it. A format major bump would be announced as a breaking change.
+The on-disk `.fqxv` format is **stable at 1.0**. That version is independent of the
+release versions below — the format is at 1.0 while the crates are still 0.x, and
+the two numbers move separately. Archives written by any format-1.x writer remain
+readable by later releases: a reader accepts its own format major version and
+tolerates newer minors, skips additions it can safely ignore (a non-critical header
+extension record), and refuses the ones it cannot — a required-feature bit or a
+per-block codec method it does not know — with an "upgrade fqxv" error rather than
+misreading. Compatibility fails loudly, never silently. A format major bump would
+be announced as a breaking change; see the
+[evolution policy](docs/design/container.md#versioning-and-evolution-policy).
+
+## [Unreleased]
+
+### Added
+
+- **Golden archive fixtures pin the on-disk format.** `crates/fqxv/tests/fixtures/`
+  now holds one small archive per on-disk layout — plain/order-k, grouped (with the
+  header extension record), the whole-file reorder layout, and the long-read overlap
+  codec — plus a manifest of what each must decode to. Until now *every* test in the
+  workspace compared a build against itself: the round-trips, the proptests, the
+  fuzz targets, the thread-determinism byte-comparisons, and the accession corpus
+  (which recompresses from FASTQ each run) are all invariant to a change that moves
+  the encoder and decoder together, which is exactly the change that breaks archives
+  already written. Regenerate with
+  `cargo run --release -p fqxv --example make_fixtures -- crates/fqxv/tests/fixtures`,
+  but note that regenerating is almost always the wrong response to a failure.
+- **CI checks cross-release compatibility.** A new `compat` job downloads the
+  previous release's CLI, compresses with it and decompresses with the PR build
+  (a hard failure if that breaks), then does the reverse and requires the old binary
+  to either reproduce the bytes exactly or refuse loudly — a silent success with
+  different output fails the job.
+- **A documented format evolution policy** (`docs/design/container.md`): which
+  mechanism a given change belongs in, the rule that any change to the footer's
+  shape or the block payload's stream layout must be gated by a `required_features`
+  bit, and the project's intent on major bumps (a last resort; a format-1 read path
+  is retained if one ever happens).
+
+### Changed
+
+- **Three implicit parts of the layout now fail closed.** Each was a structural
+  convention living in a constant rather than on disk, and each would accept an
+  archive from a future writer and get it wrong:
+  - A block payload carrying a **fourth stream** decoded its first three and dropped
+    the rest with no error at all — and the per-block content digests, which cover
+    only the streams that were read, still matched, so the archive looked healthy.
+    Trailing bytes after the three streams are now rejected.
+  - A **footer written at a different per-group stride** (a future fourth stream
+    location) passed its CRC and was then walked at the wrong stride, producing an
+    index that could satisfy every range check: `fqxv info` reported a 1,000-read
+    archive as 46,048 reads. The footer body length must now match its row-group
+    count exactly.
+  - **Unknown header flag bits** (6 and 7) were ignored, so a future flag whose
+    meaning is purely semantic would decode under the old interpretation with every
+    CRC and digest still matching. Unknown bits are now refused with a new
+    `Error::UnsupportedFlags`.
+
+  All three are backward compatible: no archive any release has written trips them.
+- **Original per-slot member labels are recorded and restored.** Member identity in
+  the container is positional, so `decompress_split` could only number its outputs
+  `_R1.._RG` — compressing a run's `_2.fastq` + `_4.fastq` and restoring them
+  renamed them `_R1`/`_R2`, and a 10x `I1` came back as `_R3`. The CLI now derives
+  each member's slot token from the input file names (all-or-nothing: every input
+  must yield a distinct token, or nothing is recorded) and stores them in the
+  header. `--mate-style auto` (the new default) restores the stored labels, falling
+  back to `_R1`,`_R2`,…; explicit `r`/`num` stay positional. This is the **first
+  user of the header extension region**: a non-critical TLV record (tag `0x01`), so
+  a reader that predates the tag skips it and decodes byte-identical reads under
+  positional names. The format version deliberately stays at **1.0** — the record is
+  skippable, and nothing about decoding depends on it. Archives compressed without
+  labels still write an empty extension region.
+
+### Fixed
+
+- **Unequal input read counts are rejected in both directions.** `compress_multi`
+  treated member 0's EOF as a clean end of input, so a *short* member 0 ended the
+  archive early and silently dropped the surplus reads from the longer members —
+  yielding a well-formed, CRC-valid archive that was quietly missing data and still
+  reported success (with an inflated ratio, since it is computed against the full
+  input size). All three interleaving sites now confirm members 1..G are also spent.
+  The reverse direction already errored.
+- **A trailing partial spot is rejected in the reorder layout too.** The plain
+  layout refuses an interleaved stream whose record count is not a multiple of the
+  group size, but the reorder layout only checked it at one call site, which
+  `compress_auto` bypasses — so `--order any` / `--max` on a mate-named stream with
+  an odd record count recorded `group_size = 2` over a stream that is not
+  spot-aligned and split it into mismatched files. The check moved into
+  `encode_reordered`, the choke point every reorder entry point passes through.
+- **The streaming parser validates the `+` separator line.** `read_raw_record`
+  compared only the sequence and quality lengths, so a header line followed by EOF
+  (`"@name\n"`) parsed as a zero-length record — silently repairing a truncated file
+  into a valid archive — and a garbage third line was consumed and discarded. Both
+  were reachable only through the multi-input path (a single-file compress rejects
+  them at the noodles-based peek). The `+` line's *content* is still dropped; `+`
+  normalization is unchanged.
+- **A non-empty header extension region no longer corrupts the footer.**
+  `FooterIndex::new` seeded block offsets from the extension-empty header length and
+  the recovery scan started there, so any extension record shifted every recorded
+  offset and failed the footer CRC. Both now use the header's actual length. The
+  region had never been exercised before the member-label record.
 
 ## [0.5.2] - 2026-07-29
 
@@ -593,8 +687,8 @@ misreading it. A format major bump would be announced as a breaking change.
   refuses a differing major and tolerates a newer minor, and additive features are
   gated behind required-feature bits so a reader that predates a feature refuses
   the archive outright rather than misreading it. That contract is now a stability
-  guarantee — archives written by a 1.x release stay readable by later ones, and a
-  major bump would be announced as a breaking change. The 1.0 format carries the
+  guarantee — archives written by any format-1.x writer stay readable by later
+  releases, and a major bump would be announced as a breaking change. The 1.0 format carries the
   long-read overlap codec, the extended per-stream footer index, and the
   per-stream block digests below.
 - **`platform` has its own header byte** — the platform tag no longer shares bits
@@ -773,6 +867,7 @@ of FASTQ. Codecs are clean-room implementations from specs and papers
   SPRING and fqz_comp do). Name, sequence, and quality are otherwise preserved
   exactly; this is the one documented deviation from byte-losslessness.
 
+[Unreleased]: https://github.com/rnabioco/fqxv/compare/v0.5.2...HEAD
 [0.5.2]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.2
 [0.5.1]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.1
 [0.5.0]: https://github.com/rnabioco/fqxv/releases/tag/v0.5.0

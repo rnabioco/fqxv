@@ -8,11 +8,15 @@ one-crate-per-algorithm codecs plus a container format and CLI.
 
 ![fqxv compress and decompress demo](docs/images/readme.gif)
 
-**The on-disk format is stable at 1.0.** Archives written today stay readable by
-later releases: a reader accepts its own major version and tolerates newer minors,
-and additive features are gated behind feature bits that an older reader refuses
-outright rather than misreading. Every archive is **deterministic** (byte-identical
-regardless of thread count), checksummed, and **verified lossless** on decode.
+**The on-disk format is stable at 1.0** — a number independent of the crate
+version (currently 0.5.x); the format and the software are versioned separately.
+Archives written today stay readable by later releases: a reader accepts its own
+format major version and tolerates newer minors, additions it can safely ignore
+(a skippable header record) it skips, and anything it cannot — a required feature
+bit or a codec it does not know — it refuses with an "upgrade fqxv" error rather
+than misreading. Compatibility fails loudly, never silently. Every archive is
+**deterministic** (byte-identical regardless of thread count), checksummed, and
+**verified lossless** on decode.
 
 ## Results
 

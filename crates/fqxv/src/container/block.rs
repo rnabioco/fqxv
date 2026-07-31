@@ -266,10 +266,14 @@ pub(crate) enum SeedContext {
 /// `k`, so anchor density (`2/(w + 1)`) and specificity are unchanged — only
 /// *which* positions are selected differs.
 ///
-/// The sketch affects ratio and speed only — the block self-describes `(w, k)`,
-/// so decode is unaffected, and the keep-the-smaller rule in
-/// [`encode_sequence_stream`] means a mis-detected platform can never regress a
-/// block below order-k.
+/// The sketch affects ratio and speed only. Nothing about it is on the wire —
+/// seeding is an encode-side choice, and the decoder replays the stored edit
+/// scripts rather than re-sketching, so it never needs `(w, k)` back. (An earlier
+/// version of this comment claimed the block self-describes them; it does not, and
+/// the distinction matters: it is the decoder's indifference that makes the sketch
+/// free to change, not a field that would have to be honored.) The
+/// keep-the-smaller rule in [`encode_sequence_stream`] means a mis-detected
+/// platform can never regress a block below order-k.
 pub(crate) fn sketch_for(platform: Platform, ctx: SeedContext) -> fqxv_lroverlap::Sketch {
     match (platform, ctx) {
         (Platform::PacBio, _) => fqxv_lroverlap::Sketch::hifi(),
@@ -933,6 +937,18 @@ pub(crate) fn decode_block_parts(
     // Slice out the three compressed streams (cheap, sequential), then decode
     // them concurrently — same rationale as the encode side.
     let (names_s, seq_s, qual_s) = (c.slice_u32()?, c.slice_u32()?, c.slice_u32()?);
+    // The stream count is a constant here, not a field on disk, so a payload
+    // carrying a fourth stream would decode its first three and drop the rest
+    // without a word — the content digests below cover only the streams we did
+    // read, so they would confirm a correct-looking decode of an archive we had
+    // silently thrown data out of. Refuse instead: within format major 1 the
+    // payload is exactly three streams, and any writer adding a fourth must set a
+    // `required_features` bit so an older reader stops at the header.
+    if !c.rest().is_empty() {
+        return Err(Error::Malformed(
+            "block payload has trailing bytes after the three streams",
+        ));
+    }
     // A sequence-conditioned quality stream (long reads) must see the decoded
     // bases, so decode the sequence first and feed it in. Short-read quality is
     // sequence-blind, so keep decoding the two streams in parallel — the common

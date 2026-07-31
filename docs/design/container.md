@@ -24,9 +24,11 @@ seek to any of them without scanning the file.
 [1]  platform tag               (0 unknown, 1 Illumina, 2 Nanopore,
                                  3 PacBio, 4 MGI/BGI)
 [2]  ext_len (LE u16)           (bytes of the extension region below)
-[ ]  extension region           (TLV records [1 tag][2 len][len bytes];
-                                 empty at 1.0, lets a later minor add skippable
-                                 header fields without a major bump)
+[ ]  extension region           (TLV records [1 tag][2 len][len bytes]; the tag's
+                                 high bit marks a record as critical — an unknown
+                                 critical tag is refused, an unknown non-critical
+                                 tag is skipped. Tag 0x01 (non-critical) carries
+                                 the per-member slot labels)
 [4]  header CRC-32C (LE)        (over the header prefix + extension region)
 repeated until the terminator:
   [4]  block sync marker "FQXB"          (recovery scans for it to resync)
@@ -50,12 +52,23 @@ trailer (at EOF):
   [4]  magic "FQXF"
 ```
 
-The on-disk format is versioned `major.minor` (currently **1.0**). A reader
-refuses an archive whose **major** differs from its own — that archive is
-wire-incompatible — but tolerates a newer **minor**, since a minor bump only adds
-backward-compatible things (a skippable header extension record, or a new optional
-codec gated by a `required_features` bit). The fixed header prefix is 21 bytes; with
-the empty 1.0 extension region and the 4-byte CRC the whole header is 25 bytes.
+The on-disk format is versioned `major.minor` (currently **1.0**, independent of
+the crate version). A reader refuses an archive whose **major** differs from its
+own — that archive is wire-incompatible — but tolerates a newer **minor**, since a
+minor bump only adds backward-compatible things (a skippable header extension
+record, or a new optional codec gated by a `required_features` bit). See
+[Versioning and evolution policy](#versioning-and-evolution-policy) for what
+warrants which.
+
+**The header is variable-length.** The fixed prefix is 21 bytes and the trailing
+CRC is 4, but the extension region between them is *not* always empty — a 1.0
+archive records per-member slot labels there (tag `0x01`), so its header is longer
+than the 25-byte extension-empty minimum. A reader MUST parse the extension region
+(regardless of the minor version — 1.0 archives already use it) and MUST derive the
+header length as `prefix + ext_len + 4` from the archive's own `ext_len`. Anything
+positioned after the header — the first block frame, a recovery scan's start, the
+block offsets recorded in the footer — is relative to *that* length, never a
+hardcoded 25.
 
 Each block payload:
 
@@ -292,3 +305,52 @@ Read name + description, sequence, and quality bytes are preserved exactly. The
 not retained), matching SPRING and fqz_comp. With `--quality-bin`, quality is
 mapped through the chosen binning table (Illumina, ONT, or PacBio HiFi) before
 coding — an explicit, opt-in lossy transform.
+
+## Versioning and evolution policy
+
+The format version (`major.minor`, currently 1.0) is **independent of the crate
+version** — the format is at 1.0 while the crates are still 0.x. The format
+version changes only when the bytes on disk do.
+
+The format has four escalating ways to add something, and the choice is decided by
+one question: *what must an old reader do when it meets this?*
+
+- **Minor bump alone** — the old reader may ignore it and still decode every byte
+  correctly. This covers a new **non-critical** extension record and nothing else.
+  Old readers skip the record; the minor is informational (nothing branches on it).
+  The per-member slot labels (tag `0x01`) are the worked example: they change only
+  what `decompress_split` *names* its outputs, so an archive that carries them
+  decodes to identical reads on a reader that has never heard of them.
+- **A `required_features` bit** — the old reader cannot decode the archive at all
+  without a capability, and that is knowable before the blocks are written. The bit
+  is refused at header-read with an "upgrade fqxv" error, before a single block is
+  touched. This is the gate for whole-archive structural change; the whole-file
+  `GLOBAL_REFERENCE` frame is the existing one. (An unknown *flags* bit is refused
+  the same way — every flag changes how the archive is read — but the flags byte has
+  only two free bits, so it is not an evolution mechanism.)
+- **A critical extension tag** (tag high bit set) — the same "refuse it" outcome
+  for a *header field* whose meaning an old reader must not guess. Prefer a feature
+  bit for capabilities; reserve a critical tag for metadata that is genuinely
+  header-shaped and load-bearing.
+- **A major bump** — the change cannot be expressed by any of the above: the fixed
+  header prefix, the frame/trailer framing, or the magic itself changes, so an old
+  reader cannot even parse far enough to be told no.
+
+**The gating rule.** Any change to the footer's shape — the field set or order of
+the row-group index — or to the block payload's stream layout MUST be gated by a
+`required_features` bit, so an old reader refuses at the header instead of parsing
+a differently-shaped structure into plausible garbage. A *per-block codec* choice
+is the exception, and only because it is already self-describing: it rides the
+sequence stream's leading method byte and surfaces as `UnsupportedMethod`
+mid-decode. That fails loudly, but it fails later than a header refusal — so a new
+method byte is acceptable for an alternative encoding of the same streams, and is
+*not* a substitute for a feature bit when the block's layout itself changes.
+
+**On major bumps.** A major bump is a last resort. The extension mechanisms are
+sized so it should not be needed: 63 unused `required_features` bits, a TLV
+extension region that can hold up to 64 KiB of skippable or critical header
+records, and 251 unused sequence method-byte values. Between them, foreseeable
+evolution — new codecs, new metadata, new whole-file structures — fits inside
+format 1. Today a differing major is refused unconditionally, with no legacy read
+path; if a major bump ever does happen, the reader will keep a read path for
+format 1 archives, so an archive written today does not become unreadable.

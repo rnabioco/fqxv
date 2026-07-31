@@ -1,0 +1,5 @@
+# name	expected_len	expected_crc32c	note
+plain_se	94800	2616439093	plain layout, order-k sequence
+paired_labels	100000	1304181949	G=2 interleaved, header extension tag 0x01 (member labels)
+reorder	838893	1005983735	whole-file global-cluster reorder layout (order discarded)
+longread	446360	3529751335	long-read cross-read overlap sequence codec

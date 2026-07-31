@@ -58,11 +58,33 @@ jobs:
         with:
           workspaces: fuzz
       - uses: taiki-e/install-action@cargo-fuzz
-      - name: Seed corpus with sample archives (container only)
+      # The container target must guess the `FQXV` magic AND a valid CRC-32C over
+      # the 21-byte header prefix before a single mutation reaches a decode path,
+      # so it is only worth running against a corpus of real archives.
+      #
+      # This step used to be `cp *.fqxv fuzz/corpus/container/ 2>/dev/null || true`,
+      # which was a permanent silent no-op: no `.fqxv` is tracked at the repo root,
+      # `fuzz/.gitignore` ignores `corpus`, and the `|| true` swallowed the miss —
+      # so every weekly run started from an empty corpus. Seed from the checked-in
+      # golden fixtures instead, and fail loudly on zero files so this cannot
+      # quietly rot back into a no-op.
+      - name: Seed corpus with the golden archive fixtures (container only)
         if: matrix.target == 'container'
         run: |
+          set -euo pipefail
+          fixtures=crates/fqxv/tests/fixtures
+          count=0
+          if [ -d "$fixtures" ]; then
+            count=$(find "$fixtures" -maxdepth 1 -type f -name '*.fqxv' | wc -l)
+          fi
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No seed archives found in $fixtures/*.fqxv. The container fuzzer would start from an empty corpus and spend the whole run guessing the header magic and CRC — refusing to run a worthless fuzz session."
+            exit 1
+          fi
           mkdir -p fuzz/corpus/container
-          cp *.fqxv fuzz/corpus/container/ 2>/dev/null || true
+          cp "$fixtures"/*.fqxv fuzz/corpus/container/
+          echo "Seeded the container corpus with $count archive(s):"
+          ls -l fuzz/corpus/container/
       # `-malloc_limit_mb=0` (with ASAN_OPTIONS=allocator_may_return_null=1) stops
       # the sanitizer aborting when a decoder's `try_reserve` asks the allocator
       # for a corrupt-length-sized block — that returns an error, not a crash. A
