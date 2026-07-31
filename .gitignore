@@ -15,6 +15,11 @@ Cargo.lock.orig
 *.fastq
 *.fastq.gz
 *.fqxv
+# ...except the golden archive fixtures, which are the only .fqxv files that
+# belong in git: they pin the on-disk format so a later release can prove it
+# still decodes what an earlier one wrote. The blanket rule above silently
+# skipped them on `git add -A` until the golden test failed in CI.
+!crates/fqxv/tests/fixtures/*.fqxv
 # Slurm job logs. submit_parallel.sh routes these to the results dir, but a
 # directly-submitted sbatch still writes to the submission dir — keep them out
 # of git status either way.
