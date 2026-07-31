@@ -10,6 +10,17 @@ harness in `bench/`, 4M-read subsets, 44 threads per tool, single node.
     quality regime (full-range vs binned). Run the `bench/` harness on your own
     libraries before drawing conclusions.
 
+!!! note "Provenance"
+    The Illumina tables were last regenerated 2026-07-15, the long-read tables
+    2026-07-22. Both are **4M-read subsets**; the whole-file per-dataset matrix —
+    the source of the ratios quoted in the README, which are higher because ratio
+    grows with file size — lives in the repository's `bench/RESULTS.md`, along with
+    MiSeq, MGI/BGISEQ and miRNA rows this page does not cover. Codec work landing
+    after those dates was performance-only, so the ratios stand for the current
+    release; the compress-throughput columns predate it. Field-tool versions are
+    whatever the repository's `pixi.lock` pins for the `bench` environment
+    (`pixi list -e bench`).
+
 `fqxv` has three operating points, all **lossless** on sequence and quality and,
 uniquely among the tools here, **deterministic** (byte-identical output
 regardless of thread count):
@@ -72,7 +83,9 @@ fqxv is ~10× faster than zstd -19 / xz -9 while beating them on ratio.*
   full-range), under the same rules SPRING plays by (reorder + renumber). SPRING
   keeps the original read *names*; `fqxv --order shuffle` renumbers, but the name
   stream is a rounding error either way (~a few KB on a 60 MB archive), so this is
-  an apples-to-apples ratio win from `fqxv`'s sequence and quality coding.
+  an apples-to-apples ratio win from `fqxv`'s sequence and quality coding. It does
+  not hold everywhere: on the hardest short-read case in the wider matrix
+  (MGI/BGISEQ, `bench/RESULTS.md`) SPRING is still smaller.
 - **`fqxv --max` is the best-ratio *fully* lossless option** — it additionally
   preserves original read order and names, which SPRING does not. That guarantee
   costs a read-order permutation: on NovaSeq the `--max` archive is
@@ -185,10 +198,11 @@ different coverage/error regime:
 - **Raw large-window LZMA** — the ordinary-coverage lever, and the biggest change
   this cycle. A real genome at typical (not 300×) coverage carries **exact**
   cross-read matches that neither the within-read model nor a per-block voted
-  consensus can reach. On the modern **Revio WGS** run (`hifi_revio_wgs`, 1.35
-  Gbase) it cuts the sequence stream from **1.391 to 0.683 bits/base**, taking the
-  whole archive from **9.7× to 17×** — from the worst lossless result in the suite
-  to a strong second behind CoLoRd (18.8×), now ahead of both zstd -19 and xz -9.
+  consensus can reach. On the modern **Revio WGS** run (`hifi_revio_wgs`,
+  SRR36938642, 1.35 Gbase) it cuts the sequence stream from **1.391 to 0.683
+  bits/base**, taking the whole archive from **9.7× to 17×** — from the worst
+  lossless result in the suite to a strong second behind CoLoRd (18.8×), now
+  ahead of both zstd -19 and xz -9.
 - **Multi-reference tiling + anchor-restricted coding** — the Nanopore lever. Each
   read is coded against earlier *raw* reads with best-of-N reference selection
   (engaged at `-l9`/`--max`), which pays where a read sits closer to another single

@@ -19,7 +19,9 @@ seek to any of them without scanning the file.
 [1]  flags                      (bit0 '+' normalized; bit1 reordered;
                                  bit2 keep-order; bit3 global-reorder;
                                  bit4 regen-names; bit5 global-reference;
-                                 bits6-7 free)
+                                 bits6-7 free. An unknown set bit is refused,
+                                 not ignored — every flag changes how the
+                                 archive is read)
 [1]  group size G               (1 single-end, 2 paired, 3-4 single-cell)
 [1]  platform tag               (0 unknown, 1 Illumina, 2 Nanopore,
                                  3 PacBio, 4 MGI/BGI)
@@ -30,6 +32,12 @@ seek to any of them without scanning the file.
                                  tag is skipped. Tag 0x01 (non-critical) carries
                                  the per-member slot labels)
 [4]  header CRC-32C (LE)        (over the header prefix + extension region)
+optional whole-file reference frame (plain layout only; present iff flag bit5 and
+the GLOBAL_REFERENCE feature bit are set):
+  [4]  len (LE)  [4] CRC-32C  [len] reference bytes
+                                (one framed long-read consensus reference,
+                                 assembled once over the whole file; the footer's
+                                 block offsets start past it)
 repeated until the terminator:
   [4]  block sync marker "FQXB"          (recovery scans for it to resync)
   [8]  block payload length (LE, nonzero)
@@ -92,6 +100,33 @@ content — one digest per stream (names, sequence, post-binning quality), verif
 after decode, so a mismatch localizes which stream a codec round-tripped wrong —
 see [Integrity](#integrity).
 
+The stream count is a constant, not a field on disk, so a payload is **exactly**
+three streams: a reader that finds bytes left over after the quality stream must
+reject the block rather than decode the three it recognizes. Otherwise a payload
+carrying a fourth stream would decode and pass every CRC and every content digest
+while silently discarding data. Adding a stream within format major 1 is not
+permitted; see [the gating rule](#versioning-and-evolution-policy).
+
+### Sequence method bytes
+
+The `seq` stream leads with one byte naming its codec, so a block is
+self-describing and one file may mix codecs block to block:
+
+| byte | codec |
+| --- | --- |
+| `0` | order-k context model (`fqxv-seq`) — always coded, the floor |
+| `1` | long-read overlap-consensus, block-local (`fqxv-lroverlap`) |
+| `2` | long-read overlap against the archive's shared reference frame |
+| `3` | raw large-window LZMA over the block's bases (`fqxv-seq`'s clean-room LZMA) |
+| `4` | multi-reference tiling against earlier raw reads (Nanopore) |
+
+The encoder codes several candidates and keeps the smallest, so the method byte
+records a measured outcome rather than a mode the user selected; order-k is always
+among them, which is what makes a long-read codec unable to enlarge a block. An
+unrecognized value is refused (`UnsupportedMethod`) rather than guessed at, and
+method `2` fails closed when the archive carries no reference frame. See
+[long reads](longread.md#wiring-and-the-per-block-coverage-cap).
+
 ## Streaming vs. seeking
 
 The block region carries an inline `[8]` length before every payload, so a
@@ -130,6 +165,16 @@ the plain layout; reordered archives use a distinct self-describing layout
   block's content digests cover the *decoded* streams and so cannot check a
   projected fetch of *coded* bytes, so each coded stream also carries its own
   CRC-32C in the footer.
+
+The per-group record size is a compile-time constant recorded nowhere on disk, so
+a reader checks the footer body's length **exactly** against its `n_row_groups` —
+`4 + 60 × n_row_groups + 8 + 4` bytes — and rejects any other size. Merely
+requiring "large enough" would let a footer written at a different stride pass its
+own CRC and then be walked at the wrong one, producing offsets that survive the
+range checks and get reported as fact. The consequence is deliberate: **the footer
+cannot grow within format major 1**, and any change to its shape must set a
+`required_features` bit so an older reader refuses at the header, long before it
+seeks here.
 
 ### Random-access API
 
@@ -178,14 +223,18 @@ so determinism holds.
 
 Capping a block at the byte budget also caps how much coverage a long-read block's
 overlap codec sees, and each block otherwise self-assembles (and re-stores) its own
-consensus reference. For long-read input the container hoists that reference out:
+consensus reference. For long-read input the container hoists that reference out
+(explicitly-declared Nanopore excepted — at ~10% error the whole-file consensus is
+too noisy to pay, so it stays on the per-block layout and streams):
 it assembles one consensus over the whole file and stores it **once** in a framed
 region between the header and the first block (gated by the `GLOBAL_REFERENCE`
 feature bit and flag bit5), then codes every block's reads against that frozen
 frame (sequence method byte 2). Placement is per-read against an immutable frame,
 so blocks stay byte-budgeted, parallel, and independently decodable given the
 frame, while the genome is stored once rather than once per block. A whole-file
-never-worse gate adopts the layout only when it beats the plain order-k total. See
+never-worse gate adopts the layout only when the frame plus the reference-coded
+sequence beats the plain layout it would otherwise fall back to (which is itself
+the per-block best of the other methods, not order-k alone). See
 [long reads](longread.md#wiring-and-the-per-block-coverage-cap).
 
 ## Grouping (paired-end and single-cell)
@@ -242,22 +291,32 @@ byte, so blocks may mix versions and decode dispatches on the byte:
   whose suffix overlaps another's prefix are chained into fewer, longer
   super-contigs) and stored once in the `global reference` frame.
 
-v4 is enabled by the adaptive rescue path (default under `--order any`; disabled by
-`--no-rescue`). It is only ever adopted when `reference frame + Σ min(v2,v3,v4)` is
-strictly smaller than the block-local `Σ min(v2,v3)` total, so the flag bit5
-reference is written only when it nets a whole-file win — v4 can never enlarge the
-archive.
+Exactly one block-local codec is coded per archive: v3 on the adaptive rescue path
+(the default under `--order any`) and v2 under `--no-rescue`, since v3 generalizes
+v2 and degenerates to the same coding, making it the block-local floor on its own.
+v4 is a candidate only on the rescue path, coded per block alongside the
+block-local one; the smaller wins, and the whole-file layout is adopted only when
+`reference frame + Σ min(block-local, v4)` is strictly smaller than `Σ block-local`.
+So the flag bit5 reference is written only when it nets a whole-file win — v4 can
+never enlarge the archive. Ties keep the lower version, for determinism.
 
-**Reference-frame coding.** The `global reference` frame begins with a method byte.
-Both methods use the **clean-room order-k `fqxv-seq` context coder** — there is no
-external compressor here (the earlier xz/`liblzma` reference path was removed, so
-the whole codec stack is pure-Rust clean-room):
+**Reference-frame coding.** The `global reference` frame begins with its own method
+byte. Every method is clean-room and pure-Rust — there is no external compressor
+here (the earlier xz/`liblzma` reference path was removed):
 
-- `0` — the whole reference coded in a single `fqxv-seq` pass.
-- `1` (the default) — the reference split into a fixed number of contig blocks,
-  each coded with `fqxv-seq` **in parallel**. The block count is fixed (never
-  derived from `--threads`), so the coded bytes are byte-identical regardless of
-  thread count.
+- `0` — the whole reference in a single order-k `fqxv-seq` pass. Decode-only: no
+  current writer emits it, but archives that carry it still read.
+- `1` — the reference split into a fixed 64 contig blocks, each coded with order-k
+  `fqxv-seq` **in parallel**. The block count is fixed (never derived from
+  `--threads`), so the coded bytes are identical regardless of thread count.
+- `4` — SPRING's approach: 2-bit-pack the ACGT consensus (a hard 2 bits/base floor,
+  non-ACGT bytes held in an exception list) and run the clean-room LZMA over the
+  packed bytes, which reaches the long-range near-duplicate-contig repeats the
+  context model cannot see. Usually the winner on a real reference.
+
+The encoder codes `4` and `1` and keeps the smaller, so the method byte here is
+also a measured outcome. Method tags `2` (LZ77) and `3` (BWT) were prototypes that
+lost on the raw bases and were removed.
 
 ## Integrity
 
@@ -290,11 +349,16 @@ quality — verified after decode. Where the CRCs catch corruption of the *store
 bytes, these digests catch a codec that turned CRC-valid bytes into
 wrong-but-in-bounds output, and localize the failure to the offending stream.
 
-[`fqxv verify`](../cli/verify.md) checks the whole-file, footer, and per-block
-CRCs in one pass without running any codec: it re-hashes the archive prefix
-against `whole_file_crc`, validates `footer_crc`, and confirms every per-block
-CRC — far cheaper than a full `decompress`. (The per-stream CRCs are checked on
-demand by the projection path rather than by `verify`.) The globally-clustered
+[`fqxv verify`](../cli/verify.md) runs without any codec, so it is far cheaper
+than a full `decompress`: it validates the header CRC, validates `footer_crc`
+before trusting an offset, and re-hashes the archive prefix against
+`whole_file_crc`. That last digest covers every block payload byte, so it subsumes
+the per-block CRCs rather than repeating them; a whole-file failure then triggers a
+block-by-block scan to name the damaged row groups. `--quick` inverts the trade —
+it walks the footer index and checks each block's stored CRC with parallel
+positioned reads, skipping the whole-file digest (and so the bytes no block
+covers). The per-stream CRCs are checked on demand by the projection path rather
+than by either mode. The globally-clustered
 [reordered layout](#reordered-archives) carries no footer, so `verify` there
 drives every frame CRC by decoding into a sink instead.
 
@@ -323,15 +387,18 @@ one question: *what must an old reader do when it meets this?*
   decodes to identical reads on a reader that has never heard of them.
 - **A `required_features` bit** — the old reader cannot decode the archive at all
   without a capability, and that is knowable before the blocks are written. The bit
-  is refused at header-read with an "upgrade fqxv" error, before a single block is
-  touched. This is the gate for whole-archive structural change; the whole-file
-  `GLOBAL_REFERENCE` frame is the existing one. (An unknown *flags* bit is refused
-  the same way — every flag changes how the archive is read — but the flags byte has
-  only two free bits, so it is not an evolution mechanism.)
+  is refused at header-read (`UnsupportedFeature`, "upgrade fqxv"), before a single
+  block is touched. This is the gate for whole-archive structural change; the
+  whole-file `GLOBAL_REFERENCE` frame is the existing one. (An unknown *flags* bit
+  is refused the same way, as `UnsupportedFlags` — every flag changes how the
+  archive is read, so a bit a reader does not act on must not be ignored — but the
+  flags byte has only two free bits, so it is not an evolution mechanism. A new flag
+  should normally come with a feature bit; refusing unknown bits makes forgetting
+  that fail closed rather than decode under the old interpretation.)
 - **A critical extension tag** (tag high bit set) — the same "refuse it" outcome
-  for a *header field* whose meaning an old reader must not guess. Prefer a feature
-  bit for capabilities; reserve a critical tag for metadata that is genuinely
-  header-shaped and load-bearing.
+  (`UnsupportedExtension`) for a *header field* whose meaning an old reader must not
+  guess. Prefer a feature bit for capabilities; reserve a critical tag for metadata
+  that is genuinely header-shaped and load-bearing.
 - **A major bump** — the change cannot be expressed by any of the above: the fixed
   header prefix, the frame/trailer framing, or the magic itself changes, so an old
   reader cannot even parse far enough to be told no.
@@ -345,6 +412,20 @@ sequence stream's leading method byte and surfaces as `UnsupportedMethod`
 mid-decode. That fails loudly, but it fails later than a header refusal — so a new
 method byte is acceptable for an alternative encoding of the same streams, and is
 *not* a substitute for a feature bit when the block's layout itself changes.
+
+**The rule is enforced, not merely stated.** A structure that grew without its
+feature bit would otherwise still pass every checksum, because the CRCs and content
+digests only attest to what a reader chose to look at. So the reader closes both
+implicit extension points itself:
+
+- a footer body whose length is not exactly `4 + 60 × n_row_groups + 8 + 4` is
+  rejected, rather than walked at a stride it guessed;
+- a block payload with bytes left over after its three streams is rejected, rather
+  than decoded as three streams and silently shortened.
+
+Together with the unknown-flag refusal above, that is three places where a
+plausible-looking newer archive now stops at a clear error instead of being
+mis-read as valid.
 
 **On major bumps.** A major bump is a last resort. The extension mechanisms are
 sized so it should not be needed: 63 unused `required_features` bits, a TLV

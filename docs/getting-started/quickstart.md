@@ -13,8 +13,9 @@ input's name with the FASTQ/gzip extension replaced by `.fqxv`:
 fqxv compress reads.fastq.gz            # writes reads.fqxv
 ```
 
-Tune effort with `--level` (1–9; higher raises the sequence context order up to
-level 5, then the block size) and threads with `--threads` (default 16, capped at
+Tune effort with `--level` (1–9; higher raises the sequence context order — up to
+order 11, reached at level 5 — then the block size, and enables a hashed
+high-order tier at level 8+) and threads with `--threads` (default 16, capped at
 available cores; 0 = all cores):
 
 ```bash
@@ -29,8 +30,9 @@ fqxv compress reads.fastq.gz --estimate
 # reads.fastq.gz (436.93 MB)  →  estimated fqxv ~216.87 MB  (50% smaller, ~2.01x)
 ```
 
-See [`compress --estimate`](../cli/compress.md#estimating-compression) for
-details and accuracy.
+A per-stream breakdown (names / sequence / quality) follows that headline; see
+[`compress --estimate`](../cli/compress.md#estimating-compression) for the full
+report and its accuracy.
 
 ## Inspect
 
@@ -40,15 +42,38 @@ fqxv info reads.fqxv
 
 ```text
 reads.fqxv
-  layout         single-end (group size 1)
-  reads          1000000
-  blocks         4
-  sequence order 11
-  quality        lossless
-  plus line      normalized
-  names   6189536 bytes (13.4%)
-  seq    17980884 bytes (38.9%)
-  qual   22083418 bytes (47.7%)
+╭────────────────┬─────────────────────────────╮
+│ property       │ value                       │
+├────────────────┼─────────────────────────────┤
+│ layout         │ single-end (group size 1)   │
+│ reads          │ 1,000,000                   │
+│ blocks         │ 4 (avg 250,000 reads)       │
+│ platform       │ Illumina                    │
+│ sequence order │ 11                          │
+│ quality        │ lossless                    │
+│ reordered      │ no                          │
+│ plus line      │ normalized                  │
+│ format         │ v1.0                        │
+│ whole-file crc │ a1b2c3d4                    │
+│ file size      │ 46.25 MB (46,254,058 bytes) │
+╰────────────────┴─────────────────────────────╯
+╭──────────┬────────────┬────────┬────────────╮
+│ stream   │      bytes │  share │ bytes/read │
+├──────────┼────────────┼────────┼────────────┤
+│ names    │  6,189,536 │  13.4% │      6.190 │
+│ sequence │ 17,980,884 │  38.9% │     17.981 │
+│ quality  │ 22,083,418 │  47.7% │     22.083 │
+│ total    │ 46,253,838 │ 100.0% │     46.254 │
+╰──────────┴────────────┴────────┴────────────╯
+46.25 bytes/read
+```
+
+`info` reads only the header and footer index, so it does not decode any payload;
+add `--stats` for content statistics, or `--tsv`/`--json` for scripts. To check an
+archive's integrity without writing output:
+
+```bash
+fqxv verify reads.fqxv
 ```
 
 ## Decompress

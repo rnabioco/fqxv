@@ -8,22 +8,25 @@ each check in a table.
 ## Usage
 
 ```bash
-fqxv verify [--quick] [--tsv | --json] <INPUT>
+fqxv verify [--quick] [--tsv | --json] <INPUTS>...
 ```
+
+Give several files, or a directory (scanned recursively for `*.fqxv`), to verify
+a batch; the exit status is non-zero if *any* archive is corrupt.
 
 ## Arguments
 
 | Argument | Description |
 | --- | --- |
-| `<INPUT>` | Input `.fqxv` file. |
+| `<INPUTS>...` | Input `.fqxv` file(s), or a directory scanned for `*.fqxv`. |
 
 ## Options
 
 | Option | Description |
 | --- | --- |
 | `--quick` | Faster, weaker check: validate each block's stored CRC via the footer index (parallel positioned reads) instead of the whole-file digest. |
-| `--tsv` | Emit tab-separated per-check rows instead of the table. |
-| `--json` | Emit a JSON object instead of the table. |
+| `--tsv` | Emit tab-separated per-check rows instead of the table (a batch prepends a `file` column). |
+| `--json` | Emit a JSON object instead of the table (a batch emits an array of them). |
 | `--threads <N>` | Worker threads (0 = all cores) for the parallelized CRC pass. |
 
 ## Output and exit status
@@ -93,14 +96,20 @@ and any `failed_blocks` (`--tsv` and `--json` are mutually exclusive):
 ## Examples
 
 ```bash
-# quick integrity check
+# full integrity check (recomputes the whole-file CRC)
 fqxv verify sample.fqxv
+
+# faster, weaker: per-block CRCs only
+fqxv verify sample.fqxv --quick
 
 # gate a pipeline on integrity (only decompress if the archive is sound)
 fqxv verify sample.fqxv >/dev/null && fqxv decompress sample.fqxv -o sample.fastq
 
-# verify a directory of archives, reporting any that fail
-for f in *.fqxv; do fqxv verify "$f" >/dev/null || echo "FAILED: $f"; done
+# verify every archive under a directory in one run (non-zero if any fails)
+fqxv verify archives/
+
+# ...as rows keyed by file, for a script
+fqxv verify archives/ --tsv | awk -F'\t' '$3=="fail"'
 ```
 
 ## Notes

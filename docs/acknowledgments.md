@@ -18,6 +18,10 @@ against several of them to verify correctness.
   CC0), which shaped the interleaved-state design of our rANS coder.
 - **Range coding** — Eugene Shelwien's range-coder design (public domain)
   underpins `fqxv-range`.
+- **LZMA** — Igor Pavlov's design (7-Zip / LZMA SDK, public domain) is the shape
+  of `fqxv-seq`'s clean-room LZMA-class coder: adaptive bit-models over
+  `fqxv-range`, a 12-state machine, matched-byte literal prediction, and
+  position-slot + aligned distance coding. No liblzma/xz source is used.
 - **noodles** — [zaeleus/noodles](https://github.com/zaeleus/noodles), by
   Michael Macias — a Rust CRAM implementation we cross-checked test vectors
   against.
@@ -55,6 +59,16 @@ These are the algorithmic references for the read-reordering engine in
 
 As with everything else here, these are reimplemented from the published papers
 — no CoLoRd, minimap2, or miniasm source is vendored or translated.
+
+## Sequence alignment
+
+- **WFA** — Marco-Sola, Moure, Moreto & Espinosa, *Bioinformatics* 2021. The
+  wavefront recurrences behind `fqxv-align`'s `wfa_align`, whose work scales with
+  alignment score rather than sequence length. Implemented from the paper;
+  [WFA2-lib](https://github.com/smarco/WFA2-lib) was consulted for behavior only.
+- **Banded Needleman–Wunsch** — Needleman & Wunsch 1970, with Sellers' 1974
+  edit-distance formulation: `align_banded`, the predictable-cost reference the
+  wavefront path is checked against.
 
 ## Licenses
 

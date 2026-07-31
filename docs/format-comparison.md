@@ -128,7 +128,8 @@ other, not against the lossless rows.
   alignments or NCBI's columnar repository.
 - **Smallest lossless short-read archive** → `fqxv --order shuffle` or `SPRING`;
   `fqxv --order shuffle` is smaller on both benchmark sets under the same
-  reorder+renumber rules.
+  reorder+renumber rules, though SPRING still wins the hardest MGI/BGISEQ case in
+  the wider matrix (`bench/RESULTS.md`).
 - **Long reads** → `fqxv` (cross-read sequence codecs) or `CoLoRd`. `fqxv`'s
   quality *leads* CoLoRd on both platforms (a sequence-conditioned, context-mixed
   coder), and the sequence stream now closes the gap too: a whole-file overlap

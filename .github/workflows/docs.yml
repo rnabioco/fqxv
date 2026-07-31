@@ -7,6 +7,9 @@ on:
       - 'docs/**'
       - 'zensical.toml'
       - '.github/workflows/docs.yml'
+      # docs/changelog.md includes this file verbatim, so an entry-only edit
+      # still has to rebuild the site.
+      - 'CHANGELOG.md'
   workflow_dispatch:
 
 # Pages deploy needs id-token + pages write; the artifact upload only reads the repo.

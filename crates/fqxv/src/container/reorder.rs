@@ -443,7 +443,9 @@ fn prepare_reordered_clustered(
     //     back-reference — at the cost of a whole-file reference frame stored once.
     // Pass 1 builds the reference; pass 2 codes every block against it in parallel;
     // then ONE whole-file choice keeps the reference layout only when it pays:
-    //   reference_frame + Σ min(v2, v3, v4)  <  Σ min(v2, v3).
+    //   reference_frame + Σ min(block-local, v4)  <  Σ block-local,
+    // where `block-local` is the ONE of v2/v3 this run codes (v3 on the rescue
+    // path, v2 under `--no-rescue`) — not the smaller of both; see the note below.
     // Otherwise no reference frame is written and the archive is byte-for-byte the
     // v2/v3 layout it was before — so v4 can only ever shrink the output. Blocks
     // may mix versions freely (decode dispatches on the leading version byte).

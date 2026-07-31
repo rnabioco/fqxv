@@ -32,7 +32,7 @@ preserved for the split.
 | `-f, --force` | Overwrite the output archive if it already exists. By default `compress` refuses to clobber an existing file and errors before doing any work. |
 | `--verify` | After writing the archive, re-read and fully decode it to confirm it round-trips before reporting success — recommended before deleting the source FASTQ. See [Verifying on write](#verifying-on-write). |
 | `--max` | Maximum-compression preset: deepest sequence context plus read reordering *where it helps* (applied to short reads, auto-skipped for long reads). Overrides `--level`/`--order`. |
-| `--estimate` | Predict the archive size and compression ratio from a sample of the input, then exit **without writing anything**. See [Estimating compression](#estimating-compression). |
+| `--estimate [<FORMAT>]` | Predict the archive size and compression ratio from a sample of the input, then exit **without writing anything**. Bare `--estimate` prints the human report; `--estimate tsv` prints a two-line table (`file`, `input_bytes`, `est_fqxv_bytes`, `ratio`). Conflicts with `--verify`. See [Estimating compression](#estimating-compression). |
 | `--threads <N>` | Worker threads (0 = all cores). |
 
 ### Advanced options
@@ -41,7 +41,7 @@ preserved for the split.
 | --- | --- |
 | `-l, --level <N>` | Effort 1–9; higher raises the sequence context order (up to order 11, reached at level 5) and the block size, and enables a hashed high-order tier at level 8+. Default: 5. |
 | `--block-reads <N>` | Reads per row group, overriding the size `--level` would pick. Decouples random-access granularity from effort: smaller groups give finer remote/parallel access and more parallelism at some ratio cost; larger groups the reverse. Sequence order still follows `--level`. Ignored by the reorder path (`--order any`/`--max`). See [Row-group sizing](#row-group-sizing). |
-| `--order <MODE>` | Read-order guarantee: `preserve` (default, restores original order), `any` (allows reordering for a better ratio; single-end order may change), or `shuffle` (like `any`, but discards order and regenerates purely positional names — reorder-lossy, single-end only). |
+| `--order <MODE>` | Read-order guarantee: `preserve` (default, restores original order), `any` (allows reordering for a better ratio; single-end order may change), or `shuffle` (like `any`, but discards order and regenerates purely positional names — reorder-lossy, single-end only; grouped input and `--keep-order` fall back to `any`). |
 | `--interleaved <N>` | Interleaving of a *single* input, in members per spot (1 = single-end, 2 = paired as from `sracha get -Z`). Auto-detected from read names by default. Ignored with multiple inputs. |
 | `--keep-order` | With `--order any`, force original read order to be restored (store a permutation, code names/quality in original order). Chosen automatically when it makes the archive smaller. |
 | `--no-rescue` | With `--order any`, disable the adaptive assembly codecs (block-local literal-rescue and the whole-file global reference) and use the faster single-contig sequence codec only. |
@@ -78,6 +78,9 @@ fqxv compress reads.fastq.gz --verify
 
 # estimate the ratio and archive size from a sample, writing nothing
 fqxv compress reads.fastq.gz --estimate
+
+# ...the same estimate as a two-line table for scripts
+fqxv compress reads.fastq.gz --estimate tsv
 ```
 
 ## Verifying on write
@@ -106,8 +109,9 @@ is the check to run before deleting the source FASTQ.
 ## Estimating compression
 
 `--estimate` tells you how well an input will compress **before** committing to a
-full run. It takes a bounded sample of the leading reads (about one block, up to
-~1M reads) and predicts the archive **without coding it**: the real codecs are
+full run. It takes a bounded sample of the leading reads (up to 300,000 reads, or
+one block's worth of bases — whichever binds first, which on long reads is the
+bases) and predicts the archive **without coding it**: the real codecs are
 entropy coders, so a histogram pass measures directly what they converge to —
 static order-k sequence entropy (blended with a k-mer duplication sketch on the
 long-read path), order-1 quality entropy, and the real tokenizer for names, each
@@ -116,23 +120,31 @@ archive at the chosen `--level`/`--quality-bin` and prints the result — no arc
 is written:
 
 ```text
-reads.fastq.gz (436.93 MB)  →  estimated fqxv ~216.87 MB  (50% smaller, ~2.01x)
+reads.fastq.gz (59.99 MB)  →  estimated fqxv ~37.58 MB  (37% smaller, ~1.60x)
 
-Estimated from a 1,048,576-read sample (1.31 GB uncompressed FASTQ):
+Estimated from a 300,000-read sample (102.26 MB uncompressed FASTQ):
   stream      compressed     share   rate
-  names         6.42 KB     0.0%   0.05 bits/read
-  sequence     17.11 MB    43.8%   1.355 bits/base
-  quality      21.97 MB    56.2%   1.740 bits/base
-  vs uncompressed FASTQ (~1.31 GB):  ~6.19x
+  names        11.27 KB     0.0%   0.31 bits/read
+  sequence      8.92 MB    31.6%   1.663 bits/base
+  quality      19.26 MB    68.3%   3.590 bits/base
+  vs uncompressed FASTQ (~136.32 MB):  ~3.63x
 ```
 
 The top line leads with the outcome: input size(s) → estimated archive size, as a
 percent reduction and ratio against the input **on disk**. The per-stream table
-below shows where the bytes go (names / sequence / quality), and the final line
-gives the ratio against the **uncompressed** FASTQ. Multiple inputs are listed
-individually under a combined headline; a streaming stdin input has no on-disk
-size, so it reports the sample's own reduction and omits the whole-file
-projection (pass a file to get one).
+below shows where the bytes go (names / sequence / quality) for the sample, and
+the final line gives the ratio against the whole file's **uncompressed** FASTQ
+bytes. Multiple inputs are listed individually under a combined headline; a
+streaming stdin input has no on-disk size, so it reports the sample's own
+reduction and omits the whole-file projection (pass a file to get one).
+
+For scripting, `--estimate tsv` prints the same projection as a header line plus
+one data row:
+
+```text
+file	input_bytes	est_fqxv_bytes	ratio
+reads.fastq.gz	62898962	39405273	1.5962
+```
 
 **Accuracy.** Because blocks are coded independently and the models are per-block
 stationary, the sample's ratio is a faithful proxy for the whole file — in

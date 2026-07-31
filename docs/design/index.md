@@ -29,18 +29,21 @@ graph TD
     SEQ --> DNA[fqxv-dna]
     FQZ --> RANGE
     REO --> RANS
+    REO --> RANGE
     REO --> SEQ
     REO --> DNA
     LRO --> SEQ
     LRO --> RANS
+    LRO --> RANGE
     LRO --> DNA
+    LRO --> ALIGN[fqxv-align]
 ```
 
-Two leaf crates sit below the codecs and are shared by several of them:
+Three leaf crates sit below the codecs and are shared by several of them:
 `fqxv-dna` (nucleotide primitives — the 2-bit ACGT lookup and reverse
-complement) and `fqxv-bytes` (on-disk byte primitives — LEB128 varints, zig-zag,
-the bounds-checked reader). They are omitted from some edges above to keep the
-graph legible.
+complement), `fqxv-bytes` (on-disk byte primitives — LEB128 varints, zig-zag,
+the bounds-checked reader), and `fqxv-align` (banded/WFA sequence alignment).
+They are omitted from some edges above to keep the graph legible.
 
 - **`fqxv-rans`** — rANS Nx16 entropy coder (32 interleaved states, 16-bit
   renormalization), with scalar, AVX2, and AVX-512 backends selected at runtime
@@ -50,10 +53,16 @@ graph legible.
   frequency model; the backend for the quality and sequence context models.
 - **`fqxv-fqzcomp`** — a fqzcomp-style quality model: each symbol is coded under
   a context of the two previous qualities and position, one adaptive model per
-  context, reset at read boundaries. Opt-in lossy binning: Illumina 2/4/8-level,
-  plus ONT and PacBio HiFi tables (see [Long-read support](longread.md)).
+  context, reset at read boundaries. Long reads instead take a
+  sequence-conditioned context (previous qualities, the current and next base, and
+  the homopolymer run-length), coded as binary decisions with logistic context
+  mixing — the mode is recorded on the stream, so short-read output is unchanged.
+  Opt-in lossy binning: Illumina 2/4/8-level, plus ONT and PacBio HiFi tables (see
+  [Long-read support](longread.md)).
 - **`fqxv-seq`** — an order-k adaptive base model over a 2-bit A/C/G/T alphabet;
-  non-ACGT bytes go to a delta-coded exception list.
+  non-ACGT bytes go to a delta-coded exception list. Also carries the clean-room
+  LZMA the container uses for its raw-sequence method and the reorder path uses
+  for its packed reference.
 - **`fqxv-tokenizer`** — splits names into digit/non-digit runs and models each
   token against the previous record's token at the same position (match / delta
   / literal), rANS-coding the op and payload streams.
@@ -72,6 +81,11 @@ graph legible.
   (LEB128 varints, zig-zag, the bounds-checked reader) that `fqxv-seq`,
   `fqxv-reorder`, `fqxv-fqzcomp`, and `fqxv-tokenizer` all read/write on disk; the
   single source of truth for those encodings.
+- **`fqxv-align`** — a zero-dependency leaf crate of edit-distance alignment
+  primitives under one unit-cost model: banded Needleman-Wunsch (with an AVX2
+  anti-diagonal backend) and clean-room WFA, whose work scales with the alignment
+  score rather than the sequence length. `fqxv-lroverlap` aligns the gaps between
+  chained anchors with these and re-exports the names.
 
 ## Clean-room provenance
 
@@ -81,9 +95,10 @@ source papers — not translated from C. See `THIRD-PARTY-NOTICES.md` in the
 repository. Everything is dual-licensed MIT OR Apache-2.0.
 
 Every compression path is pure-Rust and self-contained: there is **no external or
-C compression library** anywhere in the stack. Even the whole-file reference frame
-of the reordering codec (once handed to xz/`liblzma`) is now coded with the
-in-tree order-k `fqxv-seq` model.
+C compression library** anywhere in the stack. The whole-file reference frame of
+the reordering codec was once handed to xz/`liblzma`; it is now coded with the
+in-tree order-k `fqxv-seq` model or, more often, with `fqxv-seq`'s own clean-room
+LZMA over the 2-bit-packed consensus — whichever comes out smaller.
 
 ## Design principles
 
@@ -97,7 +112,13 @@ in-tree order-k `fqxv-seq` model.
 
 ## See also
 
+- [Container Format](container.md) — the on-disk byte layout, the footer index and
+  random access, and the versioning/evolution policy a third-party reader would be
+  written against.
+- [Read Reordering](reordering.md) — the clustering and differential coding behind
+  `--order any` / `--order shuffle`.
 - [Long-read support](longread.md) — what works on ONT/PacBio today, the
   measured per-stream gap to CoLoRd, and the overlap codec that closes it.
 - [Testing & Robustness](testing.md) — coverage map, decoder-robustness
-  guarantees, and roadmap drawn from the upstream tools' issue trackers.
+  guarantees, cross-release compatibility, and roadmap drawn from the upstream
+  tools' issue trackers.

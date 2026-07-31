@@ -28,7 +28,8 @@ block-based container.
   sequence, and quality are preserved exactly (the redundant `+` line is
   normalized to a bare `+`, as SPRING and fqz_comp do).
 - **Strong ratios** — clean-room implementations that match or beat the C
-  reference tools stream-for-stream (see [Benchmarks](benchmarks.md)).
+  reference tools stream-for-stream on most of the benchmark panel (see
+  [Benchmarks](benchmarks.md)).
 - **Parallel** — blocks compress and decompress across cores with `rayon`;
   output is deterministic regardless of thread count.
 - **Paired & single-cell aware** — interleave R1/R2 (and 10x I1/I2) into one
@@ -68,11 +69,15 @@ crates.
 
 ## Where to go next
 
-- [Installation](getting-started/installation.md) — build the CLI and crates
+- [Installation](getting-started/installation.md) — prebuilt binaries, building
+  from source, and the crates
 - [Quick Start](getting-started/quickstart.md) — compress, inspect, decompress
 - [CLI Reference](cli/index.md) — every command and flag
+- [Python API](python/index.md) — read `.fqxv` archives from Python
 - [Design](design/index.md) — codecs, container format, and reordering
 - [Long-read support](design/longread.md) — ONT/PacBio: the cross-read sequence
   codecs and where fqxv stands against CoLoRd
 - [Benchmarks](benchmarks.md) — how fqxv stacks up against gzip, fqz_comp, SPRING
+- [Format comparison](format-comparison.md) — capabilities and guarantees vs
+  gzip/zstd, SPRING, CoLoRd, CRAM, and `.sra`
 - [Acknowledgments](acknowledgments.md) — the prior work fqxv builds on

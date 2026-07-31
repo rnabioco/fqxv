@@ -3,6 +3,13 @@
 Read-only Python bindings for [`fqxv`](https://github.com/rnabioco/fqxv), a
 Rust toolkit for lossless FASTQ archiving.
 
+```bash
+uv pip install fqxv
+```
+
+The wheels are `abi3` (one per platform, CPython >= 3.9) and carry the native
+codecs, so there is no Rust toolchain to install.
+
 ```python
 import fqxv
 
@@ -35,6 +42,7 @@ for rec in remote.stream("https://host/reads.fqxv"):   # or a presigned S3 URL
 arc = remote.open_index("https://host/reads.fqxv")     # 1 tail GET → footer index
 names = arc.names()                                    # ~1% of the file, CRC-checked
 print(arc.bytes_fetched, "of", arc.size)
+n = remote.download("https://host/reads.fqxv", "reads.fastq")  # → FASTQ on disk
 
 # Any file-like works, so an AWS SDK response streams straight in — no fqxv HTTP:
 import boto3
@@ -62,9 +70,12 @@ package's), so archives written today stay readable by later releases — and an
 archive this build cannot read is refused with an error, never misread.
 
 Projection and `open_index` are unavailable for globally-reordered archives
-(`--order shuffle`), whose streams are mutually dependent; use `fqxv.open()` to
-iterate those. Everything here is read-only: `verify` and `estimate` only
-*measure* — neither writes an archive — and full compression stays in the CLI.
+(`--order any`, `--max`, `--order shuffle`), whose streams are mutually
+dependent; use `fqxv.open()` to iterate those. Everything here is read-only:
+`verify` and `estimate` only *measure* — neither writes an archive — and full
+compression stays in the CLI.
+
+Full API reference: <https://rnabioco.github.io/fqxv/python/>.
 
 ## Build from source
 

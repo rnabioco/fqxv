@@ -187,13 +187,14 @@ enum Command {
         verify: bool,
         /// Estimate the ratio and archive size from a sample, then exit.
         ///
-        /// Writes nothing. Codes the leading reads with the real codecs at the
-        /// chosen `--level`/`--quality-bin` and projects the whole-file archive.
-        /// Reordering (`--order any`/`--max`) is not modeled, so with it the
-        /// estimate is a conservative lower bound — the real archive comes out
-        /// this size or smaller. Pass `tsv` for a two-line machine-readable
-        /// table (`file`, `input_bytes`, `est_fqxv_bytes`, `ratio`) instead of
-        /// the human report.
+        /// Writes nothing, and does not code the data: it measures the empirical
+        /// entropy of a bounded leading sample (names are the exception — those
+        /// are coded with the real tokenizer) and projects the whole-file archive
+        /// from it, at a fraction of a real run's cost. Reordering
+        /// (`--order any`/`--max`) is not modeled, so with it the estimate is a
+        /// conservative lower bound — the real archive comes out this size or
+        /// smaller. Pass `tsv` for a two-line machine-readable table (`file`,
+        /// `input_bytes`, `est_fqxv_bytes`, `ratio`) instead of the human report.
         #[arg(long, value_enum, num_args = 0..=1, default_missing_value = "human", value_name = "FORMAT")]
         estimate: Option<EstimateFormat>,
         /// Compression effort level (1-9); higher raises the sequence order.
