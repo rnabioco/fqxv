@@ -25,8 +25,8 @@ fqxv decompress <INPUT> (-o <OUTPUT> | --split <PREFIX> | -Z)
 | --- | --- |
 | `-o, --output <PATH>` | Interleaved FASTQ output file. A `.gz` extension writes block-gzip (BGZF); any other extension writes plain FASTQ. `-o -` streams to stdout. |
 | `-Z, --stdout` | Stream interleaved, always-raw FASTQ to stdout (for piping into an aligner). Required to write to stdout. |
-| `--split <PREFIX>` | Restore separate per-spot files: `<PREFIX>_R1.fastq.gz … _R<G>.fastq.gz` (block-gzip by default). |
-| `--mate-style <r\|num>` | `--split` labels: `r` → `_R1`,`_R2`,… (default); `num` → `_1`,`_2`,…. |
+| `--split <PREFIX>` | Restore separate per-spot files: `<PREFIX>_R1.fastq.gz … _R<G>.fastq.gz` (block-gzip by default), or the archive's recorded slot labels if it has them. |
+| `--mate-style <auto\|r\|num>` | `--split` labels: `auto` → the archive's recorded slot labels, else `_R1`,`_R2`,… (default); `r` → always `_R1`,`_R2`,…; `num` → always `_1`,`_2`,…. |
 | `--no-gzip` | Write plain `.fastq` for `--split` instead of the default `.fastq.gz`. |
 | `--recover` | Best-effort decode of a corrupted archive: skip blocks that fail their CRC and emit the rest. See [below](#recovering-a-corrupted-archive). |
 | `-f, --force` | Overwrite output FASTQ file(s) if they already exist. By default an existing `-o` file or `--split` mate file is left untouched and the command errors before decoding. Ignored when writing to stdout (`-Z` / `-o -`). |
@@ -96,6 +96,14 @@ just one column over HTTP range requests (`fqxv.remote.RemoteArchive`). See the
   `--interleaved`.
 - `--split` reads the archive's group size from its header and creates that many
   output files, in the original input order.
+- Archives written by fqxv 1.1+ also record each member's **original slot label**
+  when it could be derived from the input file names, and `--mate-style auto` (the
+  default) restores those names. This matters for runs whose read slots are empty
+  over part of the run: their per-slot files are numbered by original slot and can
+  have gaps (`_2` and `_4`, no `_1`/`_3`), so positional naming would silently
+  renumber them to `_1`/`_2`. Pass `--mate-style r` or `num` to force positional
+  names, and note that older archives (and inputs without a recognizable slot
+  token) have no labels to restore and always number positionally.
 - BGZF outputs use a multithreaded block-gzip encoder on the `--threads` pool, so
   the resulting `.gz` files are valid gzip and additionally support random access
   via a `.gzi` index (`bgzip`/`samtools`/`tabix`).

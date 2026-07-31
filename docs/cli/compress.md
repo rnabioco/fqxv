@@ -11,7 +11,10 @@ fqxv compress <INPUTS>... [-o <OUTPUT>] [OPTIONS]
 ```
 
 Give one input for single-end, two for paired-end, or three/four for single-cell
-(R1/R2/I1[/I2]). Multiple inputs are interleaved per spot into one archive and
+(R1/R2/I1[/I2]). Each input's slot label (the `R1`/`I1`/`2` token before its
+extension) is recorded in the archive when every input has a distinct one, so
+`decompress --split` can restore the original per-slot names rather than
+renumbering positionally. Multiple inputs are interleaved per spot into one archive and
 can be split back out with [`decompress --split`](decompress.md). Input order is
 preserved for the split.
 
