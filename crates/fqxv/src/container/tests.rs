@@ -516,6 +516,72 @@ fn auto_leaves_single_end_ungrouped() {
     assert_eq!(out, single);
 }
 
+/// Member labels survive a round-trip and reach `peek`/`inspect`, for both the
+/// plain and reorder layouts (each writes its own header).
+#[test]
+fn member_labels_roundtrip_through_the_header() {
+    for reorder in [false, true] {
+        let params = Params {
+            reorder,
+            member_labels: vec!["2".to_string(), "4".to_string()],
+            ..Params::default()
+        };
+        let r1 = make_reads("a", 6);
+        let r2 = make_reads("b", 6);
+        let readers: Vec<Box<dyn Read + Send>> =
+            vec![Box::new(&r1[..]) as Box<dyn Read + Send>, Box::new(&r2[..])];
+        let mut archive = Vec::new();
+        compress_multi(readers, &mut archive, params).expect("compress");
+
+        let info = peek(&archive[..]).expect("peek");
+        assert_eq!(info.group_size, 2, "reorder={reorder}");
+        assert_eq!(info.member_labels, vec!["2", "4"], "reorder={reorder}");
+
+        // And the reads still split correctly alongside the labels.
+        let mut outs: Vec<Vec<u8>> = vec![Vec::new(); 2];
+        decompress_split(&archive[..], &mut outs, 1).unwrap();
+        assert_eq!(outs, vec![r1, r2], "reorder={reorder}");
+    }
+}
+
+/// No labels means an ext-empty header — byte-identical to what a 1.0 writer
+/// produced — so the default path gains nothing on disk.
+#[test]
+fn no_member_labels_writes_an_ext_empty_header() {
+    let archive = compress_bytes(SAMPLE, Params::default());
+    let info = peek(&archive[..]).expect("peek");
+    assert!(info.member_labels.is_empty());
+    // [19..21] is ext_len; zero means no extension region was written.
+    assert_eq!(u16::from_le_bytes([archive[19], archive[20]]), 0);
+}
+
+/// Labels that don't describe the archive are dropped rather than fatal: they are
+/// descriptive metadata, so a bad set must never fail a compress that would
+/// otherwise succeed. Count mismatch and an over-long label are both silently
+/// ignored, leaving a valid unlabeled archive.
+#[test]
+fn mismatched_member_labels_are_dropped_not_fatal() {
+    for labels in [
+        vec!["only-one".to_string()],          // count != G
+        vec!["x".repeat(64), "y".to_string()], // over-long
+        vec![String::new(), "R2".to_string()], // empty label
+    ] {
+        let params = Params {
+            member_labels: labels.clone(),
+            ..Params::default()
+        };
+        let r1 = make_reads("a", 4);
+        let r2 = make_reads("b", 4);
+        let readers: Vec<Box<dyn Read + Send>> =
+            vec![Box::new(&r1[..]) as Box<dyn Read + Send>, Box::new(&r2[..])];
+        let mut archive = Vec::new();
+        compress_multi(readers, &mut archive, params).expect("compress");
+        let info = peek(&archive[..]).expect("peek");
+        assert!(info.member_labels.is_empty(), "labels={labels:?}");
+        assert_eq!(info.group_size, 2);
+    }
+}
+
 #[test]
 fn unequal_mate_counts_error() {
     let r1 = make_reads("a", 2);
@@ -1275,7 +1341,7 @@ fn longread_routing_roundtrips_and_never_loses_to_the_plain_layout() {
         };
 
         let mut routed = Vec::new();
-        compress_auto(&input[..], &mut routed, params).expect("compress");
+        compress_auto(&input[..], &mut routed, params.clone()).expect("compress");
         let mut plain = Vec::new();
         compress_buffered_plain(&input, &mut plain, params, 1).expect("plain layout");
 
@@ -1918,7 +1984,13 @@ fn nanopore_wide_quality_roundtrip_deterministic() {
         block_reads: 4,
         ..Params::default()
     };
-    let a1 = compress_bytes(&input, Params { threads: 1, ..base });
+    let a1 = compress_bytes(
+        &input,
+        Params {
+            threads: 1,
+            ..base.clone()
+        },
+    );
     let a4 = compress_bytes(&input, Params { threads: 4, ..base });
     assert_eq!(
         a1, a4,

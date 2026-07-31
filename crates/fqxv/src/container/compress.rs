@@ -14,7 +14,7 @@ pub(crate) const DEFAULT_BLOCK_READS: usize = 1 << 20;
 pub(crate) type PrimedSpot = Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>;
 
 /// Compression parameters.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Params {
     /// Sequence context-model order (higher = better ratio, more memory).
     pub seq_order: u8,
@@ -76,6 +76,19 @@ pub struct Params {
     /// (greedy single reference); the CLI raises it at the top effort levels, `--max`
     /// to the CoLoRd-parity operating point.
     pub tile_max_refs: usize,
+    /// Per-member slot labels recorded in the archive, one per interleaved member
+    /// (`"R1"`, `"I1"`, `"2"`, …). Purely descriptive: nothing in decode depends on
+    /// them, they exist so `decompress_split` can restore the *original* per-slot
+    /// file names rather than renaming positionally. A run whose read slots are
+    /// empty over part of the run yields files numbered by original slot with gaps
+    /// (`_2` and `_4`, no `_1`/`_3`), and without these that identity is lost —
+    /// positional naming turns `_2`/`_4` back into `_1`/`_2`.
+    ///
+    /// Empty (the default) writes no labels, which is exactly the 1.0 header. When
+    /// non-empty the length must equal the group size, and the labels ride in a
+    /// *non-critical* header extension record, so a reader that predates them skips
+    /// it and decodes the archive normally.
+    pub member_labels: Vec<String>,
 }
 
 impl Default for Params {
@@ -94,6 +107,7 @@ impl Default for Params {
             platform: None,
             tile_band: 256,
             tile_max_refs: 1,
+            member_labels: Vec::new(),
         }
     }
 }
@@ -538,7 +552,7 @@ pub(crate) fn write_plain_layout<W: Write>(
     precoded_ns: Option<&[(Vec<u8>, Vec<u8>)]>,
 ) -> Result<Stats> {
     let mut w = CrcWriter::new(BufWriter::new(writer));
-    write_header(&mut w, params, group_size, platform)?;
+    let header_len = write_header(&mut w, params, group_size, platform)?;
     let mut stats = Stats {
         group_size,
         ..Stats::default()
@@ -550,7 +564,7 @@ pub(crate) fn write_plain_layout<W: Write>(
     // per-batch building is byte-identical to building them all at once.
     let num_blocks = ranges.len();
     let batch = pool.current_num_threads().max(1);
-    let mut index = FooterIndex::new();
+    let mut index = FooterIndex::new_at(header_len);
     for batch_start in (0..num_blocks).step_by(batch) {
         let batch_end = (batch_start + batch).min(num_blocks);
         let (blocks, compressed): (Vec<RawBlock>, Vec<Result<Vec<u8>>>) = pool.install(|| {
@@ -574,7 +588,7 @@ pub(crate) fn write_plain_layout<W: Write>(
     }
     let footer_bytes = write_footer(&mut w, &index, stats.reads)?;
     w.flush()?;
-    stats.out_bytes += HEADER_LEN as u64 + footer_bytes;
+    stats.out_bytes += header_len + footer_bytes;
     Ok(stats)
 }
 
@@ -845,14 +859,17 @@ fn compress_longread_shared_ref<W: Write>(
     // here, reusing the pass-1 sequence) in order.
     let mut w = CrcWriter::new(BufWriter::new(writer));
     let flags = FLAG_PLUS_NORMALIZED | FLAG_GLOBAL_REFERENCE;
-    write_header_prefix(
+    let header_len = write_header_prefix(
         &mut w,
-        params.seq_order,
-        binning_tag(params.quality_binning),
-        flags,
-        group_size,
-        platform,
-        crate::feature::GLOBAL_REFERENCE,
+        &HeaderPrefix {
+            seq_order: params.seq_order,
+            binning: binning_tag(params.quality_binning),
+            flags,
+            group_size,
+            platform,
+            required_features: crate::feature::GLOBAL_REFERENCE,
+        },
+        &encode_member_labels(&params.member_labels, group_size),
     )?;
     write_framed(&mut w, &ref_frame)?;
     // Framed slice on disk is [4 len][4 crc][bytes]; blocks begin past it.
@@ -862,7 +879,7 @@ fn compress_longread_shared_ref<W: Write>(
         group_size,
         ..Stats::default()
     };
-    let mut index = FooterIndex::new_at(HEADER_LEN as u64 + ref_frame_bytes);
+    let mut index = FooterIndex::new_at(header_len + ref_frame_bytes);
     for batch_start in (0..num_blocks).step_by(batch) {
         let batch_end = (batch_start + batch).min(num_blocks);
         let (blocks, compressed): (Vec<RawBlock>, Vec<Result<Vec<u8>>>) = pool.install(|| {
@@ -880,7 +897,7 @@ fn compress_longread_shared_ref<W: Write>(
     }
     let footer_bytes = write_footer(&mut w, &index, stats.reads)?;
     w.flush()?;
-    stats.out_bytes += HEADER_LEN as u64 + ref_frame_bytes + footer_bytes;
+    stats.out_bytes += header_len + ref_frame_bytes + footer_bytes;
     Ok(stats)
 }
 
@@ -911,13 +928,13 @@ where
         "compress pipeline ready"
     );
     let mut w = CrcWriter::new(BufWriter::new(writer));
-    write_header(&mut w, &params, group_size, platform)?;
+    let header_len = write_header(&mut w, &params, group_size, platform)?;
 
     let mut stats = Stats {
         group_size,
         ..Stats::default()
     };
-    let mut index = FooterIndex::new();
+    let mut index = FooterIndex::new_at(header_len);
 
     // A true block-level pipeline, not a batch barrier. The reader parses blocks
     // one at a time (the FASTQ stream is sequential) and streams them to a pool of
@@ -1011,6 +1028,6 @@ where
 
     let footer_bytes = write_footer(&mut w, &index, stats.reads)?;
     w.flush()?;
-    stats.out_bytes += HEADER_LEN as u64 + footer_bytes;
+    stats.out_bytes += header_len + footer_bytes;
     Ok(stats)
 }

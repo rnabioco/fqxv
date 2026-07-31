@@ -74,7 +74,7 @@ pub const FORMAT_MAJOR: u8 = 1;
 /// skippable header extension record, or a new optional codec/mode gated by a
 /// [`feature`] bit. A reader tolerates any minor within its [`FORMAT_MAJOR`]; the
 /// value is informational (surfaced by `inspect`).
-pub const FORMAT_MINOR: u8 = 0;
+pub const FORMAT_MINOR: u8 = 1;
 
 /// Coarse capability bits an archive can require in its header `required_features`
 /// word. A reader that sees a set bit outside [`KNOWN_FEATURES`] refuses the

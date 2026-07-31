@@ -42,19 +42,30 @@ pub(crate) const HDR_OFF_BINNING: usize = 15;
 /// Byte offset of the flags byte within the header.
 #[cfg(test)]
 pub(crate) const HDR_OFF_FLAGS: usize = 16;
-/// Header length for an archive with an empty extension region — the size this
-/// build writes (1.0 emits no TLV records). A later minor that appends TLVs makes
-/// the on-disk header longer; readers must use [`Header::header_len`] (not this
-/// constant) for any seek/scan start offset so they stay correct across minors.
+/// Header length for an archive with an empty extension region. An archive that
+/// records member labels appends a TLV and is longer, so readers must use
+/// [`Header::header_len`] (not this constant) for any seek/scan start offset.
 /// Blocks begin right after the header, so this is also the ext-empty block-region
 /// start offset.
 pub(crate) const HEADER_LEN: usize = HEADER_PREFIX_LEN + CRC_LEN;
 /// A header extension record is `[1 tag][2 len LE][len bytes]`. The tag's high bit
 /// marks a *critical* record: a reader that doesn't recognize a critical tag must
 /// refuse the archive ([`Error::UnsupportedExtension`]) rather than skip it; an
-/// unknown non-critical tag is skipped. No tags are defined at 1.0 — the region
-/// exists so a later minor can add skippable header fields without a major bump.
+/// unknown non-critical tag is skipped. The region exists so a later minor can add
+/// skippable header fields without a major bump.
 pub(crate) const EXT_CRITICAL_BIT: u8 = 0x80;
+/// Per-member slot labels (format 1.1). Payload is `[1 count]` then `count`
+/// records of `[1 len][len bytes UTF-8]`; `count` equals the header's group size.
+///
+/// **Non-critical on purpose.** The labels only affect what `decompress_split`
+/// *names* its outputs — no decoded byte depends on them — so a reader that
+/// predates this tag skips it and produces the same reads under positional names.
+/// Making it critical would refuse archives it can decode perfectly.
+pub(crate) const EXT_TAG_MEMBER_LABELS: u8 = 0x01;
+/// Longest single member label accepted, on both write and read. Labels are short
+/// slot tokens (`"R1"`, `"I1"`, `"2"`); the cap bounds the header and keeps a
+/// corrupt length from claiming the rest of the extension region.
+pub(crate) const MAX_MEMBER_LABEL_LEN: usize = 15;
 /// Bytes of CRC-32C appended after a frame's length field (plain block frames)
 /// or after a `[u32 len]` framed slice (reorder layout).
 pub(crate) const CRC_LEN: usize = 4;
@@ -105,7 +116,7 @@ pub(crate) const FLAG_GLOBAL_REFERENCE: u8 = 0x20;
 // now has its own header byte (see `HEADER_PREFIX_LEN`).
 
 /// Write the fixed header prefix (see [`HEADER_PREFIX_LEN`]), then the extension
-/// region (empty at 1.0), then a CRC-32C over prefix+extension — so a flipped
+/// region `ext`, then a CRC-32C over prefix+extension — so a flipped
 /// header byte is caught on read instead of silently altering decode. Shared by
 /// the plain ([`write_header`]) and reorder (`encode_reordered`) layouts, which
 /// differ only in their `flags`.
@@ -117,34 +128,75 @@ pub(crate) const FLAG_GLOBAL_REFERENCE: u8 = 0x20;
 /// by the per-stream method byte and surfaces as an [`Error::UnsupportedMethod`]
 /// on decode, not here. Pass 0 when the archive requires nothing beyond the base
 /// format for its major.
+/// Encode the member-label extension record, or an empty region when there is
+/// nothing to record. Returns the *whole* TLV (`[tag][len][payload]`) ready to
+/// concatenate into the extension region.
+///
+/// Labels are dropped rather than rejected when they don't describe the archive
+/// (wrong count, over-long, or empty): they are descriptive metadata, and an
+/// archive without them is valid and decodes identically, so a bad label set must
+/// never be the reason a compress fails.
+pub(crate) fn encode_member_labels(labels: &[String], group_size: u8) -> Vec<u8> {
+    if labels.is_empty() || labels.len() != group_size.max(1) as usize {
+        return Vec::new();
+    }
+    if labels
+        .iter()
+        .any(|l| l.is_empty() || l.len() > MAX_MEMBER_LABEL_LEN)
+    {
+        return Vec::new();
+    }
+    let mut payload = Vec::with_capacity(1 + labels.iter().map(|l| 1 + l.len()).sum::<usize>());
+    payload.push(labels.len() as u8);
+    for l in labels {
+        payload.push(l.len() as u8);
+        payload.extend_from_slice(l.as_bytes());
+    }
+    let mut out = Vec::with_capacity(3 + payload.len());
+    out.push(EXT_TAG_MEMBER_LABELS);
+    out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    out.extend_from_slice(&payload);
+    out
+}
+
+/// The header prefix's variable fields, gathered so the writer takes a record
+/// rather than six positional `u8`s that are trivial to transpose at a call site.
+pub(crate) struct HeaderPrefix {
+    pub(crate) seq_order: u8,
+    pub(crate) binning: u8,
+    pub(crate) flags: u8,
+    pub(crate) group_size: u8,
+    pub(crate) platform: Platform,
+    /// Coarse capability word; see [`write_header_prefix`].
+    pub(crate) required_features: u64,
+}
+
 pub(crate) fn write_header_prefix<W: Write>(
     w: &mut W,
-    seq_order: u8,
-    binning: u8,
-    flags: u8,
-    group_size: u8,
-    platform: Platform,
-    required_features: u64,
-) -> Result<()> {
-    // 1.0 emits an empty extension region; a later minor appends TLV records here
-    // and must update HEADER_LEN-based start offsets to use `Header::header_len`.
-    const EXT: &[u8] = &[];
-    let mut hdr = Vec::with_capacity(HEADER_PREFIX_LEN + EXT.len());
+    h: &HeaderPrefix,
+    ext: &[u8],
+) -> Result<u64> {
+    // The extension region is empty unless a caller supplied TLV records; readers
+    // must use `Header::header_len` rather than HEADER_LEN once it is non-empty.
+    let mut hdr = Vec::with_capacity(HEADER_PREFIX_LEN + ext.len());
     hdr.extend_from_slice(&MAGIC);
     hdr.push(FORMAT_MAJOR);
     hdr.push(FORMAT_MINOR);
-    hdr.extend_from_slice(&required_features.to_le_bytes());
-    hdr.push(seq_order);
-    hdr.push(binning);
-    hdr.push(flags);
-    hdr.push(group_size);
-    hdr.push(platform.to_code());
-    hdr.extend_from_slice(&(EXT.len() as u16).to_le_bytes());
-    hdr.extend_from_slice(EXT);
-    debug_assert_eq!(hdr.len(), HEADER_PREFIX_LEN + EXT.len());
+    hdr.extend_from_slice(&h.required_features.to_le_bytes());
+    hdr.push(h.seq_order);
+    hdr.push(h.binning);
+    hdr.push(h.flags);
+    hdr.push(h.group_size);
+    hdr.push(h.platform.to_code());
+    hdr.extend_from_slice(&(ext.len() as u16).to_le_bytes());
+    hdr.extend_from_slice(ext);
+    debug_assert_eq!(hdr.len(), HEADER_PREFIX_LEN + ext.len());
     w.write_all(&hdr)?;
     w.write_all(&crc32c(&hdr).to_le_bytes())?;
-    Ok(())
+    // The caller needs the *actual* length: with a non-empty extension region the
+    // header is longer than HEADER_LEN, and every block offset recorded in the
+    // footer is measured from the end of it.
+    Ok((hdr.len() + CRC_LEN) as u64)
 }
 
 /// Write the container header (plain layout).
@@ -153,7 +205,7 @@ pub(crate) fn write_header<W: Write>(
     params: &Params,
     group_size: u8,
     platform: Platform,
-) -> Result<()> {
+) -> Result<u64> {
     // The block layout is always non-reorder — reorder (both keep-order modes)
     // uses the whole-file path, which writes its own header.
     debug_assert!(!params.reorder);
@@ -163,12 +215,15 @@ pub(crate) fn write_header<W: Write>(
     // here. So the coarse feature word is empty.
     write_header_prefix(
         w,
-        params.seq_order,
-        binning_tag(params.quality_binning),
-        FLAG_PLUS_NORMALIZED,
-        group_size,
-        platform,
-        0,
+        &HeaderPrefix {
+            seq_order: params.seq_order,
+            binning: binning_tag(params.quality_binning),
+            flags: FLAG_PLUS_NORMALIZED,
+            group_size,
+            platform,
+            required_features: 0,
+        },
+        &encode_member_labels(&params.member_labels, group_size),
     )
 }
 
@@ -204,11 +259,6 @@ pub(crate) struct FooterIndex {
 }
 
 impl FooterIndex {
-    pub(crate) fn new() -> Self {
-        // Blocks begin right after the fixed header.
-        Self::new_at(HEADER_LEN as u64)
-    }
-
     /// Like [`FooterIndex::new`] but with the first block at an explicit offset —
     /// used by the shared-reference plain layout (issue #168), where a whole-file
     /// reference frame sits between the header and the first block, so block
@@ -358,6 +408,11 @@ pub(crate) struct Header {
     /// larger if a later minor appended TLV records. Any seek/scan that starts at
     /// the block region must use this, not the [`HEADER_LEN`] constant.
     pub(crate) header_len: u64,
+    /// Per-member slot labels from the [`EXT_TAG_MEMBER_LABELS`] record, one per
+    /// interleaved member. Empty when the archive records none (every 1.0 archive,
+    /// and any input whose slots weren't identifiable), in which case consumers
+    /// fall back to positional naming.
+    pub(crate) member_labels: Vec<String>,
 }
 
 pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
@@ -414,10 +469,10 @@ pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
         });
     }
     // Walk the TLV records: an unknown *critical* tag is fatal; unknown
-    // non-critical tags are skipped. (No tags are defined at 1.0.)
-    check_header_extensions(&ext)?;
-
+    // non-critical tags are skipped. Known tags are decoded here.
     let group_size = prefix[17].max(1);
+    let member_labels = check_header_extensions(&ext, group_size)?;
+
     Ok(Header {
         major,
         minor,
@@ -428,14 +483,48 @@ pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
         group_size,
         platform: prefix[18],
         header_len: (HEADER_PREFIX_LEN + ext_len + CRC_LEN) as u64,
+        member_labels,
     })
 }
 
-/// Walk the header extension region's `[1 tag][2 len][len bytes]` records. No
-/// tags are known at 1.0, so a known tag is never consumed here yet; an unknown
-/// *critical* tag (high bit set, [`EXT_CRITICAL_BIT`]) is refused, and an unknown
-/// non-critical tag is skipped. A record that overruns the region is malformed.
-fn check_header_extensions(mut ext: &[u8]) -> Result<()> {
+/// Decode an [`EXT_TAG_MEMBER_LABELS`] payload. Returns no labels for any payload
+/// that doesn't describe this archive — wrong count for the group size, a length
+/// that overruns the record, an over-long label, or non-UTF-8. The labels are
+/// descriptive only, so a malformed record degrades to positional naming instead
+/// of failing a decode that would otherwise succeed; the header CRC has already
+/// ruled out bit-rot by this point, so this is about forward compatibility with a
+/// writer that encodes them differently, not corruption.
+fn decode_member_labels(payload: &[u8], group_size: u8) -> Vec<String> {
+    let Some((&count, mut rest)) = payload.split_first() else {
+        return Vec::new();
+    };
+    if count as usize != group_size.max(1) as usize {
+        return Vec::new();
+    }
+    let mut labels = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let Some((&len, tail)) = rest.split_first() else {
+            return Vec::new();
+        };
+        let len = len as usize;
+        if len == 0 || len > MAX_MEMBER_LABEL_LEN || len > tail.len() {
+            return Vec::new();
+        }
+        match std::str::from_utf8(&tail[..len]) {
+            Ok(s) => labels.push(s.to_string()),
+            Err(_) => return Vec::new(),
+        }
+        rest = &tail[len..];
+    }
+    labels
+}
+
+/// Walk the header extension region's `[1 tag][2 len][len bytes]` records,
+/// returning any member labels found. An unknown *critical* tag (high bit set,
+/// [`EXT_CRITICAL_BIT`]) is refused, and an unknown non-critical tag is skipped. A
+/// record that overruns the region is malformed.
+fn check_header_extensions(mut ext: &[u8], group_size: u8) -> Result<Vec<String>> {
+    let mut labels = Vec::new();
     while !ext.is_empty() {
         if ext.len() < 3 {
             return Err(Error::Malformed("truncated header extension record"));
@@ -446,12 +535,14 @@ fn check_header_extensions(mut ext: &[u8]) -> Result<()> {
         if end > ext.len() {
             return Err(Error::Malformed("header extension record overruns region"));
         }
-        if tag & EXT_CRITICAL_BIT != 0 {
+        if tag == EXT_TAG_MEMBER_LABELS {
+            labels = decode_member_labels(&ext[3..end], group_size);
+        } else if tag & EXT_CRITICAL_BIT != 0 {
             return Err(Error::UnsupportedExtension(tag));
         }
         ext = &ext[end..];
     }
-    Ok(())
+    Ok(labels)
 }
 
 /// The footer index: per row group `(byte_offset, read_count)`, the total read
@@ -682,15 +773,18 @@ mod header_tests {
         let mut buf = Vec::new();
         write_header_prefix(
             &mut buf,
-            3,
-            0,
-            FLAG_PLUS_NORMALIZED,
-            2,
-            Platform::Illumina,
-            0,
+            &HeaderPrefix {
+                seq_order: 3,
+                binning: 0,
+                flags: FLAG_PLUS_NORMALIZED,
+                group_size: 2,
+                platform: Platform::Illumina,
+                required_features: 0,
+            },
+            &[],
         )
         .unwrap();
-        assert_eq!(buf.len(), HEADER_LEN, "1.0 writes an ext-empty header");
+        assert_eq!(buf.len(), HEADER_LEN, "an ext-empty header is HEADER_LEN");
         let h = read_header(&mut Cursor::new(&buf)).unwrap();
         assert_eq!((h.major, h.minor), (FORMAT_MAJOR, FORMAT_MINOR));
         assert_eq!(h.seq_order, 3);
@@ -729,8 +823,10 @@ mod header_tests {
 
     #[test]
     fn skips_unknown_noncritical_extension() {
-        // tag 0x01 (critical bit clear), 2-byte payload — a later minor's field.
-        let ext = [0x01, 0x02, 0x00, 0xaa, 0xbb];
+        // tag 0x7f (critical bit clear, not a tag this build knows) — stands in for
+        // a later minor's field. Must be a tag we do NOT define, or this would be
+        // testing the decode path instead of the skip path.
+        let ext = [0x7f, 0x02, 0x00, 0xaa, 0xbb];
         let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, 0, &ext);
         let h = read_header(&mut Cursor::new(&buf)).unwrap();
         // Block region starts past the extension region, not at the const.
@@ -738,6 +834,37 @@ mod header_tests {
             h.header_len,
             (HEADER_PREFIX_LEN + ext.len() + CRC_LEN) as u64
         );
+    }
+
+    #[test]
+    fn reads_member_labels_from_the_extension_region() {
+        let ext = encode_member_labels(&["2".to_string(), "4".to_string()], 2);
+        let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, 0, &ext);
+        let h = read_header(&mut Cursor::new(&buf)).unwrap();
+        assert_eq!(h.member_labels, vec!["2", "4"]);
+        assert_eq!(
+            h.header_len,
+            (HEADER_PREFIX_LEN + ext.len() + CRC_LEN) as u64
+        );
+    }
+
+    /// A malformed label payload degrades to "no labels" and still decodes. The
+    /// record is descriptive, so it must never be the reason a readable archive is
+    /// refused — the header CRC has already ruled out bit-rot by this point.
+    #[test]
+    fn malformed_member_labels_degrade_to_none() {
+        for payload in [
+            vec![9u8, 1, b'a'],          // count disagrees with group_size 2
+            vec![2u8, 40, b'a'],         // label length overruns the record
+            vec![2u8, 1, 0xff, 1, b'b'], // not UTF-8
+        ] {
+            let mut ext = vec![EXT_TAG_MEMBER_LABELS];
+            ext.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+            ext.extend_from_slice(&payload);
+            let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, 0, &ext);
+            let h = read_header(&mut Cursor::new(&buf)).expect("still decodes");
+            assert!(h.member_labels.is_empty(), "payload={payload:?}");
+        }
     }
 
     #[test]

@@ -26,8 +26,11 @@
 //! [ext_len] extension records -- each [1 tag][2 len LE][len bytes]. Tag high bit
 //!     marks a *critical* record: a reader that doesn't know a critical tag refuses
 //!     the archive (UnsupportedExtension); an unknown non-critical tag is skipped.
-//!     Empty at 1.0 -- the region lets a later minor add skippable header fields
-//!     without a major bump. Covered by the header CRC.
+//!     Empty at 1.0. Tag 0x01 (1.1, non-critical) carries the per-member slot
+//!     labels: [1 count][ [1 len][len bytes UTF-8] ]*count, count == G. They are
+//!     descriptive only -- `decompress_split` uses them to restore the original
+//!     per-slot file names instead of numbering positionally -- so a reader that
+//!     predates the tag skips it and decodes identically. Covered by the header CRC.
 //! [4] header_crc (LE) -- CRC-32C over every header byte above (prefix + extension
 //!     region), verified on read so a flipped version/features/flags/binning-tag/
 //!     group-size/platform byte is caught rather than silently changing decode.
@@ -121,6 +124,12 @@
 //! tokenizer collapse the near-identical mate names and keeps reads from one
 //! spot adjacent for the sequence model. [`decompress`] streams interleaved
 //! FASTQ (pipe to an aligner); [`decompress_split`] restores the `G` files.
+//!
+//! Member identity is positional on the wire (`local_index % G`), so the archive
+//! also records each member's original slot label when it is known -- a run whose
+//! read slots are empty over part of the run yields files numbered by original
+//! slot with gaps (`_2` and `_4`, no `_1`/`_3`), and positional naming alone would
+//! silently renumber them on the way back out.
 
 pub(crate) use crate::crc::{CrcWriter, crc32c, crc32c_combine};
 pub(crate) use crate::{Error, FORMAT_MAJOR, FORMAT_MINOR, KNOWN_FEATURES, MAGIC, Result};

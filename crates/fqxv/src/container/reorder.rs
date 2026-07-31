@@ -175,7 +175,7 @@ pub(crate) fn encode_reordered<W: Write>(
 
     // Reorder candidate: cluster + code sequence/names/permutation, quality
     // deferred. Owns the buffered reads and the thread pool both candidates share.
-    let prepared = prepare_reordered_clustered(all, params, group_size)?;
+    let prepared = prepare_reordered_clustered(all, params.clone(), group_size)?;
 
     // Plain candidate: order-k sequence + names per block, quality deferred — coded
     // in the reorder candidate's pool so the two never hold two pools at once. This
@@ -755,14 +755,17 @@ fn finish_reordered_clustered<W: Write>(prepared: ReorderPrepared, writer: W) ->
     } else {
         0
     };
-    write_header_prefix(
+    let header_len = write_header_prefix(
         &mut w,
-        params.seq_order,
-        binning_tag(params.quality_binning),
-        flags,
-        g,
-        platform,
-        required_features,
+        &HeaderPrefix {
+            seq_order: params.seq_order,
+            binning: binning_tag(params.quality_binning),
+            flags,
+            group_size: g,
+            platform,
+            required_features,
+        },
+        &encode_member_labels(&params.member_labels, g),
     )?;
     w.write_all(&(n as u64).to_le_bytes())?;
     write_framed(&mut w, &flip_bits)?;
@@ -827,18 +830,18 @@ fn finish_reordered_clustered<W: Write>(prepared: ReorderPrepared, writer: W) ->
     } else {
         0
     };
-    let out_bytes = (HEADER_LEN
-        + 8
-        + frame(flip_bits.len())
-        + frame(perm_c.len())
-        + ref_frame
-        + 4
-        + seq_blocks.iter().map(|p| frame(p.len())).sum::<usize>()
-        + nq_blocks
-            .iter()
-            .map(|(nm, q)| frame(nm.len()) + frame(q.len()))
-            .sum::<usize>()
-        + frame(DIGEST_LEN)) as u64;
+    let out_bytes = header_len
+        + (8usize
+            + frame(flip_bits.len())
+            + frame(perm_c.len())
+            + ref_frame
+            + 4
+            + seq_blocks.iter().map(|p| frame(p.len())).sum::<usize>()
+            + nq_blocks
+                .iter()
+                .map(|(nm, q)| frame(nm.len()) + frame(q.len()))
+                .sum::<usize>()
+            + frame(DIGEST_LEN)) as u64;
     Ok(Stats {
         reads: n as u64,
         blocks: ranges.len() as u64,
