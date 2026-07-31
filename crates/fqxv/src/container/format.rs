@@ -54,7 +54,7 @@ pub(crate) const HEADER_LEN: usize = HEADER_PREFIX_LEN + CRC_LEN;
 /// unknown non-critical tag is skipped. The region exists so a later minor can add
 /// skippable header fields without a major bump.
 pub(crate) const EXT_CRITICAL_BIT: u8 = 0x80;
-/// Per-member slot labels (format 1.1). Payload is `[1 count]` then `count`
+/// Per-member slot labels. Payload is `[1 count]` then `count`
 /// records of `[1 len][len bytes UTF-8]`; `count` equals the header's group size.
 ///
 /// **Non-critical on purpose.** The labels only affect what `decompress_split`

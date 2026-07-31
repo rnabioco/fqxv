@@ -26,7 +26,7 @@
 //! [ext_len] extension records -- each [1 tag][2 len LE][len bytes]. Tag high bit
 //!     marks a *critical* record: a reader that doesn't know a critical tag refuses
 //!     the archive (UnsupportedExtension); an unknown non-critical tag is skipped.
-//!     Empty at 1.0. Tag 0x01 (1.1, non-critical) carries the per-member slot
+//!     Usually empty. Tag 0x01 (non-critical) carries the per-member slot
 //!     labels: [1 count][ [1 len][len bytes UTF-8] ]*count, count == G. They are
 //!     descriptive only -- `decompress_split` uses them to restore the original
 //!     per-slot file names instead of numbering positionally -- so a reader that

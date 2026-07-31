@@ -96,7 +96,7 @@ just one column over HTTP range requests (`fqxv.remote.RemoteArchive`). See the
   `--interleaved`.
 - `--split` reads the archive's group size from its header and creates that many
   output files, in the original input order.
-- Archives written by fqxv 1.1+ also record each member's **original slot label**
+- Newer archives also record each member's **original slot label**
   when it could be derived from the input file names, and `--mate-style auto` (the
   default) restores those names. This matters for runs whose read slots are empty
   over part of the run: their per-slot files are numbered by original slot and can

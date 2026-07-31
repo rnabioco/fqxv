@@ -70,11 +70,17 @@ pub const MAGIC: [u8; 4] = *b"FQXV";
 /// See `container.rs` for the full layout.
 pub const FORMAT_MAJOR: u8 = 1;
 
-/// On-disk format minor version. Bumped for backward-compatible additions — a new
-/// skippable header extension record, or a new optional codec/mode gated by a
-/// [`feature`] bit. A reader tolerates any minor within its [`FORMAT_MAJOR`]; the
-/// value is informational (surfaced by `inspect`).
-pub const FORMAT_MINOR: u8 = 1;
+/// On-disk format minor version. A reader tolerates any minor within its
+/// [`FORMAT_MAJOR`]; nothing in decode branches on it, so the value is purely
+/// informational (surfaced by `inspect` and `verify`).
+///
+/// Bump it only when a reader can *act* on the difference — a new [`feature`] bit
+/// it must refuse, or a new critical extension record. A purely skippable addition
+/// (a non-critical extension tag an older reader ignores while decoding every byte
+/// identically) does **not** need one: the extension region is self-describing, so
+/// the bump would fire on every archive, including the ones carrying none of the
+/// new field, while telling a reader nothing it can use.
+pub const FORMAT_MINOR: u8 = 0;
 
 /// Coarse capability bits an archive can require in its header `required_features`
 /// word. A reader that sees a set bit outside [`KNOWN_FEATURES`] refuses the

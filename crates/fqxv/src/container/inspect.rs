@@ -397,10 +397,10 @@ pub struct Info {
     /// record the expected checksum without a full pass.
     pub whole_file_crc: Option<u32>,
     /// Original per-slot labels for the interleaved members (`["R1", "R2"]`,
-    /// `["2", "4"]`, …), when the archive recorded them (format 1.1+). Empty for a
-    /// 1.0 archive or one compressed from inputs whose slots weren't identifiable,
-    /// in which case consumers name members positionally. Length equals
-    /// `group_size` whenever it is non-empty.
+    /// `["2", "4"]`, …), when the archive recorded them. Empty for an archive
+    /// written before the tag existed, or one compressed from inputs whose slots
+    /// weren't identifiable, in which case consumers name members positionally.
+    /// Length equals `group_size` whenever it is non-empty.
     pub member_labels: Vec<String>,
 }
 
