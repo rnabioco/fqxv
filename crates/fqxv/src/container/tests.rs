@@ -516,6 +516,46 @@ fn auto_leaves_single_end_ungrouped() {
     assert_eq!(out, single);
 }
 
+/// The streaming parser has to agree with the parallel one about what a record
+/// is. A header line followed by EOF used to read back as a zero-length record,
+/// so a truncated input was silently repaired into a valid archive; a garbage
+/// third line was accepted for the same reason (only the seq/qual lengths were
+/// compared). Both reach the streaming parser through `compress_multi`, which is
+/// the multi-file path and does not go through `parse_chunk`.
+#[test]
+fn streaming_parser_rejects_malformed_records() {
+    let good = b"@b1\nACGT\n+\nIIII\n@b2\nACGT\n+\nIIII\n".to_vec();
+    for bad in [
+        b"@a1\nACGT\n+\nIIII\n@a2\n".to_vec(), // truncated: header then EOF
+        b"@a1\nACGT\nJUNK\nIIII\n".to_vec(),   // '+' separator replaced by garbage
+    ] {
+        let readers: Vec<Box<dyn Read + Send>> = vec![
+            Box::new(&bad[..]) as Box<dyn Read + Send>,
+            Box::new(&good[..]),
+        ];
+        let err = compress_multi(readers, &mut Vec::new(), Params::default());
+        assert!(
+            matches!(err, Err(Error::Malformed(_))),
+            "expected an error, got {err:?}"
+        );
+    }
+}
+
+/// A zero-length record whose trailing newline is absent (`@n\n\n+\n`) is still a
+/// complete record — the '+' line is present, and both lengths are 0. `parse_chunk`
+/// accepts it, so the streaming parser must too; the new '+' check keys off the
+/// separator line rather than a trailing-byte count precisely so these two stay
+/// aligned.
+#[test]
+fn streaming_parser_accepts_zero_length_record_at_eof() {
+    let input = b"@r1\nACGT\n+\nIIII\n@r2\n\n+\n".to_vec();
+    let mut archive = Vec::new();
+    compress(&input[..], &mut archive, Params::default()).expect("compress");
+    let mut out = Vec::new();
+    decompress(&archive[..], &mut out, 1).unwrap();
+    assert_eq!(out, b"@r1\nACGT\n+\nIIII\n@r2\n\n+\n\n".to_vec());
+}
+
 #[test]
 fn unequal_mate_counts_error() {
     let r1 = make_reads("a", 2);

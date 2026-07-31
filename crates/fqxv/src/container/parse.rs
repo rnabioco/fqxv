@@ -98,7 +98,17 @@ pub(crate) fn read_raw_record<R: BufRead>(
     seq.extend_from_slice(strip_eol(&line));
 
     line.clear();
-    r.read_until(b'\n', &mut line)?; // '+' separator line — dropped
+    r.read_until(b'\n', &mut line)?;
+    // The '+' line's *content* is dropped ('+' normalization), but its presence is
+    // the record's structural anchor and has to be checked, exactly as `parse_chunk`
+    // does. Without this a header line followed by EOF ("@name\n") reads back as a
+    // zero-length record — all three remaining `read_until` calls return 0, and
+    // `seq.len() == qual.len()` holds at 0 — so a truncated file is silently
+    // repaired into a valid archive rather than rejected. It also let a garbage
+    // third line through, since only the pair of lengths was ever compared.
+    if line.first() != Some(&b'+') {
+        return Err(Error::Malformed("expected FASTQ '+' separator line"));
+    }
 
     line.clear();
     r.read_until(b'\n', &mut line)?;
