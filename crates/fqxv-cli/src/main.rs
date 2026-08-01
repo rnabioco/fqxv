@@ -57,7 +57,8 @@ Examples:
 
   # Download from SRA with sracha (rnabioco/sracha-rs) and archive in one pass,
   # nothing hitting disk: -Z streams interleaved FASTQ to stdout, '-' reads it,
-  # and paired data is auto-detected as interleaved (override with --interleaved N)
+  # and the spot layout (paired, or single-cell up to R1/R2/I1/I2) is detected
+  # from the read names (override with --interleaved N)
   sracha get -Z --split interleaved SRR2584863 | fqxv compress - -o SRR2584863.fqxv
 ";
 
@@ -251,9 +252,10 @@ enum Command {
         block_reads: Option<usize>,
         /// Force single-input interleaving, in members per spot.
         ///
-        /// Auto-detected from read names by default; pass to force (1 =
-        /// single-end, 2 = paired as from `sracha get -Z`). Ignored with
-        /// multiple inputs. A group size of 0 is meaningless and rejected.
+        /// Auto-detected from read names by default, for 2 (paired, as from
+        /// `sracha get -Z`) through 4 (single-cell R1/R2/I1/I2); pass to force a
+        /// value, including 1 for single-end, or for spots wider than 4. Ignored
+        /// with multiple inputs. A group size of 0 is meaningless and rejected.
         #[arg(
             long,
             value_name = "N",

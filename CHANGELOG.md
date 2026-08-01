@@ -16,6 +16,44 @@ misreading. Compatibility fails loudly, never silently. A format major bump woul
 be announced as a breaking change; see the
 [evolution policy](docs/design/container.md#versioning-and-evolution-policy).
 
+## [Unreleased]
+
+### Fixed
+
+- **Single-cell interleaving is no longer archived as paired.** Layout detection
+  only ever compared records pairwise, so a 4-member spot whose members share one
+  read name — 10x R1/R2/I1/I2 as `fasterq-dump` and `sracha` emit it, where the
+  members differ only in `length=` — looked like a mate pair at every offset and
+  was recorded as *paired*. `fqxv info` reported twice the real spot count, and
+  `--split` wrote two mate files that each interleaved two different slots at two
+  different read lengths, with no warning. Detection now cuts the peeked records
+  into runs of consecutive same-spot names and infers the common run length (up to
+  4), so 3- and 4-member layouts are detected and restored to one file per slot.
+  Archives written before this are unaffected: the stream itself was always
+  byte-lossless, only the recorded grouping was wrong.
+- **Interleaved SRA deflines are detected as paired.** `@RUN.5 5 length=150` repeats
+  the *spot name* on both mates, and its leading digit was read as a Casava mate
+  number — so both mates looked like member 5, and since members must be distinct
+  that vetoed the pairing and the stream was archived single-end, leaving `--split`
+  unable to restore the mate files. A leading description digit now counts as a mate
+  field only when followed by `:` (`1:N:0:…`), which is what distinguishes it from a
+  numeric spot name. This is the defline the documented
+  `sracha get -Z … | fqxv compress -` pipeline produces.
+- **Out-of-step inputs warn instead of silently mis-pairing.** With `G > 1` member
+  assignment is positional, so a stream missing one member mid-file shifts every
+  later read into the wrong mate file while the read count stays a clean multiple of
+  `G` — invisible to the spot-multiple check and to every CRC. Compression now
+  compares the members' names within each spot and warns with the count and the
+  first offending spot. This is the shape `fasterq-dump --split-files` produces for a
+  spot whose `READ_LEN` slot is 0: it writes no record at all for the empty slot.
+
+### Added
+
+- Container-level tests for the FASTQ shapes SRA conversion produces: a zero-length
+  read inside a `G > 1` spot surviving `--split` in its own slot, and `.` plus the
+  full IUPAC ambiguity set and lowercase bases round-tripping (SRA's 4na→text map is
+  `.ACMGRSVTWYHKDBN`, so converted FASTQ carries more than `N`).
+
 ## [0.6.0] - 2026-07-31
 
 ### Added
