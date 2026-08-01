@@ -30,3 +30,8 @@ pyo3 = { workspace = true, features = ["abi3-py39", "extension-module", "macros"
 # sniff the magic and decode transparently (BGZF is gzip-framed, so MultiGzDecoder
 # reads it too), mirroring the CLI's input auto-detection.
 flate2 = { workspace = true }
+
+[build-dependencies]
+# build.rs emits the `-undefined dynamic_lookup` cdylib link args that macOS
+# needs for an unlinked-libpython extension module; see the comment there.
+pyo3-build-config = { workspace = true }
