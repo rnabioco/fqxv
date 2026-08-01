@@ -22,7 +22,7 @@ recursively for `*.fqxv`, and report one entry per archive.
 | `-v, --verbose` | Increase log verbosity, repeatable (`-v` info, `-vv` debug, `-vvv` trace with targets, thread ids, and span timing); overridden by `RUST_LOG`. Logs go to stderr, so piped FASTQ stays clean. |
 | `-q, --quiet` | Silence all output except warnings and errors (also suppresses the progress indicator and the summary). |
 | `-h, --help` | Print help (`-h` for the summary, `--help` for the long form). |
-| `-V, --version` | Print version. A build that is not a clean release tag also reports its git description (`0.6.0 (v0.6.0-5-gb2c6fee)`). |
+| `-V, --version` | Print version. A build that is not a clean release tag also reports its git description (`0.6.1 (v0.6.1-5-gb2c6fee)`). |
 
 `compress` and `decompress` fan blocks out across threads with `rayon`; the
 output is byte-identical regardless of thread count.
