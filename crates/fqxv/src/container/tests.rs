@@ -516,6 +516,234 @@ fn auto_leaves_single_end_ungrouped() {
     assert_eq!(out, single);
 }
 
+/// One interleaved stream in the defline format `fasterq-dump` and `sracha`
+/// emit by default: every member of a spot repeats the spot's name and differs
+/// only in `length=`. `slots` gives each member's read length.
+fn sra_interleaved(run: &str, slots: &[usize], spots: usize) -> Vec<u8> {
+    let mut v = Vec::new();
+    for i in 1..=spots {
+        for &len in slots {
+            let seq = "ACGT".repeat(len.div_ceil(4));
+            v.extend_from_slice(
+                format!(
+                    "@{run}.{i} length={len}\n{}\n+\n{}\n",
+                    &seq[..len],
+                    "I".repeat(len)
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    v
+}
+
+/// The sequence-line length of every record in a decoded mate file.
+fn record_lens(fastq: &[u8]) -> Vec<usize> {
+    fastq
+        .split(|&b| b == b'\n')
+        .skip(1)
+        .step_by(4)
+        .map(<[u8]>::len)
+        .collect()
+}
+
+/// Single-cell interleaving (3 and 4 members per spot) is inferred from the
+/// names, and `--split` puts each slot back in its own file at its own length.
+///
+/// The old rule only ever compared records pairwise, so a 4-member spot sharing
+/// one name — 10x R1/R2/I1/I2 out of `sracha get -Z --split interleaved
+/// --include-technical` — looked like a mate pair at every offset and was
+/// archived as *paired*. `--split` then wrote two files that each interleaved
+/// two real slots at two different read lengths, silently: the shape
+/// rnabioco/sracha-rs#84 reports against `sracha` itself.
+#[test]
+fn auto_detects_single_cell_interleaving() {
+    for slots in [vec![26, 55, 8], vec![28, 91, 8, 8]] {
+        let g = slots.len();
+        let input = sra_interleaved("SRR9827735", &slots, 40);
+        let mut archive = Vec::new();
+        let s = compress_auto(&input[..], &mut archive, Params::default()).unwrap();
+        assert_eq!(
+            s.group_size, g as u8,
+            "{slots:?} should detect as {g} members"
+        );
+        assert_eq!(peek(&archive[..]).unwrap().group_size, g as u8);
+
+        let mut outs: Vec<Vec<u8>> = vec![Vec::new(); g];
+        {
+            let mut refs: Vec<&mut Vec<u8>> = outs.iter_mut().collect();
+            decompress_split(&archive[..], &mut refs, 1).unwrap();
+        }
+        for (slot, out) in outs.iter().enumerate() {
+            let lens = record_lens(out);
+            assert_eq!(lens.len(), 40, "{slots:?} slot {slot} record count");
+            assert!(
+                lens.iter().all(|&l| l == slots[slot]),
+                "{slots:?} slot {slot} should be all {}, got {lens:?}",
+                slots[slot]
+            );
+        }
+        let mut flat = Vec::new();
+        decompress(&archive[..], &mut flat, 1).unwrap();
+        assert_eq!(flat, input, "{slots:?} interleaved round-trip");
+    }
+}
+
+/// `@RUN.5 5 length=150` — the second field is the *spot name*, repeated on both
+/// mates. Reading its leading digit as a Casava mate number made both mates of
+/// an interleaved SRA dump look like member 5; equal markers are not distinct
+/// members, so pairing was vetoed and the stream archived single-end, leaving
+/// `--split` unable to restore the mate files. This is the defline the CLI's own
+/// `sracha get -Z … | fqxv compress -` example produces.
+#[test]
+fn auto_pairs_sra_numeric_spot_name_deflines() {
+    let mut input = Vec::new();
+    for i in 1..=20 {
+        for _ in 0..2 {
+            input.extend_from_slice(
+                format!("@SRR2584863.{i} {i} length=4\nACGT\n+\nIIII\n").as_bytes(),
+            );
+        }
+    }
+    let mut archive = Vec::new();
+    let s = compress_auto(&input[..], &mut archive, Params::default()).unwrap();
+    assert_eq!(s.group_size, 2);
+    let (mut m1, mut m2) = (Vec::new(), Vec::new());
+    decompress_split(&archive[..], &mut [&mut m1, &mut m2], 1).unwrap();
+    assert_eq!(record_lens(&m1).len(), 20);
+    assert_eq!(record_lens(&m2).len(), 20);
+}
+
+/// The two conventions that genuinely mark a member still pair, and the `:` that
+/// distinguishes a Casava mate field from a numeric spot name is required.
+#[test]
+fn explicit_mate_conventions_still_pair() {
+    let mut casava = Vec::new();
+    let mut slash = Vec::new();
+    for i in 1..=20 {
+        for m in 1..=2 {
+            casava.extend_from_slice(
+                format!("@INST:1:FC:1:1101:{i}:{i} {m}:N:0:ATCACG\nACGT\n+\nIIII\n").as_bytes(),
+            );
+            slash.extend_from_slice(format!("@SRR1.{i}/{m}\nACGT\n+\nIIII\n").as_bytes());
+        }
+    }
+    for input in [casava, slash] {
+        let mut archive = Vec::new();
+        let s = compress_auto(&input[..], &mut archive, Params::default()).unwrap();
+        assert_eq!(s.group_size, 2);
+    }
+}
+
+/// Ambiguity falls back to single-end, which is always safe to archive: a spot
+/// wider than any layout we infer, and members that repeat one marker instead of
+/// each carrying a distinct one.
+#[test]
+fn ambiguous_layouts_stay_single_end() {
+    let wide = sra_interleaved("SRR1", &[4; 6], 6);
+    let mut repeated_marker = Vec::new();
+    for i in 1..=20 {
+        for _ in 0..2 {
+            repeated_marker
+                .extend_from_slice(format!("@x.{i} 1:N:0:A\nACGT\n+\nIIII\n").as_bytes());
+        }
+    }
+    for input in [wide, repeated_marker] {
+        let mut archive = Vec::new();
+        let s = compress_auto(&input[..], &mut archive, Params::default()).unwrap();
+        assert_eq!(s.group_size, 1);
+        let mut out = Vec::new();
+        decompress(&archive[..], &mut out, 1).unwrap();
+        assert_eq!(out, input);
+    }
+}
+
+/// A zero-length read inside a `G > 1` spot keeps its own slot on `--split`.
+///
+/// Normalized SRA runs carry spots like `READ_LEN = [0, 150]`
+/// (rnabioco/sracha-rs#76). Member assignment is positional (`index % G`), so the
+/// empty record has to be *emitted* into mate 1 rather than renumbering the
+/// spot's remaining members up a slot.
+#[test]
+fn zero_length_read_in_a_grouped_spot_keeps_its_slot() {
+    let (mut r1, mut r2) = (Vec::new(), Vec::new());
+    for i in 1..=12 {
+        let (seq, qual) = if i % 4 == 0 {
+            ("", "")
+        } else {
+            ("ACGT", "IIII")
+        };
+        r1.extend_from_slice(
+            format!(
+                "@SRR18959644.{i} {i} length={}\n{seq}\n+\n{qual}\n",
+                seq.len()
+            )
+            .as_bytes(),
+        );
+        r2.extend_from_slice(format!("@SRR18959644.{i} {i} length=4\nTTTT\n+\nFFFF\n").as_bytes());
+    }
+    for reorder in [false, true] {
+        let readers: Vec<Box<dyn io::Read + Send>> = vec![Box::new(&r1[..]), Box::new(&r2[..])];
+        let mut archive = Vec::new();
+        compress_multi(
+            readers,
+            &mut archive,
+            Params {
+                reorder,
+                ..Params::default()
+            },
+        )
+        .unwrap();
+        let (mut m1, mut m2) = (Vec::new(), Vec::new());
+        decompress_split(&archive[..], &mut [&mut m1, &mut m2], 1).unwrap();
+        assert_eq!(m1, r1, "reorder={reorder}: empty read must stay in mate 1");
+        assert_eq!(m2, r2, "reorder={reorder}");
+    }
+}
+
+/// SRA's 4na→text map is `.ACMGRSVTWYHKDBN`, so a converted FASTQ carries `.`
+/// and the whole ambiguity set, not just `N` (rnabioco/sracha-rs#4). All of it,
+/// plus lowercase, has to survive the container — the codecs route every
+/// non-ACGT byte through an exception list, and only `N` is free.
+#[test]
+fn iupac_dot_and_lowercase_survive_the_container() {
+    let alphabet: &[u8] = b".ACMGRSVTWYHKDBNacgtn";
+    let mut input = Vec::new();
+    for (i, w) in alphabet.windows(9).enumerate() {
+        input.extend_from_slice(format!("@r.{i} {i} length=9\n").as_bytes());
+        input.extend_from_slice(w);
+        input.extend_from_slice(b"\n+\n!~!~!~!~!\n");
+    }
+    for reorder in [false, true] {
+        let archive = compress_bytes(
+            &input,
+            Params {
+                reorder,
+                ..Params::default()
+            },
+        );
+        let mut out = Vec::new();
+        decompress(&archive[..], &mut out, 1).unwrap();
+        assert_eq!(out, input, "reorder={reorder}");
+    }
+}
+
+/// `spot_base` is what the desync guard compares across a spot's members, so it
+/// has to agree with `mate_key` about where the spot name ends.
+#[test]
+fn spot_base_identifies_the_spot_across_conventions() {
+    for (def, want) in [
+        (&b"SRR1.5 5 length=150"[..], &b"SRR1.5"[..]),
+        (b"SRR1.5/1", b"SRR1.5"),
+        (b"SRR1.5/2 extra", b"SRR1.5"),
+        (b"INST:1:FC\tdesc", b"INST:1:FC"),
+        (b"plain", b"plain"),
+        (b"", b""),
+    ] {
+        assert_eq!(spot_base(def), want, "{}", String::from_utf8_lossy(def));
+    }
+}
+
 /// Member labels survive a round-trip and reach `peek`/`inspect`, for both the
 /// plain and reorder layouts (each writes its own header).
 #[test]

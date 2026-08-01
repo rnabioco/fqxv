@@ -2,7 +2,7 @@
 
 use super::*;
 use rayon::prelude::*;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 /// Default reads per block. Larger blocks populate the sequence model's contexts
 /// better (higher ratio) but reduce parallelism and raise memory.
@@ -149,10 +149,14 @@ pub fn compress<'a, R: Read + Send + 'a, W: Write>(
     )
 }
 
+/// Widest interleaving [`detect_group_size`] will infer from read names: 4, the
+/// single-cell R1/R2/I1/I2 layout. Wider spots need an explicit group size.
+pub(crate) const MAX_AUTO_GROUP: usize = 4;
+
 /// How many leading records [`compress_auto`] reads to decide whether a single
-/// stream is interleaved paired data. Four spots' worth is plenty to be
-/// confident while staying cheap for the common single-end case.
-pub(crate) const AUTODETECT_PEEK: usize = 8;
+/// stream is interleaved per-spot data. Four spots at the widest layout we infer
+/// is plenty to be confident while staying cheap for the common single-end case.
+pub(crate) const AUTODETECT_PEEK: usize = 4 * MAX_AUTO_GROUP;
 
 /// Read from `r` into `buf` until it holds `need` complete FASTQ records or the
 /// reader is exhausted; returns `true` at EOF. A record is four newline-terminated
@@ -190,58 +194,103 @@ fn read_leading_records<R: Read>(r: &mut R, buf: &mut Vec<u8>, need: usize) -> R
     }
 }
 
-/// Split a read name into its mate-independent base and an optional mate marker.
-/// Handles the two common conventions: a `/1`|`/2` name suffix, and a mate digit
-/// as the first token of the description (`@id 1:N:…` / `@id 2:N:…`).
+/// Split a read name into the base that identifies its *spot* and an optional
+/// member marker. Handles the two conventions that actually mark a member: a
+/// `/1`..`/4` name suffix, and the Casava mate field at the head of the
+/// description (`@id 1:N:0:…` / `@id 2:N:0:…`).
+///
+/// The `:` is what makes a leading description digit a Casava mate field rather
+/// than a numeric spot name. SRA deflines are `@RUN.5 5 length=150`, where that
+/// second `5` is the spot name repeated on *every* member of the spot — reading
+/// it as a member number made both mates of an interleaved SRA dump look like
+/// member 5, and since [`detect_group_size`] wants members to be *distinct*,
+/// equal markers vetoed the spot outright and the pairing was missed.
 pub(crate) fn mate_key(rec: &noodles_fastq::Record) -> (&[u8], Option<u8>) {
     let name: &[u8] = rec.name().as_ref();
-    if let [base @ .., b'/', m @ (b'1' | b'2')] = name {
+    if let [base @ .., b'/', m @ b'1'..=b'4'] = name {
         return (base, Some(*m));
     }
     let desc: &[u8] = rec.description().as_ref();
-    let marker = desc.first().copied().filter(|c| matches!(c, b'1' | b'2'));
+    let marker = match desc {
+        [m @ b'1'..=b'4', b':', ..] => Some(*m),
+        _ => None,
+    };
     (name, marker)
 }
 
-/// True when `a` and `b` look like the two mates of one spot: same base name and
-/// either explicit, differing mate markers (`/1` vs `/2`) or none at all (a bare
-/// repeated name, as some interleaved dumps emit).
-pub(crate) fn are_mates(a: &noodles_fastq::Record, b: &noodles_fastq::Record) -> bool {
-    let (base_a, mate_a) = mate_key(a);
-    let (base_b, mate_b) = mate_key(b);
-    base_a == base_b
-        && match (mate_a, mate_b) {
-            (Some(x), Some(y)) => x != y,
-            (None, None) => true,
-            _ => false,
+/// True when a run of same-base records can be one spot: either no member is
+/// marked (a bare repeated name, as interleaved SRA dumps emit) or every member
+/// is marked and no two markers agree.
+fn members_distinct(spot: &[(&[u8], Option<u8>)]) -> bool {
+    if spot.iter().all(|(_, m)| m.is_none()) {
+        return true;
+    }
+    let mut seen = 0u16;
+    for (_, m) in spot {
+        let Some(m) = m else { return false };
+        let bit = 1u16 << (m - b'0');
+        if seen & bit != 0 {
+            return false;
         }
+        seen |= bit;
+    }
+    true
 }
 
-/// Guess the interleaving of a single stream from its leading records. Returns 2
-/// only when every peeked pair looks like paired mates; anything ambiguous falls
-/// back to 1 (single-end), which is always safe to archive. Single-cell (3-4)
-/// interleaving is not auto-detected — pass an explicit group size for that.
-pub(crate) fn detect_group_size(peeked: &[noodles_fastq::Record]) -> u8 {
-    if peeked.len() < 2 {
-        return 1;
-    }
-    let pairs = peeked.len() / 2;
-    for i in 0..pairs {
-        if !are_mates(&peeked[2 * i], &peeked[2 * i + 1]) {
-            return 1;
+/// Infer the interleaving of a single stream from its leading records.
+///
+/// Records of one spot share a name — bare-repeated, or plus a distinct member
+/// marker — so the peek is cut into maximal runs of consecutive same-base names,
+/// each run being one spot, and the layout is the common run length (up to
+/// [`MAX_AUTO_GROUP`]). Anything ambiguous falls back to 1 (single-end), which is
+/// always safe to archive.
+///
+/// Only *complete* runs count. The peek's final run is still open unless the
+/// whole stream fit inside the peek (`saw_stream_end`), and counting a truncated
+/// run would infer a narrower layout than the file really has — a 3-member
+/// layout peeked 16 records deep ends on a 1-record fragment, which would
+/// otherwise disagree with the five complete runs before it and fall back to 1.
+///
+/// The previous rule only ever compared records pairwise, so a 4-member spot
+/// sharing one name — 10x R1/R2/I1/I2 as `sracha`/`fasterq-dump` emit it —
+/// satisfied it at every pair and was archived as *paired*. `--split` then wrote
+/// two files that each interleaved two real slots, at two different read lengths,
+/// with no warning: the same shape rnabioco/sracha-rs#84 reports.
+pub(crate) fn detect_group_size(peeked: &[noodles_fastq::Record], saw_stream_end: bool) -> u8 {
+    let keys: Vec<(&[u8], Option<u8>)> = peeked.iter().map(mate_key).collect();
+    let mut runs: Vec<usize> = Vec::new();
+    let mut start = 0usize;
+    for i in 1..=keys.len() {
+        if i < keys.len() && keys[i].0 == keys[start].0 {
+            continue;
         }
+        if i < keys.len() || saw_stream_end {
+            if !members_distinct(&keys[start..i]) {
+                return 1;
+            }
+            runs.push(i - start);
+        }
+        start = i;
     }
-    2
+    let g = match runs.split_first() {
+        Some((&first, rest)) if rest.iter().all(|&r| r == first) => first,
+        _ => return 1,
+    };
+    if (2..=MAX_AUTO_GROUP).contains(&g) {
+        g as u8
+    } else {
+        1
+    }
 }
 
-/// Compress a single FASTQ stream, auto-detecting whether it is interleaved
-/// paired data from the leading read names (see `detect_group_size`). This is
-/// what the CLI uses by default for a lone input so `sracha get -Z … | fqxv
-/// compress -` archives paired downloads with the right spot grouping and no
-/// flag. Detection only ever promotes to paired on unambiguous mate names;
+/// Compress a single FASTQ stream, auto-detecting its per-spot interleaving from
+/// the leading read names (see `detect_group_size`) — paired, or single-cell up to
+/// four members (R1/R2/I1/I2). This is what the CLI uses for a lone input, so
+/// `sracha get -Z … | fqxv compress -` archives a download with the right spot
+/// grouping and no flag. Detection only promotes on unambiguous spot names;
 /// otherwise it behaves exactly like [`compress`]. `reorder` mode honours the
-/// detected grouping too: paired input is globally clustered and a permutation
-/// restores the mate interleaving (see `encode_reordered`).
+/// detected grouping too: grouped input is globally clustered and a permutation
+/// restores the interleaving (see `encode_reordered`).
 #[instrument(skip_all, fields(seq_order = params.seq_order, block_reads = params.block_reads, reorder = params.reorder, threads = params.threads))]
 pub fn compress_auto<'a, R: Read + Send + 'a, W: Write>(
     mut reader: R,
@@ -263,7 +312,10 @@ pub fn compress_auto<'a, R: Read + Send + 'a, W: Write>(
         }
         peeked.push(rec);
     }
-    let g = detect_group_size(&peeked);
+    // The peek's last record is genuinely the stream's last only if the reader
+    // ran dry *and* the peek stopped short of its own cap — at the cap there may
+    // be more records sitting in `prefix` beyond the ones we decoded.
+    let g = detect_group_size(&peeked, eof && peeked.len() < AUTODETECT_PEEK);
     // Mean sequence length over the peeked records: long reads (nanopore/PacBio)
     // want the buffered shared-reference layout (issue #168), so they can't take
     // the streaming single-end shortcut below.
@@ -303,10 +355,108 @@ pub fn compress_auto<'a, R: Read + Send + 'a, W: Write>(
     if !eof {
         reader.read_to_end(&mut prefix)?;
     }
+    if g > 1 {
+        check_spot_coherence(&prefix, g as usize);
+    }
     if params.reorder {
         return encode_reordered(buffer_records(&prefix)?, writer, params, g);
     }
     compress_buffered(&prefix, writer, params, g)
+}
+
+/// The base name shared by every member of one spot: the definition line up to
+/// its first separator, minus a `/1`..`/4` member suffix. The raw-bytes analogue
+/// of [`mate_key`]'s first element, for the paths that never build a `noodles`
+/// record.
+pub(crate) fn spot_base(def: &[u8]) -> &[u8] {
+    let end = def
+        .iter()
+        .position(|&b| b == b' ' || b == b'\t')
+        .unwrap_or(def.len());
+    match &def[..end] {
+        [base @ .., b'/', b'1'..=b'4'] => base,
+        name => name,
+    }
+}
+
+/// Running tally of spots whose members disagree on their base name.
+///
+/// With `G > 1` the layout is purely positional — member `i` of every spot is
+/// written to output `i` — so a stream that loses one member somewhere in the
+/// middle shifts every later read into the wrong mate file. The read count stays
+/// a clean multiple of `G`, so neither the spot-multiple check nor any CRC can
+/// see it; only the names can. That is exactly what
+/// `fasterq-dump --split-files` produces for a spot whose `READ_LEN` slot is 0 —
+/// it writes no record at all for the empty slot (rnabioco/sracha-rs#76).
+///
+/// This warns rather than rejects: mates whose names genuinely disagree are
+/// unusual but legal, and the archive is still byte-lossless either way. What is
+/// wrong is only the spot grouping, which does not bite until `--split`.
+#[derive(Default)]
+pub(crate) struct SpotCoherence {
+    spots: u64,
+    bad: u64,
+    first_bad: Option<u64>,
+}
+
+impl SpotCoherence {
+    /// Record one spot, given its members' raw definition lines.
+    fn observe<T: AsRef<[u8]>>(&mut self, defs: &[T]) {
+        let base = spot_base(defs[0].as_ref());
+        if defs[1..].iter().any(|d| spot_base(d.as_ref()) != base) {
+            self.bad += 1;
+            self.first_bad.get_or_insert(self.spots);
+        }
+        self.spots += 1;
+    }
+
+    /// Emit one warning covering the whole run, if any spot disagreed.
+    fn finish(&self, g: usize) {
+        if let Some(first) = self.first_bad {
+            warn!(
+                group_size = g,
+                spots = self.spots,
+                mismatched_spots = self.bad,
+                first_mismatched_spot = first,
+                "members of a spot do not share a read name — the inputs look \
+                 out of step, so reads may be assigned to the wrong mate on \
+                 --split (a converter that drops zero-length reads instead of \
+                 emitting them does this)"
+            );
+        }
+    }
+}
+
+/// [`SpotCoherence`] over an in-memory interleaved stream, without a second full
+/// parse: FASTQ is strictly four lines per record, so every fourth line is a
+/// definition. Bails out silently the moment that assumption does not hold —
+/// the real parser runs next and reports malformed input far better than a
+/// heuristic scan could.
+fn check_spot_coherence(buf: &[u8], g: usize) {
+    let mut cohere = SpotCoherence::default();
+    let mut defs: Vec<&[u8]> = Vec::with_capacity(g);
+    let mut line_no = 0usize;
+    let mut pos = 0usize;
+    while pos < buf.len() {
+        let end = memchr::memchr(b'\n', &buf[pos..]).map_or(buf.len(), |k| pos + k);
+        if line_no.is_multiple_of(4) {
+            let mut def = &buf[pos..end];
+            if def.last() == Some(&b'\r') {
+                def = &def[..def.len() - 1];
+            }
+            match def.split_first() {
+                Some((b'@', rest)) => defs.push(rest),
+                _ => return,
+            }
+            if defs.len() == g {
+                cohere.observe(&defs);
+                defs.clear();
+            }
+        }
+        line_no += 1;
+        pos = end + 1;
+    }
+    cohere.finish(g);
 }
 
 /// Compress a single FASTQ stream whose records are *already* interleaved per
@@ -331,6 +481,7 @@ pub fn compress_interleaved<R: Read + Send, W: Write>(
     }
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
+    check_spot_coherence(&buf, g as usize);
     if params.reorder {
         return encode_reordered(buffer_records(&buf)?, writer, params, g);
     }
@@ -379,6 +530,11 @@ pub fn compress_multi<'a, W: Write>(
     let mut seqs: Vec<Vec<u8>> = vec![Vec::new(); g];
     let mut quals: Vec<Vec<u8>> = vec![Vec::new(); g];
 
+    // Separate inputs can fall out of step too: a converter that drops a spot's
+    // zero-length read from one file and a different spot's from another leaves
+    // the counts equal but the spots misaligned (see `SpotCoherence`).
+    let mut cohere = SpotCoherence::default();
+
     if params.reorder {
         // Buffer every spot in interleaved order (m0₀, m1₀, …), then globally
         // cluster; the stored permutation restores this spot order on decode, so
@@ -389,10 +545,14 @@ pub fn compress_multi<'a, W: Write>(
                 if !read_raw_record(&mut fqs[j], &mut defs[j], &mut seqs[j], &mut quals[j])? {
                     if j == 0 {
                         members_at_eof(&mut fqs)?;
+                        cohere.finish(g);
                         return encode_reordered(all, writer, params, g as u8);
                     }
                     return Err(Error::Malformed("inputs have unequal read counts"));
                 }
+            }
+            if g > 1 {
+                cohere.observe(&defs);
             }
             for j in 0..g {
                 all.push_raw(&defs[j], &seqs[j], &quals[j]);
@@ -417,10 +577,13 @@ pub fn compress_multi<'a, W: Write>(
         }
         primed.push((defs[j].clone(), seqs[j].clone(), quals[j].clone()));
     }
+    if g > 1 && primed.len() == g {
+        cohere.observe(&defs);
+    }
     let refs: Vec<&[u8]> = primed.iter().map(|(d, _, _)| d.as_slice()).collect();
     let platform = params.platform.unwrap_or_else(|| detect_platform(&refs));
     let mut primed = Some(primed).filter(|p| !p.is_empty());
-    drive(writer, params, g as u8, platform, |b| {
+    let stats = drive(writer, params, g as u8, platform, |b| {
         // Emit the primed first spot into the first block before reading on.
         if let Some(spot) = primed.take() {
             for (header, seq, qual) in &spot {
@@ -441,12 +604,17 @@ pub fn compress_multi<'a, W: Write>(
                     return Err(Error::Malformed("inputs have unequal read counts"));
                 }
             }
+            if g > 1 {
+                cohere.observe(&defs);
+            }
             for j in 0..g {
                 b.push_raw(&defs[j], &seqs[j], &quals[j]);
             }
         }
         Ok(b.n_reads())
-    })
+    })?;
+    cohere.finish(g);
+    Ok(stats)
 }
 
 /// Mean sequence length over the first few FASTQ records of a buffer, for routing
