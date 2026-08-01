@@ -16,7 +16,14 @@ misreading. Compatibility fails loudly, never silently. A format major bump woul
 be announced as a breaking change; see the
 [evolution policy](docs/design/container.md#versioning-and-evolution-policy).
 
-## [Unreleased]
+## [0.6.1] - 2026-08-01
+
+Patch rather than minor: no public API changed (every helper involved is
+crate-private), no new flag or entry point was added, and the on-disk format is
+untouched — group sizes 3 and 4 were always valid and always reachable via
+`--interleaved`, so this only changes *when* they are chosen. Archives already on
+disk are unaffected, and both cross-release compatibility directions are
+unchanged.
 
 ### Fixed
 
@@ -46,13 +53,11 @@ be announced as a breaking change; see the
   compares the members' names within each spot and warns with the count and the
   first offending spot. This is the shape `fasterq-dump --split-files` produces for a
   spot whose `READ_LEN` slot is 0: it writes no record at all for the empty slot.
-
-### Added
-
-- Container-level tests for the FASTQ shapes SRA conversion produces: a zero-length
-  read inside a `G > 1` spot surviving `--split` in its own slot, and `.` plus the
-  full IUPAC ambiguity set and lowercase bases round-tripping (SRA's 4na→text map is
-  `.ACMGRSVTWYHKDBN`, so converted FASTQ carries more than `N`).
+- Two FASTQ shapes SRA conversion produces now have container-level tests, having
+  been covered only at the codec level: a zero-length read inside a `G > 1` spot
+  surviving `--split` in its own slot, and `.` plus the full IUPAC ambiguity set and
+  lowercase bases round-tripping (SRA's 4na→text map is `.ACMGRSVTWYHKDBN`, so
+  converted FASTQ carries more than `N`).
 
 ## [0.6.0] - 2026-07-31
 
