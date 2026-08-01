@@ -518,6 +518,7 @@ dependencies = [
  "flate2",
  "fqxv",
  "pyo3",
+ "pyo3-build-config",
 ]
 
 [[package]]
