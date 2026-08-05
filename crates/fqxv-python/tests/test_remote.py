@@ -227,6 +227,65 @@ def test_download_matches_local(server, archive, tmp_path):
     assert dest.read_bytes() == fqxv.decompress_to_bytes(archive)
 
 
+@pytest.fixture(scope="session")
+def longread_archive(tmp_path_factory):
+    """A Nanopore archive whose quality is coded against the sequence, so a remote
+    quality projection must refetch each group's sequence column too (remote.py's
+    seq-refetch branch, untested by the short-read fixture)."""
+    cli = _fqxv_cli()
+    if cli is None:
+        pytest.skip("fqxv CLI not found (set FQXV_BIN or build the workspace)")
+    import random
+
+    d = tmp_path_factory.mktemp("fqxv_lr_remote")
+    fastq = d / "lr.fastq"
+    qmap = {"A": "I", "C": "F", "G": ";", "T": "5"}
+    rng = random.Random(7)
+    with fastq.open("w") as fh:
+        for i in range(300):
+            seq = "".join(rng.choices("ACGT", k=750 + (i % 120)))
+            qual = "".join(qmap[b] for b in seq)
+            fh.write(f"@ln{i:08x}-1111-2222 ch={i}\n{seq}\n+\n{qual}\n")
+    archive = d / "lr.fqxv"
+    subprocess.run(
+        [
+            cli, "--quiet", "compress", "--platform", "nanopore",
+            "--block-reads", "100", str(fastq), "-o", str(archive),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return str(archive)
+
+
+@pytest.fixture(scope="session")
+def longread_server(longread_archive):
+    directory = os.path.dirname(longread_archive)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _RangeHandler)
+    httpd.directory = directory
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    host, port = httpd.server_address
+    yield f"http://{host}:{port}/{os.path.basename(longread_archive)}"
+    httpd.shutdown()
+
+
+def test_remote_longread_qualities_refetch_sequence(longread_server, longread_archive):
+    # Sanity: this fixture really does condition quality on sequence.
+    arc = remote.open_index(longread_server)
+    start, end = arc.index.stream_range(0, "quality")
+    assert fqxv.quality_needs_sequence_bytes(arc._get_range(start, end))
+
+    local = list(fqxv.open(longread_archive))
+    # remote.qualities() must refetch each group's sequence to decode its quality.
+    assert remote.read_qualities(longread_server) == [r.quality for r in local]
+    # remote.records() takes the same seq-refetch branch when zipping columns.
+    recs = remote.open_index(longread_server).records()
+    assert [r.quality for r in recs] == [r.quality for r in local]
+    assert [r.sequence for r in recs] == [r.sequence for r in local]
+    assert [r.name for r in recs] == [r.name for r in local]
+
+
 def test_primitives_drive_a_manual_projection(server, archive):
     # The IO-free primitives a custom (e.g. async) client would call directly.
     import urllib.request

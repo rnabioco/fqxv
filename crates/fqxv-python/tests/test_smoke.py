@@ -223,3 +223,115 @@ def test_verify_passes_on_good_archive(archive):
 def test_verify_rejects_non_archive():
     with pytest.raises(Exception):
         fqxv.verify(b"definitely not an fqxv archive")
+
+
+def test_version_is_exposed():
+    # The package re-exports its installed version so callers can log/branch on it.
+    assert isinstance(fqxv.__version__, str)
+    assert fqxv.__version__  # non-empty
+
+
+# --------------------------------------------------------------------------- #
+# Long-read (Nanopore/PacBio) fixtures. Reads averaging >500 bp make the quality
+# coder condition each score on its base (fqzcomp MODE_SEQ), so the quality stream
+# can't be projected alone — the decoder must be handed that group's decoded
+# sequence. Short-read fixtures never hit this path, so it needs its own coverage.
+# --------------------------------------------------------------------------- #
+# Quality that tracks the base makes the sequence context win the size trial, so
+# MODE_SEQ (quality-needs-sequence) is reliably selected.
+_QMAP = {"A": "I", "C": "F", "G": ";", "T": "5"}
+
+
+def _write_longread_fastq(dest_dir):
+    fastq = dest_dir / "longread.fastq"
+    import random
+
+    rng = random.Random(7)
+    with fastq.open("w") as fh:
+        for i in range(300):
+            length = 750 + (i % 120)  # mean ~810 bp, comfortably over 500
+            seq = "".join(rng.choices("ACGT", k=length))
+            qual = "".join(_QMAP[b] for b in seq)
+            fh.write(
+                f"@ln{i:08x}-1111-2222-3333-444455556666 runid=x ch={i}\n"
+                f"{seq}\n+\n{qual}\n"
+            )
+    return fastq
+
+
+@pytest.fixture(scope="session")
+def longread_fastq(tmp_path_factory):
+    return str(_write_longread_fastq(tmp_path_factory.mktemp("fqxv_lr_fastq")))
+
+
+@pytest.fixture(scope="session")
+def longread_archive(tmp_path_factory):
+    """A multi-group Nanopore archive whose quality is coded against the sequence.
+    Explicit ``--platform nanopore`` keeps each block's sequence self-contained (no
+    shared reference), so a projected quality read can refetch and decode it."""
+    d = tmp_path_factory.mktemp("fqxv_lr")
+    fastq = _write_longread_fastq(d)
+    cli = _fqxv_cli()
+    if cli is None:
+        pytest.skip("fqxv CLI not found (set FQXV_BIN or build the workspace)")
+    archive = d / "longread.fqxv"
+    # --block-reads 100 → 3 row groups over 300 reads.
+    subprocess.run(
+        [
+            cli, "--quiet", "compress", "--platform", "nanopore",
+            "--block-reads", "100", str(fastq), "-o", str(archive),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return str(archive)
+
+
+def test_longread_quality_is_coded_against_sequence(longread_archive):
+    info = fqxv.inspect(longread_archive)
+    assert not info.reordered, "long-read fixture must be projectable (plain layout)"
+
+    idx = fqxv.open_index(longread_archive)
+    assert idx.num_groups >= 2, "fixture should span multiple row groups"
+
+    # The quality column of group 0 must be sequence-conditioned — otherwise this
+    # test is silently exercising the short-read path, not the one it exists for.
+    raw = pathlib.Path(longread_archive).read_bytes()
+    start, end = idx.stream_range(0, "quality")
+    assert fqxv.quality_needs_sequence_bytes(raw[start:end])
+
+    # The projection paths must decode it correctly: read_qualities internally
+    # refetches each group's sequence to decode its quality.
+    local = list(fqxv.open(longread_archive))
+    assert fqxv.read_qualities(longread_archive) == [r.quality for r in local]
+    assert fqxv.read_sequences(longread_archive) == [r.sequence for r in local]
+    block0 = fqxv.read_block(longread_archive, 0)
+    assert [r.quality for r in block0] == [r.quality for r in local[: len(block0)]]
+
+
+@pytest.mark.parametrize("fixture_name", ["fastq", "longread_fastq"])
+@pytest.mark.parametrize("level", [1, 5, 7, 8, 9])
+def test_estimate_archive_bytes_matches_cli(request, fixture_name, level):
+    """`estimate` re-implements the CLI's ``level_to_*`` effort mapping; a copy that
+    drifts would silently mis-size. Lock them together: the projected archive size
+    must equal ``fqxv compress --level N --estimate tsv`` on the same input. The
+    fixtures are small enough that both fully consume them, so the size is exact.
+    The long-read fixture additionally exercises the tiler knobs (`level_to_tile`),
+    which short reads never touch."""
+    cli = _fqxv_cli()
+    if cli is None:
+        pytest.skip("fqxv CLI not found (set FQXV_BIN or build the workspace)")
+    fastq = request.getfixturevalue(fixture_name)
+    out = subprocess.run(
+        [cli, "compress", "--level", str(level), "--estimate", "tsv", fastq],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip().splitlines()
+    # TSV: "file\tinput_bytes\test_fqxv_bytes\tratio" then one data row.
+    cli_bytes = int(out[1].split("\t")[2])
+    py_bytes = fqxv.estimate(fastq, level=level).archive_bytes
+    assert py_bytes == cli_bytes, (
+        f"level {level} on {fixture_name}: python={py_bytes} cli={cli_bytes} — "
+        "the level_to_* mapping in fqxv-python drifted from fqxv-cli"
+    )
