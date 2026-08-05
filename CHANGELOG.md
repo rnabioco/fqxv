@@ -16,6 +16,30 @@ misreading. Compatibility fails loudly, never silently. A format major bump woul
 be announced as a breaking change; see the
 [evolution policy](docs/design/container.md#versioning-and-evolution-policy).
 
+## [0.6.2] - 2026-08-05
+
+Patch: no public Rust API changed and the on-disk format is untouched, so every
+existing archive reads and writes exactly as before. The changes are additive — a
+second unit on the run summary, and type information plus a version attribute on
+the Python bindings.
+
+### Added
+
+- **The Python bindings ship type information.** A `py.typed` marker and a
+  hand-written `_fqxv.pyi` stub give downstream mypy / `ty` / IDE users full types
+  for every class, property, and function instead of `Any`, and `fqxv.__version__`
+  now reports the installed version. CI type-checks the stubs against the binding
+  surface (with `ty`) so they cannot silently drift.
+
+### Changed
+
+- **Run summaries show the binary size beside the SI size** — e.g.
+  `archive 211.96 MB (202.14 MiB)`. fqxv reports decimal SI (`MB = 10⁶`) while
+  `ls -lh` / `du -h` report binary units labelled `M` (`MiB = 2²⁰`); showing both
+  reconciles the reported figure with a file listing at a glance. The decimal
+  number and `MB` label are unchanged.
+- Bumped `noodles-bgzf` 0.49 → 0.51.
+
 ## [0.6.1] - 2026-08-01
 
 Patch rather than minor: no public API changed (every helper involved is
