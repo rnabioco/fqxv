@@ -35,7 +35,7 @@ thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 noodles-fastq = "0.23"
-noodles-bgzf = "0.49"
+noodles-bgzf = "0.51"
 memchr = "2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 bitstream-io = "4"
