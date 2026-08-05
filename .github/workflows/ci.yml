@@ -134,9 +134,14 @@ jobs:
       - run: cargo build -p fqxv-cli
       - name: Build and install the bindings
         run: |
-          python -m pip install --upgrade maturin pytest
+          python -m pip install --upgrade maturin pytest ty
           maturin build --out dist --manifest-path crates/fqxv-python/Cargo.toml
           python -m pip install dist/*.whl
+      # Type-check the package against its own stubs (`_fqxv.pyi` + `py.typed`), so
+      # a stub that drifts from the binding surface fails a PR. `ty` resolves the
+      # compiled `_fqxv` through the stub, so this needs no extra config.
+      - name: Type-check the bindings (ty)
+        run: ty check crates/fqxv-python/python/fqxv/
       - name: Smoke-test the bindings
         env:
           FQXV_BIN: target/debug/fqxv
