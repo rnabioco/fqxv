@@ -6,6 +6,9 @@ fetching just the footer index and then only the column(s) you ask for, rather
 than downloading the whole file.
 """
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _version
+
 from ._fqxv import (
     Estimate,
     FqxvError,
@@ -33,7 +36,13 @@ from ._fqxv import (
 )
 from . import remote
 
+try:
+    __version__ = _version("fqxv")
+except PackageNotFoundError:  # pragma: no cover - source tree without an install
+    __version__ = "0.0.0"
+
 __all__ = [
+    "__version__",
     # Classes
     "Estimate",
     "FqxvError",

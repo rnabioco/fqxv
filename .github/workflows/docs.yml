@@ -35,9 +35,11 @@ jobs:
         with:
           python-version: '3.12'
 
+      - uses: astral-sh/setup-uv@v9.0.0
+
       - name: Install dependencies
         # Pin the version so CI doesn't drift to whatever zensical is latest.
-        run: pip install "zensical==0.0.50"
+        run: uv pip install --system "zensical==0.0.50"
 
       - name: Build documentation
         # --clean forces a cold cache; --strict validates links.
