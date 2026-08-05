@@ -86,6 +86,34 @@ pub(crate) fn format_size(bytes: u64) -> String {
     }
 }
 
+/// Format a byte count in binary units (`KiB`/`MiB`/`GiB`/`TiB`, powers of 1024) —
+/// the convention `ls -lh`/`du -h` use (labelled `M`/`G`). Shown alongside the SI
+/// figure so an archive size can be reconciled with a file listing at a glance.
+pub(crate) fn format_size_bin(bytes: u64) -> String {
+    const KIB: u64 = 1 << 10;
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    const TIB: u64 = 1 << 40;
+    if bytes >= TIB {
+        format!("{:.2} TiB", bytes as f64 / TIB as f64)
+    } else if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// The SI size with the binary equivalent appended, e.g. `211.96 MB (202.14 MiB)`.
+/// Used only for on-disk artifact sizes (the archive, the written FASTQ) so the
+/// SI figure lines up with what `ls`/`du` report without surprising the user.
+fn format_size_dual(bytes: u64) -> String {
+    format!("{} ({})", format_size(bytes), format_size_bin(bytes))
+}
+
 /// Insert thousands separators into an integer (e.g. `1234567` -> `1,234,567`).
 pub(crate) fn thousands(n: u64) -> String {
     let s = n.to_string();
@@ -145,14 +173,14 @@ pub(crate) fn compress_summary(
             "\n  {} {} {}  ({}, {} saved)",
             style::value(format_size(in_size)),
             style::header("->"),
-            style::value(format_size(stats.out_bytes)),
+            style::value(format_size_dual(stats.out_bytes)),
             style::value(format!("{ratio:.2}x")),
             style::value(format!("{saved:.1}%")),
         ));
     } else if stats.out_bytes > 0 {
         out.push_str(&format!(
             "\n  archive {}",
-            style::value(format_size(stats.out_bytes))
+            style::value(format_size_dual(stats.out_bytes))
         ));
     }
     // Detail line: layout, counts, wall time, and throughput (measured against
@@ -195,7 +223,7 @@ pub(crate) fn decompress_summary(input: &Path, dest: &str, stats: &Stats, secs: 
     if stats.out_bytes > 0 {
         line.push_str(&format!(
             "  ·  {}",
-            style::value(format_size(stats.out_bytes))
+            style::value(format_size_dual(stats.out_bytes))
         ));
         if let Some(rate) = mb_per_s(stats.out_bytes, secs) {
             line.push_str(&format!(" ({})", style::value(format!("{rate:.1} MB/s"))));
@@ -217,6 +245,24 @@ mod tests {
         assert_eq!(format_size(1_000_000), "1.00 MB");
         assert_eq!(format_size(1_000_000_000), "1.00 GB");
         assert_eq!(format_size(1_000_000_000_000), "1.00 TB");
+    }
+
+    #[test]
+    fn format_size_bin_scales() {
+        assert_eq!(format_size_bin(0), "0 B");
+        assert_eq!(format_size_bin(1023), "1023 B");
+        assert_eq!(format_size_bin(1 << 10), "1.00 KiB");
+        assert_eq!(format_size_bin(1 << 20), "1.00 MiB");
+        assert_eq!(format_size_bin(1 << 30), "1.00 GiB");
+        assert_eq!(format_size_bin(1 << 40), "1.00 TiB");
+        // The real case from the bug report: 211,956,078 bytes reads as 202.14 MiB,
+        // which is what `ls -lh`/`du -h` display (rounded) as `203M`.
+        assert_eq!(format_size_bin(211_956_078), "202.14 MiB");
+    }
+
+    #[test]
+    fn format_size_dual_shows_both() {
+        assert_eq!(format_size_dual(211_956_078), "211.96 MB (202.14 MiB)");
     }
 
     #[test]
@@ -244,6 +290,8 @@ mod tests {
         };
         let s = compress_summary(&["-".to_string()], Path::new("out.fqxv"), 0, &stats, 1.0);
         assert!(s.contains("2.00 MB"));
+        // The binary equivalent is shown alongside so it reconciles with `ls`/`du`.
+        assert!(s.contains("1.91 MiB"));
         assert!(!s.contains("saved"));
     }
 
