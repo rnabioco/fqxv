@@ -17,12 +17,12 @@ mod crc;
 
 pub use container::{
     BlockContents, ContentStats, Estimate, GroupLoc, Index, Info, Params, Platform, QUAL_MAX,
-    Record, RecordReader, Recovery, Stats, Stream, StreamSelection, SuffixParse, VerifyCheck,
-    VerifyReport, compress, compress_auto, compress_interleaved, compress_multi, content_stats,
-    decode_block_contents, decode_names, decode_quality, decode_quality_with_seq, decode_sequence,
-    decompress, decompress_fasta, decompress_records, decompress_records_select,
-    decompress_recover, decompress_split, estimate, expected_reads, inspect, peek,
-    quality_needs_sequence, verify, verify_quick, verify_report, verify_roundtrip,
+    Record, RecordReader, RecordRef, Recovery, Stats, Stream, StreamSelection, SuffixParse,
+    VerifyCheck, VerifyReport, compress, compress_auto, compress_interleaved, compress_multi,
+    content_stats, decode_block_contents, decode_names, decode_quality, decode_quality_with_seq,
+    decode_sequence, decompress, decompress_fasta, decompress_records, decompress_records_par,
+    decompress_records_select, decompress_recover, decompress_split, estimate, expected_reads,
+    inspect, peek, quality_needs_sequence, verify, verify_quick, verify_report, verify_roundtrip,
 };
 pub use fqxv_fqzcomp::QualityBinning;
 
