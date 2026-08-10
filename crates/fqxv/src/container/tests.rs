@@ -1822,6 +1822,75 @@ fn shared_reference_longread_roundtrips_across_blocks() {
 }
 
 #[test]
+fn stream_selection_agrees_on_longread_archives() {
+    // Stream-selective decode over the long-read layouts: the shared-reference
+    // method (`SEQ_METHOD_OVERLAP_REF`, hifi-like) and the plain per-block
+    // long-read path (ont-like). Long-read quality is sequence-conditioned, so a
+    // quality selection here exercises the documented dependency (the sequence
+    // stream is decoded internally but still returned empty), and a names-only
+    // selection must skip the reference frame's decode entirely.
+    //
+    // Same fixture recipe as `shared_reference_longread_roundtrips_across_blocks`;
+    // the LZMA candidate is disabled so the hifi-like input actually adopts the
+    // shared reference (nextest gives each test its own process).
+    // SAFETY: single-threaded test setup, before any compress spawns threads.
+    unsafe { std::env::set_var("FQXV_SEQ_NO_LZMA", "1") };
+    for (label, err_period, expect_reference) in
+        [("hifi-like", 300u64, true), ("ont-like", 12, false)]
+    {
+        let input = deep_longread_fastq(120, 2000, 20, 4000, err_period);
+        let params = Params {
+            threads: 2,
+            seq_order: 0,
+            block_reads: 60,
+            ..Params::default()
+        };
+        let mut archive = Vec::new();
+        compress_auto(&input[..], &mut archive, params).expect("compress");
+        if expect_reference {
+            assert_ne!(
+                archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REFERENCE,
+                0,
+                "{label}: fixture must adopt the shared reference"
+            );
+        }
+
+        let mut expected = Vec::new();
+        decompress_records(&archive[..], 2, |r| expected.push(r)).expect("full decode");
+
+        for sel in [
+            StreamSelection::SEQUENCE_ONLY,
+            StreamSelection::NAMES_ONLY,
+            StreamSelection::QUALITY_ONLY,
+            StreamSelection::NAMES_AND_SEQUENCE,
+        ] {
+            let mut got = Vec::new();
+            decompress_records_select(&archive[..], 2, sel, |r| got.push(r))
+                .expect("select decode");
+            assert_eq!(got.len(), expected.len(), "{label} {sel:?}: record count");
+            let empty: Vec<u8> = Vec::new();
+            for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
+                assert_eq!(
+                    &g.name,
+                    if sel.names { &e.name } else { &empty },
+                    "{label} {sel:?} record {i}: name"
+                );
+                assert_eq!(
+                    &g.seq,
+                    if sel.sequence { &e.seq } else { &empty },
+                    "{label} {sel:?} record {i}: sequence"
+                );
+                assert_eq!(
+                    &g.qual,
+                    if sel.quality { &e.qual } else { &empty },
+                    "{label} {sel:?} record {i}: quality"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn sketch_for_platform_picks_hifi_only_for_pacbio() {
     // PacBio's low error rate earns the sparse HiFi sketch at either coverage;
     // every other platform (including a mis- or undetected one) falls back to the

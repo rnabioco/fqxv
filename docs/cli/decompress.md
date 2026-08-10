@@ -28,12 +28,14 @@ fqxv decompress <INPUT> (-o <OUTPUT> | --split <PREFIX> | -Z)
 | `--split <PREFIX>` | Restore separate per-spot files: `<PREFIX>_R1.fastq.gz … _R<G>.fastq.gz` (block-gzip by default), or the archive's recorded slot labels if it has them. |
 | `--mate-style <auto\|r\|num>` | `--split` labels: `auto` → the archive's recorded slot labels, else `_R1`,`_R2`,… (default); `r` → always `_R1`,`_R2`,…; `num` → always `_1`,`_2`,…. |
 | `--no-gzip` | Write plain `.fastq` for `--split` instead of the default `.fastq.gz`. |
+| `--fasta` | Write FASTA instead of FASTQ. The quality stream is **skipped, not decoded** — ~12× faster on long-read archives, ~1.3–1.6× single-threaded on short-read Illumina — for k-mer counters, classifiers, and aligners that ignore base qualities. See [below](#sequence-only-decode-fasta). |
 | `--recover` | Best-effort decode of a corrupted archive: skip blocks that fail their CRC and emit the rest. See [below](#recovering-a-corrupted-archive). |
 | `-f, --force` | Overwrite output FASTQ file(s) if they already exist. By default an existing `-o` file or `--split` mate file is left untouched and the command errors before decoding. Ignored when writing to stdout (`-Z` / `-o -`). |
 | `--threads <N>` | Worker threads (0 = all cores). |
 
 `--output`, `--split`, and `--stdout` are mutually exclusive, as are `--split` and
-`--recover`. `--mate-style` / `--no-gzip` apply only with `--split`.
+`--recover`; `--fasta` cannot be combined with `--split` or `--recover`.
+`--mate-style` / `--no-gzip` apply only with `--split`.
 
 ## Examples
 
@@ -57,6 +59,10 @@ fqxv decompress sample.fqxv --split out
 # plain, numbered mate files
 fqxv decompress sample.fqxv --split out --no-gzip --mate-style num
 #   -> out_1.fastq, out_2.fastq
+
+# sequence-only FASTA, straight into a k-mer counter — the quality stream is
+# never decoded (~12x faster on long-read archives)
+fqxv decompress reads.fqxv --fasta -Z | kmc -fa ...
 ```
 
 ## Reading a remote archive
@@ -119,6 +125,33 @@ and confirms the decode produced exactly that many reads — a truncated archive
 (which also loses its footer) is rejected instead of yielding a short, silent
 prefix. Use [`--recover`](#recovering-a-corrupted-archive) to intentionally salvage
 a damaged archive.
+
+## Sequence-only decode (FASTA)
+
+Many analysis tools — k-mer counters, taxonomic classifiers, aligners run without
+base-quality awareness — never look at quality scores. `--fasta` emits single-line
+`>name` + sequence records and **seeks past the quality stream without decoding
+it**, which makes the archive directly usable as sequence input at the quality
+stream's full decode cost saved. The win tracks where decode compute sits: on
+long-read archives the sequence-conditioned quality model dominates, and `--fasta`
+measured **~12× faster** (ONT E. coli, 1 and 16 threads); on short-read Illumina
+the sequence context model shares the cost, for ~1.3–1.6× single-threaded
+(NovaSeq/MiSeq) — at high thread counts short-read decode is bounded by the serial
+output path, so the saving shows up as ~35% less CPU rather than less wall time.
+
+```bash
+fqxv decompress reads.fqxv --fasta -o reads.fasta
+fqxv decompress reads.fqxv --fasta -Z | kmc -fa @/dev/stdin out workdir
+```
+
+Records come back in the same order (and for grouped archives, the same
+interleaving) a full decompress would emit. Integrity: every stream that **is**
+decoded keeps its per-block content-digest check; the skipped quality stream's
+digest cannot be checked (its content is never reconstructed), so `fqxv verify`
+remains the tool for whole-archive integrity. Programmatic equivalents:
+`decompress_fasta` and the stream-selective `decompress_records_select` /
+`RecordReader::with_selection` (names / sequence / quality, each independently
+selectable) in the Rust API.
 
 ## Recovering a corrupted archive
 
