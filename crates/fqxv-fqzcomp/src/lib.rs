@@ -167,6 +167,12 @@ pub enum Error {
     /// The quality alphabet exceeds what this codec models (64 symbols).
     #[error("quality alphabet too large ({0} > 64 symbols)")]
     AlphabetTooLarge(usize),
+    /// The stream's quality context mode is newer than this reader knows — an
+    /// archive written by a future fqxv (a new mode byte is the blessed
+    /// evolution path for alternative encodings of this stream). Upgrading fqxv
+    /// is the fix, so the message says so instead of reporting corruption.
+    #[error("unsupported quality context mode {0}; this archive needs a newer fqxv")]
+    UnsupportedMode(u8),
     /// The provided lengths do not sum to the quality-buffer size.
     #[error("read lengths ({lens}) do not match quality bytes ({quals})")]
     LengthMismatch {
@@ -1233,18 +1239,25 @@ fn read_quant_ctx(table: &[u8], syms: &[u8], qmin: u8) -> Result<binmix::QCtx> {
     Ok(binmix::QCtx::from_tables(g1, g2, g3))
 }
 
-/// Whether a stream was coded in `MODE_SEQ` and so needs the block's decoded
-/// sequence at [`decode_seq`] time. Lets the container peek the header cheaply and
-/// decide whether to serialize seq → qual or keep decoding them in parallel,
-/// without paying that serialization on the short-read common case. A truncated or
-/// foreign stream reads as `false`; [`decode`]/[`decode_seq`] then reject it.
+/// Whether a stream was coded in a sequence-conditioned mode and so needs the
+/// block's decoded sequence at [`decode_seq`] time. Lets the container peek the
+/// header cheaply and decide whether to serialize seq → qual or keep decoding
+/// them in parallel, without paying that serialization on the short-read common
+/// case. A truncated or foreign stream reads as `false`;
+/// [`decode`]/[`decode_seq`] then reject it.
 pub fn needs_sequence(src: &[u8]) -> bool {
     // Header layout: version(0), binning tag(1), mode(2), ...
-    src.first() == Some(&FORMAT_VERSION)
-        && matches!(
-            src.get(2),
-            Some(&MODE_SEQ) | Some(&MODE_SEQ_BINMIX) | Some(&MODE_SEQ_BINMIX_Q)
-        )
+    //
+    // Fail-safe on the mode byte: only `MODE_POS` is known sequence-free, so
+    // any OTHER mode under the recognized version — including one this reader
+    // has never heard of (a future coder, e.g. a chunked mode 5) — reports
+    // `true`. The container then hands [`decode_seq`] the decoded bases and it
+    // surfaces the clean [`Error::UnsupportedMode`] ("needs a newer fqxv")
+    // instead of a spurious quality-only decode failure. The previous
+    // enumerated match was an implicit extension point: an unknown mode read as
+    // `false`, so a future stream would have been decoded WITHOUT its sequence
+    // and died with a generic corruption error.
+    src.first() == Some(&FORMAT_VERSION) && matches!(src.get(2), Some(&m) if m != MODE_POS)
 }
 
 /// Decode a sequence-blind stream produced by [`encode`], returning
@@ -1271,7 +1284,9 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     let seq_mode = match mode {
         MODE_POS => false,
         MODE_SEQ | MODE_SEQ_BINMIX | MODE_SEQ_BINMIX_Q => true,
-        _ => return Err(Error::Malformed("unknown quality context mode")),
+        // Not corruption: the mode byte is the stream's extension point, so an
+        // unknown value is a future coder this reader must refuse by name.
+        m => return Err(Error::UnsupportedMode(m)),
     };
     let k = r.u8()? as usize;
     if k == 0 || k > QMAX {
@@ -1443,6 +1458,38 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn unknown_mode_is_an_upgrade_error_and_fails_safe() {
+        // A stream whose mode byte is from the future: decode must refuse it by
+        // name (UnsupportedMode, "needs a newer fqxv") rather than as
+        // corruption, and needs_sequence must fail SAFE — report true, so the
+        // container serializes seq -> qual and the decoder gets to say why it
+        // stopped instead of failing a parallel quality-only decode.
+        let future = [
+            FORMAT_VERSION,
+            0,  /* lossless */
+            99, /* future mode */
+        ];
+        assert!(
+            needs_sequence(&future),
+            "an unknown mode must be assumed sequence-conditioned"
+        );
+        match decode_seq(&future, &[]) {
+            Err(Error::UnsupportedMode(99)) => {}
+            other => panic!("want UnsupportedMode(99), got {other:?}"),
+        }
+        // The known modes keep their meaning: MODE_POS is sequence-free...
+        assert!(!needs_sequence(&[FORMAT_VERSION, 0, MODE_POS]));
+        // ...the sequence modes still report true...
+        for m in [MODE_SEQ, MODE_SEQ_BINMIX, MODE_SEQ_BINMIX_Q] {
+            assert!(needs_sequence(&[FORMAT_VERSION, 0, m]));
+        }
+        // ...and a wrong-version or truncated stream still reads as false.
+        assert!(!needs_sequence(&[FORMAT_VERSION + 1, 0, 99]));
+        assert!(!needs_sequence(&[FORMAT_VERSION]));
+        assert!(!needs_sequence(&[]));
+    }
+
     #[test]
     fn chunk_boundaries_are_a_pure_function_of_lens() {
         let lens: Vec<u32> = (0..1000u32).map(|i| 50 + (i * 37) % 400).collect();
