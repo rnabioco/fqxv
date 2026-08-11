@@ -325,23 +325,51 @@ fn decode_block_records_select(
     Ok((n_reads as u64, recs))
 }
 
-/// Stream-selective decode of the whole-file globally-clustered reorder layout.
-/// `r` is positioned just past the header. Frames a deselected stream would
-/// feed are skipped via [`skip_framed`]; in particular the permutation is only
-/// decoded when a `keep_order` archive needs its *sequences* un-permuted
-/// (names/quality are stored in original order there), and the shared global
-/// reference only when sequences are selected. The whole-output digest spans
-/// all three streams jointly, so it cannot be verified under a partial
-/// selection (full selections never reach here — see [`decompress_select`]).
-fn decode_reordered_select<R: Read>(
+/// A whole-file reorder archive's streams, selectively entropy-decoded by
+/// [`read_reordered_streams_select`] — the selection-aware analog of
+/// [`ReorderStreams`]. A deselected stream's vectors are empty (never
+/// per-record-empty); the record count is always `n`.
+pub(crate) struct SelectedReorderStreams {
+    /// Total record count, from the layout header.
+    pub(crate) n: usize,
+    /// Coded block count.
+    pub(crate) n_blocks: usize,
+    /// Flip bitmap — decoded only when a selected stream needs it, else empty.
+    pub(crate) flip: Vec<u8>,
+    /// Coded permutation — read only when a keep-order archive's sequences were
+    /// selected (they are the only stream stored out of original order).
+    pub(crate) perm_c: Vec<u8>,
+    /// Sequences in clustered order (iff sequence was selected).
+    pub(crate) cl_reads: Vec<Vec<u8>>,
+    /// Names in coded order (iff names were selected and not regenerated).
+    pub(crate) names: Vec<Vec<u8>>,
+    /// Per-read lengths from the quality stream (iff quality was selected).
+    pub(crate) lens: Vec<u32>,
+    /// Flat quality bytes in coded order/orientation (iff quality was selected).
+    pub(crate) quals: Vec<u8>,
+    /// Name-regeneration template, when the archive carries one.
+    pub(crate) template: Option<fqxv_tokenizer::NameTemplate>,
+}
+
+/// Selectively read and entropy-decode the whole-file globally-clustered
+/// reorder layout — [`read_reordered_streams`]' selection-aware sibling, shared
+/// by the serial [`decompress_records_select`] path and the parallel visitor's
+/// reorder materialization. `r` is positioned just past the header. Frames a
+/// deselected stream would feed are skipped via [`skip_framed`]; in particular
+/// the permutation is only decoded when a `keep_order` archive needs its
+/// *sequences* un-permuted (names/quality are stored in original order there),
+/// and the shared global reference only when sequences are selected. The
+/// trailing whole-output digest frame is consumed (its own CRC checked) but not
+/// verified: it spans all three streams jointly, so no partial selection can
+/// recompute it (full selections take the canonical full-decode paths and never
+/// reach here — see [`decompress_select`]).
+pub(crate) fn read_reordered_streams_select<R: Read>(
     mut r: R,
     pool: &rayon::ThreadPool,
     keep_order: bool,
     has_reference: bool,
-    group_size: u8,
     sel: StreamSelection,
-    emit: &mut dyn FnMut(Record) -> Result<()>,
-) -> Result<Stats> {
+) -> Result<SelectedReorderStreams> {
     let mut n_buf = [0u8; 8];
     r.read_exact(&mut n_buf)?;
     let n = u64::from_le_bytes(n_buf) as usize;
@@ -419,7 +447,7 @@ fn decode_reordered_select<R: Read>(
 
     // Entropy-decode the selected partitions in parallel.
     let reference_ref = reference.as_ref();
-    let mut cl_reads: Vec<Vec<u8>> = if sel.sequence {
+    let cl_reads: Vec<Vec<u8>> = if sel.sequence {
         let blocks: Vec<Vec<Vec<u8>>> = pool.install(|| {
             seq_payloads
                 .par_iter()
@@ -437,7 +465,7 @@ fn decode_reordered_select<R: Read>(
     } else {
         Vec::new()
     };
-    let mut names: Vec<Vec<u8>> = if need_names {
+    let names: Vec<Vec<u8>> = if need_names {
         let blocks: Vec<Vec<Vec<u8>>> = pool.install(|| {
             name_payloads
                 .par_iter()
@@ -475,6 +503,37 @@ fn decode_reordered_select<R: Read>(
     } else {
         (Vec::new(), Vec::new())
     };
+    Ok(SelectedReorderStreams {
+        n,
+        n_blocks,
+        flip,
+        perm_c,
+        cl_reads,
+        names,
+        lens,
+        quals,
+        template,
+    })
+}
+
+/// Stream-selective decode of the whole-file globally-clustered reorder layout,
+/// emitting [`Record`]s serially in output order. Selective reading and entropy
+/// decoding live in [`read_reordered_streams_select`]; this adds the per-record
+/// normalization (un-permute, un-flip, quality un-reverse, template name
+/// regeneration) and the emission loop.
+fn decode_reordered_select<R: Read>(
+    r: R,
+    pool: &rayon::ThreadPool,
+    keep_order: bool,
+    has_reference: bool,
+    group_size: u8,
+    sel: StreamSelection,
+    emit: &mut dyn FnMut(Record) -> Result<()>,
+) -> Result<Stats> {
+    let mut s = read_reordered_streams_select(r, pool, keep_order, has_reference, sel)?;
+    let n = s.n;
+    let regen = s.template.is_some();
+    let need_names = sel.names && !regen;
 
     let mut qoff = 0usize;
     if keep_order {
@@ -482,7 +541,7 @@ fn decode_reordered_select<R: Read>(
         // stored in original order. (A keep-order archive never regenerates
         // names, so `regen` is always false here; guarded anyway.)
         let mut seq_orig = if sel.sequence {
-            unpermute_reads(cl_reads, &flip, &perm_c, n)?
+            unpermute_reads(std::mem::take(&mut s.cl_reads), &s.flip, &s.perm_c, n)?
         } else {
             Vec::new()
         };
@@ -493,8 +552,9 @@ fn decode_reordered_select<R: Read>(
                 Vec::new()
             };
             let qual = if sel.quality {
-                let l = lens[i] as usize;
-                let q = quals
+                let l = s.lens[i] as usize;
+                let q = s
+                    .quals
                     .get(qoff..qoff + l)
                     .ok_or(Error::Malformed("quality underrun"))?
                     .to_vec();
@@ -507,7 +567,7 @@ fn decode_reordered_select<R: Read>(
                 return Err(Error::Malformed("reordered sequence length mismatch"));
             }
             let name = if need_names {
-                std::mem::take(&mut names[i])
+                std::mem::take(&mut s.names[i])
             } else {
                 Vec::new()
             };
@@ -518,23 +578,24 @@ fn decode_reordered_select<R: Read>(
         // the record's original content.
         for j in 0..n {
             let seq = if sel.sequence {
-                let s = std::mem::take(&mut cl_reads[j]);
-                if flip_bit(&flip, j) {
-                    fqxv_reorder::revcomp(&s)
+                let cl = std::mem::take(&mut s.cl_reads[j]);
+                if flip_bit(&s.flip, j) {
+                    fqxv_reorder::revcomp(&cl)
                 } else {
-                    s
+                    cl
                 }
             } else {
                 Vec::new()
             };
             let qual = if sel.quality {
-                let l = lens[j] as usize;
-                let mut q = quals
+                let l = s.lens[j] as usize;
+                let mut q = s
+                    .quals
                     .get(qoff..qoff + l)
                     .ok_or(Error::Malformed("quality underrun"))?
                     .to_vec();
                 qoff += l;
-                if flip_bit(&flip, j) {
+                if flip_bit(&s.flip, j) {
                     q.reverse();
                 }
                 q
@@ -545,10 +606,10 @@ fn decode_reordered_select<R: Read>(
                 return Err(Error::Malformed("reordered sequence length mismatch"));
             }
             let name = if sel.names {
-                if let Some(t) = &template {
+                if let Some(t) = &s.template {
                     t.regenerate(j)
                 } else {
-                    std::mem::take(&mut names[j])
+                    std::mem::take(&mut s.names[j])
                 }
             } else {
                 Vec::new()
@@ -558,7 +619,7 @@ fn decode_reordered_select<R: Read>(
     }
     Ok(Stats {
         reads: n as u64,
-        blocks: n_blocks as u64,
+        blocks: s.n_blocks as u64,
         out_bytes: 0,
         group_size: group_size.max(1),
     })
@@ -920,6 +981,64 @@ mod tests {
         let got = select_records(&archive, StreamSelection::NAMES_AND_SEQUENCE);
         assert_eq!(got.len(), expected.len());
         for (g, e) in got.iter().zip(&expected) {
+            assert_eq!(g.name, e.name);
+            assert_eq!(g.seq, e.seq);
+            assert!(g.qual.is_empty());
+        }
+    }
+
+    #[test]
+    fn par_visitor_genuinely_skips_deselected_streams() {
+        // The parallel-visitor analog of the corruption proof above: with a
+        // byte flipped inside the first quality frame, quality-reading parallel
+        // selections must fail (frame CRC), while a quality-skipping parallel
+        // selection must still deliver every record byte-exact — proving the
+        // visitor's decode tasks never read the frame at all.
+        let mut archive = Vec::new();
+        compress_clustered_forced(
+            SAMPLE,
+            &mut archive,
+            Params {
+                reorder: true,
+                keep_order: true,
+                ..Params::default()
+            },
+            1,
+        )
+        .unwrap();
+        let expected = full_records(&archive);
+        let off = reorder_first_qual_payload_offset(&archive);
+        archive[off] ^= 0xFF;
+
+        let collect = |sel: StreamSelection| {
+            decompress_records_par_select(
+                &archive[..],
+                4,
+                sel,
+                Vec::new,
+                |v: &mut Vec<(u64, Record)>, i, rec| {
+                    v.push((i, rec.to_record()));
+                    Ok(())
+                },
+                |mut a, mut b| {
+                    a.append(&mut b);
+                    a
+                },
+            )
+        };
+        assert!(
+            collect(StreamSelection::ALL).is_err(),
+            "a full parallel decode must fail on the corrupted quality frame"
+        );
+        assert!(
+            collect(StreamSelection::QUALITY_ONLY).is_err(),
+            "a quality-selecting parallel decode must fail on the corrupted frame"
+        );
+        let (mut pairs, _) = collect(StreamSelection::NAMES_AND_SEQUENCE)
+            .expect("a quality-skipping parallel selection must never read the frame");
+        pairs.sort_by_key(|&(i, _)| i);
+        assert_eq!(pairs.len(), expected.len());
+        for ((_, g), e) in pairs.iter().zip(&expected) {
             assert_eq!(g.name, e.name);
             assert_eq!(g.seq, e.seq);
             assert!(g.qual.is_empty());

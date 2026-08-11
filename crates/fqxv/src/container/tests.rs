@@ -1891,6 +1891,87 @@ fn stream_selection_agrees_on_longread_archives() {
 }
 
 #[test]
+fn par_stream_selection_agrees_on_longread_archives() {
+    // The parallel selective visitor (issue #272) over the long-read layouts:
+    // the shared-reference method (`SEQ_METHOD_OVERLAP_REF`, hifi-like) and the
+    // plain per-block long-read path (ont-like). Selecting quality exercises
+    // the sequence-conditioned dependency *inside* the visitor's block tasks; a
+    // names-only selection skips the shared reference frame's decode entirely.
+    // The serial selective decode is the reference for every selection.
+    //
+    // Same fixture recipe as `stream_selection_agrees_on_longread_archives`.
+    // SAFETY: single-threaded test setup, before any compress spawns threads.
+    unsafe { std::env::set_var("FQXV_SEQ_NO_LZMA", "1") };
+    for (label, err_period, expect_reference) in
+        [("hifi-like", 300u64, true), ("ont-like", 12, false)]
+    {
+        let input = deep_longread_fastq(120, 2000, 20, 4000, err_period);
+        let params = Params {
+            threads: 2,
+            seq_order: 0,
+            block_reads: 60,
+            ..Params::default()
+        };
+        let mut archive = Vec::new();
+        compress_auto(&input[..], &mut archive, params).expect("compress");
+        if expect_reference {
+            assert_ne!(
+                archive[HDR_OFF_FLAGS] & FLAG_GLOBAL_REFERENCE,
+                0,
+                "{label}: fixture must adopt the shared reference"
+            );
+        }
+
+        for sel in [
+            StreamSelection::SEQUENCE_ONLY,
+            StreamSelection::NAMES_AND_SEQUENCE,
+            StreamSelection::NAMES_ONLY,
+            StreamSelection::QUALITY_ONLY,
+        ] {
+            let mut expected = Vec::new();
+            decompress_records_select(&archive[..], 2, sel, |r| expected.push(r))
+                .expect("serial select decode");
+            for threads in [1, 2, 4, 8] {
+                let (mut pairs, stats) = decompress_records_par_select(
+                    &archive[..],
+                    threads,
+                    sel,
+                    Vec::new,
+                    // `crate::Record`: this module's local `Record` alias (a
+                    // FASTQ triple for the split tests) shadows the public one.
+                    |v: &mut Vec<(u64, crate::Record)>, i, rec| {
+                        v.push((i, rec.to_record()));
+                        Ok(())
+                    },
+                    |mut a, mut b| {
+                        a.append(&mut b);
+                        a
+                    },
+                )
+                .expect("parallel select decode");
+                pairs.sort_by_key(|&(i, _)| i);
+                assert_eq!(
+                    pairs.len(),
+                    expected.len(),
+                    "{label} {sel:?} at {threads}t: record count"
+                );
+                assert_eq!(stats.reads, expected.len() as u64, "{label} {sel:?}: reads");
+                for (k, (i, rec)) in pairs.iter().enumerate() {
+                    assert_eq!(
+                        *i, k as u64,
+                        "{label} {sel:?} at {threads}t: indices must be dense"
+                    );
+                    assert_eq!(
+                        rec, &expected[k],
+                        "{label} {sel:?} at {threads}t: record {k}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn sketch_for_platform_picks_hifi_only_for_pacbio() {
     // PacBio's low error rate earns the sparse HiFi sketch at either coverage;
     // every other platform (including a mis- or undetected one) falls back to the
