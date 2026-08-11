@@ -1,8 +1,11 @@
 //! Read-only Python bindings for the `fqxv` FASTQ archiver.
 //!
-//! Exposes: a streaming record iterator ([`open`] → [`Reader`]); whole-archive
-//! convenience ([`decompress_to_path`], [`decompress_to_bytes`], [`inspect`],
-//! [`estimate`], [`verify`]); column projection / random access over the footer
+//! Exposes: a streaming record iterator ([`open`] → [`Reader`]), optionally
+//! stream-selective (`streams=` — decode only names/sequence/quality subsets,
+//! skipping the rest); whole-archive convenience ([`decompress_to_path`],
+//! [`decompress_to_bytes`] — both take `fasta=True` for quality-skipping FASTA
+//! output — [`inspect`], [`estimate`], [`verify`]); column projection / random
+//! access over the footer
 //! index ([`open_index`], [`read_names`], [`read_sequences`], [`read_qualities`],
 //! [`read_block`]); and the IO-free primitives the `fqxv.remote` module drives
 //! over HTTP range requests ([`parse_index_suffix`], `decode_*_bytes`).
@@ -23,8 +26,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList, PyTuple};
 
 use fqxv_core::{
-    Index, Params, Platform, QualityBinning, Stream, SuffixParse, decode_block_contents,
-    decode_names, decode_quality, decode_quality_with_seq, decode_sequence, quality_needs_sequence,
+    Index, Params, Platform, QualityBinning, Stream, StreamSelection, SuffixParse,
+    decode_block_contents, decode_names, decode_quality, decode_quality_with_seq, decode_sequence,
+    quality_needs_sequence,
 };
 
 /// Map a stream name (`"names"`, `"sequence"`, `"quality"`, plus the obvious
@@ -41,6 +45,43 @@ fn stream_of(name: &str) -> PyResult<Stream> {
             )));
         }
     })
+}
+
+/// Parse the `streams=` argument onto a [`StreamSelection`]: one stream name
+/// (the same names [`stream_of`] accepts) or an iterable of them, selecting the
+/// union. An empty iterable selects nothing — every record field comes back
+/// empty, which counts reads at framing speed without entropy-decoding any
+/// stream. `str` is handled before iteration so a bare `"seq"` means one
+/// stream, not the three characters `'s'`, `'e'`, `'q'`.
+fn selection_of(obj: &Bound<'_, PyAny>) -> PyResult<StreamSelection> {
+    let mut sel = StreamSelection::NONE;
+    let mut select = |name: &str| -> PyResult<()> {
+        match stream_of(name)? {
+            Stream::Names => sel.names = true,
+            Stream::Sequence => sel.sequence = true,
+            Stream::Quality => sel.quality = true,
+        }
+        Ok(())
+    };
+    if let Ok(name) = obj.extract::<String>() {
+        select(&name)?;
+        return Ok(sel);
+    }
+    let iter = obj.try_iter().map_err(|_| {
+        PyTypeError::new_err(
+            "streams must be None, a stream name, or an iterable of stream names \
+             ('names', 'sequence', 'quality')",
+        )
+    })?;
+    for item in iter {
+        let name: String = item?.extract().map_err(|_| {
+            PyTypeError::new_err(
+                "streams items must be str stream names ('names', 'sequence', 'quality')",
+            )
+        })?;
+        select(&name)?;
+    }
+    Ok(sel)
 }
 
 create_exception!(
@@ -526,46 +567,93 @@ fn to_bytes_list<'py>(py: Python<'py>, items: Vec<Vec<u8>>) -> Vec<Bound<'py, Py
 /// Open an archive for streaming record iteration. `source` may be a path,
 /// `bytes`, or a file-like object with `.read()` — an HTTP response streams
 /// straight in (see `fqxv.remote.stream`).
+///
+/// `streams` selects which of the three per-read streams to decode: `None`
+/// (the default) decodes everything; otherwise pass one stream name or an
+/// iterable of them — `"names"`, `"sequence"`, `"quality"` (or `"name"`,
+/// `"seq"`, `"qual"`). Deselected `Record` fields come back as empty `bytes`,
+/// and their coded streams are genuinely skipped — never entropy-decoded — so
+/// e.g. `streams=("seq",)` saves the names and quality streams' full decode
+/// cost (~12x measured on ONT long-read archives, where quality dominates;
+/// ~1.3-1.6x single-threaded on short-read Illumina). Caveats: a skipped
+/// stream's integrity digest cannot be checked (use `verify` for a full
+/// check), and on long-read archives quality is coded against the bases, so
+/// selecting quality still decodes the sequence stream internally.
 #[pyfunction]
-#[pyo3(signature = (source, *, threads = 0))]
-fn open(source: &Bound<'_, PyAny>, threads: usize) -> PyResult<PyReader> {
+#[pyo3(signature = (source, *, threads = 0, streams = None))]
+fn open(
+    source: &Bound<'_, PyAny>,
+    threads: usize,
+    streams: Option<&Bound<'_, PyAny>>,
+) -> PyResult<PyReader> {
+    let selection = match streams {
+        None => StreamSelection::ALL,
+        Some(obj) => selection_of(obj)?,
+    };
     let reader = open_read_source(source)?;
-    Ok(PyReader {
-        inner: fqxv_core::RecordReader::new(reader, threads),
-    })
+    // A full selection rides the pre-existing constructor (the canonical decode
+    // path with every integrity check), byte-for-byte what this API always did.
+    let inner = if selection == StreamSelection::ALL {
+        fqxv_core::RecordReader::new(reader, threads)
+    } else {
+        fqxv_core::RecordReader::with_selection(reader, threads, selection)
+    };
+    Ok(PyReader { inner })
 }
 
 /// Decompress an archive to interleaved FASTQ at `dest`. Returns the read count.
+///
+/// `fasta=True` writes single-line FASTA (`>name` + sequence) instead,
+/// mirroring the CLI's `decompress --fasta`: the quality stream is skipped —
+/// never entropy-decoded — which measured ~12x faster on ONT long-read
+/// archives (where the sequence-conditioned quality model dominates decode)
+/// and ~1.3-1.6x single-threaded on short-read Illumina. The skipped quality
+/// stream's integrity digest is not checked (use `verify` for a full check).
 #[pyfunction]
-#[pyo3(signature = (source, dest, *, threads = 0))]
+#[pyo3(signature = (source, dest, *, threads = 0, fasta = false))]
 fn decompress_to_path(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
     dest: PathBuf,
     threads: usize,
+    fasta: bool,
 ) -> PyResult<u64> {
     let reader = open_read_source(source)?;
     let file =
         File::create(&dest).map_err(|e| PyIOError::new_err(format!("{}: {e}", dest.display())))?;
     let stats = py
-        .detach(move || fqxv_core::decompress(reader, io::BufWriter::new(file), threads))
+        .detach(move || {
+            if fasta {
+                // decompress_fasta buffers its writer internally.
+                fqxv_core::decompress_fasta(reader, file, threads)
+            } else {
+                fqxv_core::decompress(reader, io::BufWriter::new(file), threads)
+            }
+        })
         .map_err(map_err)?;
     Ok(stats.reads)
 }
 
-/// Decompress an archive and return interleaved FASTQ as `bytes`.
+/// Decompress an archive and return interleaved FASTQ as `bytes` — or
+/// single-line FASTA with `fasta=True`, which skips the quality stream's
+/// decode entirely (see [`decompress_to_path`]).
 #[pyfunction]
-#[pyo3(signature = (source, *, threads = 0))]
+#[pyo3(signature = (source, *, threads = 0, fasta = false))]
 fn decompress_to_bytes<'py>(
     py: Python<'py>,
     source: &Bound<'_, PyAny>,
     threads: usize,
+    fasta: bool,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let reader = open_read_source(source)?;
     let out = py
         .detach(move || {
             let mut buf = Vec::new();
-            fqxv_core::decompress(reader, &mut buf, threads).map(|_| buf)
+            if fasta {
+                fqxv_core::decompress_fasta(reader, &mut buf, threads).map(|_| buf)
+            } else {
+                fqxv_core::decompress(reader, &mut buf, threads).map(|_| buf)
+            }
         })
         .map_err(map_err)?;
     Ok(PyBytes::new(py, &out))

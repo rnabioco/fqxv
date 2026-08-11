@@ -227,6 +227,24 @@ def test_download_matches_local(server, archive, tmp_path):
     assert dest.read_bytes() == fqxv.decompress_to_bytes(archive)
 
 
+def test_stream_selection_over_http(server, archive):
+    # streams= passes through to the streaming decoder: only the selected
+    # stream is decoded (deselected fields empty), same records as local.
+    local = list(fqxv.open(archive))
+    streamed = list(fqxv.remote.stream(server, streams=("seq",)))
+    assert [r.sequence for r in streamed] == [r.sequence for r in local]
+    assert all(r.name == b"" and r.quality == b"" for r in streamed)
+
+
+def test_download_fasta(server, archive, tmp_path):
+    dest = tmp_path / "streamed.fasta"
+    local = list(fqxv.open(archive))
+    n = fqxv.remote.download(server, dest, fasta=True)
+    assert n == len(local)
+    want = b"".join(b">" + r.name + b"\n" + r.sequence + b"\n" for r in local)
+    assert dest.read_bytes() == want
+
+
 @pytest.fixture(scope="session")
 def longread_archive(tmp_path_factory):
     """A Nanopore archive whose quality is coded against the sequence, so a remote

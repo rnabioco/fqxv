@@ -6,7 +6,7 @@ here, so this is what a type checker sees for ``import fqxv``.
 """
 
 import os
-from typing import List, Optional, Protocol, Sequence, Tuple, Union, final
+from typing import Iterable, List, Optional, Protocol, Sequence, Tuple, Union, final
 
 # A path or in-memory archive: what the seekable entry points (inspect, open_index,
 # read_*, verify) accept.
@@ -20,13 +20,19 @@ class _Readable(Protocol):
 # The streaming entry points (open, decompress_*) additionally accept a file-like.
 ReadSource = Union[StrOrBytesPath, _Readable]
 
+# The `streams=` selection: one stream name or an iterable of them, out of
+# "names"/"name", "sequence"/"seq", "quality"/"qual". None decodes everything;
+# an empty iterable decodes nothing (count reads at framing speed).
+Streams = Optional[Union[str, Iterable[str]]]
+
 class FqxvError(Exception):
     """Base error for fqxv archive failures (corrupt/unsupported archives)."""
 
 @final
 class Record:
     """One decoded FASTQ record. ``name`` excludes the leading ``@``; ``sequence``
-    and ``quality`` are raw bytes with no line endings."""
+    and ``quality`` are raw bytes with no line endings. Fields deselected via
+    ``open(..., streams=...)`` come back as empty ``bytes``."""
 
     @property
     def name(self) -> bytes: ...
@@ -138,11 +144,13 @@ class Estimate:
     def __repr__(self) -> str: ...
 
 # --- Whole-archive / streaming / projection ---------------------------------- #
-def open(source: ReadSource, *, threads: int = ...) -> Reader: ...
+def open(source: ReadSource, *, threads: int = ..., streams: Streams = ...) -> Reader: ...
 def decompress_to_path(
-    source: ReadSource, dest: StrOrBytesPath, *, threads: int = ...
+    source: ReadSource, dest: StrOrBytesPath, *, threads: int = ..., fasta: bool = ...
 ) -> int: ...
-def decompress_to_bytes(source: ReadSource, *, threads: int = ...) -> bytes: ...
+def decompress_to_bytes(
+    source: ReadSource, *, threads: int = ..., fasta: bool = ...
+) -> bytes: ...
 def inspect(source: StrOrBytesPath) -> Info: ...
 def open_index(source: StrOrBytesPath) -> Index: ...
 def read_names(
