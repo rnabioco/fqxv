@@ -927,6 +927,33 @@ pub(crate) fn decode_block_parts(
     buf: &[u8],
     shared_ref: Option<&fqxv_lroverlap::Reference>,
 ) -> Result<BlockParts> {
+    decode_block_parts_select(buf, shared_ref, StreamSelection::ALL)
+}
+
+/// Selection-aware core of [`decode_block_parts`]: decode only the streams
+/// `sel` asks for, *skipping* — never entropy-decoding — the rest. The per-stream
+/// length prefixes let a deselected stream be sliced past for free; the range
+/// coders are ~all of decode compute, so skipping a stream saves its full
+/// decode cost (see the `stream_select` module docs for measured numbers).
+///
+/// The one cross-stream dependency: a sequence-conditioned quality stream (long
+/// reads, [`fqxv_fqzcomp::needs_sequence`]) cannot decode without the bases, so
+/// selecting quality there also decodes the sequence stream internally (the
+/// minimum extra work; it is still returned empty unless selected).
+///
+/// Integrity: each *decoded* stream is verified against its stored content
+/// digest exactly as in a full decode; a skipped stream's digest cannot be
+/// checked (its content is never reconstructed), though its stored bytes remain
+/// covered by the block frame's CRC, which the caller has already verified.
+///
+/// In the returned [`BlockParts`], deselected fields are empty; `lens` is the
+/// per-read lengths whenever sequence or quality was decoded (they share it),
+/// and empty otherwise.
+pub(crate) fn decode_block_parts_select(
+    buf: &[u8],
+    shared_ref: Option<&fqxv_lroverlap::Reference>,
+    sel: StreamSelection,
+) -> Result<BlockParts> {
     let mut c = Cursor::new(buf);
     let expected = StreamDigests {
         names: c.u64()?,
@@ -954,11 +981,26 @@ pub(crate) fn decode_block_parts(
     // sequence-blind, so keep decoding the two streams in parallel — the common
     // case pays nothing for this. Peek the quality header to tell them apart.
     let seq_first = fqxv_fqzcomp::needs_sequence(qual_s);
+    let want_qual = sel.quality;
+    let want_seq = sel.sequence || (want_qual && seq_first);
+    let decode_seq = || {
+        if want_seq {
+            decode_sequence_stream(seq_s, shared_ref)
+        } else {
+            Ok((Vec::new(), Vec::new()))
+        }
+    };
     let (names, (seq_r, qual_r)) = rayon::join(
-        || fqxv_tokenizer::decode(names_s),
         || {
-            if seq_first {
-                let seq_r = decode_sequence_stream(seq_s, shared_ref);
+            if sel.names {
+                fqxv_tokenizer::decode(names_s)
+            } else {
+                Ok(Vec::new())
+            }
+        },
+        || {
+            if want_qual && seq_first {
+                let seq_r = decode_seq();
                 let qual_r = match &seq_r {
                     Ok((_, seq)) => fqxv_fqzcomp::decode_seq(qual_s, seq),
                     // Sequence decode failed; the block errors on `seq_r?` below.
@@ -967,42 +1009,47 @@ pub(crate) fn decode_block_parts(
                 };
                 (seq_r, qual_r)
             } else {
-                rayon::join(
-                    || decode_sequence_stream(seq_s, shared_ref),
-                    || fqxv_fqzcomp::decode_seq(qual_s, &[]),
-                )
+                rayon::join(decode_seq, || {
+                    if want_qual {
+                        fqxv_fqzcomp::decode_seq(qual_s, &[])
+                    } else {
+                        Ok((Vec::new(), Vec::new()))
+                    }
+                })
             }
         },
     );
     let names = names?;
     let (seq_lens, seq) = seq_r?;
-    let (_qlens, qual) = qual_r?;
-    if names.len() != n_reads || seq_lens.len() != n_reads {
+    let (qual_lens, qual) = qual_r?;
+    // Per-read lengths: the sequence stream's when it was decoded, else the
+    // quality stream's (identical by construction — both are the read lengths);
+    // empty when neither stream was decoded.
+    let lens = if want_seq { seq_lens } else { qual_lens };
+    if (sel.names && names.len() != n_reads) || ((want_seq || want_qual) && lens.len() != n_reads) {
         return Err(Error::Malformed("block stream length disagreement"));
     }
     // End-to-end check: each reconstructed stream must digest to the value the
     // encoder stored. A mismatch here (with the frame CRC intact) means a codec
     // decoded valid bytes into wrong output — the failure mode CRC cannot see —
-    // and the per-stream digests name which stream regressed.
-    let got = stream_digests(
-        n_reads,
-        names.iter().map(Vec::as_slice),
-        &seq_lens,
-        &seq,
-        &qual,
-    );
-    for (ok, what) in [
-        (got.names == expected.names, "block names digest"),
-        (got.seq == expected.seq, "block sequence digest"),
-        (got.qual == expected.qual, "block quality digest"),
+    // and the per-stream digests name which stream regressed. Only decoded
+    // streams can be checked; a skipped stream's digest inputs don't exist.
+    let got = stream_digests(n_reads, names.iter().map(Vec::as_slice), &lens, &seq, &qual);
+    for (decoded, ok, what) in [
+        (sel.names, got.names == expected.names, "block names digest"),
+        (want_seq, got.seq == expected.seq, "block sequence digest"),
+        (want_qual, got.qual == expected.qual, "block quality digest"),
     ] {
-        if !ok {
+        if decoded && !ok {
             return Err(Error::Corrupt {
                 what: what.to_string(),
             });
         }
     }
-    Ok((n_reads, names, seq_lens, seq, qual))
+    // A sequence decoded only as the quality conditioner is not part of the
+    // caller's selection: return it empty, as promised.
+    let seq = if sel.sequence { seq } else { Vec::new() };
+    Ok((n_reads, names, lens, seq, qual))
 }
 
 pub(crate) fn write_record(out: &mut Vec<u8>, name: &[u8], seq: &[u8], qual: &[u8]) {

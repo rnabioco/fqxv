@@ -156,6 +156,7 @@ mod random_access;
 mod records;
 mod reorder;
 mod select;
+mod stream_select;
 mod verify;
 
 // Internal flat namespace: every submodule item is `pub(crate)`, re-globbed here
@@ -167,6 +168,7 @@ pub(crate) use inspect::*;
 pub(crate) use parse::*;
 pub(crate) use reorder::*;
 pub(crate) use select::*;
+pub(crate) use stream_select::*;
 // `decompress` and `verify` expose only their public surface (below) to the rest
 // of the crate; their internals stay module-private, so no `*` glob here.
 
@@ -182,6 +184,7 @@ pub use random_access::{
     decode_quality, decode_quality_with_seq, decode_sequence, quality_needs_sequence,
 };
 pub use records::{Record, RecordReader, decompress_records};
+pub use stream_select::{StreamSelection, decompress_fasta, decompress_records_select};
 pub use verify::{
     VerifyCheck, VerifyReport, expected_reads, verify, verify_quick, verify_report,
     verify_roundtrip,

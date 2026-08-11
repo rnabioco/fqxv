@@ -44,8 +44,10 @@ const CHANNEL_CAP: usize = 1024;
 /// A [`Write`] sink that reassembles decoded interleaved FASTQ into [`Record`]s
 /// and hands each to `emit`. Lines cycle name → sequence → `+` → quality; a record
 /// is emitted once its quality line completes. Line reassembly buffers across
-/// arbitrary chunk boundaries exactly like `StatsSink`.
-struct RecordSink<F> {
+/// arbitrary chunk boundaries exactly like `StatsSink`. Crate-visible so the
+/// stream-selective path (`decompress_select`) can ride the canonical full
+/// decode when every stream is selected.
+pub(crate) struct RecordSink<F> {
     emit: F,
     /// Bytes of the current line seen so far (newline excluded).
     line: Vec<u8>,
@@ -57,7 +59,7 @@ struct RecordSink<F> {
 }
 
 impl<F: FnMut(Record) -> io::Result<()>> RecordSink<F> {
-    fn new(emit: F) -> Self {
+    pub(crate) fn new(emit: F) -> Self {
         RecordSink {
             emit,
             line: Vec::new(),
@@ -176,6 +178,35 @@ impl RecordReader {
                 })
             });
             decompress(reader, sink, threads)
+        });
+        RecordReader {
+            rx: Some(rx),
+            handle: Some(handle),
+            stats: None,
+        }
+    }
+
+    /// Like [`RecordReader::new`], but decoding only the streams `selection`
+    /// asks for: deselected [`Record`] fields come back empty and their coded
+    /// streams are genuinely skipped (never entropy-decoded), so e.g. a
+    /// sequence-only iteration saves the skipped streams' full decode cost
+    /// (~12x measured on ONT, ~1.3-1.6x single-threaded on short-read
+    /// Illumina). With [`StreamSelection::ALL`] this is exactly
+    /// [`RecordReader::new`]. See
+    /// [`decompress_records_select`](super::decompress_records_select) for the
+    /// selection semantics and the per-layout caveats.
+    pub fn with_selection<R: Read + Send + 'static>(
+        reader: R,
+        threads: usize,
+        selection: StreamSelection,
+    ) -> Self {
+        let (tx, rx) = sync_channel::<Record>(CHANNEL_CAP);
+        let handle = thread::spawn(move || {
+            decompress_select(reader, threads, selection, |rec| {
+                tx.send(rec).map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "record receiver dropped")
+                })
+            })
         });
         RecordReader {
             rx: Some(rx),

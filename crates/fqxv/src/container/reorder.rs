@@ -940,7 +940,7 @@ fn encode_reference_frame(
 }
 
 /// Decode a reference frame written by [`encode_reference_frame`].
-fn decode_reference_frame(bytes: &[u8]) -> Result<fqxv_reorder::GlobalReference> {
+pub(crate) fn decode_reference_frame(bytes: &[u8]) -> Result<fqxv_reorder::GlobalReference> {
     match bytes.split_first() {
         Some((&REF_METHOD_SEQ, rest)) => Ok(fqxv_reorder::GlobalReference::decode(rest)?),
         Some((&REF_METHOD_SEQPAR, rest)) => {
@@ -957,7 +957,7 @@ fn decode_reference_frame(bytes: &[u8]) -> Result<fqxv_reorder::GlobalReference>
 /// sizing hint (the vectors grow via `extend` regardless), so this never changes
 /// a valid decode; it just fails a bad archive gracefully, mirroring the
 /// `try_reserve_exact` guard in [`read_framed`].
-fn reserve_checked<T>(cap: usize) -> Result<Vec<T>> {
+pub(crate) fn reserve_checked<T>(cap: usize) -> Result<Vec<T>> {
     let mut v = Vec::new();
     v.try_reserve_exact(cap)
         .map_err(|_| Error::Malformed("reorder read count too large to allocate"))?;
@@ -1084,38 +1084,62 @@ pub(crate) fn read_reordered_streams<R: Read>(
     })
 }
 
-/// Un-permute a `keep_order` reorder archive: place each clustered sequence
-/// (un-flipped) at its original position via the stored permutation, yielding the
-/// sequences in original order. Consumes `s.cl_reads`.
-pub(crate) fn unpermute_sequences(s: &mut ReorderStreams) -> Result<Vec<Vec<u8>>> {
-    let n = s.n;
-    let perm: Vec<u32> = {
-        // The permutation is four byte-planes of `n` u32s, so `n * 4` is not an
-        // estimate — it is the only length this can be, and it was already being
-        // checked one line down. Checking it BEFORE the decode is what makes it a
-        // bound: the length in the stream header is untrusted, and unbounded
-        // `decode` allocates whatever it claims. The container CRCs each payload
-        // first, but a CRC detects accidents, not a crafted archive.
-        let pb = fqxv_rans::decode_bounded(&s.perm_c, n.saturating_mul(4))
-            .map_err(|_| Error::Malformed("bad permutation"))?;
-        if pb.len() != n * 4 {
-            return Err(Error::Malformed("permutation length mismatch"));
-        }
-        (0..n)
-            .map(|i| u32::from_le_bytes([pb[i], pb[n + i], pb[2 * n + i], pb[3 * n + i]]))
-            .collect()
-    };
+/// Decode the stored global permutation (four rANS-coded byte planes of `n`
+/// u32s) back to the per-clustered-position original indices.
+pub(crate) fn decode_permutation(perm_c: &[u8], n: usize) -> Result<Vec<u32>> {
+    // The permutation is four byte-planes of `n` u32s, so `n * 4` is not an
+    // estimate — it is the only length this can be, and it was already being
+    // checked one line down. Checking it BEFORE the decode is what makes it a
+    // bound: the length in the stream header is untrusted, and unbounded
+    // `decode` allocates whatever it claims. The container CRCs each payload
+    // first, but a CRC detects accidents, not a crafted archive.
+    let pb = fqxv_rans::decode_bounded(perm_c, n.saturating_mul(4))
+        .map_err(|_| Error::Malformed("bad permutation"))?;
+    if pb.len() != n * 4 {
+        return Err(Error::Malformed("permutation length mismatch"));
+    }
+    Ok((0..n)
+        .map(|i| u32::from_le_bytes([pb[i], pb[n + i], pb[2 * n + i], pb[3 * n + i]]))
+        .collect())
+}
+
+/// Whether clustered read `j` was stored reverse-complemented, per the decoded
+/// flip bitmap.
+pub(crate) fn flip_bit(flip: &[u8], j: usize) -> bool {
+    flip.get(j / 8).copied().unwrap_or(0) >> (j % 8) & 1 == 1
+}
+
+/// Place each clustered read (un-flipped) at its original position via the
+/// stored permutation, yielding the reads in original order. The core of
+/// [`unpermute_sequences`], shared with the stream-selective decode path.
+pub(crate) fn unpermute_reads(
+    cl_reads: Vec<Vec<u8>>,
+    flip: &[u8],
+    perm_c: &[u8],
+    n: usize,
+) -> Result<Vec<Vec<u8>>> {
+    let perm = decode_permutation(perm_c, n)?;
     let mut seq_orig: Vec<Vec<u8>> = vec![Vec::new(); n];
-    for (j, mut seq) in std::mem::take(&mut s.cl_reads).into_iter().enumerate() {
-        if s.flip.get(j / 8).copied().unwrap_or(0) >> (j % 8) & 1 == 1 {
+    for (j, mut seq) in cl_reads.into_iter().enumerate() {
+        if flip_bit(flip, j) {
             seq = fqxv_reorder::revcomp(&seq);
         }
-        let dest = perm[j] as usize;
+        let dest = perm
+            .get(j)
+            .copied()
+            .ok_or(Error::Malformed("permutation out of range"))? as usize;
         *seq_orig
             .get_mut(dest)
             .ok_or(Error::Malformed("permutation out of range"))? = seq;
     }
     Ok(seq_orig)
+}
+
+/// Un-permute a `keep_order` reorder archive: place each clustered sequence
+/// (un-flipped) at its original position via the stored permutation, yielding the
+/// sequences in original order. Consumes `s.cl_reads`.
+pub(crate) fn unpermute_sequences(s: &mut ReorderStreams) -> Result<Vec<Vec<u8>>> {
+    unpermute_reads(std::mem::take(&mut s.cl_reads), &s.flip, &s.perm_c, s.n)
 }
 
 /// Decode a whole-file globally-clustered reorder archive to interleaved FASTQ on
