@@ -4,6 +4,8 @@ Field comparison against general-purpose and FASTQ-specific compressors on two
 real Illumina RNA-seq runs spanning both quality regimes. Produced by the
 harness in `bench/`, 4M-read subsets, 44 threads per tool, single node.
 [Long reads](#long-reads-ont-pacbio) are measured separately, against CoLoRd.
+How decompression throughput scales with thread count is measured separately in
+[Decode scaling](decode-scaling.md).
 
 !!! note
     Ratios and throughput vary with data type (WGS vs RNA-seq), coverage, and
