@@ -40,7 +40,7 @@ preserved for the split.
 | Option | Description |
 | --- | --- |
 | `-l, --level <N>` | Effort 1–9; higher raises the sequence context order (up to order 11, reached at level 5) and the block size, and enables a hashed high-order tier at level 8+. Default: 5. |
-| `--block-reads <N>` | Reads per row group, overriding the size `--level` would pick. Decouples random-access granularity from effort: smaller groups give finer remote/parallel access and more parallelism at some ratio cost; larger groups the reverse. Sequence order still follows `--level`. Ignored by the reorder path (`--order any`/`--max`). See [Row-group sizing](#row-group-sizing). |
+| `--block-reads <N>` | Reads per row group, overriding the size `--level` would pick. Decouples random-access granularity from effort: smaller groups give finer remote/parallel access and more parallelism at some ratio cost; larger groups the reverse. On long-read input, where a byte budget normally cuts blocks, an explicit N makes the read count alone govern the cut. Sequence order still follows `--level`. Ignored by the reorder path (`--order any`/`--max`). See [Row-group sizing](#row-group-sizing). |
 | `--order <MODE>` | Read-order guarantee: `preserve` (default, restores original order), `any` (allows reordering for a better ratio; single-end order may change), or `shuffle` (like `any`, but discards order and regenerates purely positional names — reorder-lossy, single-end only; grouped input and `--keep-order` fall back to `any`). |
 | `--interleaved <N>` | Interleaving of a *single* input, in members per spot (1 = single-end, 2 = paired as from `sracha get -Z`). Auto-detected from read names by default. Ignored with multiple inputs. |
 | `--keep-order` | With `--order any`, force original read order to be restored (store a permutation, code names/quality in original order). Chosen automatically when it makes the archive smaller. |
@@ -173,6 +173,19 @@ to object storage where clients issue small `Range` reads — say, fetching just
 the read names, or just one row group — a smaller `--block-reads` makes those
 fetches cheaper; for a write-once/read-sequentially archive the `--level` default
 is the right call.
+
+**Long reads are sized in bytes, not reads.** A long-read file holds so few
+reads that the read count never binds; blocks are cut by a raw-sequence byte
+budget instead. For Nanopore input that budget defaults to **64 MiB** (other
+platforms use the 256 MiB cap): on a 576 MB MinION file that is 5 blocks
+instead of 2, which took full decode from flat-at-any-thread-count to 3.2×
+faster at 8 threads, and `--fasta` from 4.6 s to 1.9 s, for +1.08% archive
+size. `--max` keeps maximal 256 MiB blocks — its contract is the smallest
+archive, and the last ~1% lives in the sequence codec's per-block coverage.
+To trade further in either direction pass `--block-reads`: with it the read
+count alone governs the cut (e.g. `--block-reads 2000` on ~14 kb reads is
+~28 MB groups — more parallelism at ~+3% size; a large N restores maximal
+blocks at any level).
 
 The per-group and per-stream byte offsets recorded in the footer are what make
 this projection possible without reading whole blocks — see

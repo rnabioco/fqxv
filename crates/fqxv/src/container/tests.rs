@@ -2376,6 +2376,119 @@ fn archive_is_deterministic_across_threads() {
     assert_eq!(mk(1), mk(4));
 }
 
+/// The per-block sequence byte budget resolves per platform on auto (0), and an
+/// explicit value is clamped to the hard cap. Pure-function test because the real
+/// long-read constant is hundreds of MiB — far too big to exercise end-to-end.
+#[test]
+fn block_seq_budget_resolves_per_platform_and_clamps() {
+    let auto = Params::default();
+    assert_eq!(
+        resolve_block_seq_bytes(&auto, Platform::Nanopore),
+        LONGREAD_BLOCK_SEQ_BYTES,
+        "auto + Nanopore takes the long-read budget"
+    );
+    for p in [
+        Platform::Unknown,
+        Platform::Illumina,
+        Platform::PacBio,
+        Platform::MgiBgi,
+    ] {
+        assert_eq!(
+            resolve_block_seq_bytes(&auto, p),
+            MAX_BLOCK_SEQ_BYTES,
+            "auto keeps the full cap for {p:?}"
+        );
+    }
+    let explicit = Params {
+        block_seq_bytes: 4096,
+        ..Params::default()
+    };
+    assert_eq!(
+        resolve_block_seq_bytes(&explicit, Platform::Nanopore),
+        4096,
+        "an explicit budget wins over the platform default"
+    );
+    let pinned = Params {
+        block_seq_bytes: usize::MAX,
+        ..Params::default()
+    };
+    assert_eq!(
+        resolve_block_seq_bytes(&pinned, Platform::Illumina),
+        MAX_BLOCK_SEQ_BYTES,
+        "an explicit budget is clamped to the hard cap"
+    );
+}
+
+/// Deterministic synthetic "long reads": `n` reads of `len` pseudo-random ACGT
+/// bases with full-range quality, long enough per read that the byte budget (not
+/// the read count) is what cuts blocks — the long-read shape of issue #273.
+fn make_long_reads(n: usize, len: usize) -> Vec<u8> {
+    let mut s = 0x9E37_79B9u64;
+    let mut step = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        s
+    };
+    let mut fq = Vec::new();
+    for i in 0..n {
+        fq.extend_from_slice(format!("@lr.{i}\n").as_bytes());
+        for _ in 0..len {
+            fq.push(b"ACGT"[(step() & 3) as usize]);
+        }
+        fq.extend_from_slice(b"\n+\n");
+        for _ in 0..len {
+            fq.push(b'!' + (step() % 60) as u8);
+        }
+        fq.push(b'\n');
+    }
+    fq
+}
+
+/// `block_seq_bytes` governs long-read block granularity end-to-end: an explicit
+/// small budget cuts many blocks where the pinned cap yields one, every variant
+/// reconstructs identical FASTQ, and the cut stays byte-identical across thread
+/// counts (the determinism invariant the platform-resolved budget must not break).
+#[test]
+fn long_read_block_seq_budget_cuts_blocks_and_roundtrips() {
+    // 24 reads x 1 KiB: tiny by long-read standards, so drive the cut with an
+    // explicit budget. Forced platform keeps the test off the content classifier.
+    let input = make_long_reads(24, 1024);
+    let mk = |block_seq_bytes: usize, threads: usize| {
+        compress_bytes(
+            &input,
+            Params {
+                platform: Some(Platform::Nanopore),
+                block_seq_bytes,
+                threads,
+                ..Params::default()
+            },
+        )
+    };
+
+    let small = mk(4096, 1);
+    let pinned = mk(usize::MAX, 1);
+    let small_info = inspect(io::Cursor::new(&small)).expect("inspect small");
+    let pinned_info = inspect(io::Cursor::new(&pinned)).expect("inspect pinned");
+    assert_eq!(pinned_info.blocks, 1, "pinned budget keeps one block");
+    assert_eq!(
+        small_info.blocks, 6,
+        "4 KiB budget cuts a block per 4 reads of 1 KiB"
+    );
+
+    // Both granularities reconstruct the identical FASTQ.
+    let decode = |archive: &[u8]| {
+        let mut fastq = Vec::new();
+        decompress(archive, &mut fastq, 2).expect("decompress");
+        fastq
+    };
+    assert_eq!(decode(&small), input);
+    assert_eq!(decode(&pinned), input);
+
+    // The budget-driven cut is thread-count invariant.
+    assert_eq!(mk(4096, 1), mk(4096, 4));
+}
+
 #[test]
 fn inspect_falls_back_without_trailer() {
     let archive = compress_bytes(SAMPLE, Params::default());
