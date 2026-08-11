@@ -29,6 +29,7 @@ nav = [
     { "Testing & Robustness" = "design/testing.md" },
   ] },
   { "Benchmarks" = "benchmarks.md" },
+  { "Decode scaling" = "decode-scaling.md" },
   { "Format comparison" = "format-comparison.md" },
   { "Changelog" = "changelog.md" },
   { "Acknowledgments" = "acknowledgments.md" },

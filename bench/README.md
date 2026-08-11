@@ -216,6 +216,30 @@ PgRC -d -t 8 arch                        # -> arch_out (sequences, one per line)
 
 Once `fqxv` produces output, it joins the comparable table as another tool.
 
+## Decode thread-scaling (`scripts/decode_scaling.sh`)
+
+The matrix above measures ratio and one-configuration wall-clock. This measures
+the *analysis-substrate* property the BINSEQ paper (doi:10.1371/journal.pcbi.1014181)
+benchmarks: how full-decompression throughput scales with thread count — fqxv's
+independent parallel blocks vs `gzip`'s serial DEFLATE — against `gzip`, `pigz`,
+and `zstd` decoding the same FASTQ. Output goes through a pipe to `wc -c` (never
+`/dev/null`, never disk), and the byte count doubles as a correctness check
+across tools and thread counts. Compressed inputs are synthesized once per
+dataset (idempotent; `FQXV_REPREP=1` rebuilds): `.fqxv` and `.max.fqxv` from
+the current build (the default and `--max` operating points), `.fastq.gz` from
+`pigz -6`, `.fastq.zst` from `zstd -19 --long=27`.
+
+```bash
+sbatch slurm/decode_scaling.sbatch      # dedicated 32-CPU allocation
+# results -> $FQXV_RESULTS_DIR/decode_scaling.tsv
+```
+
+Knobs: `FQXV_DECODE_DATASETS`, `FQXV_THREAD_STEPS` (default `1 2 4 8 16 32`),
+`FQXV_DECODE_TOOLS`, `FQXV_REPS`, plus the usual `FQXV_DATA_DIR` /
+`FQXV_RESULTS_DIR` / `FQXV_BIN`. The write-up lives in
+[`docs/decode-scaling.md`](../docs/decode-scaling.md); the committed raw TSV in
+[`docs/charts/decode_scaling.tsv`](../docs/charts/decode_scaling.tsv).
+
 ## fqxv vs the archive the data shipped in (`scripts/sra_compare.sh`)
 
 `.sra` is the format most public data actually ships in, and it is itself a
