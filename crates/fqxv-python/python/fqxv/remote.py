@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import urllib.request
 from collections import namedtuple
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple, Union
 
 from . import _fqxv
 
@@ -199,19 +199,35 @@ def _urlopen(url: str, headers=None):
     return urllib.request.urlopen(urllib.request.Request(url, headers=dict(headers or {})))
 
 
-def stream(url: str, *, headers=None, threads: int = 0):
+def stream(
+    url: str,
+    *,
+    headers=None,
+    threads: int = 0,
+    streams: Optional[Union[str, Iterable[str]]] = None,
+):
     """Iterate records from a remote archive without staging it to disk. The HTTP
     response feeds straight into the streaming decoder, so records flow out as
     blocks arrive. Yields fqxv ``Record`` objects in original order.
+
+    ``streams`` selects which per-read streams to decode (see :func:`fqxv.open`):
+    e.g. ``streams=("seq",)`` skips the names and quality decode entirely —
+    deselected fields come back as empty ``bytes``. The whole archive body is
+    still transferred (it is a forward stream); for fetching *only* some columns'
+    bytes, use the :class:`RemoteArchive` projection instead.
 
     For a private object presign the URL or pass an ``Authorization`` header via
     ``headers``. For ``s3://`` with the AWS credential chain, hand a boto3 body to
     :func:`fqxv.open` directly (``fqxv.open(s3.get_object(...)["Body"])``) or use the
     CLI (``aws s3 cp s3://… - | fqxv decompress -``)."""
-    return _fqxv.open(_urlopen(url, headers), threads=threads)
+    return _fqxv.open(_urlopen(url, headers), threads=threads, streams=streams)
 
 
-def download(url: str, dest, *, headers=None, threads: int = 0) -> int:
+def download(url: str, dest, *, headers=None, threads: int = 0, fasta: bool = False) -> int:
     """Stream a remote archive and decode it to interleaved FASTQ at ``dest``
-    without buffering the archive in memory. Returns the read count."""
-    return _fqxv.decompress_to_path(_urlopen(url, headers), str(dest), threads=threads)
+    without buffering the archive in memory. Returns the read count.
+    ``fasta=True`` writes single-line FASTA instead, skipping the quality
+    stream's decode (see :func:`fqxv.decompress_to_path`)."""
+    return _fqxv.decompress_to_path(
+        _urlopen(url, headers), str(dest), threads=threads, fasta=fasta
+    )

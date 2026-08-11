@@ -21,6 +21,15 @@ for rec in fqxv.open("reads.fqxv"):
 data = open("reads.fqxv", "rb").read()
 n = sum(1 for _ in fqxv.open(data))
 
+# Decode only some streams — deselected fields come back as b"" and their coded
+# streams are skipped, never entropy-decoded (sequence-only measured ~12x faster
+# on ONT long-read archives, ~1.3-1.6x single-threaded on short-read Illumina)
+for rec in fqxv.open("reads.fqxv", streams=("seq",)):
+    ...                                         # rec.name == rec.quality == b""
+
+# FASTA out, quality skipped entirely — the CLI's `decompress --fasta` as an API
+fqxv.decompress_to_path("reads.fqxv", "reads.fasta", fasta=True)
+
 # Whole-archive convenience
 fqxv.decompress_to_path("reads.fqxv", "reads.fastq")
 raw = fqxv.decompress_to_bytes("reads.fqxv")
@@ -71,7 +80,11 @@ archive this build cannot read is refused with an error, never misread.
 
 Projection and `open_index` are unavailable for globally-reordered archives
 (`--order any`, `--max`, `--order shuffle`), whose streams are mutually
-dependent; use `fqxv.open()` to iterate those. Everything here is read-only:
+dependent; use `fqxv.open()` to iterate those — `streams=` selection works on
+every layout. Two selection caveats: long-read archives code quality against the
+bases, so selecting quality still decodes the sequence internally; and a skipped
+stream's integrity digest cannot be checked (run `fqxv.verify()` for a full
+check). Everything here is read-only:
 `verify` and `estimate` only *measure* — neither writes an archive — and full
 compression stays in the CLI.
 

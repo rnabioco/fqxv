@@ -76,6 +76,58 @@ with fqxv.open("reads.fqxv") as reader:
 
 Pass `threads=` to control the decode pool (default `0` = all cores).
 
+## Decoding only some streams
+
+Many consumers never read all three streams — k-mer counters and classifiers
+want only sequences, an ID audit only names. `open()` takes a `streams=`
+selection: one stream name or an iterable of names out of `"names"`,
+`"sequence"`, `"quality"` (the short forms `"name"`/`"seq"`/`"qual"` also
+work). Deselected fields come back as empty `bytes`, and their coded streams
+are **skipped, never entropy-decoded** — the decode cost of everything you did
+not ask for disappears.
+
+```python
+# Sequence-only pass: k-mer counting / classification input, straight from the archive.
+for rec in fqxv.open("reads.fqxv", streams=("seq",)):
+    count(rec.sequence)            # rec.name == rec.quality == b""
+
+ids = [r.name for r in fqxv.open("reads.fqxv", streams="names")]
+
+# streams=() decodes nothing: count reads at framing speed.
+n = sum(1 for _ in fqxv.open("reads.fqxv", streams=()))
+```
+
+How much skipping buys depends on where the archive's decode compute sits:
+sequence-only decode measured **~12× faster** on an ONT long-read archive (the
+sequence-conditioned quality model dominates decode there) and ~1.3–1.6×
+single-threaded on short-read Illumina; at high thread counts the short-read
+win shows up as freed CPU time rather than wall time. Two caveats:
+
+- **Long-read quality needs the sequence.** On long-read archives quality is
+  coded against the bases, so selecting quality still decodes the sequence
+  stream internally (it is returned empty unless selected). Names and sequence
+  have no such dependency.
+- **Skipped streams are not verified.** Every stream that *is* decoded keeps
+  its integrity checks, but a skipped stream's content digest cannot be checked
+  (its content is never reconstructed). Run `fqxv.verify()` when you need the
+  whole archive vouched for.
+
+Selection works on **every** layout, including globally-reordered archives —
+unlike the [column projections](#column-projection-random-access) below, which
+need the plain layout's footer index but can also skip *reading* the deselected
+bytes (the streaming selection reads the whole file and skips the decode).
+
+### FASTA output
+
+`decompress_to_path()` and `decompress_to_bytes()` take `fasta=True` — the CLI's
+`decompress --fasta` as an API: single-line FASTA (`>name` + sequence), with the
+quality stream skipped entirely, at the same speedups as above.
+
+```python
+fqxv.decompress_to_path("reads.fqxv", "reads.fasta", fasta=True)
+fa = fqxv.decompress_to_bytes("reads.fqxv", fasta=True)
+```
+
 ## Whole-archive convenience
 
 ```python
@@ -151,7 +203,8 @@ block0 = fqxv.read_block("reads.fqxv", 0)     # list[Record]
     Projection and `open_index` require the plain (per-block) layout. A
     globally-reordered archive (`--order any`, `--max`, `--order shuffle`) has no
     footer index — its streams are mutually dependent — so these raise
-    `fqxv.FqxvError`. Use `fqxv.open()` to iterate those. Check
+    `fqxv.FqxvError`. Use `fqxv.open()` to iterate those (with `streams=` if you
+    only need a subset). Check
     `fqxv.inspect(path).reordered` if you need to branch. Compressing with a
     smaller `--block-reads` makes projection finer-grained on the plain layout.
 
@@ -221,7 +274,10 @@ n = remote.download("https://host/reads.fqxv", "reads.fastq")   # read count
 `.records()` — each taking an optional `groups=` — plus `.index`, `.size`, and
 `.bytes_fetched`. The module-level shortcuts are `open_index`, `read_names`,
 `read_sequences`, `read_qualities`, `stream`, and `download`; all accept
-`headers=` for an `Authorization` header on a private object.
+`headers=` for an `Authorization` header on a private object. `stream()` also
+takes [`streams=`](#decoding-only-some-streams) (decode only some streams while
+streaming — the archive body is still transferred) and `download()` takes
+`fasta=True`.
 
 To drive the same thing from a different client — an async `httpx`/`aiohttp`
 session issuing range fetches concurrently — call the IO-free primitives
@@ -263,9 +319,9 @@ except OSError as e:
 
 | Function | Returns | Notes |
 | --- | --- | --- |
-| `open(source, *, threads=0)` | `Reader` | Iterator of `Record`; every layout |
-| `decompress_to_path(source, dest, *, threads=0)` | `int` | Read count; writes interleaved FASTQ |
-| `decompress_to_bytes(source, *, threads=0)` | `bytes` | Interleaved FASTQ |
+| `open(source, *, threads=0, streams=None)` | `Reader` | Iterator of `Record`; every layout. `streams=` decodes a subset — deselected fields are `b""`, their streams skipped |
+| `decompress_to_path(source, dest, *, threads=0, fasta=False)` | `int` | Read count; interleaved FASTQ, or single-line FASTA with `fasta=True` (quality skipped) |
+| `decompress_to_bytes(source, *, threads=0, fasta=False)` | `bytes` | Interleaved FASTQ, or single-line FASTA with `fasta=True` |
 | `inspect(source)` | `Info` | Header + footer metadata |
 | `open_index(source)` | `Index` | Footer row-group index (plain layout) |
 | `read_names(source, groups=None)` | `list[bytes]` | Names for the groups (or all) |
