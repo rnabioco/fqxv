@@ -376,6 +376,21 @@ fn tile_env(var: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// The tiler's encode options for `platform` under `params`, shared by the real
+/// candidate and the `FQXV_DIAG_TILECHUNK` measurement below so the two can
+/// never drift apart. Band and best-of-N fan-out come from the effort level the
+/// caller resolved (`--level`/`--max`); the env vars override for rebuild-free
+/// A/B measurement.
+fn tile_opts(platform: Platform, params: &Params) -> fqxv_lroverlap::EncodeOpts {
+    let mut opts = fqxv_lroverlap::EncodeOpts {
+        sketch: sketch_for(platform, SeedContext::PerBlock),
+        ..Default::default()
+    };
+    opts.tile_band = tile_env("FQXV_TILE_BAND", params.tile_band);
+    opts.tile_max_refs = tile_env("FQXV_TILE_REFS", params.tile_max_refs);
+    opts
+}
+
 /// The optional tiling candidate: `None` (skipping the encode entirely) when the
 /// caller's `want` flag is false or `FQXV_SEQ_NO_TILE` is set, else the
 /// method-tagged stream. The tiler builds a per-block overlap index, so it takes
@@ -390,14 +405,7 @@ fn tile_candidate(
     if !(want && tile_candidate_enabled()) {
         return Ok(None);
     }
-    let mut opts = fqxv_lroverlap::EncodeOpts {
-        sketch: sketch_for(platform, SeedContext::PerBlock),
-        ..Default::default()
-    };
-    // Band and best-of-N fan-out come from the effort level the caller resolved
-    // (`--level`/`--max`); the env vars override for rebuild-free A/B measurement.
-    opts.tile_band = tile_env("FQXV_TILE_BAND", params.tile_band);
-    opts.tile_max_refs = tile_env("FQXV_TILE_REFS", params.tile_max_refs);
+    let opts = tile_opts(platform, params);
     let coded = fqxv_lroverlap::tile_encode(lens, seq, &opts)?;
     let mut out = Vec::with_capacity(coded.len() + 1);
     out.push(SEQ_METHOD_TILE);
@@ -551,6 +559,46 @@ pub(crate) fn encode_sequence_stream(
             tile_len,
             bpb(tile_len),
         );
+    }
+    // `FQXV_DIAG_TILECHUNK` prices the tiler's chunk-confined reference
+    // selection — the encoder-side change a chunk-parallel `tile_decode` would
+    // need (see `EncodeOpts::diag_confine_chunks`): re-encode the tiling
+    // candidate with references confined to K equal-base chunks and report its
+    // size next to the unconfined candidate. Measurement only: the confined
+    // encodes are discarded, so the archive is byte-identical with the flag set
+    // or unset. Costs two extra tile encodes per block when set; off by
+    // default, zero-cost when unset.
+    if std::env::var_os("FQXV_DIAG_TILECHUNK").is_some()
+        && let Some(t) = &tile
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        // Arrival-order line id (blocks code in parallel), not a stable
+        // block index — it only groups the K-cells of one call.
+        static TILECHUNK_BLK: AtomicU64 = AtomicU64::new(0);
+        let blk = TILECHUNK_BLK.fetch_add(1, Ordering::Relaxed);
+        let bases: u64 = lens.iter().map(|&l| u64::from(l)).sum();
+        for kc in [4usize, 8] {
+            let mut opts = tile_opts(platform, params);
+            opts.diag_confine_chunks = Some(kc);
+            match fqxv_lroverlap::tile_encode(lens, seq, &opts) {
+                Ok(coded) => {
+                    // +1: the method byte the candidate carries, so the two
+                    // totals compare like for like.
+                    let confined = coded.len() + 1;
+                    eprintln!(
+                        "[diag tilechunk] blk={} reads={} bases={} baseline={} K={} confined={} delta_pct={:.4}",
+                        blk,
+                        lens.len(),
+                        bases,
+                        t.len(),
+                        kc,
+                        confined,
+                        (confined as f64 - t.len() as f64) * 100.0 / t.len() as f64,
+                    );
+                }
+                Err(e) => eprintln!("[diag tilechunk] blk={blk} K={kc} error={e}"),
+            }
+        }
     }
     // order-k is the always-present floor; every other candidate can only shrink it.
     let mut plain = order_k;
