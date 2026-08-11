@@ -1297,17 +1297,27 @@ pub(crate) fn decode_reordered_split<R: Read, W: Write>(
 /// keep-order archives, clustered order otherwise. Sequences are in original
 /// orientation (flips undone), quality bytes are un-reversed to match, and names
 /// are template-regenerated where the archive carries one. Produced by
-/// [`decode_reordered_records`] for the parallel record visitor, which needs
-/// random access to every record at once rather than a serial emission loop.
+/// [`decode_reordered_records`] (full decode) and
+/// [`decode_reordered_records_select`] (stream-selective) for the parallel
+/// record visitor, which needs random access to every record at once rather
+/// than a serial emission loop.
+///
+/// Under a partial [`StreamSelection`] a deselected stream's vectors are
+/// **empty** (`names`/`seqs` length 0, `quals`+`qoffs` length 0) rather than
+/// per-record-empty — record count comes from `n`, never from a stream length.
 pub(crate) struct ReorderedRecords {
-    /// Per-record name, output order.
+    /// Record count. Every populated stream below has exactly this many records.
+    pub(crate) n: usize,
+    /// Per-record name, output order; empty when names were deselected.
     pub(crate) names: Vec<Vec<u8>>,
-    /// Per-record sequence (original orientation), output order.
+    /// Per-record sequence (original orientation), output order; empty when
+    /// sequence was deselected.
     pub(crate) seqs: Vec<Vec<u8>>,
     /// Flat quality bytes in output order/orientation; record `i` is
-    /// `quals[qoffs[i]..qoffs[i + 1]]`.
+    /// `quals[qoffs[i]..qoffs[i + 1]]`. Empty when quality was deselected.
     pub(crate) quals: Vec<u8>,
-    /// Cumulative per-record quality offsets (`names.len() + 1` entries).
+    /// Cumulative per-record quality offsets (`n + 1` entries; empty when
+    /// quality was deselected).
     pub(crate) qoffs: Vec<usize>,
     /// Number of coded blocks in the archive (for `Stats::blocks`).
     pub(crate) n_blocks: usize,
@@ -1435,6 +1445,130 @@ pub(crate) fn decode_reordered_records<R: Read>(
     }
 
     Ok(ReorderedRecords {
+        n,
+        names,
+        seqs,
+        quals,
+        qoffs,
+        n_blocks,
+    })
+}
+
+/// Selection-aware [`decode_reordered_records`]: materialize only the streams
+/// `sel` asks for, *skipping* — never entropy-decoding — the rest (via
+/// [`read_reordered_streams_select`]), for the parallel record visitor.
+/// Deselected streams come back as empty vectors in the returned
+/// [`ReorderedRecords`].
+///
+/// A full selection delegates to [`decode_reordered_records`], keeping the
+/// whole-output digest check bit-for-bit. Any *partial* selection skips that
+/// digest fold: it spans all three streams jointly, so it cannot be recomputed
+/// unless everything was decoded — the same contract as the serial
+/// [`decompress_records_select`](super::decompress_records_select) path (each
+/// stream that *is* decoded still went through its frame CRC).
+pub(crate) fn decode_reordered_records_select<R: Read>(
+    r: R,
+    pool: &rayon::ThreadPool,
+    keep_order: bool,
+    has_reference: bool,
+    sel: StreamSelection,
+) -> Result<ReorderedRecords> {
+    if sel == StreamSelection::ALL {
+        return decode_reordered_records(r, pool, keep_order, has_reference);
+    }
+    let mut s = read_reordered_streams_select(r, pool, keep_order, has_reference, sel)?;
+    let n = s.n;
+    let n_blocks = s.n_blocks;
+    let regen = s.template.is_some();
+
+    // Sequences into output order: un-permute (keep-order) or un-flip in place
+    // (discard-order), exactly as the full decode does — in parallel.
+    let seqs: Vec<Vec<u8>> = if sel.sequence {
+        if keep_order {
+            unpermute_reads(std::mem::take(&mut s.cl_reads), &s.flip, &s.perm_c, n)?
+        } else {
+            let mut seqs = std::mem::take(&mut s.cl_reads);
+            let flip = &s.flip;
+            pool.install(|| {
+                seqs.par_iter_mut().enumerate().for_each(|(j, sq)| {
+                    if flip_bit(flip, j) {
+                        *sq = fqxv_reorder::revcomp(sq);
+                    }
+                });
+            });
+            seqs
+        }
+    } else {
+        Vec::new()
+    };
+
+    // Quality into output order/orientation with cumulative offsets. Keep-order
+    // quality is stored in original order already; discard-order un-reverses
+    // flipped reads over disjoint slices split off up front (no `unsafe`), the
+    // same pattern as the full decode.
+    let (quals, qoffs) = if sel.quality {
+        let mut quals = std::mem::take(&mut s.quals);
+        let mut qoffs = Vec::with_capacity(n + 1);
+        let mut acc = 0usize;
+        for &l in &s.lens {
+            qoffs.push(acc);
+            acc = acc
+                .checked_add(l as usize)
+                .ok_or(Error::Malformed("read length overflow"))?;
+        }
+        qoffs.push(acc);
+        if acc > quals.len() {
+            return Err(Error::Malformed("quality underrun"));
+        }
+        if !keep_order {
+            let mut dsts: Vec<&mut [u8]> = Vec::with_capacity(n);
+            let mut rest: &mut [u8] = &mut quals;
+            for j in 0..n {
+                let (head, tail) = rest.split_at_mut(s.lens[j] as usize);
+                dsts.push(head);
+                rest = tail;
+            }
+            let flip = &s.flip;
+            pool.install(|| {
+                dsts.par_iter_mut().enumerate().for_each(|(j, q)| {
+                    if flip_bit(flip, j) {
+                        q.reverse();
+                    }
+                });
+            });
+        }
+        (quals, qoffs)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    // When both sequence and quality were decoded their per-read lengths must
+    // agree — the same cross-check the serial selective path applies.
+    if sel.sequence && sel.quality {
+        for i in 0..n {
+            if seqs[i].len() != s.lens[i] as usize {
+                return Err(Error::Malformed("reordered sequence length mismatch"));
+            }
+        }
+    }
+
+    // Names into output order. A keep-order archive never (validly) carries a
+    // name template; if one does, the name stream is empty and the serial
+    // selective path emits empty names — mirrored here by leaving `names`
+    // deselected-empty.
+    let names: Vec<Vec<u8>> = if sel.names && !regen {
+        std::mem::take(&mut s.names)
+    } else if sel.names && !keep_order {
+        match &s.template {
+            Some(t) => pool.install(|| (0..n).into_par_iter().map(|j| t.regenerate(j)).collect()),
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    Ok(ReorderedRecords {
+        n,
         names,
         seqs,
         quals,

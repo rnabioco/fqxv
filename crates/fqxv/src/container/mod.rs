@@ -185,7 +185,7 @@ pub use random_access::{
     decode_quality, decode_quality_with_seq, decode_sequence, quality_needs_sequence,
 };
 pub use records::{Record, RecordReader, decompress_records};
-pub use records_par::{RecordRef, decompress_records_par};
+pub use records_par::{RecordRef, decompress_records_par, decompress_records_par_select};
 pub use stream_select::{StreamSelection, decompress_fasta, decompress_records_select};
 pub use verify::{
     VerifyCheck, VerifyReport, expected_reads, verify, verify_quick, verify_report,
