@@ -8,6 +8,40 @@ use tracing::{debug, info, instrument, warn};
 /// better (higher ratio) but reduce parallelism and raise memory.
 pub(crate) const DEFAULT_BLOCK_READS: usize = 1 << 20;
 
+/// Per-block raw-sequence byte budget for Nanopore blocks when
+/// [`Params::block_seq_bytes`] is 0 (auto). Long-read files hold few enough reads
+/// that the read-count budget never binds, so this byte budget alone sets the
+/// block count — and with the short-read 256 MiB cap a typical ONT file collapses
+/// into ~2 blocks, leaving block-level decode parallelism nothing to work with
+/// (issue #273).
+///
+/// 64 MiB is the measured knee of the ratio-vs-parallelism curve on a 576 MB ONT
+/// MinION file (DRR205413, 21 k × ~14 kb reads): 2 → 5 blocks for **+1.08%**
+/// archive size, full decode 56.4 s → 17.6 s at 8 threads (3.2×) and seq-only
+/// (`--fasta`) 4.6 s → 1.9 s — where 256 MiB was flat at every thread count.
+/// Compress drops 65 s → 25 s too (block-parallel encode was equally starved).
+/// The cost is almost entirely the sequence stream (the per-block overlap codec
+/// sees less coverage; quality pays only ~+0.5%), and it is what halving again
+/// doubles: 32 MiB measured +2.7% for 5.3× at 16 threads. Block count scales
+/// with file size at a fixed budget, so larger files gain parallelism while the
+/// per-block ratio cost stays put.
+pub(crate) const LONGREAD_BLOCK_SEQ_BYTES: usize = 64 << 20;
+
+/// Resolve [`Params::block_seq_bytes`] against the resolved platform: 0 means
+/// auto (the platform default — [`LONGREAD_BLOCK_SEQ_BYTES`] for Nanopore,
+/// [`MAX_BLOCK_SEQ_BYTES`] otherwise); an explicit value is clamped to the hard
+/// cap. Platform is a pure function of the input and the caller's `Params`, so
+/// the budget — and with it the block boundaries — stays thread-count invariant.
+pub(crate) fn resolve_block_seq_bytes(params: &Params, platform: Platform) -> usize {
+    match params.block_seq_bytes {
+        0 => match platform {
+            Platform::Nanopore => LONGREAD_BLOCK_SEQ_BYTES,
+            _ => MAX_BLOCK_SEQ_BYTES,
+        },
+        n => n.min(MAX_BLOCK_SEQ_BYTES),
+    }
+}
+
 /// One interleaved spot's records — `(raw_header, sequence, quality)` per member —
 /// owned so the platform can be detected before the streaming header is written
 /// (see `compress_multi`). The header is the byte-exact definition line.
@@ -76,6 +110,18 @@ pub struct Params {
     /// (greedy single reference); the CLI raises it at the top effort levels, `--max`
     /// to the CoLoRd-parity operating point.
     pub tile_max_refs: usize,
+    /// Per-block raw-sequence byte budget; 0 (the default) means auto.
+    ///
+    /// Blocks are cut at whichever comes first — `block_reads` reads or this many
+    /// raw sequence bytes. Long-read files hold few enough reads that the byte
+    /// budget alone sets the block count, and blocks are the unit of decode
+    /// parallelism and random access, so this is the granularity lever for
+    /// long-read archives (issue #273). Auto resolves per platform: Nanopore gets
+    /// [`LONGREAD_BLOCK_SEQ_BYTES`], everything else the 256 MiB cap. An explicit
+    /// value is clamped to that cap; the CLI keeps `--block-reads`'s historical
+    /// read-count-only semantics by pinning this to the cap when that flag is
+    /// given. Ignored by the reorder path, which sizes its own blocks.
+    pub block_seq_bytes: usize,
     /// Per-member slot labels recorded in the archive, one per interleaved member
     /// (`"R1"`, `"I1"`, `"2"`, …). Purely descriptive: nothing in decode depends on
     /// them, they exist so `decompress_split` can restore the *original* per-slot
@@ -107,6 +153,7 @@ impl Default for Params {
             platform: None,
             tile_band: 256,
             tile_max_refs: 1,
+            block_seq_bytes: 0,
             member_labels: Vec::new(),
         }
     }
@@ -582,6 +629,10 @@ pub fn compress_multi<'a, W: Write>(
     }
     let refs: Vec<&[u8]> = primed.iter().map(|(d, _, _)| d.as_slice()).collect();
     let platform = params.platform.unwrap_or_else(|| detect_platform(&refs));
+    // Platform-resolved byte budget: must match `compress_buffered_plain`'s so an
+    // explicit-Nanopore stream cuts the same blocks as the buffered path (#211's
+    // byte-identical claim).
+    let seq_budget = resolve_block_seq_bytes(&params, platform);
     let mut primed = Some(primed).filter(|p| !p.is_empty());
     let stats = drive(writer, params, g as u8, platform, |b| {
         // Emit the primed first spot into the first block before reading on.
@@ -593,7 +644,7 @@ pub fn compress_multi<'a, W: Write>(
         // Cut on reads OR the raw-sequence byte budget, whichever comes first;
         // the loop reads whole spots, so a byte cut still lands on a spot
         // boundary. Matches the byte budgeting in `block_ranges`.
-        while b.n_reads() < block_reads && b.seq.len() < MAX_BLOCK_SEQ_BYTES {
+        while b.n_reads() < block_reads && b.seq.len() < seq_budget {
             // Read one record from each input; member 0 EOF ends cleanly.
             for j in 0..g {
                 if !read_raw_record(&mut fqs[j], &mut defs[j], &mut seqs[j], &mut quals[j])? {
@@ -697,9 +748,14 @@ pub(crate) fn compress_buffered_plain<W: Write>(
     let (chunks, gstart, _n) = parse_chunks(buf, g, &pool)?;
     let platform = resolve_platform_buf(params.platform, buf);
     // Byte-budgeted row-group ranges (min of block_reads and a raw-sequence byte
-    // cap, on whole-spot boundaries) — a pure function of the read lengths, so
-    // determinism holds regardless of thread count.
-    let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
+    // cap, on whole-spot boundaries) — a pure function of the read lengths and the
+    // resolved platform, so determinism holds regardless of thread count.
+    let ranges = block_ranges(
+        &chunks,
+        block_reads,
+        resolve_block_seq_bytes(&params, platform),
+        g,
+    );
     write_plain_layout(
         writer, buf, &chunks, &gstart, &ranges, &params, group_size, platform, &pool, None, None,
     )
@@ -890,7 +946,15 @@ fn compress_longread_shared_ref<W: Write>(
     let pool = build_pool(params.threads)?;
     let (chunks, gstart, _n) = parse_chunks(buf, g, &pool)?;
     let platform = resolve_platform_buf(params.platform, buf);
-    let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
+    // Auto keeps the full 256 MiB here (this path never runs for Nanopore), but an
+    // explicit `block_seq_bytes` is honored: the shared reference is stored once
+    // regardless of the cut, so granularity stays a per-block-stream decision.
+    let ranges = block_ranges(
+        &chunks,
+        block_reads,
+        resolve_block_seq_bytes(&params, platform),
+        g,
+    );
     let num_blocks = ranges.len();
     let batch = pool.current_num_threads().max(1);
 

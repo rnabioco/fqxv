@@ -212,7 +212,7 @@ decoded without touching the rest of the file.
 ## Row-group sizing (short and long reads)
 
 A row group is cut at whichever comes first: `block_reads` reads (set by
-`--level`) or a fixed raw-sequence **byte budget**. For fixed short reads
+`--level`) or a raw-sequence **byte budget**. For fixed short reads
 (Illumina) the read count binds and the byte budget never triggers. For long,
 ragged reads (nanopore) the byte budget binds first — otherwise a read-count
 block of, say, 1M × 10 kb reads would be a ~10 GB row group that destroys
@@ -220,6 +220,18 @@ parallelism and random-access granularity and could overflow the `u32` per-strea
 compressed length. Byte cuts still land on whole-spot boundaries. Boundaries
 depend only on the read lengths and the two limits, never on thread scheduling,
 so determinism holds.
+
+The byte budget resolves per platform (`Params::block_seq_bytes`, 0 = auto):
+**64 MiB for Nanopore, 256 MiB otherwise**. Because the byte budget is the sole
+cut for long reads, it alone sets the archive's block count — the unit of decode
+parallelism — and 256 MiB left a typical single-flowcell ONT file at ~2 blocks
+with a decode curve flat in the thread count (issue #273). 64 MiB is the
+measured knee: +1.08% archive for 3.2× full decode at 8 threads on a 576 MB
+MinION file, the cost concentrated in the overlap codec's per-block coverage.
+The CLI's `--max` pins the cap back (smallest-archive contract), and an explicit
+`--block-reads` also pins it so the read count alone governs. The budget is a
+pure function of input and parameters — platform comes from the caller or
+content/name detection, never the pool — so thread-count determinism survives.
 
 Capping a block at the byte budget also caps how much coverage a long-read block's
 overlap codec sees, and each block otherwise self-assembles (and re-stores) its own

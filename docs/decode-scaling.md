@@ -78,6 +78,14 @@ each read from a consensus reference plus an edit script). Small long-read
 files expose the serial cost; scaling returns with file size, not thread
 count.
 
+Since these numbers were taken, the default Nanopore block budget dropped from
+256 MiB of raw sequence to **64 MiB** (issue #273) — this same file now cuts
+**5 blocks**, measured full decode 56.4 s → 17.6 s at 8 threads (3.2×) and
+`--fasta` 4.6 s → 1.9 s, for +1.08% archive size. `--max` keeps the old
+maximal blocks (smallest-archive contract), and `--block-reads` trades
+further: ~28 MB groups (`--block-reads 2000` at these read lengths) measured
+5.3× at 16 threads for ~+3%.
+
 ## Why the curves look like this
 
 **The unit of `fqxv` decode parallelism is the block.** Blocks are independent
@@ -98,8 +106,18 @@ blocks to spare (DRR174812's 113), the `--max` curve still bends at ~16
 threads: restoring the original read order from the stored permutation and
 reassembling interleaved output is work the block fan-out cannot hide, and
 the memory-bandwidth ceiling (below) applies sooner because each of its
-threads decodes faster. The ONT tiling path keeps the same 2 blocks either
-way.
+threads decodes faster. The ONT tiling path kept the same 2 blocks either
+way when this table was measured; the Nanopore default block budget has
+since dropped to 64 MiB (5 blocks on this file — see the note under the ONT
+table), while ONT `--max` still keeps maximal blocks.
+
+Long-read blocks cannot be un-serialized from the inside, which is why block
+count is the whole lever: long-read quality is coded *conditioned on the
+decoded bases* (`fqzcomp` MODE_SEQ), so a block's sequence must finish
+decoding before its quality — 92% of the work — can start, and the overlap
+codec's edit-script streams thread adaptive range-coder models across every
+read in the block, so neither stream can fan out within a block without an
+on-disk format change.
 
 **`gzip`'s flat line is a property of the format, not a slow implementation.**
 A `.gz` member is one DEFLATE stream whose back-references chain each byte to

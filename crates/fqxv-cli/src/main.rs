@@ -246,8 +246,12 @@ enum Command {
         /// finer random access and more parallelism at some ratio cost (the
         /// order-k sequence model trains on fewer reads), larger groups the
         /// reverse. Useful when archiving to object storage where you want to
-        /// fetch small ranges. Sequence order still follows `--level`. Ignored by
-        /// the reorder path (`--order any`/`--max`), which clusters globally.
+        /// fetch small ranges. On long-read input, where a raw-sequence byte
+        /// budget normally sets the block size, an explicit N makes the read
+        /// count alone govern the cut — e.g. `--block-reads 2000` on ~14 kb
+        /// nanopore reads yields ~28 MB blocks for more decode parallelism.
+        /// Sequence order still follows `--level`. Ignored by the reorder path
+        /// (`--order any`/`--max`), which clusters globally.
         #[arg(long, value_name = "N", help_heading = "Advanced")]
         block_reads: Option<usize>,
         /// Force single-input interleaving, in members per spot.
@@ -521,6 +525,24 @@ fn level_to_block(level: u8) -> usize {
     }
 }
 
+/// Map a 1-9 effort level to the per-block raw-sequence byte budget passed as
+/// `Params::block_seq_bytes` — the block-granularity lever for long-read input,
+/// where the byte budget (not `block_reads`) is what cuts blocks (#273).
+///
+/// The default levels use 0 (auto): the library resolves it per platform, giving
+/// Nanopore smaller blocks so long-read archives decode block-parallel (measured
+/// 3.2× full-decode at 8 threads for +1.08% size on a 576 MB MinION file).
+/// `--max` (level 9) pins the budget to the hard cap instead — its contract is
+/// the smallest archive, so it keeps the old maximal blocks and buys that ~1%
+/// back at the price of the flat decode curve. Short-read input is unaffected
+/// either way (its read-count budget binds first).
+fn level_to_seq_budget(level: u8) -> usize {
+    match level {
+        0..=8 => 0,
+        _ => usize::MAX,
+    }
+}
+
 /// Map a 1-9 effort level to the multi-reference tiler's `(band, max_refs)`
 /// (Nanopore long reads only — the only path that runs the tiler). Best-of-N
 /// reference selection is the dominant ONT sequence-ratio lever, so it ramps with
@@ -624,6 +646,16 @@ fn main() -> anyhow::Result<()> {
                 block_reads: block_reads
                     .filter(|&n| n > 0)
                     .unwrap_or(level_to_block(level)),
+                // An explicit --block-reads keeps its historical semantics: the
+                // read count alone sets the block size (byte budget pinned to the
+                // hard cap). Otherwise the level decides: the default levels take
+                // the library's platform auto — smaller long-read blocks for
+                // decode parallelism (#273) — and `--max` pins the cap for the
+                // last ~1% of ratio.
+                block_seq_bytes: match block_reads.filter(|&n| n > 0) {
+                    Some(_) => usize::MAX,
+                    None => level_to_seq_budget(level),
+                },
                 quality_binning: quality_bin.into(),
                 reorder: reorders,
                 keep_order: keep_order && reorders,

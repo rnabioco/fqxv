@@ -42,9 +42,14 @@ The container and codecs were hardened for long reads already:
 
 - Read lengths are `u32` end to end (`container/*`, `fqxv-seq`, `fqxv-fqzcomp`)
   — a single read can be 4.29 Gbp; no truncation, no per-read overflow.
-- Blocks are cut by a **256 MiB raw-sequence byte budget**
-  (`MAX_BLOCK_SEQ_BYTES`), not just a read count, so a file of 14 kb reads does
-  not collapse into one giant row group — parallelism and random access survive.
+- Blocks are cut by a **raw-sequence byte budget** — 64 MiB for Nanopore,
+  256 MiB otherwise (`LONGREAD_BLOCK_SEQ_BYTES` / `MAX_BLOCK_SEQ_BYTES`,
+  overridable via `Params::block_seq_bytes`; `--max` pins the cap) — not just a
+  read count, so a file of 14 kb reads does not collapse into one giant row
+  group. The Nanopore budget is deliberately smaller: block count is the decode
+  parallelism ceiling, and 256 MiB left typical single-flowcell ONT files at
+  ~2 flat-decoding blocks (#273); 64 MiB is the measured knee (+1.08% size for
+  3.2× full decode at 8 threads).
 - The quality alphabet cap is the full Sanger range (`QMAX = 94`); the model is
   sized to the alphabet actually present, so narrow HiFi Q pays nothing for
   unused levels.
