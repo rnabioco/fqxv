@@ -1292,6 +1292,157 @@ pub(crate) fn decode_reordered_split<R: Read, W: Write>(
     Ok(stats)
 }
 
+/// Whole-file reorder records fully decoded into **output order** — the order
+/// [`decompress`](super::decompress) emits them: original input order for
+/// keep-order archives, clustered order otherwise. Sequences are in original
+/// orientation (flips undone), quality bytes are un-reversed to match, and names
+/// are template-regenerated where the archive carries one. Produced by
+/// [`decode_reordered_records`] for the parallel record visitor, which needs
+/// random access to every record at once rather than a serial emission loop.
+pub(crate) struct ReorderedRecords {
+    /// Per-record name, output order.
+    pub(crate) names: Vec<Vec<u8>>,
+    /// Per-record sequence (original orientation), output order.
+    pub(crate) seqs: Vec<Vec<u8>>,
+    /// Flat quality bytes in output order/orientation; record `i` is
+    /// `quals[qoffs[i]..qoffs[i + 1]]`.
+    pub(crate) quals: Vec<u8>,
+    /// Cumulative per-record quality offsets (`names.len() + 1` entries).
+    pub(crate) qoffs: Vec<usize>,
+    /// Number of coded blocks in the archive (for `Stats::blocks`).
+    pub(crate) n_blocks: usize,
+}
+
+/// Decode a whole-file reorder archive into visit-ready [`ReorderedRecords`].
+///
+/// The entropy decode is block-parallel ([`read_reordered_streams`]); the
+/// per-record normalization here (un-permuting, un-flipping sequence and
+/// quality, template name regeneration) fans out on `pool` as well. The
+/// archive's trailing output digest is verified — a serial but hash-only pass —
+/// **before** returning, so a caller hands records to a visitor only after the
+/// same end-to-end check the serial decode paths enforce. `r` is positioned
+/// just past the header; `keep_order`/`has_reference` are the header's
+/// `FLAG_KEEP_ORDER`/`FLAG_GLOBAL_REFERENCE` bits.
+pub(crate) fn decode_reordered_records<R: Read>(
+    r: R,
+    pool: &rayon::ThreadPool,
+    keep_order: bool,
+    has_reference: bool,
+) -> Result<ReorderedRecords> {
+    let mut s = read_reordered_streams(r, pool, has_reference)?;
+    let n = s.n;
+    let n_blocks = s.n_blocks;
+    let expected_digest = s.output_digest;
+
+    let (names, seqs, quals) = if keep_order {
+        // Un-permute into original order; names/lens/quals were coded in
+        // original order already.
+        let seqs = unpermute_sequences(&mut s)?;
+        for i in 0..n {
+            if seqs[i].len() != s.lens[i] as usize {
+                return Err(Error::Malformed("reordered sequence length mismatch"));
+            }
+        }
+        (
+            std::mem::take(&mut s.names),
+            seqs,
+            std::mem::take(&mut s.quals),
+        )
+    } else {
+        // Clustered order throughout: un-flip the reverse-complemented reads
+        // (sequence and quality) to restore each record's original content.
+        let template = s.template.take();
+        let flip = std::mem::take(&mut s.flip);
+        let mut seqs = std::mem::take(&mut s.cl_reads);
+        let mut quals = std::mem::take(&mut s.quals);
+        for j in 0..n {
+            if seqs[j].len() != s.lens[j] as usize {
+                return Err(Error::Malformed("reordered sequence length mismatch"));
+            }
+        }
+        let total: usize = s.lens.iter().map(|&l| l as usize).sum();
+        if total > quals.len() {
+            return Err(Error::Malformed("quality underrun"));
+        }
+        pool.install(|| {
+            seqs.par_iter_mut().enumerate().for_each(|(j, sq)| {
+                if flip_bit(&flip, j) {
+                    *sq = fqxv_reorder::revcomp(sq);
+                }
+            });
+        });
+        {
+            // Disjoint per-read destinations split off the flat buffer up front
+            // (a few pointer moves), so the parallel un-reversal needs no
+            // `unsafe` and each worker touches only its own slice — the same
+            // pattern the clustered-sequence fill uses on the encode side.
+            let mut dsts: Vec<&mut [u8]> = Vec::with_capacity(n);
+            let mut rest: &mut [u8] = &mut quals;
+            for j in 0..n {
+                let (head, tail) = rest.split_at_mut(s.lens[j] as usize);
+                dsts.push(head);
+                rest = tail;
+            }
+            pool.install(|| {
+                dsts.par_iter_mut().enumerate().for_each(|(j, q)| {
+                    if flip_bit(&flip, j) {
+                        q.reverse();
+                    }
+                });
+            });
+        }
+        // Discard-order archives with a template carry no name stream; each
+        // output name is regenerated at its position. Pure, so it fans out.
+        let names = match &template {
+            Some(t) => pool.install(|| (0..n).into_par_iter().map(|j| t.regenerate(j)).collect()),
+            None => std::mem::take(&mut s.names),
+        };
+        (names, seqs, quals)
+    };
+
+    // A keep-order archive that (invalidly) also carries a name template has an
+    // empty name stream; refuse it rather than index past it below.
+    if names.len() != n || seqs.len() != n {
+        return Err(Error::Malformed("reordered stream length disagreement"));
+    }
+
+    // Cumulative quality offsets; every slice below is in range once the total
+    // fits (the serial paths tolerate trailing extra bytes, so only underrun is
+    // an error — mirrored here).
+    let mut qoffs = Vec::with_capacity(n + 1);
+    let mut acc = 0usize;
+    for sq in &seqs {
+        qoffs.push(acc);
+        acc += sq.len();
+    }
+    qoffs.push(acc);
+    if acc > quals.len() {
+        return Err(Error::Malformed("quality underrun"));
+    }
+
+    // Whole-output content digest, folded in output order exactly as the serial
+    // decode paths do. The fold itself is inherently serial (a rolling xxh3),
+    // but it is hash-only — all per-record materialization already happened in
+    // parallel above.
+    let mut od = OutputDigest::new();
+    for i in 0..n {
+        od.push(&names[i], &seqs[i], &quals[qoffs[i]..qoffs[i + 1]]);
+    }
+    if od.finish() != expected_digest {
+        return Err(Error::Corrupt {
+            what: "reorder output digest".to_string(),
+        });
+    }
+
+    Ok(ReorderedRecords {
+        names,
+        seqs,
+        quals,
+        qoffs,
+        n_blocks,
+    })
+}
+
 /// Rolling xxh3-64 over reads in output order — the whole-file reorder layout's
 /// analog of the plain layout's per-block, per-stream [`stream_digests`] (that
 /// layout splits reads across seq/name/quality partitions, so there is no single
