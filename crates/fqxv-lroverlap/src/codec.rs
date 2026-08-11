@@ -152,6 +152,17 @@ pub struct EncodeOpts {
     /// Affects ratio and speed only — the block self-describes, so decode is
     /// unaffected.
     pub tile_max_refs: usize,
+    /// **Measurement-only** knob for the multi-reference tiler
+    /// ([`tile_encode`](crate::tile_encode)): `Some(n)` splits the block's reads
+    /// into `n` contiguous chunks of ~equal cumulative bases and confines every
+    /// tile's reference to reads of its *own* chunk (on top of the existing
+    /// earlier-id constraint), so each chunk's reads reference nothing outside
+    /// it — the layout a chunk-parallel `tile_decode` would need. The container's
+    /// `FQXV_DIAG_TILECHUNK` sweep uses it to price that confinement in ratio;
+    /// nothing ships it. `None` (the default) is byte-identical to the
+    /// pre-knob tiler. Like every option here, decode is unaffected — the block
+    /// self-describes.
+    pub diag_confine_chunks: Option<usize>,
 }
 
 impl Default for EncodeOpts {
@@ -163,6 +174,7 @@ impl Default for EncodeOpts {
             band_cap: 2048,
             tile_band: 256,
             tile_max_refs: 1,
+            diag_confine_chunks: None,
         }
     }
 }

@@ -283,13 +283,40 @@ fn build_exceptions(seq: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (exc_pos, exc_bytes)
 }
 
+/// Contiguous whole-read chunk boundaries with ~equal cumulative bases
+/// (`n_chunks + 1` monotone read-index boundaries) — the same pure function of
+/// `(lens, n_chunks)` as fqxv-fqzcomp's quality-chunk splitter, duplicated here
+/// because the two crates share no dependency below the container. Only the
+/// measurement-only `diag_confine_chunks` path calls it.
+fn chunk_boundaries(lens: &[u32], n_chunks: usize) -> Vec<usize> {
+    let total: u64 = lens.iter().map(|&l| u64::from(l)).sum();
+    let n = n_chunks.max(1);
+    let mut out = Vec::with_capacity(n + 1);
+    out.push(0usize);
+    let mut cum = 0u64;
+    let mut i = 0usize;
+    for c in 1..n {
+        let target = total * c as u64 / n as u64;
+        while i < lens.len() && cum < target {
+            cum += u64::from(lens[i]);
+            i += 1;
+        }
+        out.push(i);
+    }
+    out.push(lens.len());
+    out
+}
+
 /// Tile one read against its earlier-id overlapping neighbours, returning its
 /// stream contribution. At each uncovered position an overlap is chosen to code
 /// the next span as an edit script; genuinely uncovered runs are stored as
 /// literals. `max_refs <= 1` is the plain greedy max-reach cover (take the overlap
 /// that reaches furthest); `max_refs > 1` selects best-of-N (see [`cover_bestof`]).
-/// Pure function of `(i, seq, offs, idx, band, max_refs)`, so the per-read work is
-/// order-free and thread-count invariant.
+/// Pure function of `(i, seq, offs, idx, band, max_refs, min_target)`, so the
+/// per-read work is order-free and thread-count invariant. `min_target` is the
+/// measurement-only chunk confinement (0 — a no-op filter — unless
+/// [`EncodeOpts::diag_confine_chunks`] is set).
+#[allow(clippy::too_many_arguments)] // per-read coding context, one input per arg
 fn tile_one_read(
     i: usize,
     seq: &[u8],
@@ -298,6 +325,7 @@ fn tile_one_read(
     band: usize,
     max_refs: usize,
     gate: GateCfg,
+    min_target: usize,
 ) -> TileStreams {
     let read = &seq[offs[i]..offs[i + 1]];
     let mut s = TileStreams::default();
@@ -312,7 +340,12 @@ fn tile_one_read(
 
     let mut ovs = find_overlaps(idx, i as u32, read, ChainOpts::default());
     // Only earlier reads can be a reference — the decoder resolves ids forward.
-    ovs.retain(|o| (o.target as usize) < i);
+    // `min_target` additionally confines the reference to this read's own chunk
+    // when the diag knob is on (0 otherwise, leaving the filter unchanged).
+    ovs.retain(|o| {
+        let t = o.target as usize;
+        t < i && t >= min_target
+    });
     // Total order for the greedy scan (find_overlaps is score-sorted); stable so
     // q_start ties keep the score order, making the cover thread-independent.
     ovs.sort_by_key(|o| o.q_start);
@@ -636,10 +669,36 @@ fn tile_encode_with(
     // One index over every read. On failure fall back to all-literal (lossless).
     let idx = Index::build(lens, &norm, opts.sketch, Repeat::default()).ok();
 
+    // Measurement-only chunk confinement (`EncodeOpts::diag_confine_chunks`):
+    // per read, the first read id of its chunk. All-zero when disabled, which
+    // leaves `tile_one_read`'s reference filter — and so the block — untouched.
+    let chunk_start: Vec<usize> = match opts.diag_confine_chunks {
+        Some(nc) if nc > 1 => {
+            let bounds = chunk_boundaries(lens, nc);
+            let mut cs = vec![0usize; n];
+            for w in bounds.windows(2) {
+                cs[w[0]..w[1]].fill(w[0]);
+            }
+            cs
+        }
+        _ => vec![0usize; n],
+    };
+
     // Tile each read in parallel; merge in id order for a thread-independent block.
     let parts: Vec<TileStreams> = (0..n)
         .into_par_iter()
-        .map(|i| tile_one_read(i, &norm, &offs, idx.as_ref(), band, max_refs, gate))
+        .map(|i| {
+            tile_one_read(
+                i,
+                &norm,
+                &offs,
+                idx.as_ref(),
+                band,
+                max_refs,
+                gate,
+                chunk_start[i],
+            )
+        })
         .collect();
     let mut all = TileStreams::default();
     for p in &parts {
@@ -998,6 +1057,39 @@ mod tests {
                     },
                 );
             }
+        }
+    }
+
+    #[test]
+    fn diag_confine_chunks_is_lossless_and_off_by_default() {
+        // The measurement-only chunk confinement must (a) leave the block
+        // byte-identical when unset or degenerate (None / Some(0) / Some(1) all
+        // mean "no confinement"), and (b) stay exactly lossless when active —
+        // it only restricts which neighbour a tile references, never how the
+        // decoder replays the result.
+        let reads = overlapping_reads(4_000, 900, 60, 80, 11);
+        let (lens, seq) = flatten(&reads);
+        let base = tile_encode(&lens, &seq, &EncodeOpts::default()).expect("base");
+        for none_like in [Some(0usize), Some(1)] {
+            let opts = EncodeOpts {
+                diag_confine_chunks: none_like,
+                ..EncodeOpts::default()
+            };
+            let got = tile_encode(&lens, &seq, &opts).expect("degenerate confine");
+            assert_eq!(
+                got, base,
+                "confine={none_like:?} must be the unconfined block"
+            );
+        }
+        for kc in [4usize, 8] {
+            let opts = EncodeOpts {
+                diag_confine_chunks: Some(kc),
+                ..EncodeOpts::default()
+            };
+            let block = tile_encode(&lens, &seq, &opts).expect("confined encode");
+            let (dl, ds) = tile_decode(&block).expect("confined decode");
+            assert_eq!(dl, lens, "confined lengths round-trip");
+            assert_eq!(ds, seq, "confined sequence round-trips exactly");
         }
     }
 
