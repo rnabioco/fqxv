@@ -237,6 +237,21 @@ impl<const N: usize> SimpleModel<N> {
         self.update(sym);
     }
 
+    /// Encode symbol `sym` (`0..N`) **without adapting**: the frequencies are
+    /// read but never updated, so the model state before and after the call is
+    /// identical. This lets one trained snapshot code many independent streams
+    /// (the chunked-decode diagnostics in `fqxv-fqzcomp` measure a shared
+    /// frozen-snapshot variant with it). The symbol must have non-zero
+    /// frequency — i.e. `sym < active` for a [`SimpleModel::with_active`]
+    /// model, as [`SimpleModel::encode`] already requires.
+    pub fn encode_frozen(&self, enc: &mut Encoder, sym: usize) {
+        let mut cum = 0u32;
+        for f in &self.freq[..sym] {
+            cum += u32::from(*f);
+        }
+        enc.encode(cum, u32::from(self.freq[sym]), self.tot);
+    }
+
     /// Decode and adapt, returning the symbol (`0..N`).
     pub fn decode(&mut self, dec: &mut Decoder<'_>) -> usize {
         let target = dec.freq(self.tot);
@@ -303,6 +318,47 @@ mod tests {
             data[i] = 1;
         }
         roundtrip::<2>(&data);
+    }
+
+    #[test]
+    fn encode_frozen_is_read_only_and_decodable() {
+        // Train a model, then code the same stream twice through the frozen
+        // path: byte-identical outputs prove the state never moves. A manual
+        // frozen decode (same fixed frequencies) must invert the stream.
+        let mut m = SimpleModel::<8>::new();
+        {
+            let mut enc = Encoder::new();
+            for s in [0usize, 1, 0, 2, 0, 0, 3, 0, 1, 0, 0, 5] {
+                m.encode(&mut enc, s); // training pass (adaptive)
+            }
+            let _ = enc.finish();
+        }
+        let data = [0usize, 3, 1, 0, 7, 2, 0, 0, 4, 1];
+        let coded = |m: &SimpleModel<8>| {
+            let mut enc = Encoder::new();
+            for &s in &data {
+                m.encode_frozen(&mut enc, s);
+            }
+            enc.finish()
+        };
+        let a = coded(&m);
+        let b = coded(&m);
+        assert_eq!(a, b, "a frozen pass must not change the model");
+
+        let mut dec = Decoder::new(&a);
+        let out: Vec<usize> = (0..data.len())
+            .map(|_| {
+                let target = dec.freq(m.tot);
+                let (mut cum, mut sym) = (0u32, 0usize);
+                while sym + 1 < 8 && cum + u32::from(m.freq[sym]) <= target {
+                    cum += u32::from(m.freq[sym]);
+                    sym += 1;
+                }
+                dec.decode(cum, u32::from(m.freq[sym]));
+                sym
+            })
+            .collect();
+        assert_eq!(out, data, "frozen round-trip mismatch");
     }
 
     #[test]

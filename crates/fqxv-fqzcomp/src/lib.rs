@@ -335,16 +335,24 @@ macro_rules! by_size_class {
     };
 }
 
-fn encode_payload<const NM: usize>(
+/// Code the reads `lens`/`binned` into `enc` under the per-context `models`.
+///
+/// The chunking twin of `binmix`'s `encode_reads`: every per-read feature (the
+/// recent qualities, delta counter, position, and — in `MODE_SEQ` — the base
+/// window) resets at read boundaries, so the only cross-read state is the model
+/// table plus the range coder. `ADAPT = true` is the shipped path (byte-identical
+/// to the pre-refactor coder; the const flag monomorphizes away); `ADAPT = false`
+/// reads the models without updating them ([`SimpleModel::encode_frozen`]), the
+/// frozen-snapshot variant the chunked-decode diagnostics measure.
+fn encode_payload_into<const NM: usize, const ADAPT: bool>(
+    models: &mut [SimpleModel<NM>],
+    enc: &mut Encoder,
     lens: &[u32],
     binned: &[u8],
     seq: Option<&[u8]>,
     dense: &[u8; 256],
     qmin: u8,
-    k: usize,
-) -> Vec<u8> {
-    let mut models = vec![SimpleModel::<NM>::with_active(k); N_CTX];
-    let mut enc = Encoder::new();
+) {
     let mut rest: &[u8] = binned;
     let seq_mode = seq.is_some();
     let mut srest: &[u8] = seq.unwrap_or(&[]);
@@ -378,7 +386,12 @@ fn encode_payload<const NM: usize>(
             };
             debug_assert!(c < N_CTX);
             // SAFETY: both contexts pack into ≤18 bits, so `c < N_CTX == models.len()`.
-            unsafe { models.get_unchecked_mut(c) }.encode(&mut enc, dv as usize);
+            let model = unsafe { models.get_unchecked_mut(c) };
+            if ADAPT {
+                model.encode(enc, dv as usize);
+            } else {
+                model.encode_frozen(enc, dv as usize);
+            }
             if pos > 0 && cv != q1 {
                 delta = (delta + 1).min(DELTA_MAX);
             }
@@ -387,6 +400,19 @@ fn encode_payload<const NM: usize>(
             q1 = cv;
         }
     }
+}
+
+fn encode_payload<const NM: usize>(
+    lens: &[u32],
+    binned: &[u8],
+    seq: Option<&[u8]>,
+    dense: &[u8; 256],
+    qmin: u8,
+    k: usize,
+) -> Vec<u8> {
+    let mut models = vec![SimpleModel::<NM>::with_active(k); N_CTX];
+    let mut enc = Encoder::new();
+    encode_payload_into::<NM, true>(&mut models, &mut enc, lens, binned, seq, dense, qmin);
     enc.finish()
 }
 
