@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 fqxv-bytes.workspace = true
 fqxv-range.workspace = true
+rayon.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -543,6 +543,24 @@ fn level_to_seq_budget(level: u8) -> usize {
     }
 }
 
+/// Map a 1-9 effort level to `Params::quality_chunks` — the within-block
+/// quality-decode parallelism lever for long-read input (#278).
+///
+/// The default levels use 0 (auto): the library codes long-read (Nanopore /
+/// PacBio) quality **chunked** — a serial warmup plus parallel segments — so
+/// the stream that is 92–98% of long-read decode time no longer serializes a
+/// block, for a measured ~0.2–0.4% of archive size. `--max` (level 9) pins the
+/// serial layout (1) instead: its contract is the smallest archive, so it buys
+/// those tenths of a percent back at the price of serial within-block quality,
+/// exactly as it pins the block byte budget. Short reads are unaffected either
+/// way (their position-context quality is never chunked).
+fn level_to_quality_chunks(level: u8) -> usize {
+    match level {
+        0..=8 => 0,
+        _ => 1,
+    }
+}
+
 /// Map a 1-9 effort level to the multi-reference tiler's `(band, max_refs)`
 /// (Nanopore long reads only — the only path that runs the tiler). Best-of-N
 /// reference selection is the dominant ONT sequence-ratio lever, so it ramps with
@@ -656,6 +674,9 @@ fn main() -> anyhow::Result<()> {
                     Some(_) => usize::MAX,
                     None => level_to_seq_budget(level),
                 },
+                // Long-read quality decodes (and encodes) chunk-parallel at the
+                // default levels; `--max` keeps the serial smallest layout.
+                quality_chunks: level_to_quality_chunks(level),
                 quality_binning: quality_bin.into(),
                 reorder: reorders,
                 keep_order: keep_order && reorders,

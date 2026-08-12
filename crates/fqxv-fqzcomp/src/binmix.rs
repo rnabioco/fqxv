@@ -258,6 +258,61 @@ impl BinMixer {
         }
         dv as usize
     }
+
+    /// Decode one symbol without adapting: bits are predicted and coded from the
+    /// current tables but neither the mixer weights nor the tier probabilities
+    /// move. Takes `&self`, so one warmed snapshot can be shared read-only by any
+    /// number of concurrently-decoding chunks — the warm-frozen chunk variant's
+    /// O(1)-memory property. The decode twin of `encode_sym::<false>`.
+    #[inline]
+    fn decode_sym_frozen(&self, dec: &mut Decoder<'_>, keys: &[u32; NMODELS]) -> usize {
+        let bases = self.bases(keys);
+        let mut node = 1usize;
+        let mut dv = 0u32;
+        for bpos in 0..self.d {
+            let (p, _st, _gate) = self.predict(&bases, node, bpos);
+            let target = dec.freq(PONE);
+            let bit = if target < u32::from(p) { 1u32 } else { 0 };
+            if bit == 1 {
+                dec.decode(0, u32::from(p));
+            } else {
+                dec.decode(u32::from(p), PONE - u32::from(p));
+            }
+            node = 2 * node + bit as usize;
+            dv = (dv << 1) | bit;
+        }
+        dv as usize
+    }
+}
+
+/// One-symbol decode dispatch for the shared read loop in [`decode_into`]:
+/// adapting (`&mut BinMixer`, the shipped path) or frozen (`&BinMixer`, the
+/// shared-snapshot chunk variant). Static dispatch — each implementation
+/// monomorphizes [`decode_into`] into the same code the pre-trait loop compiled
+/// to, so the hot adaptive path is unchanged.
+pub(crate) trait DecodeState {
+    /// Decode one symbol under `keys`, returning its dense index.
+    fn sym(&mut self, dec: &mut Decoder<'_>, keys: &[u32; NMODELS]) -> usize;
+}
+
+/// Adapting decode state: owns exclusive access to a mixer that keeps learning.
+pub(crate) struct Adapting<'a>(pub &'a mut BinMixer);
+
+impl DecodeState for Adapting<'_> {
+    #[inline]
+    fn sym(&mut self, dec: &mut Decoder<'_>, keys: &[u32; NMODELS]) -> usize {
+        self.0.decode_sym(dec, keys)
+    }
+}
+
+/// Frozen decode state: a shared read-only snapshot (no adaptation).
+pub(crate) struct Frozen<'a>(pub &'a BinMixer);
+
+impl DecodeState for Frozen<'_> {
+    #[inline]
+    fn sym(&mut self, dec: &mut Decoder<'_>, keys: &[u32; NMODELS]) -> usize {
+        self.0.decode_sym_frozen(dec, keys)
+    }
 }
 
 /// 2-bit base code, matching [`crate::base_code`].
@@ -416,9 +471,9 @@ pub(crate) fn encode(
 }
 
 /// Train a fresh mixer by coding the leading reads (the warmup prefix) into a
-/// throwaway encoder. Returns the warmed mixer and the bytes that warmup
-/// segment costs when coded from scratch (flush included) — segment 0 of the
-/// chunked layouts the `FQXV_DIAG_QCHUNK` probe measures.
+/// fresh encoder. Returns the warmed mixer and the warmup segment's coded bytes
+/// (flush included) — segment 0 of the chunked quality layout
+/// (`MODE_SEQ_BINMIX_CHUNKED`), also charged by the `FQXV_DIAG_QCHUNK` probe.
 #[allow(clippy::too_many_arguments)] // parallel of `encode`, one arg per coder input
 pub(crate) fn warm_mixer(
     lens: &[u32],
@@ -428,19 +483,36 @@ pub(crate) fn warm_mixer(
     qmin: u8,
     k: usize,
     qc: &QCtx,
-) -> (BinMixer, usize) {
+) -> (BinMixer, Vec<u8>) {
     let mut mx = BinMixer::new(k);
     let mut enc = Encoder::new();
     encode_reads::<true>(&mut mx, &mut enc, lens, binned, seq, dense, qmin, qc);
-    let bytes = enc.finish().len();
-    (mx, bytes)
+    (mx, enc.finish())
 }
 
-/// Bytes to code one whole-read chunk from mixer state `mx` with a fresh range
-/// coder (so the per-chunk flush overhead is included, exactly as a chunked
-/// stream would pay it). `ADAPT = false` leaves `mx` untouched (the shared
-/// frozen snapshot); `ADAPT = true` adapts `mx`, so hand in a clone when the
-/// snapshot must survive (the warm-clone variant).
+/// Code one whole-read chunk from mixer state `mx` with a fresh range coder
+/// (so the per-chunk flush overhead is included, exactly as the chunked stream
+/// pays it), returning the chunk's coded bytes. `ADAPT = false` leaves `mx`
+/// untouched (the shared frozen snapshot); `ADAPT = true` adapts `mx`, so hand
+/// in a clone when the snapshot must survive (the warm-clone variant).
+#[allow(clippy::too_many_arguments)] // parallel of `encode`, one arg per coder input
+pub(crate) fn encode_chunk<const ADAPT: bool>(
+    mx: &mut BinMixer,
+    lens: &[u32],
+    binned: &[u8],
+    seq: &[u8],
+    dense: &[u8; 256],
+    qmin: u8,
+    qc: &QCtx,
+) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    encode_reads::<ADAPT>(mx, &mut enc, lens, binned, seq, dense, qmin, qc);
+    enc.finish()
+}
+
+/// Bytes to code one whole-read chunk from mixer state `mx` (see
+/// [`encode_chunk`]) — the measurement-only entry the `FQXV_DIAG_QCHUNK`
+/// sweep uses.
 #[allow(clippy::too_many_arguments)] // parallel of `encode`, one arg per coder input
 pub(crate) fn chunk_bytes<const ADAPT: bool>(
     mx: &mut BinMixer,
@@ -451,26 +523,29 @@ pub(crate) fn chunk_bytes<const ADAPT: bool>(
     qmin: u8,
     qc: &QCtx,
 ) -> usize {
-    let mut enc = Encoder::new();
-    encode_reads::<ADAPT>(mx, &mut enc, lens, binned, seq, dense, qmin, qc);
-    enc.finish().len()
+    encode_chunk::<ADAPT>(mx, lens, binned, seq, dense, qmin, qc).len()
 }
 
-/// Decode a binary-mixing payload into `quals` under quantizer `qc`.
+/// Decode the reads `lens` from `payload` into `out` under decode state `st`
+/// (adapting or frozen — see [`DecodeState`]) and quantizer `qc`.
+///
+/// `out` must be exactly `sum(lens)` bytes and `seq` the same reads' decoded
+/// bases; the chunked layout hands each chunk a disjoint `out` range, so
+/// chunks decode concurrently into one buffer without reordering.
 #[allow(clippy::too_many_arguments)] // parallel of `encode`, one arg per coder input
-pub(crate) fn decode(
+pub(crate) fn decode_into<S: DecodeState>(
+    st: &mut S,
     lens: &[u32],
     payload: &[u8],
     seq: &[u8],
     syms: &[u8],
     qmin: u8,
-    k: usize,
     qc: &QCtx,
-    quals: &mut Vec<u8>,
+    out: &mut [u8],
 ) -> Result<()> {
-    let mut mx = BinMixer::new(k);
     let mut dec = Decoder::new(payload);
     let mut srest = seq;
+    let mut opos = 0usize;
     for &l in lens {
         if srest.len() < l as usize {
             return Err(Error::Malformed("sequence shorter than quality lengths"));
@@ -496,11 +571,13 @@ pub(crate) fn decode(
                 run,
             );
             prev_base = base;
-            let dv = mx.decode_sym(&mut dec, &kk);
+            let dv = st.sym(&mut dec, &kk);
             let b = *syms
                 .get(dv)
                 .ok_or(Error::Malformed("decoded symbol outside alphabet"))?;
-            quals.push(b);
+            *out.get_mut(opos)
+                .ok_or(Error::Malformed("quality output range too short"))? = b;
+            opos += 1;
             let cv = b - qmin;
             q3 = q2;
             q2 = q1;
@@ -508,6 +585,33 @@ pub(crate) fn decode(
         }
     }
     Ok(())
+}
+
+/// Decode a whole (unchunked) binary-mixing payload into `out` under quantizer
+/// `qc` — the serial `MODE_SEQ_BINMIX`/`MODE_SEQ_BINMIX_Q` path, a fresh
+/// adapting mixer over every read.
+#[allow(clippy::too_many_arguments)] // parallel of `encode`, one arg per coder input
+pub(crate) fn decode(
+    lens: &[u32],
+    payload: &[u8],
+    seq: &[u8],
+    syms: &[u8],
+    qmin: u8,
+    k: usize,
+    qc: &QCtx,
+    out: &mut [u8],
+) -> Result<()> {
+    let mut mx = BinMixer::new(k);
+    decode_into(
+        &mut Adapting(&mut mx),
+        lens,
+        payload,
+        seq,
+        syms,
+        qmin,
+        qc,
+        out,
+    )
 }
 
 #[cfg(test)]
@@ -581,7 +685,10 @@ mod tests {
             k,
             &qc,
         );
-        assert!(warm_bytes > 0, "warmup must produce a coded segment");
+        assert!(
+            !warm_bytes.is_empty(),
+            "warmup must produce a coded segment"
+        );
         // Coding the tail twice with `ADAPT = false` from the SAME mixer must
         // give byte-identical streams (the frozen path never mutates state),
         // and a clone of the snapshot must code the same bytes as the original.
@@ -650,9 +757,56 @@ mod tests {
         let (syms, dense, qmin, k) = dense_of(&quals);
         let qc = QCtx::flat();
         let payload = encode(&lens, &quals, &seq, &dense, qmin, k, &qc);
-        let mut out = Vec::new();
+        let mut out = vec![0u8; quals.len()];
         decode(&lens, &payload, &seq, &syms, qmin, k, &qc, &mut out).unwrap();
         assert_eq!(out, quals, "binmix round-trip must be lossless");
+    }
+
+    #[test]
+    fn frozen_decode_roundtrips_and_is_shareable() {
+        // A frozen-encoded chunk must decode back through the frozen decode
+        // state, from a `&BinMixer` shared reference (the concurrent-chunk
+        // sharing model), and repeated decodes from the same snapshot must
+        // agree — the snapshot really is read-only on both sides.
+        let (lens, seq, quals) = fixture(40, 60);
+        let (syms, dense, qmin, k) = dense_of(&quals);
+        let qc = QCtx::flat();
+        let half = lens.len() / 2;
+        let cut: usize = lens[..half].iter().map(|&l| l as usize).sum();
+        let (mut warm, _) = warm_mixer(
+            &lens[..half],
+            &quals[..cut],
+            &seq[..cut],
+            &dense,
+            qmin,
+            k,
+            &qc,
+        );
+        let payload = encode_chunk::<false>(
+            &mut warm,
+            &lens[half..],
+            &quals[cut..],
+            &seq[cut..],
+            &dense,
+            qmin,
+            &qc,
+        );
+        let shared: &BinMixer = &warm;
+        for _ in 0..2 {
+            let mut out = vec![0u8; quals.len() - cut];
+            decode_into(
+                &mut Frozen(shared),
+                &lens[half..],
+                &payload,
+                &seq[cut..],
+                &syms,
+                qmin,
+                &qc,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(out, &quals[cut..], "frozen chunk round-trip");
+        }
     }
 
     #[test]
@@ -683,7 +837,7 @@ mod tests {
         }
         let qc = QCtx::from_tables(g1, g2, g3);
         let payload = encode(&lens, &quals, &seq, &dense, qmin, k, &qc);
-        let mut out = Vec::new();
+        let mut out = vec![0u8; quals.len()];
         decode(&lens, &payload, &seq, &syms, qmin, k, &qc, &mut out).unwrap();
         assert_eq!(out, quals, "tabled-quantizer round-trip must be lossless");
     }
@@ -696,7 +850,7 @@ mod tests {
         let (syms, dense, qmin, k) = dense_of(&quals);
         let qc = QCtx::flat();
         let payload = encode(&lens, &quals, &seq, &dense, qmin, k, &qc);
-        let mut out = Vec::new();
+        let mut out = vec![0u8; quals.len()];
         decode(&lens, &payload, &seq, &syms, qmin, k, &qc, &mut out).unwrap();
         assert_eq!(out, quals);
     }

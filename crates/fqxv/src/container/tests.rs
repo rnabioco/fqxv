@@ -2500,6 +2500,60 @@ fn block_seq_budget_resolves_per_platform_and_clamps() {
     );
 }
 
+/// Quality chunking resolves per platform on auto (0): the long-read platforms
+/// take the measured warm-clone operating point (K = 8, ONT's fixed 8 MiB
+/// warmup vs HiFi's total/K), short-read platforms stay serial, and `1` (the
+/// CLI's `--max`) pins serial everywhere. Pure-function test for the same
+/// reason as the block budget above — the coder's own eligibility floor is
+/// 16 MiB of quality, far too big to exercise end-to-end here (the fqzcomp
+/// crate pins the wire round-trips; real-data validation covers the composed
+/// path).
+#[test]
+fn quality_chunking_resolves_per_platform_and_max_pins_serial() {
+    use fqxv_fqzcomp::{ChunkVariant, ChunkWarmup};
+    let auto = Params::default();
+    let ont = super::compress::resolve_quality_chunking(&auto, Platform::Nanopore)
+        .expect("Nanopore chunks by default");
+    assert_eq!(ont.segments, LONGREAD_QUALITY_CHUNKS);
+    assert_eq!(ont.warmup, ChunkWarmup::Bases(8 << 20));
+    assert_eq!(ont.variant, ChunkVariant::WarmClone);
+    let hifi = super::compress::resolve_quality_chunking(&auto, Platform::PacBio)
+        .expect("PacBio chunks by default");
+    assert_eq!(hifi.segments, LONGREAD_QUALITY_CHUNKS);
+    assert_eq!(
+        hifi.warmup,
+        ChunkWarmup::TotalOverSegments,
+        "HiFi takes the proportional warmup (CCS quality drifts)"
+    );
+    assert_eq!(hifi.variant, ChunkVariant::WarmClone);
+    for p in [Platform::Unknown, Platform::Illumina, Platform::MgiBgi] {
+        assert!(
+            super::compress::resolve_quality_chunking(&auto, p).is_none(),
+            "short-read/unknown platforms stay serial ({p:?})"
+        );
+    }
+    // `--max` (quality_chunks = 1) pins the serial smallest layout everywhere.
+    let pinned = Params {
+        quality_chunks: 1,
+        ..Params::default()
+    };
+    for p in [Platform::Nanopore, Platform::PacBio] {
+        assert!(
+            super::compress::resolve_quality_chunking(&pinned, p).is_none(),
+            "quality_chunks = 1 must pin serial on {p:?}"
+        );
+    }
+    // An explicit K applies on any platform, with the platform's warmup.
+    let explicit = Params {
+        quality_chunks: 4,
+        ..Params::default()
+    };
+    let forced = super::compress::resolve_quality_chunking(&explicit, Platform::Illumina)
+        .expect("an explicit K forces chunking");
+    assert_eq!(forced.segments, 4);
+    assert_eq!(forced.warmup, ChunkWarmup::Bases(8 << 20));
+}
+
 /// Deterministic synthetic "long reads": `n` reads of `len` pseudo-random ACGT
 /// bases with full-range quality, long enough per read that the byte budget (not
 /// the read count) is what cuts blocks — the long-read shape of issue #273.

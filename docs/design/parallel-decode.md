@@ -7,6 +7,15 @@ diagnostics (`FQXV_DIAG_QCHUNK`, `FQXV_DIAG_TILECHUNK`) that re-code real blocks
 under the candidate layouts without touching the emitted archive. The go/no-go
 bars in this document were written **before** the measurements landed.
 
+> **Status: shipped.** The go/no-go issue (#278) exercised the GO on both
+> long-read platforms, and the chunked layout below ships as quality modes
+> **5** (`MODE_SEQ_BINMIX_CHUNKED`) and **6** (its per-block-quantizer twin,
+> mode 5 : 6 :: 3 : 4) — warm-clone at K = 8 by platform default on
+> Nanopore/PacBio, `--max` pins serial, reset (variant 0) reserved unimplemented,
+> and warm-frozen carried for its O(1)-memory decode. See `fqxv-fqzcomp`'s
+> mode docs for the final wire layout; this document remains the design
+> record and measurement archive.
+
 ## Problem
 
 `.fqxv` decode parallelism is per block. Long-read archives have few blocks

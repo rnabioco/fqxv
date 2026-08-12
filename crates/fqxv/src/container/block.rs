@@ -801,13 +801,17 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params, platform: Platform) 
                 // reads it ignores them and codes the position context as before.
                 // The per-block quantizer trial only pays on PacBio (skewed quality);
                 // gate it off on Nanopore so ONT doesn't pay the probe for 0 gain.
+                // Long-read platforms also request chunked quality coding
+                // (`resolve_quality_chunking`), which parallelizes this — the
+                // block's dominant — stream on both sides of the codec.
                 || {
-                    fqxv_fqzcomp::encode_seq(
+                    fqxv_fqzcomp::encode_seq_chunked(
                         &b.lens,
                         &b.qual,
                         &b.seq,
                         params.quality_binning,
                         !matches!(platform, Platform::Nanopore),
+                        super::compress::resolve_quality_chunking(params, platform),
                     )
                 },
             )
@@ -826,14 +830,26 @@ pub(crate) fn compress_block(b: &RawBlock, params: &Params, platform: Platform) 
 pub(crate) fn compress_block_with_seq(
     b: &RawBlock,
     params: &Params,
+    platform: Platform,
     precoded_seq: &[u8],
 ) -> Result<Vec<u8>> {
     let header_refs = b.header_refs();
     let (names_c, qual_c) = rayon::join(
         || fqxv_tokenizer::encode(&header_refs),
         // The shared-reference path is non-Nanopore (issue #211), so the quantizer
-        // trial is worth running here.
-        || fqxv_fqzcomp::encode_seq(&b.lens, &b.qual, &b.seq, params.quality_binning, true),
+        // trial is worth running here; the platform (typically PacBio on this
+        // path) resolves the quality-chunking request exactly as in
+        // [`compress_block`].
+        || {
+            fqxv_fqzcomp::encode_seq_chunked(
+                &b.lens,
+                &b.qual,
+                &b.seq,
+                params.quality_binning,
+                true,
+                super::compress::resolve_quality_chunking(params, platform),
+            )
+        },
     );
     let (names_c, qual_c) = (names_c?, qual_c?);
     assemble_block_payload(b, &names_c, precoded_seq, &qual_c, params)

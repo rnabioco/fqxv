@@ -493,6 +493,7 @@ dependencies = [
  "fqxv-bytes",
  "fqxv-range",
  "proptest",
+ "rayon",
  "thiserror",
 ]
 

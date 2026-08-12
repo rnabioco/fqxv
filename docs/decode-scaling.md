@@ -111,13 +111,18 @@ way when this table was measured; the Nanopore default block budget has
 since dropped to 64 MiB (5 blocks on this file — see the note under the ONT
 table), while ONT `--max` still keeps maximal blocks.
 
-Long-read blocks cannot be un-serialized from the inside, which is why block
-count is the whole lever: long-read quality is coded *conditioned on the
-decoded bases* (`fqzcomp` MODE_SEQ), so a block's sequence must finish
-decoding before its quality — 92% of the work — can start, and the overlap
-codec's edit-script streams thread adaptive range-coder models across every
-read in the block, so neither stream can fan out within a block without an
-on-disk format change.
+Block count was the whole lever when these tables were measured, because
+long-read blocks could not be un-serialized from the inside: quality is coded
+*conditioned on the decoded bases* (`fqzcomp` MODE_SEQ), so a block's sequence
+must finish decoding before its quality — 92% of the work — can start, and
+that quality stream was one adaptive coding pass over the whole block. The
+on-disk format change that fixes the second half of that has since shipped
+(quality mode 5, issue #278; design and measured costs in
+`docs/design/parallel-decode.md`): long-read quality is now coded as a serial
+warmup plus K−1 chunks that decode in parallel once the bases exist, so
+within-block quality fan-out composes with the block-level parallelism below.
+The sequence stream itself (the tiler/overlap read-chains) still decodes
+serially per block, and the tables in this document predate mode 5.
 
 **`gzip`'s flat line is a property of the format, not a slow implementation.**
 A `.gz` member is one DEFLATE stream whose back-references chain each byte to
