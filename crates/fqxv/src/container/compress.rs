@@ -42,6 +42,51 @@ pub(crate) fn resolve_block_seq_bytes(params: &Params, platform: Platform) -> us
     }
 }
 
+/// Default quality-stream segment count for long-read platforms when
+/// [`Params::quality_chunks`] is 0 (auto): the measured knee of the
+/// cost-vs-parallelism curve on both platforms (#277's sweep — ONT warm-clone
+/// +0.36% of archive, HiFi +0.19%, for a projected ~4×/~3.7× full decode at 16
+/// threads over the block-parallel baseline). Higher K buys little at 16
+/// threads (the total-work bound dominates) while the cost keeps growing.
+pub(crate) const LONGREAD_QUALITY_CHUNKS: usize = 8;
+
+/// Resolve [`Params::quality_chunks`] against the resolved platform into the
+/// quality coder's chunking request: `None` (serial) for short-read platforms
+/// and wherever chunking is pinned off, or the platform's measured operating
+/// point — warm-clone at [`LONGREAD_QUALITY_CHUNKS`] segments, with ONT's
+/// fixed 8 MiB warmup (chunk cost nearly K-invariant) and HiFi's
+/// total/K warmup (CCS quality drifts; a proportional warmup tracks it).
+///
+/// Like [`resolve_block_seq_bytes`], this is a pure function of the caller's
+/// `Params` and the resolved platform — never of the thread count — so block
+/// bytes stay thread-count invariant. `Platform::Unknown` stays serial: name
+/// detection that cannot see a long-read platform (SRA-renamed input) keeps
+/// the pre-chunking layout, exactly as it keeps the 256 MiB block budget.
+pub(crate) fn resolve_quality_chunking(
+    params: &Params,
+    platform: Platform,
+) -> Option<fqxv_fqzcomp::QualityChunking> {
+    let segments = match params.quality_chunks {
+        0 => match platform {
+            Platform::Nanopore | Platform::PacBio => LONGREAD_QUALITY_CHUNKS,
+            _ => 1,
+        },
+        n => n,
+    };
+    if segments < 2 {
+        return None;
+    }
+    let warmup = match platform {
+        Platform::PacBio => fqxv_fqzcomp::ChunkWarmup::TotalOverSegments,
+        _ => fqxv_fqzcomp::ChunkWarmup::Bases(8 << 20),
+    };
+    Some(fqxv_fqzcomp::QualityChunking {
+        segments,
+        warmup,
+        variant: fqxv_fqzcomp::ChunkVariant::WarmClone,
+    })
+}
+
 /// One interleaved spot's records — `(raw_header, sequence, quality)` per member —
 /// owned so the platform can be detected before the streaming header is written
 /// (see `compress_multi`). The header is the byte-exact definition line.
@@ -122,6 +167,19 @@ pub struct Params {
     /// read-count-only semantics by pinning this to the cap when that flag is
     /// given. Ignored by the reorder path, which sizes its own blocks.
     pub block_seq_bytes: usize,
+    /// Quality-stream segment count for within-block parallel decode/encode;
+    /// 0 (the default) means auto.
+    ///
+    /// Long-read quality is one adaptive coding pass — measured at 92–98% of
+    /// single-thread decode — so on long-read platforms the auto default codes
+    /// it **chunked** ([`LONGREAD_QUALITY_CHUNKS`] segments: a serial warmup
+    /// plus K−1 chunks that encode and decode in parallel), for a measured
+    /// ~0.2–0.4% of archive size. `1` pins the serial (smallest) layout — the
+    /// CLI's `--max` does this, keeping its smallest-archive contract — and an
+    /// explicit K ≥ 2 forces that segment count. Short-read platforms are
+    /// always serial (their quality decodes block-parallel already); the coder
+    /// also falls back to serial for blocks too small to be worth segmenting.
+    pub quality_chunks: usize,
     /// Per-member slot labels recorded in the archive, one per interleaved member
     /// (`"R1"`, `"I1"`, `"2"`, …). Purely descriptive: nothing in decode depends on
     /// them, they exist so `decompress_split` can restore the *original* per-slot
@@ -154,6 +212,7 @@ impl Default for Params {
             tile_band: 256,
             tile_max_refs: 1,
             block_seq_bytes: 0,
+            quality_chunks: 0,
             member_labels: Vec::new(),
         }
     }
@@ -814,7 +873,9 @@ pub(crate) fn write_plain_layout<W: Write>(
                         (Some(ns), _) => {
                             compress_block_with_names_seq(&blk, params, &ns[bi].0, &ns[bi].1)
                         }
-                        (None, Some(seqs)) => compress_block_with_seq(&blk, params, &seqs[bi]),
+                        (None, Some(seqs)) => {
+                            compress_block_with_seq(&blk, params, platform, &seqs[bi])
+                        }
                         (None, None) => compress_block(&blk, params, platform),
                     };
                     (blk, payload)
@@ -1133,7 +1194,7 @@ fn compress_longread_shared_ref<W: Write>(
                 .map(|bi| {
                     let (gs, ge) = ranges[bi];
                     let blk = build_block(buf, &chunks, &gstart, gs, ge);
-                    let payload = compress_block_with_seq(&blk, &params, &shared_seq[bi]);
+                    let payload = compress_block_with_seq(&blk, &params, platform, &shared_seq[bi]);
                     (blk, payload)
                 })
                 .unzip()
