@@ -10,7 +10,7 @@ one-crate-per-algorithm codecs plus a container format and CLI.
 ![fqxv compress and decompress demo](docs/images/readme.gif)
 
 **The on-disk format is stable at 1.0** — a number independent of the crate
-version (currently 0.5.x); the format and the software are versioned separately.
+version (currently 0.7.x); the format and the software are versioned separately.
 Archives written today stay readable by later releases: a reader accepts its own
 format major version and tolerates newer minors, additions it can safely ignore
 (a skippable header record) it skips, and anything it cannot — a required feature
@@ -64,7 +64,7 @@ Intel/Apple silicon, Windows x86-64) plus a `SHA256SUMS.txt` to its
 [GitHub Release](https://github.com/rnabioco/fqxv/releases):
 
 ```bash
-VER=v0.6.2   # the latest release tag
+VER=v0.7.0   # the latest release tag
 curl -LO https://github.com/rnabioco/fqxv/releases/download/$VER/fqxv-$VER-x86_64-unknown-linux-musl.tar.gz
 tar xzf fqxv-$VER-x86_64-unknown-linux-musl.tar.gz && mv fqxv ~/.local/bin/
 ```

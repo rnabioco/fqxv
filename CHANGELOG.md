@@ -16,6 +16,64 @@ misreading. Compatibility fails loudly, never silently. A format major bump woul
 be announced as a breaking change; see the
 [evolution policy](docs/design/container.md#versioning-and-evolution-policy).
 
+## [0.7.0] - 2026-08-12
+
+Minor: this cycle makes decode parallel-first — the archive is an analysis
+substrate, not just cold storage. Additive Rust and Python APIs (stream
+selection, a parallel record visitor, FASTA output) plus one
+**writer-side compatibility note**: long-read archives written at the default
+level now use chunked quality coding (context modes 5/6), which v0.6.x readers
+refuse with an "upgrade fqxv" error. The on-disk format stays 1.0 — this
+release reads every archive any earlier release wrote, and short-read archives
+are byte-identical in both directions.
+
+### Added
+
+- **Stream-selective decode** (#269): `StreamSelection` plus
+  `decompress_records_select` / `RecordReader::with_selection` skip deselected
+  streams *without entropy-decoding them*. The range coders are ~96–98% of
+  decode compute, so sequence-only decode of an ONT archive runs ~12× faster.
+  `decompress_fasta` and `fqxv decompress --fasta` emit names+sequence as
+  single-line FASTA, skipping quality entirely. No format change; a full
+  selection keeps the canonical full-decode path bit-for-bit.
+- **Parallel record visitor** (#271, #276): `decompress_records_par` — a
+  map-reduce visitor (`init`/`visit`/`merge`) that scales record consumers with
+  the block parallelism instead of funneling through one serial channel — and
+  `decompress_records_par_select`, its composition with stream selection
+  (parallel sequence-only decode measured 13× on ONT).
+- **Python: `streams=` and `fasta=`** (#274): `fqxv.open(..., streams="seq")`
+  decodes only the selected streams; `decompress_to_path` /
+  `decompress_to_bytes` accept `fasta=True`; `fqxv.remote` passes both through.
+- **Decode thread-scaling benchmark** (#270): `bench/scripts/decode_scaling.sh`
+  plus `docs/decode-scaling.md` measure full-decode throughput versus thread
+  count against gzip/pigz/zstd, with byte-identity asserted for every cell.
+- **`Params::block_seq_bytes`** (#275): the long-read per-block raw-sequence
+  budget is a library parameter (0 = platform auto) instead of a hard-wired
+  constant.
+
+### Changed
+
+- **Long-read quality is coded in parallel-decodable chunks by default**
+  (#279; design and measurements in #277/#278). Quality — 92–98% of long-read
+  decode — was one adaptive coding pass per block; it is now a serially-coded
+  warmup prefix plus K−1 whole-read chunks that encode and decode in parallel
+  (context modes `5`/`6`, K = 8, Nanopore + PacBio only). Measured on ONT/HiFi:
+  full decode **~1.9× faster at 16–32 threads** (ONT 17.7 → 9.1 s, HiFi 66.5 →
+  33.8 s), HiFi **compress 17% faster**, for **+0.36% / +0.19%** archive size.
+  **Compatibility**: v0.6.x binaries cannot read mode-5/6 archives — they
+  refuse loudly (`unsupported quality context mode 5; this archive needs a
+  newer fqxv`), never misread. Short-read archives are byte-identical, and
+  `--max` (level 9) pins the serial smallest-archive layout, also
+  byte-identical — chunking is a default-level trade only, and
+  `Params::quality_chunks` (0 auto / 1 serial / K ≥ 2) opts out or tunes it.
+- **Nanopore default block budget dropped 256 → 64 MiB of raw sequence**
+  (#275): the benchmark ONT file cuts 5 blocks instead of 2, unlocking
+  block-parallel decode (measured 3.2× at 8 threads) for +1.1% archive size.
+  `--max` and explicit `--block-reads` keep maximal blocks. Combined with
+  chunked quality, the flat ~11 MB/s ONT decode becomes 8.3 → 67 MB/s over
+  1→32 threads (`docs/decode-scaling.md`).
+- Bumped the cargo minor/patch dependency group (#268).
+
 ## [0.6.2] - 2026-08-05
 
 Patch: no public Rust API changed and the on-disk format is untouched, so every
