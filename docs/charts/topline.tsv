@@ -7,26 +7,26 @@
 #   value  — the number the bar length encodes (sorted descending per chart)
 #   vlabel — the text drawn at the end of the bar
 chart	label	group	value	vlabel
-illumina_ratio_novaseq	fqxv --order shuffle	fqxv	23.9	23.9×
-illumina_ratio_novaseq	SPRING	other	21.9	21.9×
-illumina_ratio_novaseq	fqxv --max	fqxv	20.2	20.2×
-illumina_ratio_novaseq	fqxv	fqxv	9.8	9.8×
-illumina_ratio_novaseq	fqz_comp	other	9.6	9.6×
-illumina_ratio_novaseq	zstd -19	other	9.4	9.4×
-illumina_ratio_novaseq	xz -9	other	8.9	8.9×
+illumina_ratio_novaseq	fqxv --order shuffle	fqxv	24.0	24.0×
+illumina_ratio_novaseq	SPRING	other	22.0	22.0×
+illumina_ratio_novaseq	fqxv --max	fqxv	20.4	20.4×
+illumina_ratio_novaseq	fqxv	fqxv	9.9	9.9×
+illumina_ratio_novaseq	fqz_comp	other	9.7	9.7×
+illumina_ratio_novaseq	zstd -19	other	9.5	9.5×
+illumina_ratio_novaseq	xz -9	other	9.0	9.0×
 illumina_ratio_novaseq	gzip	other	5.0	5.0×
-illumina_ratio_gaiix	fqxv --order shuffle	fqxv	10.25	10.25×
-illumina_ratio_gaiix	SPRING	other	9.81	9.81×
-illumina_ratio_gaiix	fqxv --max	fqxv	9.71	9.71×
-illumina_ratio_gaiix	fqxv	fqxv	7.12	7.12×
-illumina_ratio_gaiix	fqz_comp	other	7.05	7.05×
-illumina_ratio_gaiix	xz -9	other	6.07	6.07×
-illumina_ratio_gaiix	zstd -19	other	5.87	5.87×
-illumina_ratio_gaiix	gzip	other	3.52	3.52×
-illumina_speed_novaseq	gzip	other	374	374
-illumina_speed_novaseq	fqxv	fqxv	123	123
-illumina_speed_novaseq	fqz_comp	other	105	105
-illumina_speed_novaseq	SPRING	other	70	70
+illumina_ratio_gaiix	fqxv --order shuffle	fqxv	11.97	11.97×
+illumina_ratio_gaiix	fqxv --max	fqxv	10.48	10.48×
+illumina_ratio_gaiix	SPRING	other	10.32	10.32×
+illumina_ratio_gaiix	fqxv	fqxv	7.80	7.80×
+illumina_ratio_gaiix	fqz_comp	other	7.45	7.45×
+illumina_ratio_gaiix	xz -9	other	6.15	6.15×
+illumina_ratio_gaiix	zstd -19	other	6.00	6.00×
+illumina_ratio_gaiix	gzip	other	3.77	3.77×
+illumina_speed_novaseq	gzip	other	380	380
+illumina_speed_novaseq	fqxv	fqxv	116	116
+illumina_speed_novaseq	fqz_comp	other	107	107
+illumina_speed_novaseq	SPRING	other	71	71
 illumina_speed_novaseq	zstd -19	other	11	11
 illumina_speed_novaseq	xz -9	other	10	10
 longread_ratio	fqxv · HiFi	fqxv	4.77	4.77×

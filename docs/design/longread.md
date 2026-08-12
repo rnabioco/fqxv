@@ -104,7 +104,13 @@ high-Q, low error):
 | tool | total | non-quality (seq+names) | qual | non-quality bits/base |
 | --- | --- | --- | --- | --- |
 | CoLoRd `-q org` | 697.7M | **13.4M** | 684.3M | 0.069 |
-| fqxv (shared ref) | 649.5M | **12.3M** (seq) | 635.6M | 0.064 |
+| fqxv `--max` (shared ref) | 649.5M | **12.3M** (seq) | 635.6M | 0.064 |
+
+(The fqxv rows in both tables are the serial `-l9`/`--max` layout. Since
+v0.7.0 the *default* level codes long-read quality in parallel-decodable
+chunks — mode 5/6, `docs/design/parallel-decode.md` — for +0.19–0.36% of
+archive; `--max` pins the serial smallest layout, so these numbers are
+unchanged.)
 
 Two facts, confirmed on **both** platforms:
 
