@@ -19,6 +19,13 @@
 //!   requires the decoded sequence at decode time (see
 //!   [`decode_seq`]/[`needs_sequence`]).
 //!
+//! Long-read streams can additionally be **chunked** for within-block parallel
+//! decode and encode ([`encode_seq_chunked`] with a [`QualityChunking`]): a
+//! serially-coded warmup prefix trains the model, and the remaining reads
+//! split into whole-read chunks coded from snapshots of the warmed state — see
+//! `MODE_SEQ_BINMIX_CHUNKED` for the wire layout and
+//! `docs/design/parallel-decode.md` for the measured costs.
+//!
 //! Lossy quality binning ([`QualityBinning`]) is applied before modeling; the
 //! default is lossless. Three quantization tables are offered (exact ranges in
 //! [`QualityBinning::apply`]):
@@ -50,7 +57,7 @@
 
 use std::borrow::Cow;
 
-use fqxv_bytes::{ReaderError, read_lens, write_lens};
+use fqxv_bytes::{ReaderError, read_lens, write_lens, write_varint};
 use fqxv_range::{Decoder, Encoder, SimpleModel};
 use thiserror::Error;
 
@@ -157,6 +164,65 @@ impl QualityBinning {
     }
 }
 
+/// Warmup policy for chunked quality coding ([`QualityChunking`]): how many
+/// leading bases the serially-coded warmup prefix covers before the model is
+/// snapshotted and the remaining reads fan into parallel chunks.
+///
+/// The warmup is rounded up to whole reads, and the exact boundary is
+/// transmitted (`warm_bases`), so the decoder never re-derives the policy —
+/// only the encoder resolves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkWarmup {
+    /// A fixed number of leading bases (ONT's measured operating point is
+    /// 8 MiB: chunk cost becomes nearly K-invariant, +0.36% of archive at
+    /// `K = 8`).
+    Bases(usize),
+    /// `total / K` bases — the warmup is one K-th of the block, like every
+    /// other segment (HiFi's measured operating point: +0.19% of archive at
+    /// `K = 8`; CCS quality drifts, so a proportional warmup tracks it).
+    TotalOverSegments,
+}
+
+/// Chunk-model variant for chunked quality coding ([`QualityChunking`]) — how
+/// each parallel chunk relates to the model snapshot taken after the warmup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChunkVariant {
+    /// Each chunk starts from a **clone** of the snapshot and keeps adapting.
+    /// The default and the recommended variant on both long-read platforms;
+    /// decode memory scales with concurrently-active chunks (each clone is the
+    /// full model, up to ~336 MiB at long-read alphabet depth — the decoder
+    /// runs chunk-at-a-time tasks so the rayon pool bounds active clones).
+    #[default]
+    WarmClone,
+    /// Every chunk codes against the single **read-only** snapshot: `O(1)`
+    /// model memory at any fan-out, at the price of no adaptation after the
+    /// warmup — measured near-free on ONT (+0.61%, K-invariant) and
+    /// disqualified on HiFi (+5.5–9.6%), so callers should not select it for
+    /// PacBio data.
+    WarmFrozen,
+}
+
+/// Chunked-quality coding parameters for [`encode_seq_chunked`]
+/// (`MODE_SEQ_BINMIX_CHUNKED`): split a long-read block's quality stream into
+/// a warmup prefix plus `segments - 1` chunks that encode and decode in
+/// parallel.
+///
+/// Chunking **costs** bytes (~0.2–0.4% of archive at `segments = 8`), so it is
+/// opt-in per call rather than a keep-smaller trial the serial mode would
+/// always win; the container gates it by platform. Everything here is a pure
+/// function of the input and these parameters — never of the thread count — so
+/// the emitted stream is byte-identical at any parallelism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QualityChunking {
+    /// Total segment count `K` (the warmup plus `K - 1` parallel chunks).
+    /// Must be at least 2; the measured knee on both long-read platforms is 8.
+    pub segments: usize,
+    /// Warmup policy (see [`ChunkWarmup`]).
+    pub warmup: ChunkWarmup,
+    /// Chunk-model variant (see [`ChunkVariant`]).
+    pub variant: ChunkVariant,
+}
+
 /// Errors returned by the quality codec.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -173,6 +239,13 @@ pub enum Error {
     /// is the fix, so the message says so instead of reporting corruption.
     #[error("unsupported quality context mode {0}; this archive needs a newer fqxv")]
     UnsupportedMode(u8),
+    /// A chunked quality stream's variant tag is one this reader does not
+    /// implement (tag `0`, reset, is reserved; a future fqxv may define more).
+    /// Like [`Error::UnsupportedMode`], this is an upgrade message, not
+    /// corruption: the variant byte is the chunked layout's own extension
+    /// point.
+    #[error("unsupported quality chunk variant {0}; this archive needs a newer fqxv")]
+    UnsupportedChunkVariant(u8),
     /// The provided lengths do not sum to the quality-buffer size.
     #[error("read lengths ({lens}) do not match quality bytes ({quals})")]
     LengthMismatch {
@@ -247,6 +320,71 @@ const MODE_SEQ_BINMIX: u8 = 3;
 /// [`encode_seq`] trials both and keeps the smaller, so a block can only match or
 /// shrink. Needs the decoded bases exactly like `MODE_SEQ_BINMIX`.
 const MODE_SEQ_BINMIX_Q: u8 = 4;
+/// **Chunked** long-read binary-mixing quality model: the same coder as
+/// [`MODE_SEQ_BINMIX`], but the block's reads are split into a serially-coded
+/// **warmup** prefix plus `K - 1` whole-read **chunks** that encode and decode
+/// in parallel, each from a snapshot of the model taken at the end of the
+/// warmup (docs/design/parallel-decode.md; the format change #277 measured).
+///
+/// Wire layout — the chunk table sits where [`MODE_SEQ_BINMIX_Q`]'s qtable
+/// sits, after `syms` and before the length array:
+///
+/// ```text
+/// version(=2) | binning | mode=5 | k | syms[k]
+/// [1] variant     (1 warm-clone, 2 warm-frozen; 0 reserved for reset)
+/// [v] K           (total segment count, warmup included; 2..=MAX_CHUNK_SEGMENTS)
+/// [v] warm_bases  (the warmup prefix's exact base count — a prefix sum of lens)
+/// [v] warm_len    (the warmup segment's coded byte length)
+/// [v] chunk_len × (K-1)   (each parallel chunk's coded byte length)
+/// lens            (the existing read-length array)
+/// payload         (segments concatenated: warmup, chunk 1, .., chunk K-1)
+/// ```
+///
+/// Chunk boundaries are **never transmitted**: both sides recompute them as a
+/// pure function of `(lens, K)` (`chunk_boundaries`, whole-read,
+/// equal-cumulative-bases) over the reads after the warmup, and the warmup
+/// read count is recovered from `warm_bases` (`warmup_reads`, self-checked to
+/// land exactly on a read boundary). Segment byte lengths ARE transmitted so
+/// the decoder can slice the payload and hand each chunk to a worker without
+/// parsing it. Under **warm-clone** each chunk starts from a clone of the
+/// snapshot and keeps adapting; under **warm-frozen** every chunk codes
+/// against the one read-only snapshot (O(1) model memory at any fan-out; near
+/// free on ONT, disqualified on HiFi — the variant byte is why the header
+/// carries it). Chunking costs a measured ~0.2–0.4% of archive at `K = 8`
+/// (the per-chunk range-coder flush plus the clone's lost adaptation), so the
+/// encoder emits it only where the caller asks ([`QualityChunking`], platform
+/// gated by the container) — never through a keep-smaller trial, which the
+/// serial mode would always win. Needs the decoded bases like every binmix
+/// mode.
+const MODE_SEQ_BINMIX_CHUNKED: u8 = 5;
+/// Chunked long-read binary-mixing quality model **with the per-block context
+/// quantizer**: [`MODE_SEQ_BINMIX_CHUNKED`]'s layout with
+/// [`MODE_SEQ_BINMIX_Q`]'s transmitted qtable (the `2 * k` bytes directly
+/// after `syms`, before the chunk table). The chunked twin of the mode-3/4
+/// pair: mode is to quantizer as 5 is to 6, so the qtable's presence stays a
+/// pure function of the mode byte rather than a second flag mechanism.
+/// [`encode_seq_chunked`] trials 5 and 6 under the same segmentation and keeps
+/// the smaller, exactly as 3/4 are trialled serially.
+const MODE_SEQ_BINMIX_CHUNKED_Q: u8 = 6;
+
+/// Chunk-variant tag: warm-clone — each parallel chunk starts from a clone of
+/// the warmed snapshot and keeps adapting. The shipping default on both
+/// long-read platforms (ONT +0.36%, HiFi +0.19% of archive at `K = 8`).
+const CHUNK_VARIANT_WARM_CLONE: u8 = 1;
+/// Chunk-variant tag: warm-frozen — every chunk codes against the single
+/// read-only snapshot (`O(1)` model memory at any fan-out; ONT-safe only).
+const CHUNK_VARIANT_WARM_FROZEN: u8 = 2;
+/// Decode-side ceiling on the transmitted segment count `K`. The encoder emits
+/// single-digit K (8 at the measured knee); this bound only stops a hostile
+/// chunk table from allocating per-segment state for millions of declared
+/// segments before the payload-length cross-check would catch it.
+const MAX_CHUNK_SEGMENTS: usize = 4096;
+/// Minimum total quality bases for the encoder to emit a chunked stream.
+/// Below this the block decodes fast serially and the per-chunk overhead is
+/// proportionally larger, so chunking buys nothing; the trailing block of a
+/// long-read file falls back to the serial mode. Decode accepts any size —
+/// this gates the writer only.
+const MIN_CHUNKED_BASES: usize = 16 << 20;
 
 /// Mean read length (bases) above which [`encode_seq`] selects `MODE_SEQ`. Long
 /// reads (HiFi ~15 kb, ONT ~10 kb) clear this comfortably; Illumina (≤250 bp)
@@ -541,6 +679,33 @@ pub fn encode_seq(
     // `MODE_SEQ_BINMIX` baseline either way, so this only changes speed.
     try_quantizer: bool,
 ) -> Result<Vec<u8>> {
+    encode_seq_chunked(lens, quals, seq, binning, try_quantizer, None)
+}
+
+/// [`encode_seq`] with opt-in **chunked** coding of a long-read quality stream
+/// (`MODE_SEQ_BINMIX_CHUNKED`): a serially-coded warmup prefix trains the
+/// model, then the remaining reads split into `segments - 1` whole-read chunks
+/// coded **in parallel**, each from a snapshot of the warmed model — and a
+/// decoder fans the same chunks out, un-serializing the block's dominant
+/// stream (measured 92–98% of long-read decode time) at a measured ~0.2–0.4%
+/// size cost at `segments = 8`.
+///
+/// `chunking` is honored only where it makes sense: when the stream selects a
+/// long-read (sequence-conditioned) mode, the block has at least
+/// `MIN_CHUNKED_BASES` quality bytes and `segments` whole reads, and the
+/// warmup leaves reads to fan. Otherwise — short reads, tiny trailing blocks,
+/// `None` — the output is byte-identical to [`encode_seq`]. The emitted bytes
+/// are a pure function of the input and `chunking` (chunk boundaries derive
+/// from the read lengths, the parallel encode concatenates by chunk index), so
+/// archives stay byte-identical at any thread count.
+pub fn encode_seq_chunked(
+    lens: &[u32],
+    quals: &[u8],
+    seq: &[u8],
+    binning: QualityBinning,
+    try_quantizer: bool,
+    chunking: Option<QualityChunking>,
+) -> Result<Vec<u8>> {
     let total: usize = lens.iter().map(|&l| l as usize).sum();
     if total != quals.len() {
         return Err(Error::LengthMismatch {
@@ -585,10 +750,38 @@ pub fn encode_seq(
     //
     // The retired single-context `MODE_SEQ` stays decodable but is no longer emitted.
     if seq_mode {
+        // Chunked coding is opt-in and platform-gated by the caller, never a
+        // keep-smaller trial — a chunked stream always costs a little over the
+        // serial one (per-chunk flush + the snapshot's lost adaptation), so a
+        // size trial would always keep serial and the mode would never ship.
+        // Ineligible blocks (too small, too few reads) fall back to the serial
+        // modes, byte-identical to a `None` request.
+        if let Some(c) = chunking.filter(|c| chunking_eligible(lens, total, c)) {
+            return encode_binmix_chunked(
+                lens,
+                &binned,
+                seq,
+                &dense,
+                qmin,
+                k,
+                &syms,
+                binning,
+                try_quantizer,
+                c,
+            );
+        }
         let flat = binmix::QCtx::flat();
         let base_payload = binmix::encode(lens, &binned, seq, &dense, qmin, k, &flat);
-        let baseline =
-            assemble_quality_stream(binning, MODE_SEQ_BINMIX, k, &syms, &[], lens, &base_payload);
+        let baseline = assemble_quality_stream(
+            binning,
+            MODE_SEQ_BINMIX,
+            k,
+            &syms,
+            &[],
+            &[],
+            lens,
+            &base_payload,
+        );
 
         // On regimes where the quantizer never wins (Nanopore), skip the histogram
         // build and the probe outright — the baseline is what would be kept anyway.
@@ -645,6 +838,7 @@ pub fn encode_seq(
             k,
             &syms,
             &qtable,
+            &[],
             lens,
             &q_payload,
         );
@@ -699,6 +893,7 @@ pub fn encode_seq(
             k,
             &syms,
             &[],
+            &[],
             lens,
             &payload,
         ))
@@ -706,28 +901,225 @@ pub fn encode_seq(
 }
 
 /// Assemble a full quality stream: `version | binning | mode | k | syms[k] |
-/// qtable | lens | payload`. `qtable` is empty for every mode except
-/// [`MODE_SEQ_BINMIX_Q`], whose per-block context quantizer is transmitted here
-/// (after `syms`, before the length array) so the decoder can rebuild it.
+/// qtable | chunk_table | lens | payload`. `qtable` is empty for every mode
+/// except [`MODE_SEQ_BINMIX_Q`] / [`MODE_SEQ_BINMIX_CHUNKED_Q`], whose
+/// per-block context quantizer is transmitted here (after `syms`, before the
+/// length array) so the decoder can rebuild it; `chunk_table` is empty for
+/// every mode except the two chunked ones, whose segment table
+/// (see [`MODE_SEQ_BINMIX_CHUNKED`]) follows the qtable slot.
+#[allow(clippy::too_many_arguments)] // one arg per header field, in wire order
 fn assemble_quality_stream(
     binning: QualityBinning,
     mode: u8,
     k: usize,
     syms: &[u8],
     qtable: &[u8],
+    chunk_table: &[u8],
     lens: &[u32],
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(16 + k + qtable.len() + lens.len() + payload.len());
+    let mut out =
+        Vec::with_capacity(16 + k + qtable.len() + chunk_table.len() + lens.len() + payload.len());
     out.push(FORMAT_VERSION);
     out.push(binning.tag());
     out.push(mode);
     out.push(k as u8);
     out.extend_from_slice(syms);
     out.extend_from_slice(qtable);
+    out.extend_from_slice(chunk_table);
     write_lens(&mut out, lens);
     out.extend_from_slice(payload);
     out
+}
+
+/// Whether the encoder should honor a chunking request for this block: the
+/// segment count is sane, the block carries at least [`MIN_CHUNKED_BASES`]
+/// quality bytes and one whole read per segment, and the warmup prefix leaves
+/// reads for the parallel chunks. A `false` falls back to the serial modes —
+/// never an error, exactly the `chunking: None` output.
+fn chunking_eligible(lens: &[u32], total: usize, c: &QualityChunking) -> bool {
+    if c.segments < 2 || c.segments > MAX_CHUNK_SEGMENTS {
+        return false;
+    }
+    if total < MIN_CHUNKED_BASES || lens.len() < c.segments {
+        return false;
+    }
+    warmup_reads(lens, chunk_warm_target(total, c)) < lens.len()
+}
+
+/// The warmup prefix's target size in bases for a chunking request — the
+/// encoder-side resolution of [`ChunkWarmup`]. The achieved boundary (whole
+/// reads covering at least this) is what the stream transmits; the decoder
+/// never re-derives the policy.
+fn chunk_warm_target(total: usize, c: &QualityChunking) -> usize {
+    match c.warmup {
+        ChunkWarmup::Bases(b) => b.min(total),
+        ChunkWarmup::TotalOverSegments => total.div_ceil(c.segments),
+    }
+}
+
+/// Code a long-read block's quality as a **chunked** stream
+/// ([`MODE_SEQ_BINMIX_CHUNKED`]), trialling the per-block context quantizer
+/// ([`MODE_SEQ_BINMIX_CHUNKED_Q`]) under the same segmentation when
+/// `try_quantizer` is set — the chunked twin of the serial mode-3/4 trial,
+/// with the same probe gate, keep-smaller rule, and tie-break.
+#[allow(clippy::too_many_arguments)] // mirrors the coder's input list
+fn encode_binmix_chunked(
+    lens: &[u32],
+    binned: &[u8],
+    seq: &[u8],
+    dense: &[u8; 256],
+    qmin: u8,
+    k: usize,
+    syms: &[u8],
+    binning: QualityBinning,
+    try_quantizer: bool,
+    c: QualityChunking,
+) -> Result<Vec<u8>> {
+    let flat = binmix::QCtx::flat();
+    let (base_table, base_payload) =
+        encode_chunked_payload(lens, binned, seq, dense, qmin, k, &flat, c);
+    let baseline = assemble_quality_stream(
+        binning,
+        MODE_SEQ_BINMIX_CHUNKED,
+        k,
+        syms,
+        &[],
+        &base_table,
+        lens,
+        &base_payload,
+    );
+    if !try_quantizer {
+        return Ok(baseline);
+    }
+    let (qc, qtable) = build_quant_ctx(binned, syms, qmin);
+    if !quant_wins_probe(lens, binned, seq, dense, qmin, k, &flat, &qc) {
+        return Ok(baseline);
+    }
+    let (q_table, q_payload) = encode_chunked_payload(lens, binned, seq, dense, qmin, k, &qc, c);
+    let quantized = assemble_quality_stream(
+        binning,
+        MODE_SEQ_BINMIX_CHUNKED_Q,
+        k,
+        syms,
+        &qtable,
+        &q_table,
+        lens,
+        &q_payload,
+    );
+    // Keep the smaller; a tie keeps the un-quantized baseline — the same
+    // deterministic candidate order and tie-break as the serial trial.
+    Ok(if quantized.len() < baseline.len() {
+        quantized
+    } else {
+        baseline
+    })
+}
+
+/// Code the chunked layout's segments under quantizer `qc`: the warmup prefix
+/// serially from a fresh model, then the `segments - 1` chunks — **in
+/// parallel** from per-chunk clones of the warmed snapshot (warm-clone), or
+/// serially against the shared read-only snapshot (warm-frozen, whose chunks
+/// are cheap enough that parallel encode isn't worth a second code path).
+/// Returns `(chunk_table, payload)` for [`assemble_quality_stream`].
+///
+/// Determinism: the segmentation is a pure function of `(lens, c)`, each
+/// chunk's bytes are a pure function of (its reads, the snapshot), and the
+/// results are concatenated by chunk index — so the emitted bytes are
+/// identical whether the chunks are coded serially or by any number of rayon
+/// workers. Encode memory: one model clone per *running* chunk task, bounded
+/// by the rayon pool's thread count, never by `segments`.
+#[allow(clippy::too_many_arguments)] // mirrors the coder's input list
+fn encode_chunked_payload(
+    lens: &[u32],
+    binned: &[u8],
+    seq: &[u8],
+    dense: &[u8; 256],
+    qmin: u8,
+    k: usize,
+    qc: &binmix::QCtx,
+    c: QualityChunking,
+) -> (Vec<u8>, Vec<u8>) {
+    use rayon::prelude::*;
+    let total = binned.len();
+    let wreads = warmup_reads(lens, chunk_warm_target(total, &c));
+    let offs = prefix_offsets(lens);
+    let wbases = offs[wreads];
+    let (warm, warm_payload) = binmix::warm_mixer(
+        &lens[..wreads],
+        &binned[..wbases],
+        &seq[..wbases],
+        dense,
+        qmin,
+        k,
+        qc,
+    );
+    let n_chunks = c.segments - 1;
+    let bounds = chunk_boundaries(&lens[wreads..], n_chunks);
+    let chunks: Vec<Vec<u8>> = match c.variant {
+        ChunkVariant::WarmClone => (0..n_chunks)
+            .into_par_iter()
+            .map(|i| {
+                let (a, b) = (wreads + bounds[i], wreads + bounds[i + 1]);
+                binmix::encode_chunk::<true>(
+                    &mut warm.clone(),
+                    &lens[a..b],
+                    &binned[offs[a]..offs[b]],
+                    &seq[offs[a]..offs[b]],
+                    dense,
+                    qmin,
+                    qc,
+                )
+            })
+            .collect(),
+        ChunkVariant::WarmFrozen => {
+            // Frozen never adapts (`ADAPT = false` provably leaves the mixer
+            // untouched), so one serial pass over the shared snapshot codes
+            // every chunk in O(1) model memory — the variant's whole point.
+            let mut mx = warm;
+            (0..n_chunks)
+                .map(|i| {
+                    let (a, b) = (wreads + bounds[i], wreads + bounds[i + 1]);
+                    binmix::encode_chunk::<false>(
+                        &mut mx,
+                        &lens[a..b],
+                        &binned[offs[a]..offs[b]],
+                        &seq[offs[a]..offs[b]],
+                        dense,
+                        qmin,
+                        qc,
+                    )
+                })
+                .collect()
+        }
+    };
+    let mut table = Vec::with_capacity(1 + 10 * (n_chunks + 3));
+    table.push(match c.variant {
+        ChunkVariant::WarmClone => CHUNK_VARIANT_WARM_CLONE,
+        ChunkVariant::WarmFrozen => CHUNK_VARIANT_WARM_FROZEN,
+    });
+    write_varint(&mut table, c.segments as u64);
+    write_varint(&mut table, wbases as u64);
+    write_varint(&mut table, warm_payload.len() as u64);
+    for ch in &chunks {
+        write_varint(&mut table, ch.len() as u64);
+    }
+    let mut payload = warm_payload;
+    for ch in &chunks {
+        payload.extend_from_slice(ch);
+    }
+    (table, payload)
+}
+
+/// Per-read prefix offsets into the concatenated quality/sequence buffers:
+/// `lens.len() + 1` entries with `offs[i]` = bases before read `i`.
+fn prefix_offsets(lens: &[u32]) -> Vec<usize> {
+    let mut offs = Vec::with_capacity(lens.len() + 1);
+    offs.push(0usize);
+    for &l in lens {
+        offs.push(offs.last().copied().unwrap_or(0) + l as usize);
+    }
+    offs
 }
 
 /// Per-block context quantizer for the long-read binary-mixing coder
@@ -1030,7 +1422,7 @@ fn qchunk_probe_binmix(
     let warm_cells = |policy: &str, warm_target: usize, kc: usize| {
         let wreads = warmup_reads(lens, warm_target.min(total));
         let wbases = offs[wreads];
-        let (warm, warm_bytes) = binmix::warm_mixer(
+        let (warm, warm_seg) = binmix::warm_mixer(
             &lens[..wreads],
             &binned[..wbases],
             &seq[..wbases],
@@ -1039,6 +1431,7 @@ fn qchunk_probe_binmix(
             k,
             qc,
         );
+        let warm_bytes = warm_seg.len();
         let bounds = chunk_boundaries(&lens[wreads..], kc - 1);
         for (variant, adapt) in [("warmclone", true), ("warmfrozen", false)] {
             let mut frozen = warm.clone(); // one read-only state for every frozen chunk
@@ -1280,10 +1673,14 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     }
     let _binning = QualityBinning::from_tag(r.u8()?)?;
     let mode = r.u8()?;
-    // Both sequence modes need the decoded bases; `MODE_POS` does not.
+    // Every sequence-conditioned mode needs the decoded bases; `MODE_POS` does not.
     let seq_mode = match mode {
         MODE_POS => false,
-        MODE_SEQ | MODE_SEQ_BINMIX | MODE_SEQ_BINMIX_Q => true,
+        MODE_SEQ
+        | MODE_SEQ_BINMIX
+        | MODE_SEQ_BINMIX_Q
+        | MODE_SEQ_BINMIX_CHUNKED
+        | MODE_SEQ_BINMIX_CHUNKED_Q => true,
         // Not corruption: the mode byte is the stream's extension point, so an
         // unknown value is a future coder this reader must refuse by name.
         m => return Err(Error::UnsupportedMode(m)),
@@ -1294,12 +1691,19 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     }
     let syms = r.take(k)?.to_vec();
     let qmin = syms[0];
-    // `MODE_SEQ_BINMIX_Q` transmits its per-block context quantizer here, after the
+    // The quantizer modes transmit the per-block context quantizer here, after the
     // symbol alphabet and before the length array (see `assemble_quality_stream`).
-    let qtable: Vec<u8> = if mode == MODE_SEQ_BINMIX_Q {
+    let qtable: Vec<u8> = if mode == MODE_SEQ_BINMIX_Q || mode == MODE_SEQ_BINMIX_CHUNKED_Q {
         r.take(2 * k)?.to_vec()
     } else {
         Vec::new()
+    };
+    // The chunked modes transmit their segment table next (after the qtable
+    // slot, before the length array — see `MODE_SEQ_BINMIX_CHUNKED`).
+    let chunk_table = if mode == MODE_SEQ_BINMIX_CHUNKED || mode == MODE_SEQ_BINMIX_CHUNKED_Q {
+        Some(read_chunk_table(&mut r)?)
+    } else {
+        None
     };
     let lens = read_lens(&mut r)?;
 
@@ -1342,11 +1746,26 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
     match mode {
         MODE_SEQ_BINMIX => {
             let qc = binmix::QCtx::flat();
+            quals.resize(total, 0);
             binmix::decode(&lens, payload, seq, &syms, qmin, k, &qc, &mut quals)?;
         }
         MODE_SEQ_BINMIX_Q => {
             let qc = read_quant_ctx(&qtable, &syms, qmin)?;
+            quals.resize(total, 0);
             binmix::decode(&lens, payload, seq, &syms, qmin, k, &qc, &mut quals)?;
+        }
+        MODE_SEQ_BINMIX_CHUNKED | MODE_SEQ_BINMIX_CHUNKED_Q => {
+            let qc = if mode == MODE_SEQ_BINMIX_CHUNKED_Q {
+                read_quant_ctx(&qtable, &syms, qmin)?
+            } else {
+                binmix::QCtx::flat()
+            };
+            // Parsed above whenever the mode is chunked, so always present here.
+            let t = chunk_table
+                .as_ref()
+                .ok_or(Error::Malformed("missing chunk table"))?;
+            quals.resize(total, 0);
+            decode_chunked(t, &lens, payload, seq, &syms, qmin, k, &qc, &mut quals)?;
         }
         _ => {
             let mut dec = Decoder::new(payload);
@@ -1362,6 +1781,150 @@ pub fn decode_seq(src: &[u8], seq: &[u8]) -> Result<(Vec<u32>, Vec<u8>)> {
         }
     }
     Ok((lens, quals))
+}
+
+/// Parsed segment table of a chunked quality stream (see
+/// [`MODE_SEQ_BINMIX_CHUNKED`]): the variant tag, the total segment count `K`,
+/// the warmup boundary in bases, and the `K` segment byte lengths
+/// (`seg_lens[0]` is the warmup segment's).
+struct ChunkTable {
+    variant: u8,
+    segments: usize,
+    warm_bases: usize,
+    seg_lens: Vec<usize>,
+}
+
+/// Read a [`ChunkTable`], refusing an unknown variant tag by name
+/// ([`Error::UnsupportedChunkVariant`] — the chunked layout's extension point,
+/// with tag `0` reserved for a reset variant no writer emits) and bounding the
+/// declared segment count before any per-segment allocation.
+fn read_chunk_table(r: &mut ByteReader<'_>) -> Result<ChunkTable> {
+    let variant = r.u8()?;
+    if variant != CHUNK_VARIANT_WARM_CLONE && variant != CHUNK_VARIANT_WARM_FROZEN {
+        return Err(Error::UnsupportedChunkVariant(variant));
+    }
+    let segments = r.varint()?;
+    if !(2..=MAX_CHUNK_SEGMENTS as u64).contains(&segments) {
+        return Err(Error::Malformed("chunk segment count out of range"));
+    }
+    let segments = segments as usize;
+    let warm_bases = usize::try_from(r.varint()?)
+        .map_err(|_| Error::Malformed("chunk warmup boundary overflows"))?;
+    let mut seg_lens = Vec::with_capacity(segments);
+    for _ in 0..segments {
+        let l = usize::try_from(r.varint()?)
+            .map_err(|_| Error::Malformed("chunk segment length overflows"))?;
+        seg_lens.push(l);
+    }
+    Ok(ChunkTable {
+        variant,
+        segments,
+        warm_bases,
+        seg_lens,
+    })
+}
+
+/// Decode a chunked quality payload into `quals` (already sized to the total):
+/// recompute the segmentation from `(lens, K)`, decode the warmup serially
+/// from a fresh model, snapshot it, then fan the `K - 1` chunks out on the
+/// rayon pool — each into its own disjoint output range, so the result is
+/// byte-for-byte the serial order at any thread count.
+///
+/// Decode memory: under warm-clone each **running** chunk task owns one clone
+/// of the snapshot (up to ~336 MiB at long-read alphabet depth), and rayon
+/// executes at most pool-threads tasks at once — so peak model memory is
+/// bounded by `threads × model + one snapshot per in-flight block`, never by
+/// `K` (the design doc's "schedule chunks, never spawn all K"). Warm-frozen
+/// shares the one snapshot read-only: O(1) model memory at any fan-out.
+#[allow(clippy::too_many_arguments)] // mirrors the coder's input list
+fn decode_chunked(
+    t: &ChunkTable,
+    lens: &[u32],
+    payload: &[u8],
+    seq: &[u8],
+    syms: &[u8],
+    qmin: u8,
+    k: usize,
+    qc: &binmix::QCtx,
+    quals: &mut [u8],
+) -> Result<()> {
+    use rayon::prelude::*;
+    let total = quals.len();
+    // The transmitted segment lengths must tile the payload exactly — a table
+    // whose lengths overflow, fall short, or overrun is hostile or corrupt.
+    let declared = t
+        .seg_lens
+        .iter()
+        .try_fold(0usize, |a, &l| a.checked_add(l))
+        .ok_or(Error::Malformed("chunk segment lengths overflow"))?;
+    if declared != payload.len() {
+        return Err(Error::Malformed(
+            "chunk segment lengths do not match the payload",
+        ));
+    }
+    // The warmup boundary must land exactly on a read boundary — it is a
+    // prefix sum of `lens` by construction, and `warmup_reads` re-derives the
+    // same minimal read count the encoder used.
+    if t.warm_bases > total {
+        return Err(Error::Malformed("chunk warmup boundary past the block"));
+    }
+    let offs = prefix_offsets(lens);
+    let wreads = warmup_reads(lens, t.warm_bases);
+    if offs[wreads] != t.warm_bases {
+        return Err(Error::Malformed(
+            "chunk warmup boundary not on a read boundary",
+        ));
+    }
+    let n_chunks = t.segments - 1;
+    let bounds = chunk_boundaries(&lens[wreads..], n_chunks);
+    // Serial warmup: train a fresh model over the leading reads, exactly as
+    // the encoder did; the state at its end is the chunk snapshot.
+    let (warm_out, mut chunk_out) = quals.split_at_mut(t.warm_bases);
+    let mut mx = binmix::BinMixer::new(k);
+    binmix::decode_into(
+        &mut binmix::Adapting(&mut mx),
+        &lens[..wreads],
+        &payload[..t.seg_lens[0]],
+        &seq[..t.warm_bases],
+        syms,
+        qmin,
+        qc,
+        warm_out,
+    )?;
+    // Slice each chunk's payload, reads, bases, and disjoint output range.
+    let mut tasks = Vec::with_capacity(n_chunks);
+    let mut poff = t.seg_lens[0];
+    for i in 0..n_chunks {
+        let (a, b) = (wreads + bounds[i], wreads + bounds[i + 1]);
+        let (head, tail) = std::mem::take(&mut chunk_out).split_at_mut(offs[b] - offs[a]);
+        chunk_out = tail;
+        let pl = &payload[poff..poff + t.seg_lens[i + 1]];
+        poff += t.seg_lens[i + 1];
+        tasks.push((pl, &lens[a..b], &seq[offs[a]..offs[b]], head));
+    }
+    match t.variant {
+        CHUNK_VARIANT_WARM_CLONE => tasks.into_par_iter().try_for_each(|(pl, l, s, o)| {
+            let mut clone = mx.clone();
+            binmix::decode_into(
+                &mut binmix::Adapting(&mut clone),
+                l,
+                pl,
+                s,
+                syms,
+                qmin,
+                qc,
+                o,
+            )
+        }),
+        CHUNK_VARIANT_WARM_FROZEN => {
+            let shared = &mx;
+            tasks.into_par_iter().try_for_each(|(pl, l, s, o)| {
+                binmix::decode_into(&mut binmix::Frozen(shared), l, pl, s, syms, qmin, qc, o)
+            })
+        }
+        // `read_chunk_table` admits only the two tags above.
+        v => Err(Error::UnsupportedChunkVariant(v)),
+    }
 }
 
 /// The set of quality values actually present, as a compact coding alphabet.
@@ -1671,6 +2234,7 @@ mod tests {
             k,
             &syms,
             &[],
+            &[],
             &lens,
             &base_payload,
         );
@@ -1719,6 +2283,7 @@ mod tests {
             k,
             &syms,
             &qtable,
+            &[],
             &lens,
             &payload,
         );
@@ -1983,6 +2548,369 @@ mod tests {
         buf.push(1); // fixed = true
         push_varint(&mut buf, u32::MAX as u64); // each read u32::MAX long
         assert!(matches!(decode(&buf), Err(Error::Malformed(_))));
+    }
+
+    // --- chunked quality (MODE_SEQ_BINMIX_CHUNKED / _Q) ----------------------
+
+    /// A chunking request usable on the small in-crate fixtures (the public
+    /// gate demands `MIN_CHUNKED_BASES`, so tests drive the internal
+    /// entry points directly to keep them fast).
+    fn chunking(segments: usize, warmup: ChunkWarmup, variant: ChunkVariant) -> QualityChunking {
+        QualityChunking {
+            segments,
+            warmup,
+            variant,
+        }
+    }
+
+    /// Chunked-encode a fixture through the internal (gate-free) path.
+    fn encode_chunked_fixture(
+        lens: &[u32],
+        seq: &[u8],
+        quals: &[u8],
+        try_quantizer: bool,
+        c: QualityChunking,
+    ) -> Vec<u8> {
+        let (syms, dense) = dense_alphabet(quals).expect("alphabet");
+        let (qmin, k) = (syms[0], syms.len());
+        encode_binmix_chunked(
+            lens,
+            quals,
+            seq,
+            &dense,
+            qmin,
+            k,
+            &syms,
+            QualityBinning::Lossless,
+            try_quantizer,
+            c,
+        )
+        .expect("chunked encode")
+    }
+
+    #[test]
+    fn chunked_roundtrips_across_variants_ks_and_warmups() {
+        let (lens, seq, quals) = longread_fixture(60, 900);
+        for segments in [2usize, 3, 8, 16] {
+            for warmup in [
+                ChunkWarmup::TotalOverSegments,
+                ChunkWarmup::Bases(10_000),
+                ChunkWarmup::Bases(0), // degenerate: one-read warmup
+            ] {
+                for variant in [ChunkVariant::WarmClone, ChunkVariant::WarmFrozen] {
+                    let stream = encode_chunked_fixture(
+                        &lens,
+                        &seq,
+                        &quals,
+                        false,
+                        chunking(segments, warmup, variant),
+                    );
+                    assert_eq!(
+                        stream.get(2),
+                        Some(&MODE_SEQ_BINMIX_CHUNKED),
+                        "flat chunked stream must carry mode 5"
+                    );
+                    assert!(needs_sequence(&stream), "chunked modes need the sequence");
+                    let (out_lens, out_quals) = decode_seq(&stream, &seq).unwrap_or_else(|e| {
+                        panic!("decode K={segments} {warmup:?} {variant:?}: {e}")
+                    });
+                    assert_eq!(out_lens, lens);
+                    assert_eq!(out_quals, quals, "K={segments} {warmup:?} {variant:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn chunked_quantizer_trial_roundtrips_and_is_deterministic() {
+        let (lens, seq, quals) = longread_fixture(50, 1200);
+        let c = chunking(4, ChunkWarmup::TotalOverSegments, ChunkVariant::WarmClone);
+        let a = encode_chunked_fixture(&lens, &seq, &quals, true, c);
+        let b = encode_chunked_fixture(&lens, &seq, &quals, true, c);
+        assert_eq!(a, b, "chunked encode must be deterministic");
+        assert!(
+            matches!(
+                a.get(2),
+                Some(&MODE_SEQ_BINMIX_CHUNKED) | Some(&MODE_SEQ_BINMIX_CHUNKED_Q)
+            ),
+            "the chunked trial must keep one of the two chunked modes"
+        );
+        let (out_lens, out_quals) = decode_seq(&a, &seq).expect("decode");
+        assert_eq!(out_lens, lens);
+        assert_eq!(out_quals, quals);
+    }
+
+    #[test]
+    fn chunked_q_mode_roundtrips_directly() {
+        // Pin the mode-6 wire path explicitly (qtable + chunk table together),
+        // independent of whether the trial would select it on this fixture.
+        let (lens, seq, quals) = longread_fixture(40, 1000);
+        let (syms, dense) = dense_alphabet(&quals).expect("alphabet");
+        let (qmin, k) = (syms[0], syms.len());
+        let (qc, qtable) = build_quant_ctx(&quals, &syms, qmin);
+        let c = chunking(3, ChunkWarmup::Bases(8_000), ChunkVariant::WarmClone);
+        let (chunk_table, payload) =
+            encode_chunked_payload(&lens, &quals, &seq, &dense, qmin, k, &qc, c);
+        let stream = assemble_quality_stream(
+            QualityBinning::Lossless,
+            MODE_SEQ_BINMIX_CHUNKED_Q,
+            k,
+            &syms,
+            &qtable,
+            &chunk_table,
+            &lens,
+            &payload,
+        );
+        assert_eq!(stream.get(2), Some(&MODE_SEQ_BINMIX_CHUNKED_Q));
+        assert!(needs_sequence(&stream));
+        let (out_lens, out_quals) = decode_seq(&stream, &seq).expect("decode");
+        assert_eq!(out_lens, lens);
+        assert_eq!(out_quals, quals);
+    }
+
+    #[test]
+    fn chunked_bytes_and_decode_are_thread_count_invariant() {
+        // The hard repo invariant, at the codec level: the same input must
+        // produce identical chunked bytes — and decode back identically —
+        // whether rayon has 1 worker or several.
+        let (lens, seq, quals) = longread_fixture(48, 1100);
+        let c = chunking(8, ChunkWarmup::Bases(12_000), ChunkVariant::WarmClone);
+        let one = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("pool");
+        let four = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        let enc1 = one.install(|| encode_chunked_fixture(&lens, &seq, &quals, false, c));
+        let enc4 = four.install(|| encode_chunked_fixture(&lens, &seq, &quals, false, c));
+        assert_eq!(enc1, enc4, "chunked encode must be thread-count invariant");
+        let dec1 = one.install(|| decode_seq(&enc1, &seq).expect("decode@1"));
+        let dec4 = four.install(|| decode_seq(&enc1, &seq).expect("decode@4"));
+        assert_eq!(dec1, dec4, "chunked decode must be thread-count invariant");
+        assert_eq!(dec1.1, quals);
+    }
+
+    #[test]
+    fn chunked_gate_falls_back_to_serial_below_minimum() {
+        // Under MIN_CHUNKED_BASES the public entry point must ignore the
+        // chunking request entirely — byte-identical to the serial encode.
+        let (lens, seq, quals) = longread_fixture(40, 2000);
+        assert!(quals.len() < MIN_CHUNKED_BASES);
+        let serial = encode_seq(&lens, &quals, &seq, QualityBinning::Lossless, true).expect("s");
+        let chunked_req = encode_seq_chunked(
+            &lens,
+            &quals,
+            &seq,
+            QualityBinning::Lossless,
+            true,
+            Some(chunking(
+                8,
+                ChunkWarmup::Bases(8 << 20),
+                ChunkVariant::WarmClone,
+            )),
+        )
+        .expect("c");
+        assert_eq!(
+            chunked_req, serial,
+            "an ineligible chunking request must be a no-op"
+        );
+    }
+
+    #[test]
+    fn chunking_eligibility_bounds() {
+        // Only the read lengths matter to eligibility; keep `total` consistent
+        // with them (as the real caller guarantees) without materializing MiB
+        // of data.
+        let lens = vec![600_000u32; 40]; // 24 MB of quality across 40 reads
+        let total = 40 * 600_000usize;
+        assert!(total >= MIN_CHUNKED_BASES);
+        let ok = |c: QualityChunking| chunking_eligible(&lens, total, &c);
+        // Segment count out of range.
+        for segments in [0usize, 1, MAX_CHUNK_SEGMENTS + 1] {
+            assert!(!ok(chunking(
+                segments,
+                ChunkWarmup::TotalOverSegments,
+                ChunkVariant::WarmClone
+            )));
+        }
+        // More segments than reads.
+        assert!(!ok(chunking(
+            lens.len() + 1,
+            ChunkWarmup::TotalOverSegments,
+            ChunkVariant::WarmClone
+        )));
+        // A warmup that swallows every read leaves nothing to fan.
+        assert!(!ok(chunking(
+            4,
+            ChunkWarmup::Bases(usize::MAX),
+            ChunkVariant::WarmClone
+        )));
+        // Too few total bases.
+        let small = vec![100_000u32; 40]; // 4 MB — under the floor
+        assert!(!chunking_eligible(
+            &small,
+            40 * 100_000,
+            &chunking(4, ChunkWarmup::TotalOverSegments, ChunkVariant::WarmClone)
+        ));
+        // The shapes the encoder actually emits are eligible.
+        assert!(ok(chunking(
+            8,
+            ChunkWarmup::TotalOverSegments,
+            ChunkVariant::WarmClone
+        )));
+        assert!(ok(chunking(
+            8,
+            ChunkWarmup::Bases(8 << 20),
+            ChunkVariant::WarmClone
+        )));
+    }
+
+    #[test]
+    fn chunked_zero_length_reads_at_the_warm_boundary_roundtrip() {
+        // Zero-length reads make prefix sums repeat; the warm boundary and the
+        // chunk boundaries must stay consistent between encode and decode.
+        let (mut lens, seq, quals) = longread_fixture(30, 800);
+        // Splice zero-length reads around the warmup landing zone and the end.
+        lens.insert(1, 0);
+        lens.insert(5, 0);
+        lens.push(0);
+        for variant in [ChunkVariant::WarmClone, ChunkVariant::WarmFrozen] {
+            let stream = encode_chunked_fixture(
+                &lens,
+                &seq,
+                &quals,
+                false,
+                chunking(4, ChunkWarmup::Bases(800), variant),
+            );
+            let (out_lens, out_quals) =
+                decode_seq(&stream, &seq).unwrap_or_else(|e| panic!("{variant:?}: {e}"));
+            assert_eq!(out_lens, lens);
+            assert_eq!(out_quals, quals);
+        }
+    }
+
+    /// Build a syntactically-valid chunked header with an arbitrary table, for
+    /// the adversarial parse tests: `version|binning|mode=5|k=1|sym` + `table`
+    /// + a lens array of `n` fixed-length-1 reads + `payload`.
+    fn chunked_stream_with_table(table: &[u8], n_reads: u64, payload: &[u8]) -> Vec<u8> {
+        let mut s = vec![FORMAT_VERSION, 0, MODE_SEQ_BINMIX_CHUNKED, 1, b'I'];
+        s.extend_from_slice(table);
+        push_varint(&mut s, n_reads); // n reads...
+        s.push(1); // ...fixed-length...
+        push_varint(&mut s, 1); // ...of 1 base each
+        s.extend_from_slice(payload);
+        s
+    }
+
+    #[test]
+    fn chunked_rejects_hostile_tables() {
+        let n = 64u64; // 64 reads of 1 base
+        let seq = vec![b'A'; 64];
+        let table = |variant: u8, k: u64, warm_bases: u64, seg_lens: &[u64]| {
+            let mut t = vec![variant];
+            push_varint(&mut t, k);
+            push_varint(&mut t, warm_bases);
+            for &l in seg_lens {
+                push_varint(&mut t, l);
+            }
+            t
+        };
+        // Reserved / unknown variant tags refuse by name, before anything else.
+        for v in [0u8, 3, 99] {
+            let s = chunked_stream_with_table(&table(v, 2, 8, &[4, 4]), n, &[0; 8]);
+            match decode_seq(&s, &seq) {
+                Err(Error::UnsupportedChunkVariant(got)) => assert_eq!(got, v),
+                other => panic!("variant {v}: want UnsupportedChunkVariant, got {other:?}"),
+            }
+        }
+        // Segment counts out of range: 0, 1, and absurd.
+        for k in [0u64, 1, MAX_CHUNK_SEGMENTS as u64 + 1, u64::MAX >> 8] {
+            let s = chunked_stream_with_table(&table(1, k, 8, &[4, 4]), n, &[0; 8]);
+            assert!(
+                matches!(decode_seq(&s, &seq), Err(Error::Malformed(_))),
+                "K={k} must be rejected"
+            );
+        }
+        // A table truncated mid-list (declares 4 segments, carries 1 length).
+        let mut t = vec![1u8];
+        push_varint(&mut t, 4);
+        push_varint(&mut t, 8);
+        push_varint(&mut t, 4);
+        let mut s = vec![FORMAT_VERSION, 0, MODE_SEQ_BINMIX_CHUNKED, 1, b'I'];
+        s.extend_from_slice(&t);
+        assert!(matches!(decode_seq(&s, &seq), Err(Error::Malformed(_))));
+        // Segment lengths that overflow usize when summed.
+        let s = chunked_stream_with_table(
+            &table(1, 3, 8, &[u64::MAX / 2, u64::MAX / 2, 64]),
+            n,
+            &[0; 8],
+        );
+        assert!(matches!(decode_seq(&s, &seq), Err(Error::Malformed(_))));
+        // Lengths that do not tile the payload exactly (short and long).
+        for lens2 in [[4u64, 3], [4, 5]] {
+            let s = chunked_stream_with_table(&table(1, 2, 8, &lens2), n, &[0; 8]);
+            assert!(matches!(decode_seq(&s, &seq), Err(Error::Malformed(_))));
+        }
+        // A warmup boundary past the block.
+        let s = chunked_stream_with_table(&table(1, 2, 65, &[4, 4]), n, &[0; 8]);
+        assert!(matches!(decode_seq(&s, &seq), Err(Error::Malformed(_))));
+    }
+
+    #[test]
+    fn chunked_rejects_warm_boundary_off_a_read() {
+        // 64 reads of 3 bases: a warm boundary of 4 lands inside read 1.
+        let seq = vec![b'A'; 192];
+        let mut s = vec![FORMAT_VERSION, 0, MODE_SEQ_BINMIX_CHUNKED, 1, b'I'];
+        s.push(1); // warm-clone
+        push_varint(&mut s, 2); // K = 2
+        push_varint(&mut s, 4); // warm boundary: not a multiple of 3
+        push_varint(&mut s, 4); // warm segment length
+        push_varint(&mut s, 4); // chunk length
+        push_varint(&mut s, 64); // 64 reads...
+        s.push(1); // ...fixed-length...
+        push_varint(&mut s, 3); // ...of 3 bases
+        s.extend_from_slice(&[0; 8]);
+        match decode_seq(&s, &seq) {
+            Err(Error::Malformed(m)) => assert!(m.contains("read boundary"), "{m}"),
+            other => panic!("want Malformed(read boundary), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn needs_sequence_knows_the_chunked_modes() {
+        for m in [MODE_SEQ_BINMIX_CHUNKED, MODE_SEQ_BINMIX_CHUNKED_Q] {
+            assert!(needs_sequence(&[FORMAT_VERSION, 0, m]));
+        }
+    }
+
+    proptest::proptest! {
+        // Chunked round-trip over arbitrary read shapes (including empty
+        // reads), K, and both variants — decode(encode(x)) == x with the
+        // segmentation recomputed on the decode side.
+        #[test]
+        fn chunked_roundtrip_arbitrary(
+            reads in proptest::collection::vec(
+                proptest::collection::vec(33u8..=90, 0..60), 4..24),
+            segments in 2usize..6,
+            frozen in proptest::bool::ANY,
+        ) {
+            let lens: Vec<u32> = reads.iter().map(|r| r.len() as u32).collect();
+            let quals: Vec<u8> = reads.concat();
+            if quals.is_empty() {
+                return Ok(());
+            }
+            let seq: Vec<u8> = quals.iter().map(|&q| b"ACGT"[q as usize % 4]).collect();
+            let variant = if frozen { ChunkVariant::WarmFrozen } else { ChunkVariant::WarmClone };
+            let stream = encode_chunked_fixture(
+                &lens, &seq, &quals, false,
+                chunking(segments, ChunkWarmup::TotalOverSegments, variant),
+            );
+            let (out_lens, out_quals) = decode_seq(&stream, &seq).expect("decode");
+            proptest::prop_assert_eq!(out_lens, lens);
+            proptest::prop_assert_eq!(out_quals, quals);
+        }
     }
 
     proptest::proptest! {
