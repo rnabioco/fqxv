@@ -13,15 +13,15 @@ How decompression throughput scales with thread count is measured separately in
     libraries before drawing conclusions.
 
 !!! note "Provenance"
-    The Illumina tables were last regenerated 2026-07-15, the long-read tables
-    2026-07-22. Both are **4M-read subsets**; the whole-file per-dataset matrix —
-    the source of the ratios quoted in the README, which are higher because ratio
-    grows with file size — lives in the repository's `bench/RESULTS.md`, along with
-    MiSeq, MGI/BGISEQ and miRNA rows this page does not cover. Codec work landing
-    after those dates was performance-only, so the ratios stand for the current
-    release; the compress-throughput columns predate it. Field-tool versions are
-    whatever the repository's `pixi.lock` pins for the `bench` environment
-    (`pixi list -e bench`).
+    The Illumina tables were regenerated 2026-08-11 (4M-read R1 subsets, freshly
+    staged with `sracha`; not byte-comparable with subsets staged for earlier
+    revisions of this page) and the long-read tables 2026-08-12 at the v0.7.0
+    codebase. The Illumina tables are **4M-read subsets**; the whole-file
+    per-dataset matrix — the source of the ratios quoted in the README, which are
+    higher because ratio grows with file size — lives in the repository's
+    `bench/RESULTS.md`, along with MiSeq, MGI/BGISEQ and miRNA rows this page
+    does not cover. Field-tool versions are whatever the repository's `pixi.lock`
+    pins for the `bench` environment (`pixi list -e bench`).
 
 `fqxv` has three operating points, all **lossless** on sequence and quality and,
 uniquely among the tools here, **deterministic** (byte-identical output
@@ -44,14 +44,14 @@ regardless of thread count):
 
 | Tool | Ratio | Compress | Decompress | Lossless | Deterministic |
 | --- | ---: | ---: | ---: | :---: | :---: |
-| **`fqxv --order shuffle`** | **23.9×** | 13 MB/s | 148 MB/s | seq+qual (renumbered) | **yes** |
-| SPRING | 21.9× | 70 MB/s | 136 MB/s | reordered | — |
-| **`fqxv --max`** | 20.2× | 19 MB/s | 124 MB/s | **yes (order-preserving)** | **yes** |
-| `fqxv` (default) | 9.8× | **123 MB/s** | 116 MB/s | **yes** | **yes** |
-| fqz_comp | 9.6× | 105 MB/s | 73 MB/s | **no** | — |
-| zstd -19 | 9.4× | 11 MB/s | 415 MB/s | yes | — |
-| xz -9 | 8.9× | 10 MB/s | 321 MB/s | yes | — |
-| gzip | 5.0× | 374 MB/s | 194 MB/s | yes | — |
+| **`fqxv --order shuffle`** | **24.0×** | 20 MB/s | 137 MB/s | seq+qual (renumbered) | **yes** |
+| SPRING | 22.0× | 71 MB/s | 137 MB/s | reordered | — |
+| **`fqxv --max`** | 20.4× | 21 MB/s | 118 MB/s | **yes (order-preserving)** | **yes** |
+| `fqxv` (default) | 9.9× | **116 MB/s** | 110 MB/s | **yes** | **yes** |
+| fqz_comp | 9.7× | 107 MB/s | 65 MB/s | **no** | — |
+| zstd -19 | 9.5× | 11 MB/s | 283 MB/s | yes | — |
+| xz -9 | 9.0× | 10 MB/s | 356 MB/s | yes | — |
+| gzip | 5.0× | 380 MB/s | 173 MB/s | yes | — |
 
 ![NovaSeq compress throughput — fqxv vs the field](images/illumina_speed_novaseq.dark.png)
 ![NovaSeq compress throughput — fqxv vs the field](images/illumina_speed_novaseq.light.png)
@@ -69,19 +69,19 @@ fqxv is ~10× faster than zstd -19 / xz -9 while beating them on ratio.*
 
 | Tool | Ratio | Compress | Decompress | Lossless | Deterministic |
 | --- | ---: | ---: | ---: | :---: | :---: |
-| **`fqxv --order shuffle`** | **10.25×** | 18 MB/s | 147 MB/s | seq+qual (renumbered) | **yes** |
-| SPRING | 9.81× | 58 MB/s | 131 MB/s | reordered | — |
-| **`fqxv --max`** | 9.71× | 15 MB/s | 125 MB/s | **yes (order-preserving)** | **yes** |
-| `fqxv` (default) | 7.12× | **124 MB/s** | 116 MB/s | **yes** | **yes** |
-| fqz_comp | 7.05× | 92 MB/s | 70 MB/s | **no** | — |
-| xz -9 | 6.07× | 6 MB/s | 288 MB/s | yes | — |
-| zstd -19 | 5.87× | 11 MB/s | 390 MB/s | yes | — |
-| gzip | 3.52× | 363 MB/s | 164 MB/s | yes | — |
+| **`fqxv --order shuffle`** | **11.97×** | 22 MB/s | 202 MB/s | seq+qual (renumbered) | **yes** |
+| **`fqxv --max`** | 10.48× | 24 MB/s | 132 MB/s | **yes (order-preserving)** | **yes** |
+| SPRING | 10.32× | 67 MB/s | 134 MB/s | reordered | — |
+| `fqxv` (default) | 7.80× | **140 MB/s** | 138 MB/s | **yes** | **yes** |
+| fqz_comp | 7.45× | 101 MB/s | 80 MB/s | **no** | — |
+| xz -9 | 6.15× | 7 MB/s | 286 MB/s | yes | — |
+| zstd -19 | 6.00× | 13 MB/s | 491 MB/s | yes | — |
+| gzip | 3.77× | 414 MB/s | 166 MB/s | yes | — |
 
 ## Reading the numbers
 
 - **`fqxv --order shuffle` is the smallest lossless compressor here — it beats
-  SPRING on both datasets** (23.9× vs 21.9× on NovaSeq, 10.25× vs 9.81× on
+  SPRING on both datasets** (24.0× vs 22.0× on NovaSeq, 11.97× vs 10.32× on
   full-range), under the same rules SPRING plays by (reorder + renumber). SPRING
   keeps the original read *names*; `fqxv --order shuffle` renumbers, but the name
   stream is a rounding error either way (~a few KB on a 60 MB archive), so this is
@@ -89,18 +89,19 @@ fqxv is ~10× faster than zstd -19 / xz -9 while beating them on ratio.*
   not hold everywhere: on the hardest short-read case in the wider matrix
   (MGI/BGISEQ, `bench/RESULTS.md`) SPRING is still smaller.
 - **`fqxv --max` is the best-ratio *fully* lossless option** — it additionally
-  preserves original read order and names, which SPRING does not. That guarantee
-  costs a read-order permutation: on NovaSeq the `--max` archive is
-  names 0.1 MB + sequence 40.7 MB (of which ~11 MB is the permutation) +
-  quality 29.3 MB. Dropping just that permutation (via `--order shuffle`) is what
-  takes the sequence stream from 40.7 MB to 29.8 MB and puts `fqxv` ahead of
-  SPRING.
+  preserves original read order and names, which SPRING does not, and on the
+  full-range set it now beats SPRING outright (10.48× vs 10.32×) despite that
+  stronger guarantee. The guarantee costs a read-order permutation: on NovaSeq
+  the `--max` archive is names 0.1 MB + sequence 42.7 MB (of which ~11 MB is the
+  permutation) + quality 30.7 MB. Dropping just that permutation (via
+  `--order shuffle`) is what takes the sequence stream from 42.7 MB to 31.3 MB
+  and puts `fqxv` further ahead of SPRING.
 - **Determinism and verified losslessness are `fqxv`'s alone here.** Every `fqxv`
   archive round-trips its exact content (sequence+quality multiset, and names in
   the order-preserving modes) and is byte-identical across thread counts;
   `fqz_comp` fails the content round-trip in this harness on both sets.
 - **The default mode trades ratio for speed cleanly**: still ahead of fqz_comp /
-  zstd / xz on ratio, at >120 MB/s — an order of magnitude faster to compress
+  zstd / xz on ratio, at ~115–140 MB/s — an order of magnitude faster to compress
   than zstd -19 or xz -9.
 - **Lossy quality is a separate tier.** `fqxv --quality-bin bin8|bin4|bin2` and
   SPRING's `ill_bin` / `binary` modes quantize quality for more ratio; compare
@@ -142,7 +143,16 @@ basecaller):
 | Tool | Total | Non-quality | Quality | Non-quality bits/base |
 | --- | ---: | ---: | ---: | ---: |
 | CoLoRd `-q org` | 697.7M | 13.4M | 684.3M | 0.069 |
-| `fqxv` | **649.5M** | **12.3M (seq)** | **635.6M** | **0.064** |
+| `fqxv --max` | **649.5M** | **12.3M (seq)** | **635.6M** | **0.064** |
+
+!!! note "Default-level long-read archives now chunk quality"
+    The fqxv rows above are the best-ratio serial layout (`-l9`/`--max`),
+    byte-identical across recent releases. Since v0.7.0 the *default* level
+    codes long-read quality in parallel-decodable chunks (context mode 5/6),
+    trading **+0.36% (ONT) / +0.19% (HiFi)** archive size for full decode
+    **~1.9× faster at 16+ threads** and HiFi compress **17% faster** — see
+    [Decode scaling](decode-scaling.md). `--max` pins the serial
+    smallest-archive layout.
 
 Two facts hold on both platforms:
 
@@ -150,7 +160,7 @@ Two facts hold on both platforms:
   context-mixing quality coder codes the HiFi quality stream to **635.6M vs
   CoLoRd's 684.3M** (~7% smaller) and ONT to **163.7M vs 166.5M** (~2% smaller).
   On HiFi that quality win carries the **lossless total ahead of CoLoRd** (649.5M
-  vs 697.7M, **4.77× vs 4.44×** on the full file); on ONT fqxv now edges ahead on
+  vs 697.7M, **4.77× vs 4.44×** on the full file); on ONT fqxv edges ahead on
   the **total** too — **197.1M vs 197.9M** (3.06× vs 3.05×).
 - **The sequence stream is no longer a blanket deficit.** On HiFi Sequel II it is a
   *credit* (12.3M vs 13.4M) — the same locus is read hundreds of times at ~300×,
@@ -166,11 +176,12 @@ recent work cut that cost without touching the output: on a 16-thread node,
 default-mode compress of the noisy ONT run is now **~3× faster** (skipping an
 always-discarded consensus candidate and the redundant shared-reference assembly
 on Nanopore, and de-packing the alignment traceback), and HiFi is ~9% faster —
-same archives, same ratios. On top of that the anchor-restricted tiler coder (#231)
-makes ONT another **1.54× faster at 16 threads** *and* smaller (it aligns only
-inter-anchor gaps). The deepest sequence lever (best-of-N tiling references) stays
-gated to `--max`, so the default stays fast and `--max` buys the extra ratio only
-when you ask for it.
+same archives, same ratios. The anchor-restricted tiler coder (#231) makes ONT
+another **1.54× faster at 16 threads** *and* smaller (it aligns only inter-anchor
+gaps), and chunked quality (#279) makes default-level HiFi compress **17% faster**
+still (the chunks encode in parallel too). The deepest sequence lever (best-of-N
+tiling references) stays gated to `--max`, so the default stays fast and `--max`
+buys the extra ratio only when you ask for it.
 
 ### Lossy quality
 
