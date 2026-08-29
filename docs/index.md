@@ -1,5 +1,10 @@
 # 🗜️ fqxv
 
+[![Bioconda](https://img.shields.io/conda/vn/bioconda/fqxv?label=bioconda)](https://anaconda.org/bioconda/fqxv)
+[![Bioconda downloads](https://img.shields.io/conda/dn/bioconda/fqxv?label=downloads)](https://anaconda.org/bioconda/fqxv)
+[![PyPI](https://img.shields.io/pypi/v/fqxv)](https://pypi.org/project/fqxv/)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](https://github.com/rnabioco/fqxv#license)
+
 A fast, reference-free **FASTQ archiver**, written in Rust. `fqxv` compresses each part of a FASTQ record with a codec
 tuned to it — a context model for quality, an order-k model for sequence, a
 positional tokenizer for names — and composes them into one parallel,
@@ -37,6 +42,17 @@ block-based container.
 - **One crate per algorithm** — every codec is an independently usable,
   independently published Rust crate.
 
+## Install
+
+```bash
+pixi add bioconda::fqxv                          # Bioconda
+conda install -c conda-forge -c bioconda fqxv    # or conda / mamba
+uv pip install fqxv                              # read-only Python package
+```
+
+Prebuilt binaries, BioContainers Docker/Singularity images and Nextflow usage
+are all in [Installation](getting-started/installation.md).
+
 ## Quick look
 
 ```bash
@@ -69,8 +85,8 @@ crates.
 
 ## Where to go next
 
-- [Installation](getting-started/installation.md) — prebuilt binaries, building
-  from source, and the crates
+- [Installation](getting-started/installation.md) — Bioconda, containers and
+  Nextflow, prebuilt binaries, building from source, and the crates
 - [Quick Start](getting-started/quickstart.md) — compress, inspect, decompress
 - [CLI Reference](cli/index.md) — every command and flag
 - [Python API](python/index.md) — read `.fqxv` archives from Python

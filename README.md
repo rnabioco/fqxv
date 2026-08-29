@@ -1,5 +1,7 @@
 # 🗜️ fqxv
 
+[![Bioconda](https://img.shields.io/conda/vn/bioconda/fqxv?label=bioconda)](https://anaconda.org/bioconda/fqxv)
+[![Bioconda downloads](https://img.shields.io/conda/dn/bioconda/fqxv?label=downloads)](https://anaconda.org/bioconda/fqxv)
 [![PyPI](https://img.shields.io/pypi/v/fqxv)](https://pypi.org/project/fqxv/)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
@@ -59,8 +61,16 @@ losslessness, integrity, and remote access.
 
 ## Install
 
-Every release attaches a static `fqxv` binary (Linux x86-64/arm64, macOS
-Intel/Apple silicon, Windows x86-64) plus a `SHA256SUMS.txt` to its
+Install via [Bioconda](https://bioconda.github.io/):
+
+```bash
+pixi add bioconda::fqxv
+# or: conda install -c conda-forge -c bioconda fqxv
+```
+
+Or download a prebuilt binary — every release attaches a static `fqxv`
+(Linux x86-64/arm64, macOS Intel/Apple silicon, Windows x86-64) plus a
+`SHA256SUMS.txt` to its
 [GitHub Release](https://github.com/rnabioco/fqxv/releases):
 
 ```bash
@@ -69,21 +79,48 @@ curl -LO https://github.com/rnabioco/fqxv/releases/download/$VER/fqxv-$VER-x86_6
 tar xzf fqxv-$VER-x86_64-unknown-linux-musl.tar.gz && mv fqxv ~/.local/bin/
 ```
 
-Until `fqxv` lands on [bioconda](https://bioconda.github.io/), the alternative is
-to build from source with Cargo (Rust 1.95+):
+Or build from source with Cargo (Rust 1.95+):
 
 ```bash
 cargo install --git https://github.com/rnabioco/fqxv fqxv-cli
 ```
 
-Either way you get the `fqxv` binary. A read-only Python package reads `.fqxv`
-archives directly (compression stays in the CLI):
+### Containers
+
+Because fqxv is on Bioconda, [BioContainers](https://biocontainers.pro/)
+automatically publishes a Docker/Singularity image for every release — no
+local build required.
+
+```bash
+# Docker / Podman
+docker run --rm quay.io/biocontainers/fqxv:0.7.0--hfa8f182_0 fqxv --help
+
+# Singularity / Apptainer
+singularity run \
+  https://depot.galaxyproject.org/singularity/fqxv:0.7.0--hfa8f182_0 fqxv --help
+```
+
+quay.io publishes no `latest` tag for Bioconda-derived images, so a tag has to
+name a concrete `<version>--<build>`; the pins here track the current Bioconda
+release and are refreshed weekly by a CI job. BioContainers builds an image a
+day or two behind a new release, so just after a release the tag here may still
+name the previous version — see
+[quay.io](https://quay.io/repository/biocontainers/fqxv?tab=tags) for every
+published tag.
+
+### Python
+
+Any of the above gives you the `fqxv` binary. A read-only Python package reads
+`.fqxv` archives directly (compression stays in the CLI):
 
 ```bash
 uv pip install fqxv
 ```
 
-See [Installation](https://rnabioco.github.io/fqxv/getting-started/installation/)
+Using fqxv in a workflow manager? See
+[Nextflow and workflow integration](https://rnabioco.github.io/fqxv/getting-started/installation/#nextflow)
+in the docs. See
+[Installation](https://rnabioco.github.io/fqxv/getting-started/installation/)
 for the full asset list and the crate-level dependencies.
 
 ## Usage
