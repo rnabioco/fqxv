@@ -60,7 +60,7 @@ impl Design {
         let mut acc = 0.0f64;
         let mut tot = 0u64;
         let mut nctx = 0usize;
-        for row in self.counts.chunks_exact(QN) {
+        for row in self.counts.as_chunks::<QN>().0 {
             let n: u64 = row.iter().map(|&c| u64::from(c)).sum();
             if n == 0 {
                 continue;
