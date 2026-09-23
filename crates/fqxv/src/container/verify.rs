@@ -8,10 +8,20 @@ use rayon::prelude::*;
 /// For the plain layout this checks the footer's own CRC, then re-hashes the
 /// archive prefix and compares against the stored whole-file CRC-32C — a single
 /// linear pass that catches any corruption in the header, any block payload,
-/// framing, or the index. For the globally-clustered reorder layout (which has no
-/// footer) it decodes into a sink, so every frame CRC and cross-stream length
-/// check is exercised. Returns `Ok(())` iff the archive is intact.
-pub fn verify<R: Read + Seek>(reader: R, threads: usize) -> Result<()> {
+/// framing, or the index. None of this needs a passphrase: CRC-32C covers
+/// whatever bytes are actually on disk, ciphertext included. For the
+/// globally-clustered reorder layout (which has no footer) it decodes into a
+/// sink, so every frame CRC and cross-stream length check is exercised. Returns
+/// `Ok(())` iff the archive is intact.
+///
+/// `opts.password`, when the archive is encrypted, additionally checks the
+/// footer's authentication tag ([`fqxv_crypt::ArchiveCipher::verify_footer`]) —
+/// the one check here that needs the passphrase, and the cheapest way to prove
+/// both that the passphrase is right and that no block was dropped from the
+/// archive's tail (see `docs/design/encryption.md`). Omitting the password skips
+/// just that one check; every other check above still runs.
+pub fn verify<R: Read + Seek>(reader: R, opts: impl Into<DecodeOptions>) -> Result<()> {
+    let opts = opts.into();
     let mut r = BufReader::new(reader);
     let header = read_header(&mut r)?;
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
@@ -21,16 +31,23 @@ pub fn verify<R: Read + Seek>(reader: R, threads: usize) -> Result<()> {
         decode_reordered_whole(
             r,
             io::sink(),
-            threads,
+            opts.threads,
             keep_order,
             header.group_size,
             has_reference,
         )?;
         return Ok(());
     }
-    let footer = read_footer(&mut r)?;
+    let footer = read_footer(&mut r, header.encryption.is_some())?;
+    if let (Some(enc), Some(pw)) = (&header.encryption, &opts.password) {
+        let cipher = open_encryption(pw, enc)?;
+        let tag = footer
+            .footer_tag
+            .ok_or(Error::Malformed("encrypted archive footer has no auth tag"))?;
+        cipher.verify_footer(&footer.body_bytes(), &tag)?;
+    }
     r.seek(SeekFrom::Start(0))?;
-    if verify_whole_file_crc(&mut r, footer.covered_len, threads)? != footer.whole_file_crc {
+    if verify_whole_file_crc(&mut r, footer.covered_len, opts.threads)? != footer.whole_file_crc {
         return Err(Error::Corrupt {
             what: "archive (whole-file crc)".to_string(),
         });
@@ -57,23 +74,30 @@ pub fn verify<R: Read + Seek>(reader: R, threads: usize) -> Result<()> {
 /// page-cache-coherent, it validates the bytes the encoder emitted rather than the
 /// storage medium — latent bit-rot is what a later [`verify`] catches.
 ///
-/// `threads` sizes the rayon pool for the whole-file CRC and the decode exactly as
-/// it does for [`decompress`] — `0` means all cores. This is what makes a CLI
-/// `--verify` honor the command's `--threads`: the check runs under the same worker
-/// budget as the compression it follows rather than silently grabbing every core.
-pub fn verify_roundtrip<R: Read + Seek>(mut reader: R, threads: usize) -> Result<u64> {
+/// `opts` sizes the rayon pool for the whole-file CRC and the decode exactly as
+/// it does for [`decompress`] — `0` threads means all cores. This is what makes a
+/// CLI `--verify` honor the command's `--threads`: the check runs under the same
+/// worker budget as the compression it follows rather than silently grabbing
+/// every core. For an encrypted archive `opts.password` is required (the decode
+/// half cannot run without it) and is also reused for `verify`'s footer-tag check
+/// — no second prompt.
+pub fn verify_roundtrip<R: Read + Seek>(
+    mut reader: R,
+    opts: impl Into<DecodeOptions>,
+) -> Result<u64> {
+    let opts = opts.into();
     let header = read_header(&mut BufReader::new(&mut reader))?;
     reader.seek(SeekFrom::Start(0))?;
 
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
         // One decode is both the structural and the content check here.
-        return Ok(decompress(reader, io::sink(), threads)?.reads);
+        return Ok(decompress(reader, io::sink(), opts)?.reads);
     }
 
     // Plain layout: whole-file CRC (structure/framing) then decode (content).
-    verify(&mut reader, threads)?;
+    verify(&mut reader, opts.clone())?;
     reader.seek(SeekFrom::Start(0))?;
-    Ok(decompress(reader, io::sink(), threads)?.reads)
+    Ok(decompress(reader, io::sink(), opts)?.reads)
 }
 
 /// The authoritative number of reads the archive should contain, for detecting a
@@ -96,7 +120,9 @@ pub fn expected_reads<R: Read + Seek>(reader: R) -> Result<Option<u64>> {
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
         return Ok(None);
     }
-    Ok(Some(read_footer(&mut r)?.total_reads))
+    Ok(Some(
+        read_footer(&mut r, header.encryption.is_some())?.total_reads,
+    ))
 }
 
 /// CRC-32C of the first `covered` bytes of `r`, computed in parallel.
@@ -170,7 +196,7 @@ pub fn verify_quick(file: &File, threads: usize) -> Result<()> {
         r.seek(SeekFrom::Start(0))?;
         return verify(r, threads);
     }
-    let footer = read_footer(&mut r)?;
+    let footer = read_footer(&mut r, header.encryption.is_some())?;
     quick_check_blocks(file, &footer, threads)
 }
 
@@ -288,7 +314,18 @@ impl VerifyReport {
 /// Returns `Err` only when the input is not a readable fqxv container (bad
 /// magic/version); a recognized-but-corrupt archive comes back as a report whose
 /// [`passed`](VerifyReport::passed) is `false`.
-pub fn verify_report(file: &File, quick: bool, threads: usize) -> Result<VerifyReport> {
+///
+/// `opts.password`, for an encrypted archive, additionally runs a `"footer auth
+/// tag"` check (see [`verify`]) — proving both the passphrase and that no block
+/// was dropped from the tail. Without it that check is reported as explicitly
+/// skipped (not silently omitted) rather than failed.
+pub fn verify_report(
+    file: &File,
+    quick: bool,
+    opts: impl Into<DecodeOptions>,
+) -> Result<VerifyReport> {
+    let opts = opts.into();
+    let threads = opts.threads;
     let mut r = BufReader::new(file);
     let header = read_header(&mut r)?;
     let mut report = VerifyReport::default();
@@ -318,7 +355,7 @@ pub fn verify_report(file: &File, quick: bool, threads: usize) -> Result<VerifyR
     );
 
     // Footer (read_footer verifies the footer's own CRC).
-    let footer = match read_footer(&mut r) {
+    let footer = match read_footer(&mut r, header.encryption.is_some()) {
         Ok(footer) => footer,
         Err(e) => {
             report.push("footer", false, e.to_string());
@@ -334,6 +371,28 @@ pub fn verify_report(file: &File, quick: bool, threads: usize) -> Result<VerifyR
             report.blocks_total, footer.total_reads
         ),
     );
+
+    if let Some(enc) = &header.encryption {
+        match &opts.password {
+            Some(pw) => {
+                let outcome = open_encryption(pw, enc).and_then(|cipher| {
+                    let tag = footer
+                        .footer_tag
+                        .ok_or(Error::Malformed("encrypted archive footer has no auth tag"))?;
+                    Ok(cipher.verify_footer(&footer.body_bytes(), &tag)?)
+                });
+                match outcome {
+                    Ok(()) => report.push(
+                        "footer auth tag",
+                        true,
+                        "passphrase correct; no blocks missing from the tail",
+                    ),
+                    Err(e) => report.push("footer auth tag", false, e.to_string()),
+                }
+            }
+            None => report.push("footer auth tag", true, "skipped (no passphrase supplied)"),
+        }
+    }
 
     if quick {
         // Weaker, faster: only the per-block payload CRCs (parallel).

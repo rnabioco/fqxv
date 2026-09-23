@@ -126,6 +126,24 @@ impl Seek for SeekReader {
     }
 }
 
+/// Accept a Python `str` (UTF-8-encoded) or `bytes` (used as-is) as a passphrase
+/// — the same source-dependent encoding rule the CLI uses (a `str` source is
+/// UTF-8, raw bytes are used verbatim), so a passphrase typed as a Python `str`
+/// derives the same key as the same text typed at a CLI prompt or set via
+/// `FQXV_PASSWORD`.
+fn password_bytes(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u8>>> {
+    let Some(obj) = obj else {
+        return Ok(None);
+    };
+    if let Ok(b) = obj.cast::<PyBytes>() {
+        return Ok(Some(b.as_bytes().to_vec()));
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return Ok(Some(s.into_bytes()));
+    }
+    Err(PyTypeError::new_err("password must be str or bytes"))
+}
+
 /// Open a Python `source` (`bytes`, `str`, or `os.PathLike`) as a seekable reader.
 fn open_source(obj: &Bound<'_, PyAny>) -> PyResult<SeekReader> {
     if let Ok(b) = obj.cast::<PyBytes>() {
@@ -364,6 +382,19 @@ impl PyInfo {
     fn required_features(&self) -> u64 {
         self.inner.required_features
     }
+    /// Whether the archive is encrypted. Readable without a passphrase.
+    #[getter]
+    fn encrypted(&self) -> bool {
+        self.inner.encrypted
+    }
+    /// Total on-disk ciphertext bytes across all blocks. `0` and meaningless for
+    /// an unencrypted archive; `names_bytes`/`sequence_bytes`/`quality_bytes`
+    /// stay `0` for an encrypted one (whole-block encryption means the
+    /// per-stream split can't be known without decrypting every block).
+    #[getter]
+    fn encrypted_bytes(&self) -> u64 {
+        self.inner.encrypted_bytes
+    }
     fn __repr__(&self) -> String {
         // `format_version` is packed `(major << 8) | minor`; show it as `major.minor`.
         let v = self.inner.format_version;
@@ -580,23 +611,28 @@ fn to_bytes_list<'py>(py: Python<'py>, items: Vec<Vec<u8>>) -> Vec<Bound<'py, Py
 /// check), and on long-read archives quality is coded against the bases, so
 /// selecting quality still decodes the sequence stream internally.
 #[pyfunction]
-#[pyo3(signature = (source, *, threads = 0, streams = None))]
+#[pyo3(signature = (source, *, threads = 0, streams = None, password = None))]
 fn open(
     source: &Bound<'_, PyAny>,
     threads: usize,
     streams: Option<&Bound<'_, PyAny>>,
+    password: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<PyReader> {
     let selection = match streams {
         None => StreamSelection::ALL,
         Some(obj) => selection_of(obj)?,
     };
     let reader = open_read_source(source)?;
+    let opts = fqxv_core::DecodeOptions {
+        threads,
+        password: password_bytes(password)?,
+    };
     // A full selection rides the pre-existing constructor (the canonical decode
     // path with every integrity check), byte-for-byte what this API always did.
     let inner = if selection == StreamSelection::ALL {
-        fqxv_core::RecordReader::new(reader, threads)
+        fqxv_core::RecordReader::new(reader, opts)
     } else {
-        fqxv_core::RecordReader::with_selection(reader, threads, selection)
+        fqxv_core::RecordReader::with_selection(reader, opts, selection)
     };
     Ok(PyReader { inner })
 }
@@ -610,24 +646,29 @@ fn open(
 /// and ~1.3-1.6x single-threaded on short-read Illumina. The skipped quality
 /// stream's integrity digest is not checked (use `verify` for a full check).
 #[pyfunction]
-#[pyo3(signature = (source, dest, *, threads = 0, fasta = false))]
+#[pyo3(signature = (source, dest, *, threads = 0, fasta = false, password = None))]
 fn decompress_to_path(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
     dest: PathBuf,
     threads: usize,
     fasta: bool,
+    password: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<u64> {
     let reader = open_read_source(source)?;
     let file =
         File::create(&dest).map_err(|e| PyIOError::new_err(format!("{}: {e}", dest.display())))?;
+    let opts = fqxv_core::DecodeOptions {
+        threads,
+        password: password_bytes(password)?,
+    };
     let stats = py
         .detach(move || {
             if fasta {
                 // decompress_fasta buffers its writer internally.
-                fqxv_core::decompress_fasta(reader, file, threads)
+                fqxv_core::decompress_fasta(reader, file, opts)
             } else {
-                fqxv_core::decompress(reader, io::BufWriter::new(file), threads)
+                fqxv_core::decompress(reader, io::BufWriter::new(file), opts)
             }
         })
         .map_err(map_err)?;
@@ -638,21 +679,26 @@ fn decompress_to_path(
 /// single-line FASTA with `fasta=True`, which skips the quality stream's
 /// decode entirely (see [`decompress_to_path`]).
 #[pyfunction]
-#[pyo3(signature = (source, *, threads = 0, fasta = false))]
+#[pyo3(signature = (source, *, threads = 0, fasta = false, password = None))]
 fn decompress_to_bytes<'py>(
     py: Python<'py>,
     source: &Bound<'_, PyAny>,
     threads: usize,
     fasta: bool,
+    password: Option<&Bound<'_, PyAny>>,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let reader = open_read_source(source)?;
+    let opts = fqxv_core::DecodeOptions {
+        threads,
+        password: password_bytes(password)?,
+    };
     let out = py
         .detach(move || {
             let mut buf = Vec::new();
             if fasta {
-                fqxv_core::decompress_fasta(reader, &mut buf, threads).map(|_| buf)
+                fqxv_core::decompress_fasta(reader, &mut buf, opts).map(|_| buf)
             } else {
-                fqxv_core::decompress(reader, &mut buf, threads).map(|_| buf)
+                fqxv_core::decompress(reader, &mut buf, opts).map(|_| buf)
             }
         })
         .map_err(map_err)?;
@@ -1062,10 +1108,19 @@ fn estimate(
 /// decode). Accepts a path or `bytes`. Returns `None` on success and raises
 /// `fqxv.FqxvError` (or `OSError`) if the archive is corrupt or unreadable.
 #[pyfunction]
-#[pyo3(signature = (source, *, threads = 0))]
-fn verify(py: Python<'_>, source: &Bound<'_, PyAny>, threads: usize) -> PyResult<()> {
+#[pyo3(signature = (source, *, threads = 0, password = None))]
+fn verify(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    threads: usize,
+    password: Option<&Bound<'_, PyAny>>,
+) -> PyResult<()> {
     let reader = open_source(source)?;
-    py.detach(move || fqxv_core::verify(reader, threads))
+    let opts = fqxv_core::DecodeOptions {
+        threads,
+        password: password_bytes(password)?,
+    };
+    py.detach(move || fqxv_core::verify(reader, opts))
         .map_err(map_err)
 }
 

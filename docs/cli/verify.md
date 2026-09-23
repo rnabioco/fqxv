@@ -28,6 +28,7 @@ a batch; the exit status is non-zero if *any* archive is corrupt.
 | `--tsv` | Emit tab-separated per-check rows instead of the table (a batch prepends a `file` column). |
 | `--json` | Emit a JSON object instead of the table (a batch emits an array of them). |
 | `--threads <N>` | Worker threads (0 = all cores) for the parallelized CRC pass. |
+| `--password-file <PATH>` | Passphrase for an [encrypted](#encryption) archive's footer-authentication check. Optional even for an encrypted archive — every other check still runs without it. `verify` never prompts interactively (see [Encryption](#encryption)). |
 
 ## Output and exit status
 
@@ -129,3 +130,24 @@ fqxv verify archives/ --tsv | awk -F'\t' '$3=="fail"'
 - To *recover data* from an archive that fails verification rather than just
   detect the damage, use [`decompress --recover`](decompress.md#recovering-a-corrupted-archive),
   which skips the corrupt blocks and decodes the rest.
+
+## Encryption
+
+Every check above works on an [encrypted](compress.md#encryption) archive with
+no passphrase — CRC-32C covers whatever bytes are actually on disk, ciphertext
+included, so it needs no key. Pass `--password-file` to additionally run a
+`footer auth tag` check: it proves both that the passphrase is correct and
+that no block was silently dropped from the archive's *tail* — something the
+keyless CRC checks above cannot catch, since an attacker with file-write
+access can always recompute them for a forged, shorter footer. Without
+`--password-file` that one row is reported as `ok` with detail `skipped (no
+passphrase supplied)`, not silently omitted:
+
+```text
+│ footer auth tag │ ok     │ skipped (no passphrase supplied)                    │
+```
+
+`verify` **never prompts interactively** for this, unlike `compress`/
+`decompress` — a routine `fqxv verify archives/*.fqxv` batch run should never
+block waiting on a TTY. Supply `--password-file` or set `FQXV_PASSWORD`
+explicitly if you want the deeper check.

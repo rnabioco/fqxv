@@ -102,6 +102,17 @@ ones. Build understanding bottom-up:
   rANS). `encode`/`decode` are the container's sequence path for long-read blocks
   (auto-selected, kept only when it beats order-k). Sibling of `fqxv-reorder`;
   never depends on it.
+- **`fqxv-crypt`** — leaf crate wrapping the container's optional encryption
+  envelope: Argon2id key derivation and per-block ChaCha20-Poly1305 AEAD
+  seal/open. Unlike every other leaf crate in this DAG, it is **not**
+  clean-room — it takes real dependencies on RustCrypto's `chacha20poly1305`
+  and `argon2` crates (plus `getrandom` for CSPRNG salt/nonce material and
+  `zeroize` for wiping key material on drop). This is a deliberate, documented
+  exception to the workspace's clean-room codec policy — see
+  `THIRD-PARTY-NOTICES.md`. Consumed only by `fqxv`; no codec crate
+  (`fqxv-seq`/`fqxv-rans`/`fqxv-fqzcomp`/…) depends on it or is aware
+  encryption exists — encryption wraps a block's already-coded bytes, never
+  the codecs themselves.
 - **`fqxv`** — the `.fqxv` container format; composes all codec crates into
   `compress`/`compress_multi`/`decompress`/`decompress_split`/`inspect`. This is
   where the on-disk layout lives (`src/container/`).
@@ -137,6 +148,11 @@ evolution policy (what warrants a minor bump vs a feature bit vs a major bump) i
   preserved exactly. This is the one documented deviation from byte-losslessness.
 - **CLI effort mapping.** `--level 1-9` maps to sequence context order and block
   size via `level_to_order`/`level_to_block` in `fqxv-cli/src/main.rs`.
+- **Encryption stays per-block.** When `Params.encrypt`/an archive's
+  `feature::ENCRYPTED` bit is set, sealing/opening must stay a per-block,
+  order-free operation (`fqxv_crypt::ArchiveCipher`) — never a stream cipher
+  over the whole file — so it can't become a new serialization point against
+  the parallel-blocks invariant above.
 
 ## Conventions
 

@@ -176,8 +176,16 @@ pub(crate) use stream_select::*;
 // Public surface, re-exported unchanged from `lib.rs` at the crate root. These
 // explicit `pub use`s elevate the names above the `pub(crate)` globs above so the
 // external API is preserved.
-pub use compress::{Params, Stats, compress, compress_auto, compress_interleaved, compress_multi};
-pub use decompress::{Recovery, content_stats, decompress, decompress_recover, decompress_split};
+pub use compress::{
+    EncryptSpec, Params, Stats, compress, compress_auto, compress_interleaved, compress_multi,
+};
+pub use decompress::{
+    DecodeOptions, Recovery, content_stats, decompress, decompress_recover, decompress_split,
+};
+// Crate-internal only: builds an `ArchiveCipher` from a header + `DecodeOptions`,
+// shared by every decode entry point that reads blocks directly (not through
+// `decompress` itself).
+pub(crate) use decompress::cipher_for_header;
 pub use estimate::{Estimate, estimate};
 pub use inspect::{ContentStats, Info, Platform, QUAL_MAX, inspect, peek};
 pub use random_access::{

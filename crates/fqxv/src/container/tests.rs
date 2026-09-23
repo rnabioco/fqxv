@@ -2948,7 +2948,7 @@ fn verify_report_intact_lists_passing_checks() {
 #[test]
 fn verify_report_localizes_corrupt_block() {
     let archive = multiblock_archive(40, 8);
-    let footer = read_footer(&mut io::Cursor::new(&archive)).unwrap();
+    let footer = read_footer(&mut io::Cursor::new(&archive), false).unwrap();
     assert!(footer.groups.len() >= 3, "need multiple blocks to localize");
     // Corrupt the payload of the second block (index 1): its footer offset
     // points at the frame head ([4 marker][8 len][4 crc]), so the payload follows.
@@ -3172,7 +3172,7 @@ fn oversized_block_length_is_rejected_not_allocated() {
 #[test]
 fn recover_skips_corrupt_block_and_keeps_the_rest() {
     let mut archive = multiblock_archive(40, 8);
-    let footer = read_footer(&mut io::Cursor::new(&archive)).unwrap();
+    let footer = read_footer(&mut io::Cursor::new(&archive), false).unwrap();
     assert!(
         footer.groups.len() >= 3,
         "need several blocks for this test"
@@ -3203,7 +3203,7 @@ fn recover_skips_corrupt_block_and_keeps_the_rest() {
 #[test]
 fn recover_scans_when_footer_is_lost() {
     let full = multiblock_archive(40, 8);
-    let footer = read_footer(&mut io::Cursor::new(&full)).unwrap();
+    let footer = read_footer(&mut io::Cursor::new(&full), false).unwrap();
     assert!(footer.groups.len() >= 3, "need several blocks");
     // Drop the footer + trailer at the terminator boundary — a truncated tail.
     let n = full.len();
@@ -3226,7 +3226,7 @@ fn recover_scans_when_footer_is_lost() {
 #[test]
 fn recover_scans_past_a_corrupt_block_without_footer() {
     let full = multiblock_archive(40, 8);
-    let footer = read_footer(&mut io::Cursor::new(&full)).unwrap();
+    let footer = read_footer(&mut io::Cursor::new(&full), false).unwrap();
     assert!(footer.groups.len() >= 3, "need several blocks");
     let n = full.len();
     let footer_offset =
@@ -3632,7 +3632,7 @@ fn footer_size_must_match_its_group_count() {
     // The footer offset must sit past the single group's block for the range
     // checks to pass; anything beyond HEADER_LEN does.
     let footer_offset = HEADER_LEN as u64 + 4096;
-    let ok = format::parse_footer_body(&body(0, &[]), footer_offset);
+    let ok = format::parse_footer_body(&body(0, &[]), footer_offset, false);
     assert!(ok.is_ok(), "a well-formed footer must still parse: {ok:?}");
 
     for (what, forged) in [
@@ -3642,7 +3642,7 @@ fn footer_size_must_match_its_group_count() {
             body(0, &1u64.to_le_bytes()),
         ),
     ] {
-        let err = format::parse_footer_body(&forged, footer_offset).unwrap_err();
+        let err = format::parse_footer_body(&forged, footer_offset, false).unwrap_err();
         assert!(
             matches!(&err, Error::Malformed(m) if m.contains("row-group count")),
             "expected the footer-size guard for {what}, got {err:?}"
@@ -3684,4 +3684,339 @@ fn unknown_header_flag_bits_are_refused() {
     let buf = build(format::KNOWN_FLAGS);
     let h = format::read_header(&mut io::Cursor::new(&buf)).expect("KNOWN_FLAGS must parse");
     assert_eq!(h.flags, format::KNOWN_FLAGS);
+}
+
+// --- encryption -----------------------------------------------------------
+
+fn encrypt_params(passphrase: &[u8]) -> EncryptSpec {
+    EncryptSpec {
+        passphrase: passphrase.to_vec(),
+        kdf: fqxv_crypt::KdfParams::DEFAULT,
+    }
+}
+
+fn compress_encrypted(input: &[u8], passphrase: &[u8], params: Params) -> Vec<u8> {
+    compress_bytes(
+        input,
+        Params {
+            encrypt: Some(encrypt_params(passphrase)),
+            ..params
+        },
+    )
+}
+
+fn decode_opts(threads: usize, passphrase: &[u8]) -> DecodeOptions {
+    DecodeOptions {
+        threads,
+        password: Some(passphrase.to_vec()),
+    }
+}
+
+/// An encrypted archive round-trips to the exact same FASTQ a plain archive of
+/// the same input would produce, and its header actually advertises encryption
+/// (`feature::ENCRYPTED` set, `inspect`/`peek` report it without a password).
+#[test]
+fn encrypted_archive_roundtrips() {
+    let passphrase = b"correct horse battery staple";
+    let archive = compress_encrypted(SAMPLE, passphrase, Params::default());
+
+    let header = format::read_header(&mut io::Cursor::new(&archive)).unwrap();
+    assert_ne!(header.required_features & crate::feature::ENCRYPTED, 0);
+    assert!(header.encryption.is_some());
+
+    let info = peek(io::Cursor::new(&archive)).unwrap();
+    assert!(info.encrypted);
+
+    let mut out = Vec::new();
+    decompress(
+        io::Cursor::new(&archive),
+        &mut out,
+        decode_opts(1, passphrase),
+    )
+    .unwrap();
+
+    let mut expected = Vec::new();
+    compress(SAMPLE, &mut Vec::new(), Params::default()).ok(); // sanity: SAMPLE compresses
+    decompress(
+        io::Cursor::new(compress_bytes(SAMPLE, Params::default())),
+        &mut expected,
+        1,
+    )
+    .unwrap();
+    assert_eq!(
+        out, expected,
+        "encrypted archive must decode to the same FASTQ"
+    );
+}
+
+/// Compressing identical input with an identical passphrase twice produces
+/// *different* ciphertext (fresh random salt/nonce_id each time — see
+/// `fqxv_crypt`'s docs on why), but both archives still decrypt to identical
+/// content.
+#[test]
+fn encryption_is_nondeterministic_across_runs_but_content_agrees() {
+    let passphrase = b"same passphrase, two runs";
+    let a = compress_encrypted(SAMPLE, passphrase, Params::default());
+    let b = compress_encrypted(SAMPLE, passphrase, Params::default());
+    assert_ne!(a, b, "two runs must not produce byte-identical archives");
+
+    let mut out_a = Vec::new();
+    let mut out_b = Vec::new();
+    decompress(io::Cursor::new(&a), &mut out_a, decode_opts(1, passphrase)).unwrap();
+    decompress(io::Cursor::new(&b), &mut out_b, decode_opts(1, passphrase)).unwrap();
+    assert_eq!(out_a, out_b, "both must decrypt to the same content");
+}
+
+/// Decoding an encrypted archive is thread-count invariant, exactly like a
+/// plain archive: the same archive decrypted at different worker counts must
+/// produce byte-identical output.
+#[test]
+fn encrypted_decode_is_thread_count_invariant() {
+    let passphrase = b"thread invariance";
+    let mut input = Vec::new();
+    for i in 0..64u32 {
+        input.extend_from_slice(format!("@r{i}\nACGTACGTACGT\n+\nIIIIIIIIIIII\n").as_bytes());
+    }
+    let archive = compress_encrypted(
+        &input,
+        passphrase,
+        Params {
+            block_reads: 4,
+            ..Params::default()
+        },
+    );
+    let mut baseline = Vec::new();
+    decompress(
+        io::Cursor::new(&archive),
+        &mut baseline,
+        decode_opts(1, passphrase),
+    )
+    .unwrap();
+    for threads in [2, 4, 8] {
+        let mut out = Vec::new();
+        decompress(
+            io::Cursor::new(&archive),
+            &mut out,
+            decode_opts(threads, passphrase),
+        )
+        .unwrap();
+        assert_eq!(
+            out, baseline,
+            "threads={threads} must match the single-thread decode"
+        );
+    }
+}
+
+/// A wrong passphrase must fail cleanly — no panic, and critically, no
+/// partial/garbage output is ever handed to the writer before the error.
+#[test]
+fn wrong_passphrase_is_rejected_before_any_output_is_trusted() {
+    let archive = compress_encrypted(SAMPLE, b"the real passphrase", Params::default());
+    let mut out = Vec::new();
+    let err = decompress(
+        io::Cursor::new(&archive),
+        &mut out,
+        decode_opts(1, b"a wrong guess"),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::Crypt(_)),
+        "expected a Crypt error, got {err:?}"
+    );
+    assert!(
+        out.is_empty(),
+        "no output must be written before the first block fails to open"
+    );
+}
+
+/// No passphrase at all against an encrypted archive is a distinct, precise
+/// error (`PasswordRequired`), not a generic decode failure.
+#[test]
+fn missing_passphrase_is_password_required() {
+    let archive = compress_encrypted(SAMPLE, b"needs a password", Params::default());
+    let err = decompress(io::Cursor::new(&archive), &mut Vec::new(), 1).unwrap_err();
+    assert!(matches!(err, Error::PasswordRequired));
+}
+
+/// A passphrase supplied against a *plain* (unencrypted) archive is simply
+/// unused — no error, exactly as an unencrypted archive requires none.
+#[test]
+fn password_is_ignored_against_a_plain_archive() {
+    let archive = compress_bytes(SAMPLE, Params::default());
+    let mut out = Vec::new();
+    decompress(
+        io::Cursor::new(&archive),
+        &mut out,
+        decode_opts(1, b"unused password"),
+    )
+    .unwrap();
+    let mut expected = Vec::new();
+    decompress(io::Cursor::new(&archive), &mut expected, 1).unwrap();
+    assert_eq!(out, expected);
+}
+
+/// A single flipped ciphertext byte must be caught before any output is
+/// trusted. The block frame's outer CRC-32C (a cheap, keyless corruption
+/// filter, checked before the costlier AEAD open — see
+/// `docs/design/encryption.md`) catches a single-byte flip first in practice,
+/// surfacing `Corrupt`; a corruption that happened to preserve the CRC would
+/// instead be caught by AEAD authentication (`Error::Crypt`, exercised
+/// directly at the `fqxv_crypt` unit level). Either way decode must fail
+/// cleanly with no output written, never succeed with wrong bytes.
+#[test]
+fn tampered_ciphertext_is_rejected_before_any_output_is_trusted() {
+    let mut archive = compress_encrypted(SAMPLE, b"tamper test", Params::default());
+    // Flip a byte well past the header, inside the first (and only) block's
+    // ciphertext payload.
+    let header_len = format::read_header(&mut io::Cursor::new(&archive))
+        .unwrap()
+        .header_len as usize;
+    let flip_at = header_len + format::FRAME_HEAD_LEN + 4;
+    archive[flip_at] ^= 0xFF;
+    let mut out = Vec::new();
+    let err = decompress(
+        io::Cursor::new(&archive),
+        &mut out,
+        decode_opts(1, b"tamper test"),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::Crypt(_) | Error::Corrupt { .. }),
+        "expected a Crypt or Corrupt error, got {err:?}"
+    );
+    assert!(
+        out.is_empty(),
+        "no output must be written before the first block fails to open"
+    );
+}
+
+/// `--encrypt` combined with read reordering is refused, both via `compress`
+/// (reorder path) and explicitly, before any output is produced.
+#[test]
+fn encryption_and_reorder_are_incompatible() {
+    let err = compress(
+        SAMPLE,
+        &mut Vec::new(),
+        Params {
+            reorder: true,
+            encrypt: Some(encrypt_params(b"pw")),
+            ..Params::default()
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Malformed(_)));
+}
+
+/// Random-access column projection refuses an encrypted archive outright,
+/// rather than exposing the footer's degraded (whole-block-duplicated)
+/// per-stream index as a misleading partial projection.
+#[test]
+fn index_read_refuses_encrypted_archives() {
+    let archive = compress_encrypted(SAMPLE, b"random access", Params::default());
+    let err = Index::read(io::Cursor::new(&archive)).unwrap_err();
+    assert!(matches!(err, Error::EncryptedArchiveNotSupported));
+}
+
+/// `inspect`/`peek` report an encrypted archive's `encrypted`/`encrypted_bytes`
+/// with no password at all, and never fabricate a per-stream split.
+#[test]
+fn inspect_and_peek_report_encryption_without_a_password() {
+    let archive = compress_encrypted(SAMPLE, b"inspect me", Params::default());
+
+    let peeked = peek(io::Cursor::new(&archive)).unwrap();
+    assert!(peeked.encrypted);
+
+    let info = inspect(io::Cursor::new(&archive)).unwrap();
+    assert!(info.encrypted);
+    assert!(info.encrypted_bytes > 0);
+    assert_eq!(info.names_bytes, 0);
+    assert_eq!(info.seq_bytes, 0);
+    assert_eq!(info.qual_bytes, 0);
+    assert!(info.reads > 0);
+}
+
+/// `decompress_recover` on an encrypted archive skips a block whose ciphertext
+/// was corrupted (an AEAD-open failure) exactly as it skips a CRC failure on a
+/// plain archive, and still recovers every other block.
+#[test]
+fn decompress_recover_skips_a_corrupted_block_in_an_encrypted_archive() {
+    let mut input = Vec::new();
+    for i in 0..40u32 {
+        input.extend_from_slice(format!("@r{i}\nACGTACGTACGT\n+\nIIIIIIIIIIII\n").as_bytes());
+    }
+    let passphrase = b"recovery test";
+    let mut archive = compress_encrypted(
+        &input,
+        passphrase,
+        Params {
+            block_reads: 4,
+            ..Params::default()
+        },
+    );
+    let footer = format::read_footer(&mut io::Cursor::new(&archive), true).unwrap();
+    assert!(footer.groups.len() >= 3, "fixture must have several blocks");
+    // Corrupt the second block's ciphertext.
+    let (off, _) = footer.groups[1];
+    let corrupt_at = off as usize + format::FRAME_HEAD_LEN + 2;
+    archive[corrupt_at] ^= 0xFF;
+
+    let mut out = Vec::new();
+    let rec = decompress_recover(
+        io::Cursor::new(&archive),
+        &mut out,
+        decode_opts(1, passphrase),
+    )
+    .unwrap();
+    assert_eq!(rec.blocks_skipped, 1);
+    assert_eq!(rec.blocks_recovered, footer.groups.len() as u64 - 1);
+}
+
+/// `verify` without a passphrase runs only the keyless CRC checks; a forged
+/// footer that recomputes those checks consistently (something an attacker
+/// without the passphrase can always do) slips past them — but `verify` given
+/// the real passphrase additionally checks the footer's authentication tag,
+/// which the forger could not recompute without the key, and catches it. This
+/// is the intentional, documented asymmetry (see `docs/design/encryption.md`).
+#[test]
+fn footer_auth_tag_catches_a_forged_but_crc_consistent_footer() {
+    let mut archive = compress_encrypted(SAMPLE, b"footer tag test", Params::default());
+    let n = archive.len();
+    let footer_offset = u64::from_le_bytes(archive[n - 12..n - 4].try_into().unwrap()) as usize;
+    let body_end = n - 12;
+
+    let n_groups = format::read_footer(&mut io::Cursor::new(&archive), true)
+        .unwrap()
+        .groups
+        .len();
+    let total_reads_off = footer_offset + 4 + n_groups * format::FOOTER_GROUP_BYTES;
+    let whole_file_crc_off = total_reads_off + 8;
+    let footer_crc_off = body_end - 4;
+
+    // An attacker with file-write access can always edit `total_reads` and
+    // recompute the two CRC-32C fields that cover it — CRC-32C is keyless.
+    let bumped = u64::from_le_bytes(
+        archive[total_reads_off..total_reads_off + 8]
+            .try_into()
+            .unwrap(),
+    )
+    .wrapping_add(1);
+    archive[total_reads_off..total_reads_off + 8].copy_from_slice(&bumped.to_le_bytes());
+    let new_whole_file_crc = crc32c(&archive[..whole_file_crc_off]);
+    archive[whole_file_crc_off..whole_file_crc_off + 4]
+        .copy_from_slice(&new_whole_file_crc.to_le_bytes());
+    let new_footer_crc = crc32c(&archive[footer_offset..footer_crc_off]);
+    archive[footer_crc_off..body_end].copy_from_slice(&new_footer_crc.to_le_bytes());
+    // The footer_tag field itself (between whole_file_crc and footer_crc) is
+    // left untouched — stale, since it no longer authenticates the edited body,
+    // and the attacker cannot recompute it without the passphrase.
+
+    assert!(
+        verify(io::Cursor::new(archive.clone()), 1).is_ok(),
+        "keyless checks alone must not catch a forged-but-consistent footer"
+    );
+    let err = verify(io::Cursor::new(archive), decode_opts(1, b"footer tag test")).unwrap_err();
+    assert!(
+        matches!(err, Error::Crypt(_)),
+        "expected a Crypt error, got {err:?}"
+    );
 }

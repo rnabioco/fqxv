@@ -48,6 +48,13 @@ preserved for the split.
 | `--quality-bin <MODE>` | `lossless` (default), or a lossy table: `bin8`, `bin4`, `bin2` (Illumina), `ont`, `hifi` (long read). See [Lossy quality binning](#lossy-quality-binning). |
 | `--platform <NAME>` | Sequencing platform to record: `illumina`, `nanopore`, `pacbio`, `mgi`. Auto-detected from read names by default; pass to override. |
 
+### Encryption options
+
+| Option | Description |
+| --- | --- |
+| `--encrypt` | Encrypt the archive with a passphrase (ChaCha20-Poly1305, per-block AEAD). Not supported together with `--order any`/`shuffle` or `--max`. **There is no recovery without the passphrase** — losing it means losing the archive. See [Encryption](#encryption). |
+| `--password-file <PATH>` | Read the passphrase from a file's contents (a single trailing newline is stripped). Requires `--encrypt`. |
+
 ## Examples
 
 ```bash
@@ -81,6 +88,12 @@ fqxv compress reads.fastq.gz --estimate
 
 # ...the same estimate as a two-line table for scripts
 fqxv compress reads.fastq.gz --estimate tsv
+
+# encrypt with a passphrase read from a file
+fqxv compress reads.fastq.gz -o reads.fqxv --encrypt --password-file secret.txt
+
+# ...or scripted via an environment variable (no file, no prompt)
+FQXV_PASSWORD=hunters2 fqxv compress reads.fastq.gz -o reads.fqxv --encrypt
 ```
 
 ## Verifying on write
@@ -222,6 +235,46 @@ On the `ecoli_ont` benchmark, `--quality-bin ont` cuts the quality stream from
 |Δ| 3.35. Cutpoints should ultimately be
 judged by downstream fidelity, not raw ratio — see
 [Long-read support](../design/longread.md).
+
+## Encryption
+
+`--encrypt` seals the archive with a passphrase (ChaCha20-Poly1305, per-block
+AEAD via Argon2id key derivation) — natively, inside the container's own
+framing, rather than wrapping the file with a separate tool. An old `fqxv`
+build refuses an encrypted archive cleanly (it recognizes the feature bit and
+reports "upgrade fqxv") rather than misreading it.
+
+The passphrase is resolved from, in order:
+
+1. `--password-file <PATH>` — the file's raw bytes (a single trailing newline
+   stripped); keep this file access-controlled, `fqxv` does not manage its
+   permissions or lifecycle.
+2. the `FQXV_PASSWORD` environment variable — scriptable/CI-friendly, but
+   visible to other processes of the same user (e.g. via `/proc/<pid>/environ`
+   on Linux).
+3. an interactive hidden-terminal prompt, asked twice with confirmation (a
+   typo here is unrecoverable, unlike a wrong guess at decode time, which just
+   fails cleanly and can be retried) — the safest source against shell-history
+   or process-inspection leakage, but needs a real terminal.
+
+**There is no recovery without the passphrase.** Losing it means losing the
+archive; there is no back door, and no CLI flag to reset or rotate it in
+place. `fqxv info`/`fqxv verify` on an encrypted archive both work without a
+password — `info` reports `encrypted: yes` and the total ciphertext size but
+no per-stream breakdown (that can't be known without decrypting every block);
+`verify` runs its usual checksum checks and, given the passphrase via
+`--password-file`, additionally checks a footer-authentication tag that
+catches an archive whose trailing blocks were silently dropped — see
+[`fqxv verify`](verify.md#encryption).
+
+Not supported with `--order any`/`shuffle` or `--max` (which implies
+`--order any`) in this release — that layout needs its own encryption design,
+distinct from the plain layout's per-block scheme. Column-projection random
+access (`fqxv.remote` in the Python bindings) is also not supported against an
+encrypted archive: whole-block encryption means a single stream can't be
+fetched or authenticated independently of the block that contains it, so
+`fqxv.remote` falls back to fetching and decrypting the whole archive instead.
+Full design and rationale: [Encryption](../design/encryption.md).
 
 ## Notes
 

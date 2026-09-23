@@ -27,6 +27,7 @@ fqxv-tokenizer = { path = "crates/fqxv-tokenizer", version = "0.7.0" }
 fqxv-seq = { path = "crates/fqxv-seq", version = "0.7.0" }
 fqxv-reorder = { path = "crates/fqxv-reorder", version = "0.7.0" }
 fqxv-lroverlap = { path = "crates/fqxv-lroverlap", version = "0.7.0" }
+fqxv-crypt = { path = "crates/fqxv-crypt", version = "0.7.0" }
 fqxv = { path = "crates/fqxv", version = "0.7.0" }
 
 # Shared third-party deps, versions pinned once here.
@@ -54,6 +55,16 @@ pyo3 = { version = "0.29", default-features = false }
 # Build-script half of pyo3, used by fqxv-python/build.rs for the macOS
 # extension-module link args. Keep in lockstep with the pyo3 version above.
 pyo3-build-config = "0.29"
+
+# fqxv-crypt only: real cryptographic dependencies, a deliberate exception to
+# this workspace's clean-room policy (see THIRD-PARTY-NOTICES.md). No other
+# crate depends on these directly.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+getrandom = "0.4"
+zeroize = { version = "1", features = ["derive"] }
+# fqxv-cli only: hidden-terminal-input passphrase prompt.
+rpassword = "7"
 
 # Dev/bench deps.
 proptest = "1"
@@ -108,6 +119,8 @@ opt-level = 2
 [profile.dev.package.fqxv-reorder]
 opt-level = 2
 [profile.dev.package.fqxv-lroverlap]
+opt-level = 2
+[profile.dev.package.fqxv-crypt]
 opt-level = 2
 [profile.dev.package.fqxv]
 opt-level = 2

@@ -74,7 +74,10 @@ with fqxv.open("reads.fqxv") as reader:
             break        # no hang; the decoder is torn down on exit
 ```
 
-Pass `threads=` to control the decode pool (default `0` = all cores).
+Pass `threads=` to control the decode pool (default `0` = all cores). Pass
+`password=` (`bytes` or `str`; a `str` is UTF-8-encoded, the same rule the CLI
+uses for its own passphrase sources) for an [encrypted](#reading-encrypted-archives)
+archive — ignored, with no error, against a plain one.
 
 ## Decoding only some streams
 
@@ -146,7 +149,10 @@ print(info.reads, info.blocks, info.format_version, info.platform)
 `reordered`, `keep_order`, `regenerated_names`, `plus_normalized`,
 `format_version`, `seq_order`, `quality_binning`, `names_bytes`,
 `sequence_bytes`, `quality_bytes`, `platform`, `whole_file_crc`,
-`required_features`, and `member_labels`.
+`required_features`, `member_labels`, `encrypted`, and `encrypted_bytes`.
+`inspect()` never needs a passphrase; `decompress_to_path`/
+`decompress_to_bytes` take a `password=` keyword for an
+[encrypted](#reading-encrypted-archives) archive, same as `fqxv.open()`.
 
 `format_version` is the **container format** version packed as
 `(major << 8) | minor` — `256` for format 1.0 — and is independent of the
@@ -208,6 +214,16 @@ block0 = fqxv.read_block("reads.fqxv", 0)     # list[Record]
     `fqxv.inspect(path).reordered` if you need to branch. Compressing with a
     smaller `--block-reads` makes projection finer-grained on the plain layout.
 
+!!! note "Encrypted archives"
+
+    Projection and `open_index` also raise `fqxv.FqxvError` on an
+    [encrypted](#reading-encrypted-archives) archive — whole-block encryption
+    means a single stream can't be fetched or decrypted independently of the
+    block that contains it, so there is no way to project just one column.
+    `open_index`/`inspect(path).encrypted` tell you this without a password;
+    use `fqxv.open()`/`decompress_to_path`/`decompress_to_bytes` with
+    `password=` to read the whole archive instead.
+
 ## Estimating a compression ratio
 
 `fqxv.estimate()` projects an archive's size from a **FASTQ** input (not an
@@ -250,6 +266,37 @@ This is the tool for "is this archive intact": a *streaming* read of a truncated
 archive can end early and silently, since the block region carries no running
 read count.
 
+`verify()` needs no passphrase for these checks — CRC-32C covers whatever
+bytes are on disk, ciphertext included. Pass `password=` on an
+[encrypted](#reading-encrypted-archives) archive to additionally check a
+footer-authentication tag, which catches trailing blocks silently dropped from
+the archive (something the CRC checks alone cannot, since they're
+keyless and forgeable by anyone with file-write access).
+
+## Reading encrypted archives
+
+```python
+info = fqxv.inspect("reads.fqxv")
+print(info.encrypted, info.encrypted_bytes)   # readable without a password
+
+raw = fqxv.decompress_to_bytes("reads.fqxv", password="hunter2")
+for rec in fqxv.open("reads.fqxv", password=b"hunter2"):   # bytes or str
+    ...
+```
+
+Archives encrypted with `fqxv compress --encrypt` (ChaCha20-Poly1305,
+per-block AEAD) are decoded with the same `fqxv.open`/`decompress_to_path`/
+`decompress_to_bytes`/`verify` entry points above, plus a `password=` keyword
+(`bytes` used verbatim, or `str` UTF-8-encoded — the same rule the CLI's
+`--password-file`/`FQXV_PASSWORD`/prompt sources follow, so one passphrase
+works everywhere). `inspect()`/`open_index()` never need a password: whether
+an archive is encrypted, and its total ciphertext size, are readable from the
+header and footer alone. **Compression stays in the CLI** — there is no
+Python-side `compress(..., encrypt=...)`. Column-projection random access
+(`open_index`, `read_names`, `fqxv.remote`'s per-column fetches) does not work
+on an encrypted archive; see the note above. Full design:
+[Encryption](../design/encryption.md).
+
 ## Reading over HTTP
 
 `fqxv.remote` reads an archive over HTTP using the standard library only (no
@@ -277,7 +324,12 @@ n = remote.download("https://host/reads.fqxv", "reads.fastq")   # read count
 `headers=` for an `Authorization` header on a private object. `stream()` also
 takes [`streams=`](#decoding-only-some-streams) (decode only some streams while
 streaming — the archive body is still transferred) and `download()` takes
-`fasta=True`.
+`fasta=True`. Both also take `password=` and support
+[encrypted](#reading-encrypted-archives) archives, since they transfer and
+decode the whole body; `RemoteArchive`/`open_index` and the other
+column-projection functions do not (whole-block encryption means a stream
+can't be fetched without its whole block) and raise clearly on one — use
+`stream`/`download` instead.
 
 To drive the same thing from a different client — an async `httpx`/`aiohttp`
 session issuing range fetches concurrently — call the IO-free primitives
@@ -301,10 +353,11 @@ at most one extra round trip. Long-read quality is coded against the sequence:
 
 Decode and I/O failures raise exceptions: a missing or unreadable file raises
 `OSError`; a corrupt or truncated archive, an unsupported format version or
-feature, and any projection on a reordered archive raise `fqxv.FqxvError`. A
-`source` of the wrong type raises `TypeError`, and a bad argument value (an
-unknown `quality_binning` or stream name, an empty source list) raises
-`ValueError`.
+feature, a missing or wrong `password` against an encrypted archive, and any
+projection on a reordered or encrypted archive raise `fqxv.FqxvError`. A
+`source` (or `password`) of the wrong type raises `TypeError`, and a bad
+argument value (an unknown `quality_binning` or stream name, an empty source
+list) raises `ValueError`.
 
 ```python
 try:
@@ -319,17 +372,20 @@ except OSError as e:
 
 | Function | Returns | Notes |
 | --- | --- | --- |
-| `open(source, *, threads=0, streams=None)` | `Reader` | Iterator of `Record`; every layout. `streams=` decodes a subset — deselected fields are `b""`, their streams skipped |
-| `decompress_to_path(source, dest, *, threads=0, fasta=False)` | `int` | Read count; interleaved FASTQ, or single-line FASTA with `fasta=True` (quality skipped) |
-| `decompress_to_bytes(source, *, threads=0, fasta=False)` | `bytes` | Interleaved FASTQ, or single-line FASTA with `fasta=True` |
-| `inspect(source)` | `Info` | Header + footer metadata |
-| `open_index(source)` | `Index` | Footer row-group index (plain layout) |
+| `open(source, *, threads=0, streams=None, password=None)` | `Reader` | Iterator of `Record`; every layout. `streams=` decodes a subset — deselected fields are `b""`, their streams skipped |
+| `decompress_to_path(source, dest, *, threads=0, fasta=False, password=None)` | `int` | Read count; interleaved FASTQ, or single-line FASTA with `fasta=True` (quality skipped) |
+| `decompress_to_bytes(source, *, threads=0, fasta=False, password=None)` | `bytes` | Interleaved FASTQ, or single-line FASTA with `fasta=True` |
+| `inspect(source)` | `Info` | Header + footer metadata; no password needed, even for an encrypted archive |
+| `open_index(source)` | `Index` | Footer row-group index (plain layout); raises on an encrypted archive |
 | `read_names(source, groups=None)` | `list[bytes]` | Names for the groups (or all) |
 | `read_sequences(source, groups=None)` | `list[bytes]` | Sequences for the groups (or all) |
 | `read_qualities(source, groups=None)` | `list[bytes]` | Qualities for the groups (or all) |
 | `read_block(source, group)` | `list[Record]` | Decode one whole row group |
 | `estimate(source, *, level=5, quality_binning="lossless", sample_reads=1048576, threads=0)` | `Estimate` | Projected size/ratio from a FASTQ; `source` may be a list of mates |
-| `verify(source, *, threads=0)` | `None` | Integrity check; raises if the archive is bad |
+| `verify(source, *, threads=0, password=None)` | `None` | Integrity check; raises if the archive is bad. `password=` on an encrypted archive additionally checks the footer auth tag |
+
+`password` is `bytes` (used verbatim) or `str` (UTF-8-encoded); see
+[Reading encrypted archives](#reading-encrypted-archives).
 
 Random-access primitives — no I/O of their own, for driving a custom (e.g. async)
 remote client; `fqxv.remote` is built on them:

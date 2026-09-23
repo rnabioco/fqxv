@@ -127,6 +127,20 @@ pub(crate) fn encode_reordered<W: Write>(
     params: Params,
     group_size: u8,
 ) -> Result<Stats> {
+    // Encryption is not supported on this layout in this release: its footer-less,
+    // many-small-frames shape (flip bitmap, permutation, name template, per-block
+    // sequence/names/quality frames, trailing output digest) needs its own
+    // nonce/AAD and tail-truncation design, distinct from the plain layout's
+    // per-block scheme (see `docs/design/encryption.md`'s out-of-scope list).
+    // Checked here — the one choke point every reorder entry point passes
+    // through — rather than at each call site, so it can't be forgotten at a new
+    // one.
+    if params.encrypt.is_some() {
+        return Err(Error::Malformed(
+            "encryption is not supported with read reordering (--order any/shuffle/--max) \
+             in this release; use --order preserve (the default)",
+        ));
+    }
     // Whole spots only, same rule the plain layout enforces in `parse_chunks`. The
     // check belongs here rather than at the call sites: this is the one choke point
     // every reorder entry point passes through, and having it at only some of them

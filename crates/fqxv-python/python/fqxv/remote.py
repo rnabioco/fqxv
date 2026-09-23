@@ -30,7 +30,17 @@ the shape). A short async example:
     names = fqxv.decode_names_bytes(coded)
 
 The globally-reordered layout (``--order shuffle``) has no footer index and cannot
-be projected; :func:`fqxv.parse_index_suffix` raises for it. Use :func:`stream`.
+be projected; :func:`fqxv.parse_index_suffix` raises for it. An encrypted archive
+also cannot be projected — whole-block encryption means a single stream can't be
+decrypted without its whole block — but the error is less precise here than for
+:func:`fqxv.open_index` (which reads the header first and raises a clear "archive
+is encrypted" error): :func:`fqxv.parse_index_suffix` is IO-free and never sees the
+header, so on an encrypted archive it just fails the footer's own checksum and
+raises a generic ``fqxv.FqxvError``. :class:`RemoteArchive.open` (and so
+:func:`open_index`/:func:`read_names`/:func:`read_sequences`/:func:`read_qualities`
+here) go through that IO-free path. Use :func:`stream` / :func:`download` with
+``password=`` instead for an encrypted archive — those decode the whole archive
+and support encryption.
 """
 
 from __future__ import annotations
@@ -205,6 +215,7 @@ def stream(
     headers=None,
     threads: int = 0,
     streams: Optional[Union[str, Iterable[str]]] = None,
+    password: Optional[Union[str, bytes]] = None,
 ):
     """Iterate records from a remote archive without staging it to disk. The HTTP
     response feeds straight into the streaming decoder, so records flow out as
@@ -216,18 +227,33 @@ def stream(
     still transferred (it is a forward stream); for fetching *only* some columns'
     bytes, use the :class:`RemoteArchive` projection instead.
 
+    ``password`` decrypts an encrypted archive (``str`` is UTF-8-encoded, ``bytes``
+    used as-is); unlike :class:`RemoteArchive`'s column projection, this whole-file
+    streaming path supports encrypted archives.
+
     For a private object presign the URL or pass an ``Authorization`` header via
     ``headers``. For ``s3://`` with the AWS credential chain, hand a boto3 body to
     :func:`fqxv.open` directly (``fqxv.open(s3.get_object(...)["Body"])``) or use the
     CLI (``aws s3 cp s3://… - | fqxv decompress -``)."""
-    return _fqxv.open(_urlopen(url, headers), threads=threads, streams=streams)
+    return _fqxv.open(
+        _urlopen(url, headers), threads=threads, streams=streams, password=password
+    )
 
 
-def download(url: str, dest, *, headers=None, threads: int = 0, fasta: bool = False) -> int:
+def download(
+    url: str,
+    dest,
+    *,
+    headers=None,
+    threads: int = 0,
+    fasta: bool = False,
+    password: Optional[Union[str, bytes]] = None,
+) -> int:
     """Stream a remote archive and decode it to interleaved FASTQ at ``dest``
     without buffering the archive in memory. Returns the read count.
     ``fasta=True`` writes single-line FASTA instead, skipping the quality
-    stream's decode (see :func:`fqxv.decompress_to_path`)."""
+    stream's decode (see :func:`fqxv.decompress_to_path`). ``password`` decrypts
+    an encrypted archive (``str`` is UTF-8-encoded, ``bytes`` used as-is)."""
     return _fqxv.decompress_to_path(
-        _urlopen(url, headers), str(dest), threads=threads, fasta=fasta
+        _urlopen(url, headers), str(dest), threads=threads, fasta=fasta, password=password
     )

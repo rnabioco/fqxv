@@ -108,7 +108,12 @@ impl Index {
     /// a local `File`, or an in-memory `Cursor` over a fully-fetched archive.
     ///
     /// Returns [`Error::Malformed`] for the footer-less globally-clustered reorder
-    /// layout, whose streams cannot be projected.
+    /// layout, whose streams cannot be projected, and
+    /// [`Error::EncryptedArchiveNotSupported`] for an encrypted archive: whole-block
+    /// encryption means a single stream can't be decrypted without its whole
+    /// block, so the footer's per-stream offsets (all three pointing at the same
+    /// ciphertext, see `block::write_blocks`) would be actively misleading to
+    /// expose as a projection. Decode the whole archive with a passphrase instead.
     pub fn read<R: Read + Seek>(mut reader: R) -> Result<Index> {
         let header = read_header(&mut reader)?;
         if header.flags & FLAG_GLOBAL_REORDER != 0 {
@@ -116,7 +121,10 @@ impl Index {
                 "reorder layout has no row-group index; random access is unsupported",
             ));
         }
-        Index::from_footer(read_footer(&mut reader)?)
+        if header.encryption.is_some() {
+            return Err(Error::EncryptedArchiveNotSupported);
+        }
+        Index::from_footer(read_footer(&mut reader, false)?)
     }
 
     /// Parse the index from a buffer holding the archive's *tail*, IO-free.
@@ -126,6 +134,16 @@ impl Index {
     /// `Range: bytes=-N` request — and `file_len` the archive's total size. If the
     /// suffix does not reach back to the footer start, returns
     /// [`SuffixParse::NeedAtLeast`] with the exact tail length to refetch.
+    ///
+    /// **Encrypted archives**: this is IO-free by design — it never reads the
+    /// header, only the tail — so it has no way to know an archive is encrypted
+    /// before parsing its footer, unlike [`Index::read`]. An encrypted archive's
+    /// footer carries an extra 16-byte authentication tag this parser doesn't
+    /// know to expect, so its `footer_crc` check will (with overwhelming
+    /// probability) fail and this returns [`Error::Corrupt`] rather than the
+    /// clearer [`Error::EncryptedArchiveNotSupported`] `Index::read` gives. This
+    /// is a known, accepted rough edge of the suffix-only path; callers that can
+    /// fetch the header first should use [`Index::read`] to get the precise error.
     pub fn from_suffix(suffix: &[u8], file_len: u64) -> Result<SuffixParse> {
         if suffix.len() as u64 > file_len {
             return Err(Error::Malformed("suffix longer than the archive"));
@@ -152,7 +170,7 @@ impl Index {
         }
         let start = (footer_offset - suffix_start) as usize;
         let end = (body_end - suffix_start) as usize;
-        let footer = parse_footer_body(&suffix[start..end], footer_offset)?;
+        let footer = parse_footer_body(&suffix[start..end], footer_offset, false)?;
         Ok(SuffixParse::Parsed(Index::from_footer(footer)?))
     }
 
