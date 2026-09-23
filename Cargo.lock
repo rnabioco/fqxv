@@ -551,7 +551,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "fqxv"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "fqxv-bytes",
  "fqxv-crypt",
@@ -574,21 +574,21 @@ dependencies = [
 
 [[package]]
 name = "fqxv-align"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "fqxv-bytes"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "fqxv-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "fqxv-crypt"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -621,14 +621,14 @@ dependencies = [
 
 [[package]]
 name = "fqxv-dna"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "fqxv-fqzcomp"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "fqxv-bytes",
@@ -640,7 +640,7 @@ dependencies = [
 
 [[package]]
 name = "fqxv-lroverlap"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "fqxv-align",
  "fqxv-bytes",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "fqxv-python"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "flate2",
  "fqxv",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "fqxv-range"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "proptest",
  "thiserror",
@@ -673,7 +673,7 @@ dependencies = [
 
 [[package]]
 name = "fqxv-rans"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -682,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "fqxv-reorder"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "fqxv-bytes",
@@ -697,7 +697,7 @@ dependencies = [
 
 [[package]]
 name = "fqxv-seq"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "fqxv-bytes",
@@ -709,7 +709,7 @@ dependencies = [
 
 [[package]]
 name = "fqxv-tokenizer"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "criterion",
  "fqxv-bytes",
