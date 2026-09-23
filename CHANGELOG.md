@@ -16,6 +16,47 @@ misreading. Compatibility fails loudly, never silently. A format major bump woul
 be announced as a breaking change; see the
 [evolution policy](docs/design/container.md#versioning-and-evolution-policy).
 
+## [0.8.0] - 2026-09-23
+
+Minor: native passphrase encryption. Purely additive — an unencrypted archive
+compresses, decompresses, and verifies exactly as before; encryption is
+opt-in via `--encrypt` and gated by a new `required_features` bit, so an
+older `fqxv` refuses an encrypted archive cleanly ("upgrade fqxv") rather
+than misreading it. The on-disk format stays 1.0.
+
+### Added
+
+- **`fqxv compress --encrypt`** (#289): seal an archive with a passphrase
+  (ChaCha20-Poly1305, per-block AEAD; Argon2id key derivation) inside the
+  container's own framing — no external tool wrapper needed, and
+  `fqxv info`/`inspect`/`--recover` keep working on the sealed archive.
+  Passphrase sources, in order: `--password-file`, `$FQXV_PASSWORD`, or an
+  interactive hidden-terminal prompt (asked twice on `compress`, never
+  prompted on `verify`). New `fqxv-crypt` crate wraps RustCrypto's
+  `chacha20poly1305`/`argon2` — the one deliberate exception to the
+  workspace's otherwise clean-room codec policy (see
+  `THIRD-PARTY-NOTICES.md`, `docs/design/encryption.md`).
+- **`decompress`/`verify`/`info` support for encrypted archives**: `verify
+  --password-file` additionally checks a footer-authentication tag that
+  catches an archive whose trailing blocks were silently dropped, which the
+  existing (keyless) CRC checks alone cannot; `info` reports `encrypted`/
+  `encrypted_bytes` without a password. `decompress --recover`'s
+  footer-driven path works on an encrypted archive; its marker-scan fallback
+  (used only when the footer itself is unreadable) does not, since scan-
+  assigned block positions can desync from the true encryption nonce under
+  partial corruption.
+- **Python**: `password=` on `fqxv.open`/`decompress_to_path`/
+  `decompress_to_bytes`/`verify`; `Info.encrypted`/`encrypted_bytes`;
+  `fqxv.remote.stream`/`download` support it. Column-projection random
+  access (`open_index`, `fqxv.remote`'s per-column fetches) does not support
+  encrypted archives — whole-block encryption means a single stream can't be
+  fetched independently of its block — and raises clearly instead.
+- Not supported yet, by design: recipient/public-key mode, a raw-keyfile
+  mode, per-stream (rather than per-block) encryption, encrypting the
+  read-reordered layout (`--order any`/`shuffle`, `--max`), and passphrase
+  rotation in place. See `docs/design/encryption.md` for the full scope and
+  rationale.
+
 ## [0.7.0] - 2026-08-12
 
 Minor: this cycle makes decode parallel-first — the archive is an analysis
