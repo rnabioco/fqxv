@@ -402,6 +402,15 @@ pub struct Info {
     /// weren't identifiable, in which case consumers name members positionally.
     /// Length equals `group_size` whenever it is non-empty.
     pub member_labels: Vec<String>,
+    /// Whether the archive is encrypted ([`crate::feature::ENCRYPTED`]). Readable
+    /// from the header alone — no passphrase needed to learn this.
+    pub encrypted: bool,
+    /// Total on-disk ciphertext bytes across all blocks. `0` and meaningless for
+    /// an unencrypted archive. Distinct from `names_bytes`/`seq_bytes`/
+    /// `qual_bytes`, which stay `0` for an encrypted archive rather than
+    /// fabricating a per-stream split that can't be known without decrypting
+    /// every block (whole-block encryption; see `docs/design/encryption.md`).
+    pub encrypted_bytes: u64,
 }
 
 /// Highest Phred quality value tracked in [`ContentStats::qual_hist`]. Raw
@@ -510,6 +519,7 @@ pub fn peek<R: Read>(reader: R) -> Result<Info> {
         format_version: (u16::from(header.major) << 8) | u16::from(header.minor),
         required_features: header.required_features,
         member_labels: header.member_labels,
+        encrypted: header.encryption.is_some(),
         ..Info::default()
     })
 }
@@ -551,6 +561,7 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
         format_version: (u16::from(header.major) << 8) | u16::from(header.minor),
         required_features: header.required_features,
         member_labels: header.member_labels,
+        encrypted: header.encryption.is_some(),
         ..Info::default()
     };
     // Whole-file global-cluster layout: [u64 n][flip][perm][name template]
@@ -586,18 +597,29 @@ pub fn inspect<R: Read + Seek>(reader: R) -> Result<Info> {
     // download loses the EOF trailer, corruption can fail its CRC — fall back to
     // scanning block frames forward from the header so a partial file still
     // reports what it contains.
-    match read_footer(&mut r) {
+    match read_footer(&mut r, info.encrypted) {
         Ok(footer) => {
             info.reads = footer.total_reads;
             info.blocks = footer.groups.len() as u64;
             info.whole_file_crc = Some(footer.whole_file_crc);
-            // Per-stream sizes are recorded in the footer index itself (v3), so
-            // summing them needs no per-block seeks — one footer read is the whole
-            // metadata cost. The three streams are names, sequence, quality.
-            for streams in &footer.stream_locs {
-                info.names_bytes += u64::from(streams[0].len);
-                info.seq_bytes += u64::from(streams[1].len);
-                info.qual_bytes += u64::from(streams[2].len);
+            if info.encrypted {
+                // All three StreamLoc entries point at the same whole-block
+                // ciphertext (see `block::write_blocks`) — sum just one of them
+                // rather than the per-stream split, which cannot be known
+                // without decrypting every block.
+                for streams in &footer.stream_locs {
+                    info.encrypted_bytes += u64::from(streams[0].len);
+                }
+            } else {
+                // Per-stream sizes are recorded in the footer index itself (v3),
+                // so summing them needs no per-block seeks — one footer read is
+                // the whole metadata cost. The three streams are names, sequence,
+                // quality.
+                for streams in &footer.stream_locs {
+                    info.names_bytes += u64::from(streams[0].len);
+                    info.seq_bytes += u64::from(streams[1].len);
+                    info.qual_bytes += u64::from(streams[2].len);
+                }
             }
         }
         Err(_) => scan_blocks_sequentially(&mut r, header.header_len, &mut info)?,

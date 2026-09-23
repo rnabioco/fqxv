@@ -32,6 +32,7 @@ fqxv decompress <INPUT> (-o <OUTPUT> | --split <PREFIX> | -Z)
 | `--recover` | Best-effort decode of a corrupted archive: skip blocks that fail their CRC and emit the rest. See [below](#recovering-a-corrupted-archive). |
 | `-f, --force` | Overwrite output FASTQ file(s) if they already exist. By default an existing `-o` file or `--split` mate file is left untouched and the command errors before decoding. Ignored when writing to stdout (`-Z` / `-o -`). |
 | `--threads <N>` | Worker threads (0 = all cores). |
+| `--password-file <PATH>` | Passphrase for an [encrypted](#encryption) archive (a single trailing newline stripped). Ignored, with no error, against a plain archive. |
 
 `--output`, `--split`, and `--stdout` are mutually exclusive, as are `--split` and
 `--recover`; `--fasta` cannot be combined with `--split` or `--recover`.
@@ -185,4 +186,21 @@ Notes and limits:
   falls back to scanning for each block's sync marker, so it resynchronizes past a
   corrupt length prefix or a bad block and still recovers every intact block. (In
   that mode the per-block read counts are gone, so the "reads lost" tally is
-  unavailable, but the recovered reads are all emitted.)
+  unavailable, but the recovered reads are all emitted.) **Not for an [encrypted](#encryption)
+  archive**, though: an encrypted block's decryption key is derived from its
+  position in the archive, and marker-scanning cannot reliably recover that position
+  once the footer (which records it directly) is gone — recovery on an encrypted
+  archive requires an intact footer, and errors otherwise rather than risk
+  decrypting blocks under the wrong position. Recompress from source if both are
+  lost.
+
+## Encryption
+
+`--password-file <PATH>` supplies the passphrase for an [encrypted](compress.md#encryption)
+archive; without it, `decompress` falls back to the `FQXV_PASSWORD` environment
+variable, then — for a seekable file input on a real terminal — an interactive
+hidden prompt. stdin input (`-`) can't pause mid-stream to prompt, so it relies on
+`--password-file`/`FQXV_PASSWORD` or errors clearly. A passphrase against a
+*plain* archive is simply unused, no error. See
+[`compress --encrypt`](compress.md#encryption) for the full passphrase-precedence
+rules and the format's design.

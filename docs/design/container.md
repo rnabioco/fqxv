@@ -12,7 +12,8 @@ seek to any of them without scanning the file.
 [1]  format version major (LE)  (reader refuses a differing major)
 [1]  format version minor (LE)  (tolerated within a major; informational)
 [8]  required_features (LE u64) (coarse capability bits; an unknown set bit is
-                                 refused rather than mis-decoded)
+                                 refused rather than mis-decoded; bit0
+                                 GLOBAL_REFERENCE, bit1 ENCRYPTED)
 [1]  sequence context order (k)
 [1]  quality binning tag        (0 lossless, 1 bin8, 2 bin4, 3 bin2,
                                  4 ont, 5 hifi)
@@ -30,7 +31,9 @@ seek to any of them without scanning the file.
                                  high bit marks a record as critical — an unknown
                                  critical tag is refused, an unknown non-critical
                                  tag is skipped. Tag 0x01 (non-critical) carries
-                                 the per-member slot labels)
+                                 the per-member slot labels; tag 0x81 (critical)
+                                 carries passphrase-encryption parameters — see
+                                 [encryption.md](encryption.md))
 [4]  header CRC-32C (LE)        (over the header prefix + extension region)
 optional whole-file reference frame (plain layout only; present iff flag bit5 and
 the GLOBAL_REFERENCE feature bit are set):
@@ -175,6 +178,22 @@ range checks and get reported as fact. The consequence is deliberate: **the foot
 cannot grow within format major 1**, and any change to its shape must set a
 `required_features` bit so an older reader refuses at the header, long before it
 seeks here.
+
+### Encrypted archives
+
+An archive compressed with `--encrypt` (`feature::ENCRYPTED`, header extension
+tag `0x81`) keeps this same footer stride, but every group's three
+`StreamLoc` triples are identical — all three point at the group's whole
+sealed block, not at three real sub-block ranges, since a single stream can no
+longer be fetched or authenticated without its whole block. A 16-byte
+footer-authentication tag is also inserted between `whole_file_crc` and
+`footer_crc`, checkable only with the passphrase (`fqxv verify` reports it as
+explicitly skipped without one). `Index::read`/`from_suffix` refuse an
+encrypted archive outright (`Error::EncryptedArchiveNotSupported`) rather than
+expose the duplicated per-stream entries as a misleading projection — decode
+the whole archive with a passphrase instead. See
+[encryption.md](encryption.md) for the full nonce/AAD scheme, the footer tag's
+purpose, and why per-stream projection isn't supported.
 
 ### Random-access API
 
@@ -361,6 +380,17 @@ quality — verified after decode. Where the CRCs catch corruption of the *store
 bytes, these digests catch a codec that turned CRC-valid bytes into
 wrong-but-in-bounds output, and localize the failure to the offending stream.
 
+An encrypted archive layers a sixth, genuinely different kind of check on top
+of these four CRCs: ChaCha20-Poly1305 authentication. Where CRC-32C only
+detects *accidental* corruption (it is trivially forgeable by anyone who can
+edit the file), AEAD detects deliberate tampering too, and it supersedes the
+CRCs for that purpose — but the two coexist rather than one replacing the
+other, since the frame CRC is a cheap, keyless first-pass filter checked
+before the costlier AEAD open. See
+[encryption.md](encryption.md#nonceaad-scheme-and-what-it-does-and-does-not-defeat)
+for what the position-bound AEAD construction does and does not defeat on its
+own, and what the footer's added authentication tag closes.
+
 [`fqxv verify`](../cli/verify.md) runs without any codec, so it is far cheaper
 than a full `decompress`: it validates the header CRC, validates `footer_crc`
 before trusting an offset, and re-hashes the archive prefix against
@@ -401,7 +431,10 @@ one question: *what must an old reader do when it meets this?*
   without a capability, and that is knowable before the blocks are written. The bit
   is refused at header-read (`UnsupportedFeature`, "upgrade fqxv"), before a single
   block is touched. This is the gate for whole-archive structural change; the
-  whole-file `GLOBAL_REFERENCE` frame is the existing one. (An unknown *flags* bit
+  whole-file `GLOBAL_REFERENCE` frame is the existing one, and `ENCRYPTED`
+  (see [encryption.md](encryption.md)) the second — an old reader cannot
+  decode even one byte of ciphertext, so it refuses at the header rather than
+  attempt it. (An unknown *flags* bit
   is refused the same way, as `UnsupportedFlags` — every flag changes how the
   archive is read, so a bit a reader does not act on must not be ignored — but the
   flags byte has only two free bits, so it is not an evolution mechanism. A new flag
@@ -410,7 +443,10 @@ one question: *what must an old reader do when it meets this?*
 - **A critical extension tag** (tag high bit set) — the same "refuse it" outcome
   (`UnsupportedExtension`) for a *header field* whose meaning an old reader must not
   guess. Prefer a feature bit for capabilities; reserve a critical tag for metadata
-  that is genuinely header-shaped and load-bearing.
+  that is genuinely header-shaped and load-bearing. Encryption's tag `0x81`
+  (salt, nonce id, KDF params — [encryption.md](encryption.md)) is the second
+  worked example, paired with the `ENCRYPTED` feature bit above: the bit gates
+  the capability, the tag carries the metadata a reader needs to exercise it.
 - **A major bump** — the change cannot be expressed by any of the above: the fixed
   header prefix, the frame/trailer framing, or the magic itself changes, so an old
   reader cannot even parse far enough to be told no.
@@ -418,7 +454,10 @@ one question: *what must an old reader do when it meets this?*
 **The gating rule.** Any change to the footer's shape — the field set or order of
 the row-group index — or to the block payload's stream layout MUST be gated by a
 `required_features` bit, so an old reader refuses at the header instead of parsing
-a differently-shaped structure into plausible garbage. A *per-block codec* choice
+a differently-shaped structure into plausible garbage. Encrypted archives are the
+second worked example: the footer gains a 16-byte authentication tag
+([encryption.md](encryption.md)) that an old reader has no idea to expect, so
+it is gated by `ENCRYPTED` exactly like `GLOBAL_REFERENCE`'s reference frame. A *per-block codec* choice
 is the exception, and only because it is already self-describing: it rides the
 sequence stream's leading method byte and surfaces as `UnsupportedMethod`
 mid-decode. That fails loudly, but it fails later than a header refusal — so a new

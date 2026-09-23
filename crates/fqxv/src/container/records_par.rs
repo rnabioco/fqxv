@@ -215,7 +215,7 @@ impl<'a, S, I: Fn() -> S> StatePool<'a, S, I> {
 /// ```
 pub fn decompress_records_par<R, S, I, V, M>(
     reader: R,
-    threads: usize,
+    opts: impl Into<DecodeOptions>,
     init: I,
     visit: V,
     merge: M,
@@ -228,7 +228,7 @@ where
     M: FnMut(S, S) -> S,
 {
     let (state, mut stats) =
-        decompress_records_par_select(reader, threads, StreamSelection::ALL, init, visit, merge)?;
+        decompress_records_par_select(reader, opts, StreamSelection::ALL, init, visit, merge)?;
     // The selective entry point counts emitted field bytes (its `out_bytes`
     // contract, matching `decompress_records_select`); this API documents the
     // FASTQ byte count instead. With everything selected the two differ by
@@ -293,7 +293,7 @@ where
 /// ```
 pub fn decompress_records_par_select<R, S, I, V, M>(
     reader: R,
-    threads: usize,
+    opts: impl Into<DecodeOptions>,
     selection: StreamSelection,
     init: I,
     visit: V,
@@ -306,14 +306,24 @@ where
     V: Fn(&mut S, u64, RecordRef<'_>) -> Result<()> + Sync,
     M: FnMut(S, S) -> S,
 {
-    let pool = build_pool(threads)?;
+    let opts = opts.into();
+    let pool = build_pool(opts.threads)?;
     let mut r = BufReader::new(reader);
     let header = read_header(&mut r)?;
     let states = StatePool::new(&init);
     let stats = if header.flags & FLAG_GLOBAL_REORDER != 0 {
         par_visit_reordered(r, &pool, &header, selection, &states, &visit)?
     } else {
-        par_visit_plain(r, &pool, &header, selection, &states, &visit)?
+        let cipher = cipher_for_header(&header, &opts)?;
+        par_visit_plain(
+            r,
+            &pool,
+            &header,
+            selection,
+            cipher.as_ref(),
+            &states,
+            &visit,
+        )?
     };
     Ok((states.into_merged(merge), stats))
 }
@@ -335,11 +345,13 @@ fn peek_block_reads(payload: &[u8]) -> Result<u32> {
 /// ([`decode_block_parts_select`], which skips deselected streams), and visit
 /// each block's records inside its decode task. `r` is positioned just past the
 /// header.
+#[allow(clippy::too_many_arguments)]
 fn par_visit_plain<R, S, I, V>(
     mut r: BufReader<R>,
     pool: &rayon::ThreadPool,
     header: &Header,
     sel: StreamSelection,
+    cipher: Option<&fqxv_crypt::ArchiveCipher>,
     states: &StatePool<'_, S, I>,
     visit: &V,
 ) -> Result<Stats>
@@ -356,7 +368,7 @@ where
         skip_framed(&mut r)?;
         None
     } else {
-        read_reference_frame(&mut r, header.flags)?
+        read_reference_frame(&mut r, header.flags, cipher)?
     };
     let reference = reference.as_ref();
     let batch = pool.current_num_threads().max(1);
@@ -365,18 +377,25 @@ where
         ..Stats::default()
     };
     let mut base = 0u64;
-    for_each_block_batch(&mut r, batch, |raw_blocks| {
+    for_each_block_batch(&mut r, batch, |batch_base, raw_blocks| {
         // Record index base of each block in the batch, from the payloads'
-        // n_reads fields (verified against the decode inside the task).
-        let mut bases = Vec::with_capacity(raw_blocks.len());
-        for b in raw_blocks {
+        // n_reads fields (verified against the decode inside the task). Blocks
+        // must be opened (decrypted, if encrypted) before their n_reads field is
+        // readable.
+        let opened: Vec<Cow<'_, [u8]>> = raw_blocks
+            .iter()
+            .enumerate()
+            .map(|(i, b)| open_block_payload(b, cipher.map(|c| (c, batch_base + i as u64))))
+            .collect::<Result<_>>()?;
+        let mut bases = Vec::with_capacity(opened.len());
+        for b in &opened {
             bases.push(base);
             base += u64::from(peek_block_reads(b)?);
         }
         let decoded: Vec<Result<(u64, u64)>> = pool.install(|| {
-            (0..raw_blocks.len())
+            (0..opened.len())
                 .into_par_iter()
-                .map(|k| visit_block(&raw_blocks[k], bases[k], reference, sel, states, visit))
+                .map(|k| visit_block(&opened[k], bases[k], reference, sel, states, visit))
                 .collect()
         });
         for d in decoded {

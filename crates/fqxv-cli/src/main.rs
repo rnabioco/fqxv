@@ -1,6 +1,7 @@
 //! `fqxv` command-line interface — a thin front-end over the [`fqxv`] library.
 
 mod output;
+mod password;
 mod progress;
 mod report;
 
@@ -273,6 +274,28 @@ enum Command {
         /// for unusual name conventions the detector doesn't recognize).
         #[arg(long, value_enum, help_heading = "Advanced")]
         platform: Option<Platform>,
+        /// Encrypt the archive with a passphrase (ChaCha20-Poly1305, per-block AEAD).
+        ///
+        /// The passphrase is read from --password-file, the FQXV_PASSWORD
+        /// environment variable, or (interactively, with confirmation) a hidden
+        /// terminal prompt — in that order. There is no recovery without it:
+        /// losing the passphrase means losing the archive. Not supported together
+        /// with --order any/shuffle or --max (which implies --order any) in this
+        /// release.
+        #[arg(long, help_heading = "Encryption")]
+        encrypt: bool,
+        /// Read the passphrase from a file's contents (requires --encrypt).
+        ///
+        /// A single trailing newline is stripped; every other byte is the
+        /// passphrase verbatim, no encoding assumed. Keep this file
+        /// access-controlled — fqxv does not manage its permissions or lifecycle.
+        #[arg(
+            long,
+            requires = "encrypt",
+            value_name = "PATH",
+            help_heading = "Encryption"
+        )]
+        password_file: Option<PathBuf>,
     },
     /// Decompress a `.fqxv` file to FASTQ.
     ///
@@ -345,6 +368,15 @@ enum Command {
         /// decompress would emit them.
         #[arg(long, conflicts_with_all = ["split", "recover"])]
         fasta: bool,
+        /// Passphrase for an encrypted archive (see FQXV_PASSWORD / --password-file
+        /// on `compress`).
+        ///
+        /// Only needed against an encrypted archive; ignored (no error) against a
+        /// plain one. For a seekable file input, a missing passphrase on an
+        /// encrypted archive falls back to an interactive hidden prompt; stdin
+        /// input cannot pause mid-stream to prompt and errors instead.
+        #[arg(long, value_name = "PATH", help_heading = "Encryption")]
+        password_file: Option<PathBuf>,
     },
     /// Print `.fqxv` container metadata and per-stream sizes.
     ///
@@ -397,6 +429,16 @@ enum Command {
         /// Emit a JSON object instead of the human table.
         #[arg(long)]
         json: bool,
+        /// Passphrase for an encrypted archive's footer-authentication check.
+        ///
+        /// Optional even for an encrypted archive: without it, every check that
+        /// needs no key still runs (header, footer, block/whole-file CRCs); with
+        /// it, an additional "footer auth tag" check proves the passphrase is
+        /// correct and that no block was dropped from the archive's tail. Never
+        /// prompts interactively — pass this or set FQXV_PASSWORD explicitly, so
+        /// a routine batch `fqxv verify *.fqxv` never blocks on a TTY prompt.
+        #[arg(long, value_name = "PATH", help_heading = "Encryption")]
+        password_file: Option<PathBuf>,
     },
 }
 
@@ -633,6 +675,8 @@ fn main() -> anyhow::Result<()> {
             platform,
             estimate,
             verify,
+            encrypt,
+            password_file,
         } => {
             if inputs.is_empty() {
                 anyhow::bail!("at least one input FASTQ is required");
@@ -651,6 +695,27 @@ fn main() -> anyhow::Result<()> {
             // archives still round-trip in order regardless. `shuffle` additionally
             // opts into name regeneration (reorder-lossy) for single-end input.
             let reorders = order != ReadOrder::Preserve;
+            if encrypt && reorders {
+                anyhow::bail!(
+                    "--encrypt does not support --order any/shuffle or --max (which implies \
+                     --order any) yet; use --order preserve (the default)"
+                );
+            }
+            // Resolved before any output file is created, so a passphrase typo or
+            // a cancelled prompt never leaves a partial archive behind.
+            let encrypt_spec = if encrypt {
+                Some(fqxv::EncryptSpec {
+                    passphrase: password::resolve_passphrase_for_compress(password_file.as_deref())
+                        .context("resolving --encrypt passphrase")?,
+                    kdf: fqxv::KdfParams::DEFAULT,
+                })
+            } else {
+                None
+            };
+            // Captured before `encrypt_spec` moves into `params`, so `--verify`'s
+            // round-trip decode below can reuse the same passphrase with no
+            // second prompt.
+            let verify_password = encrypt_spec.as_ref().map(|s| s.passphrase.clone());
             let (tile_band, tile_max_refs) = level_to_tile(level);
             let params = fqxv::Params {
                 seq_order: level_to_order(level),
@@ -690,6 +755,7 @@ fn main() -> anyhow::Result<()> {
                 // the original per-slot names instead of renumbering positionally.
                 // Empty unless every input yields a distinct slot token.
                 member_labels: member_labels_for(&inputs),
+                encrypt: encrypt_spec,
             };
             warn_redundant_binning(&inputs, params.quality_binning);
             // `--estimate` samples the input and reports a projected ratio/size
@@ -773,7 +839,11 @@ fn main() -> anyhow::Result<()> {
                         format!("reopening {} to verify", archive.temp_path().display())
                     })
                     .and_then(|f| {
-                        fqxv::verify_roundtrip(f, cli.threads).context("verifying the archive")
+                        let opts = fqxv::DecodeOptions {
+                            threads: cli.threads,
+                            password: verify_password.clone(),
+                        };
+                        fqxv::verify_roundtrip(f, opts).context("verifying the archive")
                     });
                 match verified {
                     Ok(decoded) if decoded == stats.reads => sp.abandon(),
@@ -832,6 +902,7 @@ fn main() -> anyhow::Result<()> {
             recover,
             force,
             fasta,
+            password_file,
         } => {
             // Input is a local path or stdin (`-`). stdin streams the archive body
             // straight into the decoder (`decompress` only needs `Read`) — the way
@@ -848,6 +919,28 @@ fn main() -> anyhow::Result<()> {
                         format!("opening input {}", input.display())
                     })?))
                 }
+            };
+            // Whether the archive is encrypted, known without a password (a header
+            // peek) — used only to decide whether an interactive prompt is worth
+            // attempting; stdin can't be peeked (no second pass), so it never
+            // prompts and instead relies on --password-file/$FQXV_PASSWORD or the
+            // library's own clear PasswordRequired error.
+            let encrypted = if stdin_input {
+                false
+            } else {
+                fqxv::peek(
+                    File::open(&input)
+                        .with_context(|| format!("opening input {}", input.display()))?,
+                )?
+                .encrypted
+            };
+            let prompt_ok = encrypted && !stdin_input && io::stdin().is_terminal();
+            let password =
+                password::resolve_passphrase_for_decode(password_file.as_deref(), prompt_ok)
+                    .context("resolving passphrase")?;
+            let opts = fqxv::DecodeOptions {
+                threads: cli.threads,
+                password,
             };
             // Where the decoded FASTQ is headed, for the summary line. Computed
             // from borrows before `split`/`output` are consumed below.
@@ -877,7 +970,7 @@ fn main() -> anyhow::Result<()> {
                 let (pending, mut sink) = open_sink(output.as_deref(), stdout, force)?;
                 let archive = File::open(&input)
                     .with_context(|| format!("opening input {}", input.display()))?;
-                let rec = fqxv::decompress_recover(archive, &mut sink, cli.threads)?;
+                let rec = fqxv::decompress_recover(archive, &mut sink, opts)?;
                 sink.finish()?;
                 // Recovery's output is deliberately incomplete, but it is still a
                 // *finished* artifact — publish it only once the salvage is done,
@@ -972,7 +1065,7 @@ fn main() -> anyhow::Result<()> {
                         .into_iter()
                         .map(|s| CountingSink::new(s, Arc::clone(&lines), Arc::clone(&done), 4))
                         .collect();
-                    let stats = fqxv::decompress_split(open_in()?, &mut sinks, cli.threads)?;
+                    let stats = fqxv::decompress_split(open_in()?, &mut sinks, opts)?;
                     for sink in sinks {
                         sink.into_inner().finish()?;
                     }
@@ -989,9 +1082,9 @@ fn main() -> anyhow::Result<()> {
                         lines_per_record,
                     );
                     let stats = if fasta {
-                        fqxv::decompress_fasta(open_in()?, &mut sink, cli.threads)?
+                        fqxv::decompress_fasta(open_in()?, &mut sink, opts)?
                     } else {
-                        fqxv::decompress(open_in()?, &mut sink, cli.threads)?
+                        fqxv::decompress(open_in()?, &mut sink, opts)?
                     };
                     sink.into_inner().finish()?;
                     (stats, pending.into_iter().collect())
@@ -1035,7 +1128,14 @@ fn main() -> anyhow::Result<()> {
             quick,
             tsv,
             json,
-        } => print_verify(&inputs, quick, tsv, json, cli.threads)?,
+            password_file,
+        } => {
+            // Never prompts (see the flag's own help text) — resolves only from
+            // --password-file/$FQXV_PASSWORD.
+            let password = password::resolve_passphrase_for_decode(password_file.as_deref(), false)
+                .context("resolving passphrase")?;
+            print_verify(&inputs, quick, tsv, json, cli.threads, password)?
+        }
     }
     Ok(())
 }
@@ -1075,8 +1175,13 @@ struct InfoReport {
     reordered: bool,
     read_order_preserved: bool,
     plus_normalized: bool,
-    streams: InfoStreams,
-    /// Compressed stream bytes divided by read count (null when there are none).
+    /// Per-stream compressed sizes. Absent for an encrypted archive: whole-block
+    /// encryption means the per-stream split can't be known without decrypting
+    /// every block — see `encrypted_bytes` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    streams: Option<InfoStreams>,
+    /// Compressed stream bytes divided by read count (null when there are none,
+    /// or the archive is encrypted).
     #[serde(skip_serializing_if = "Option::is_none")]
     bytes_per_read: Option<f64>,
     /// On-disk container format version.
@@ -1086,6 +1191,12 @@ struct InfoReport {
     /// recomputes.
     #[serde(skip_serializing_if = "Option::is_none")]
     whole_file_crc: Option<String>,
+    /// Whether the archive is encrypted (readable without a passphrase).
+    encrypted: bool,
+    /// Total on-disk ciphertext bytes across all blocks. Present only when
+    /// `encrypted` is true.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    encrypted_bytes: Option<u64>,
     /// Content statistics from a full decode; present only with `--stats`.
     #[serde(skip_serializing_if = "Option::is_none")]
     stats: Option<StatsJson>,
@@ -1299,6 +1410,9 @@ fn info_tsv_header(stats: bool) -> String {
     if stats {
         header.push_str("\tbases\tmin_len\tmax_len\tgc_fraction\tmean_quality");
     }
+    // Appended after the optional --stats columns, not before, so an existing
+    // --stats consumer's fixed column positions don't shift.
+    header.push_str("\tencrypted\tencrypted_bytes");
     header
 }
 
@@ -1336,6 +1450,15 @@ fn info_tsv_row(fi: &FileInfo) -> String {
                 .unwrap_or_default(),
         ));
     }
+    row.push_str(&format!(
+        "\t{}\t{}",
+        info.encrypted as u8,
+        if info.encrypted {
+            info.encrypted_bytes.to_string()
+        } else {
+            String::new()
+        },
+    ));
     row
 }
 
@@ -1390,15 +1513,17 @@ fn info_json_report(fi: &FileInfo) -> InfoReport {
         reordered: info.reordered,
         read_order_preserved: info.keep_order,
         plus_normalized: info.plus_normalized,
-        streams: InfoStreams {
+        streams: (!info.encrypted).then(|| InfoStreams {
             names: stream(info.names_bytes),
             sequence: stream(info.seq_bytes),
             quality: stream(info.qual_bytes),
             total: stream(total),
-        },
-        bytes_per_read,
+        }),
+        bytes_per_read: bytes_per_read.filter(|_| !info.encrypted),
         format_version: info.format_version,
         whole_file_crc: fi.crc_hex.clone(),
+        encrypted: info.encrypted,
+        encrypted_bytes: info.encrypted.then_some(info.encrypted_bytes),
         stats: content.as_ref().map(|cs| StatsJson {
             reads: cs.reads,
             bases: cs.bases,
@@ -1523,39 +1648,51 @@ fn print_info_human(fi: &FileInfo) {
             group_digits(fi.file_size)
         ),
     );
+    meta_row(
+        "encrypted",
+        if info.encrypted {
+            format!("yes ({} ciphertext)", human_bytes(info.encrypted_bytes))
+        } else {
+            "no".to_string()
+        },
+    );
     let mut meta = meta.build();
     meta.with(Style::rounded());
 
-    let mut streams = TableBuilder::default();
-    streams.push_record([
-        "stream".to_string(),
-        "bytes".to_string(),
-        "share".to_string(),
-        "bytes/read".to_string(),
-    ]);
-    for (label, bytes) in [
-        ("names", info.names_bytes),
-        ("sequence", info.seq_bytes),
-        ("quality", info.qual_bytes),
-        ("total", total),
-    ] {
-        streams.push_record([
-            label.to_string(),
-            group_digits(bytes),
-            format!("{:.1}%", pct(bytes)),
-            per_read(bytes).map_or_else(|| "—".to_string(), |x| format!("{x:.3}")),
-        ]);
-    }
-    let mut streams = streams.build();
-    streams
-        .with(Style::rounded())
-        .with(Modify::new(Columns::new(1..)).with(Alignment::right()));
-
     println!("{}", fi.path.display());
     println!("{meta}");
-    println!("{streams}");
-    if let Some(bpr) = bytes_per_read {
-        println!("{bpr:.2} bytes/read");
+    // Per-stream sizes can't be known without decrypting every block, so an
+    // encrypted archive skips this table rather than showing a fabricated split
+    // (the meta table above already reports the real ciphertext total).
+    if !info.encrypted {
+        let mut streams = TableBuilder::default();
+        streams.push_record([
+            "stream".to_string(),
+            "bytes".to_string(),
+            "share".to_string(),
+            "bytes/read".to_string(),
+        ]);
+        for (label, bytes) in [
+            ("names", info.names_bytes),
+            ("sequence", info.seq_bytes),
+            ("quality", info.qual_bytes),
+            ("total", total),
+        ] {
+            streams.push_record([
+                label.to_string(),
+                group_digits(bytes),
+                format!("{:.1}%", pct(bytes)),
+                per_read(bytes).map_or_else(|| "—".to_string(), |x| format!("{x:.3}")),
+            ]);
+        }
+        let mut streams = streams.build();
+        streams
+            .with(Style::rounded())
+            .with(Modify::new(Columns::new(1..)).with(Alignment::right()));
+        println!("{streams}");
+        if let Some(bpr) = bytes_per_read {
+            println!("{bpr:.2} bytes/read");
+        }
     }
     if let Some(cs) = content {
         print!("{}", render_content_stats(cs));
@@ -1694,19 +1831,26 @@ fn print_verify(
     tsv: bool,
     json: bool,
     threads: usize,
+    password: Option<Vec<u8>>,
 ) -> anyhow::Result<()> {
     let (files, batch) = resolve_fqxv_inputs(inputs)?;
 
     // Verify each archive. In single-file mode a bad archive is a hard error (as
     // before); in a batch it becomes a failing entry so one corrupt file doesn't
-    // abort the rest.
+    // abort the rest. The same passphrase (if any) applies to every archive in
+    // the batch — it enables the extra footer-tag check only on the ones that
+    // are actually encrypted; a plain archive ignores it.
     let mut results: Vec<(PathBuf, Result<fqxv::VerifyReport, String>)> =
         Vec::with_capacity(files.len());
     for path in &files {
+        let opts = fqxv::DecodeOptions {
+            threads,
+            password: password.clone(),
+        };
         let r = File::open(path)
             .map_err(|e| format!("opening input {}: {e}", path.display()))
             .and_then(|f| {
-                fqxv::verify_report(&f, quick, threads)
+                fqxv::verify_report(&f, quick, opts)
                     .map_err(|e| format!("{} is not a readable fqxv archive: {e}", path.display()))
             });
         if !batch {

@@ -107,31 +107,47 @@ pub(crate) fn build_block(
 
 /// Write a batch's compressed payloads in order, updating `stats` and recording
 /// each row group in `index` for the footer.
+///
+/// `cipher` is `Some` for an encrypted archive: each block's plaintext payload is
+/// sealed with [`fqxv_crypt::ArchiveCipher::seal_block`] before framing, keyed by
+/// its 0-based footer ordinal (`index.entries.len()` at the time it is pushed —
+/// the same value a decoder recovers by counting blocks read in order). The
+/// footer's per-stream index then records the whole ciphertext three times (see
+/// [`whole_block_stream_locs`]) rather than real sub-block offsets, since a
+/// stream cannot be fetched or decrypted independently of its block.
 pub(crate) fn write_blocks<W: Write>(
     w: &mut W,
     blocks: &[RawBlock],
     compressed: Vec<Result<Vec<u8>>>,
     stats: &mut Stats,
     index: &mut FooterIndex,
+    cipher: Option<&fqxv_crypt::ArchiveCipher>,
 ) -> Result<()> {
     for (b, payload) in blocks.iter().zip(compressed) {
         let payload = payload?;
+        let block_index = index.entries.len() as u64;
+        let on_disk = match cipher {
+            Some(c) => c.seal_block(block_index, &payload),
+            None => payload,
+        };
         index.entries.push((index.offset, b.n_reads() as u32));
         // Record each coded stream's absolute (offset, len, crc) for the footer's
         // column-projection index, before `index.offset` advances past this block.
-        index
-            .streams
-            .push(payload_stream_locs(&payload, index.offset)?);
+        let locs = match cipher {
+            Some(_) => whole_block_stream_locs(&on_disk, index.offset)?,
+            None => payload_stream_locs(&on_disk, index.offset)?,
+        };
+        index.streams.push(locs);
         // Frame: [4 BLOCK_MAGIC][8 payload_len][4 crc32c(payload)][payload].
         w.write_all(&BLOCK_MAGIC)?;
-        w.write_all(&(payload.len() as u64).to_le_bytes())?;
-        w.write_all(&crc32c(&payload).to_le_bytes())?;
-        w.write_all(&payload)?;
-        let framed = (FRAME_HEAD_LEN + payload.len()) as u64;
+        w.write_all(&(on_disk.len() as u64).to_le_bytes())?;
+        w.write_all(&crc32c(&on_disk).to_le_bytes())?;
+        w.write_all(&on_disk)?;
+        let framed = (FRAME_HEAD_LEN + on_disk.len()) as u64;
         index.offset += framed;
         trace!(
             reads = b.n_reads(),
-            payload = payload.len(),
+            payload = on_disk.len(),
             "block written"
         );
         stats.reads += b.n_reads() as u64;
@@ -139,6 +155,35 @@ pub(crate) fn write_blocks<W: Write>(
         stats.out_bytes += framed;
     }
     Ok(())
+}
+
+/// The footer's per-stream index for an encrypted block: all three [`StreamLoc`]
+/// entries point at the *whole* ciphertext (identical offset/len/crc), since a
+/// single stream cannot be fetched or authenticated independently of its block
+/// once the payload is sealed. `random_access::Index` refuses encrypted archives
+/// outright rather than exposing this as a misleading "projection."
+fn whole_block_stream_locs(on_disk: &[u8], block_offset: u64) -> Result<[StreamLoc; 3]> {
+    let len = u32::try_from(on_disk.len())
+        .map_err(|_| Error::Malformed("encrypted block payload exceeds u32 length"))?;
+    let loc = StreamLoc {
+        offset: block_offset + FRAME_HEAD_LEN as u64,
+        len,
+        crc: crc32c(on_disk),
+    };
+    Ok([loc, loc, loc])
+}
+
+/// Decrypt one block's raw on-disk payload if `cipher` is set, else return it
+/// unchanged. `block_index` is the block's 0-based position in read order — see
+/// [`fqxv_crypt::ArchiveCipher`]'s nonce/AAD construction, which binds it.
+pub(crate) fn open_block_payload<'a>(
+    raw: &'a [u8],
+    cipher: Option<(&fqxv_crypt::ArchiveCipher, u64)>,
+) -> Result<Cow<'a, [u8]>> {
+    match cipher {
+        Some((c, idx)) => Ok(Cow::Owned(c.open_block(idx, raw)?)),
+        None => Ok(Cow::Borrowed(raw)),
+    }
 }
 
 /// One xxh3-64 digest per decoded stream (names, sequence, quality) of a block's
@@ -920,13 +965,17 @@ fn assemble_block_payload(
     Ok(out)
 }
 
-/// Read blocks in batches of `batch`, invoking `f` on each batch.
+/// Read blocks in batches of `batch`, invoking `f` on each batch with the
+/// 0-based index of the batch's first block (each block in `raw_blocks` is at
+/// `base + i`) — the same ordinal [`write_blocks`] sealed it under, for an
+/// encrypted archive's decrypt step.
 pub(crate) fn for_each_block_batch<R: Read, F>(r: &mut R, batch: usize, mut f: F) -> Result<()>
 where
-    F: FnMut(&[Vec<u8>]) -> Result<()>,
+    F: FnMut(u64, &[Vec<u8>]) -> Result<()>,
 {
     let mut block_index = 0u64;
     loop {
+        let base = block_index;
         let mut raw_blocks: Vec<Vec<u8>> = Vec::with_capacity(batch);
         for _ in 0..batch {
             match read_block(r, block_index)? {
@@ -941,7 +990,7 @@ where
             break;
         }
         let full = raw_blocks.len() == batch;
-        f(&raw_blocks)?;
+        f(base, &raw_blocks)?;
         if !full {
             break;
         }

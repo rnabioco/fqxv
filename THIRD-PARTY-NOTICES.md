@@ -1,9 +1,37 @@
 # Third-party notices
 
 `fqxv` contains clean-room reimplementations of published compression algorithms.
-No third-party source code is vendored. The algorithms were implemented from
-public specifications and papers; we acknowledge the original authors and the
-reference implementations we cross-checked against for correctness.
+No third-party source code is vendored — with one deliberate exception for
+cryptographic primitives, see [Encryption](#encryption-fqxv-crypt) below. The
+algorithms were implemented from public specifications and papers; we
+acknowledge the original authors and the reference implementations we
+cross-checked against for correctness.
+
+## Encryption (`fqxv-crypt`)
+
+Unlike every other entry in this file, `fqxv`'s optional passphrase encryption
+does **not** reimplement its cryptographic primitives from a spec. Rolling
+your own AEAD or password-based KDF is a well-known way to build something
+that looks correct and isn't; this is a deliberate, explicit exception to the
+workspace's otherwise strict clean-room policy (see `docs/design/encryption.md`
+and CLAUDE.md's Architecture section, the `fqxv-crypt` bullet).
+
+- **ChaCha20-Poly1305** (Bernstein's ChaCha20 stream cipher; RFC 8439's
+  Poly1305-AEAD construction) — via the RustCrypto **`chacha20poly1305`**
+  crate (https://github.com/RustCrypto/AEADs, MIT OR Apache-2.0). Used
+  directly as a dependency, not reimplemented.
+- **Argon2id** (Biryukov, Dinu & Khovratovich; the Password Hashing
+  Competition winner; RFC 9106) — via the RustCrypto **`argon2`** crate
+  (https://github.com/RustCrypto/password-hashes, MIT OR Apache-2.0). Used
+  directly as a dependency, not reimplemented.
+- **`getrandom`** (https://github.com/rust-random/getrandom, MIT OR
+  Apache-2.0) — a thin OS-CSPRNG syscall wrapper (no algorithm of its own),
+  used to draw the per-archive Argon2id salt and AEAD nonce identifier.
+- **`zeroize`** (https://github.com/RustCrypto/utils, MIT OR Apache-2.0) —
+  wipes derived key material from memory on drop.
+
+See `docs/design/encryption.md` for the on-disk scheme these crates
+implement.
 
 ## CRAM 3.1 codecs (rANS Nx16, fqzcomp quality model, name tokenizer)
 
@@ -65,5 +93,6 @@ reference implementations we cross-checked against for correctness.
   path is checked against. Textbook dynamic programming, implemented directly.
 
 None of the implemented-from references above impose obligations beyond
-attribution; all are permissive (BSD 3-Clause / MIT) or public domain. This
-project is licensed MIT OR Apache-2.0.
+attribution; all are permissive (BSD 3-Clause / MIT) or public domain. The
+`fqxv-crypt` dependencies above are likewise permissively licensed (MIT OR
+Apache-2.0). This project is licensed MIT OR Apache-2.0.

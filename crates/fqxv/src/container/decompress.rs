@@ -4,34 +4,84 @@ use super::*;
 use rayon::prelude::*;
 use tracing::{debug, info, instrument, trace, warn};
 
+/// Options for a decode entry point: worker threads and, for an encrypted
+/// archive, the passphrase.
+///
+/// Every decode entry point that used to take a bare `threads: usize` now takes
+/// `impl Into<DecodeOptions>` instead, so an existing call site passing a `usize`
+/// keeps compiling unchanged via the blanket [`From<usize>`] below; a caller that
+/// needs to decode an encrypted archive constructs this directly.
+#[derive(Debug, Clone, Default)]
+pub struct DecodeOptions {
+    /// Worker threads (0 = all available cores); clamped to available cores.
+    pub threads: usize,
+    /// Passphrase for an encrypted archive ([`crate::feature::ENCRYPTED`]).
+    /// Ignored (no error) against a plain archive. Against an encrypted one,
+    /// `None` surfaces [`Error::PasswordRequired`] before any block is read.
+    pub password: Option<Vec<u8>>,
+}
+
+impl From<usize> for DecodeOptions {
+    fn from(threads: usize) -> Self {
+        DecodeOptions {
+            threads,
+            password: None,
+        }
+    }
+}
+
+/// Build the archive's [`fqxv_crypt::ArchiveCipher`] from `opts.password` and the
+/// header's recorded [`EncryptionHeader`] — `None` for a plain archive,
+/// [`Error::PasswordRequired`] for an encrypted one with no password supplied.
+pub(crate) fn cipher_for_header(
+    header: &Header,
+    opts: &DecodeOptions,
+) -> Result<Option<fqxv_crypt::ArchiveCipher>> {
+    match &header.encryption {
+        Some(enc) => match &opts.password {
+            Some(pw) => Ok(Some(open_encryption(pw, enc)?)),
+            None => Err(Error::PasswordRequired),
+        },
+        None => Ok(None),
+    }
+}
+
 /// Decompress a `.fqxv` stream into interleaved FASTQ on `writer`.
 ///
 /// For grouped archives this yields interleaved output — exactly what aligners
 /// that accept interleaved paired reads want (`fqxv decompress x.fqxv | bwa mem -p`).
-#[instrument(skip_all, fields(threads))]
-pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Result<Stats> {
-    let pool = build_pool(threads)?;
+#[instrument(skip_all, fields(threads = tracing::field::Empty))]
+pub fn decompress<R: Read, W: Write>(
+    reader: R,
+    writer: W,
+    opts: impl Into<DecodeOptions>,
+) -> Result<Stats> {
+    let opts = opts.into();
+    tracing::Span::current().record("threads", opts.threads);
+    let pool = build_pool(opts.threads)?;
     let batch = pool.current_num_threads().max(1);
     let mut r = BufReader::new(reader);
     let header = read_header(&mut r)?;
     // Whole-file globally-clustered reorder (both keep-order modes) uses a
     // distinct layout — two stream partitions and, with keep-order, a global
-    // permutation — not the per-block loop below.
+    // permutation — not the per-block loop below. Encryption is not supported on
+    // this layout (rejected at compress time), so no cipher is needed here.
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
         let keep_order = header.flags & FLAG_KEEP_ORDER != 0;
         let has_reference = header.flags & FLAG_GLOBAL_REFERENCE != 0;
         return decode_reordered_whole(
             r,
             writer,
-            threads,
+            opts.threads,
             keep_order,
             header.group_size,
             has_reference,
         );
     }
+    let cipher = cipher_for_header(&header, &opts)?;
     // Whole-file shared reference frame (plain layout, issue #168): read it once,
     // right after the header, and thread it into every block's sequence decode.
-    let reference = read_reference_frame(&mut r, header.flags)?;
+    let reference = read_reference_frame(&mut r, header.flags, cipher.as_ref())?;
     let reference = reference.as_ref();
     let mut w = BufWriter::new(writer);
 
@@ -42,12 +92,16 @@ pub fn decompress<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Re
         "decompress pool ready"
     );
     let mut stats = Stats::default();
-    for_each_block_batch(&mut r, batch, |raw_blocks| {
+    for_each_block_batch(&mut r, batch, |base, raw_blocks| {
         debug!(blocks = raw_blocks.len(), "decoding batch");
         let decoded: Vec<Result<(u64, Vec<u8>)>> = pool.install(|| {
             raw_blocks
                 .par_iter()
-                .map(|b| decode_block(b, reference))
+                .enumerate()
+                .map(|(i, b)| {
+                    let buf = open_block_payload(b, cipher.as_ref().map(|c| (c, base + i as u64)))?;
+                    decode_block(&buf, reference)
+                })
                 .collect()
         });
         for d in decoded {
@@ -153,22 +207,25 @@ impl Write for StatsSink {
 /// handles every layout (plain, per-block and whole-file reorder, grouped) with
 /// no codec-specific logic and is guaranteed consistent with what `decompress`
 /// would actually emit. Cost is O(archive) — a real decode — unlike [`inspect`],
-/// which is O(row groups). `threads` matches [`decompress`].
-pub fn content_stats<R: Read>(reader: R, threads: usize) -> Result<ContentStats> {
+/// which is O(row groups). `opts` matches [`decompress`] (a passphrase is needed
+/// for an encrypted archive).
+pub fn content_stats<R: Read>(reader: R, opts: impl Into<DecodeOptions>) -> Result<ContentStats> {
     let mut sink = StatsSink::default();
-    decompress(reader, &mut sink, threads)?;
+    decompress(reader, &mut sink, opts)?;
     Ok(sink.stats)
 }
 
 /// Decompress a grouped archive, splitting reads back into `G` writers by their
 /// per-spot member. `writers.len()` must equal the archive's group size.
-#[instrument(skip_all, fields(threads, outputs = writers.len()))]
+#[instrument(skip_all, fields(threads = tracing::field::Empty, outputs = writers.len()))]
 pub fn decompress_split<R: Read, W: Write>(
     reader: R,
     writers: &mut [W],
-    threads: usize,
+    opts: impl Into<DecodeOptions>,
 ) -> Result<Stats> {
-    let pool = build_pool(threads)?;
+    let opts = opts.into();
+    tracing::Span::current().record("threads", opts.threads);
+    let pool = build_pool(opts.threads)?;
     let batch = pool.current_num_threads().max(1);
     let mut r = BufReader::new(reader);
     let header = read_header(&mut r)?;
@@ -182,19 +239,21 @@ pub fn decompress_split<R: Read, W: Write>(
         // Grouped global-reorder archives are always `keep_order`, so the
         // permutation restores the original spot interleaving and we can
         // de-interleave into the G writers. Single-end clustered-output archives
-        // (no preserved order) cannot be split.
+        // (no preserved order) cannot be split. Encryption is not supported on
+        // this layout (rejected at compress time).
         let global = header.flags & FLAG_GLOBAL_REORDER != 0;
         let keep_order = header.flags & FLAG_KEEP_ORDER != 0;
         if global && keep_order {
             let has_reference = header.flags & FLAG_GLOBAL_REFERENCE != 0;
-            return decode_reordered_split(r, writers, threads, g, has_reference);
+            return decode_reordered_split(r, writers, opts.threads, g, has_reference);
         }
         return Err(Error::Malformed(
             "reordered archive without preserved order: use decompress, not split",
         ));
     }
 
-    let reference = read_reference_frame(&mut r, header.flags)?;
+    let cipher = cipher_for_header(&header, &opts)?;
+    let reference = read_reference_frame(&mut r, header.flags, cipher.as_ref())?;
     let reference = reference.as_ref();
     debug!(
         threads = pool.current_num_threads(),
@@ -204,12 +263,16 @@ pub fn decompress_split<R: Read, W: Write>(
         "decompress-split pool ready"
     );
     let mut stats = Stats::default();
-    for_each_block_batch(&mut r, batch, |raw_blocks| {
+    for_each_block_batch(&mut r, batch, |base, raw_blocks| {
         debug!(blocks = raw_blocks.len(), "decoding batch");
         let decoded: Vec<Result<(u64, Vec<Vec<u8>>)>> = pool.install(|| {
             raw_blocks
                 .par_iter()
-                .map(|b| decode_block_group(b, g, reference))
+                .enumerate()
+                .map(|(i, b)| {
+                    let buf = open_block_payload(b, cipher.as_ref().map(|c| (c, base + i as u64)))?;
+                    decode_block_group(&buf, g, reference)
+                })
                 .collect()
         });
         for d in decoded {
@@ -261,9 +324,10 @@ pub struct Recovery {
 pub fn decompress_recover<R: Read + Seek, W: Write>(
     reader: R,
     writer: W,
-    threads: usize,
+    opts: impl Into<DecodeOptions>,
 ) -> Result<Recovery> {
-    let pool = build_pool(threads)?;
+    let opts = opts.into();
+    let pool = build_pool(opts.threads)?;
     let mut r = BufReader::new(reader);
     let header = read_header(&mut r)?;
     if header.flags & FLAG_GLOBAL_REORDER != 0 {
@@ -271,19 +335,40 @@ pub fn decompress_recover<R: Read + Seek, W: Write>(
             "recover supports only the plain layout; reordered archives decode all-or-nothing",
         ));
     }
+    let cipher = cipher_for_header(&header, &opts)?;
     // Read the whole-file shared reference frame (if any) before seeking around, so
     // reference-coded blocks can be recovered. A corrupt frame fails closed here —
     // its blocks then simply won't decode and are skipped like any other bad block.
-    let reference = read_reference_frame(&mut r, header.flags)?;
+    let reference = read_reference_frame(&mut r, header.flags, cipher.as_ref())?;
     let reference = reference.as_ref();
     // Prefer the footer's row-group index — it carries per-group read counts, so
     // losses can be tallied exactly. If the footer is unreadable (the common
     // truncated-tail case, which also loses the trailing blocks), fall back to
     // scanning for block sync markers: that needs no index and resynchronizes past
     // a corrupt length prefix or a bad block.
-    let rec = match read_footer(&mut r) {
-        Ok(footer) => recover_via_footer(&mut r, &pool, &footer, writer, reference)?,
+    //
+    // Scan recovery is refused for an encrypted archive: each block's AEAD nonce
+    // is derived from its position in read order, and the scan's block counter
+    // only advances on a *successfully validated* frame (see `recover_via_scan`).
+    // If a middle frame's CRC has failed and was silently absorbed as noise, every
+    // later block's assumed position — and so its derived nonce — desyncs from
+    // the true one it was sealed under, turning one corrupt block into a cascade
+    // of spurious AEAD failures on otherwise-intact blocks. The footer's row-group
+    // index has no such gap (each entry is the true ordinal regardless of what
+    // corruption exists in the blocks themselves), so footer-driven recovery is
+    // unaffected and remains the recommended path.
+    let rec = match read_footer(&mut r, header.encryption.is_some()) {
+        Ok(footer) => {
+            recover_via_footer(&mut r, &pool, &footer, writer, reference, cipher.as_ref())?
+        }
         Err(footer_err) => {
+            if cipher.is_some() {
+                return Err(Error::Malformed(
+                    "encrypted archive's footer is unreadable; marker-scan recovery is not \
+                     supported for encrypted archives (block positions cannot be trusted \
+                     without it) — recompress from source instead",
+                ));
+            }
             debug!(error = %footer_err, "footer unreadable; scanning for block markers");
             recover_via_scan(&mut r, &pool, writer, reference, header.header_len)?
         }
@@ -305,16 +390,18 @@ fn recover_via_footer<R: Read + Seek, W: Write>(
     footer: &Footer,
     writer: W,
     reference: Option<&fqxv_lroverlap::Reference>,
+    cipher: Option<&fqxv_crypt::ArchiveCipher>,
 ) -> Result<Recovery> {
     let mut rec = Recovery::default();
     let mut w = BufWriter::new(writer);
     for (i, &(off, read_count)) in footer.groups.iter().enumerate() {
         r.seek(SeekFrom::Start(off))?;
         // read_block checks the marker, bounds the length, and verifies the CRC;
-        // any failure — bad marker/CRC, truncation, or a decode error — drops just
-        // this group.
+        // any failure — bad marker/CRC, truncation, a decrypt failure, or a
+        // decode error — drops just this group.
         let outcome = match read_block(r, i as u64) {
-            Ok(Some(payload)) => pool.install(|| decode_block(&payload, reference)),
+            Ok(Some(payload)) => open_block_payload(&payload, cipher.map(|c| (c, i as u64)))
+                .and_then(|buf| pool.install(|| decode_block(&buf, reference))),
             Ok(None) => Err(Error::Malformed(
                 "row-group offset points at the terminator",
             )),

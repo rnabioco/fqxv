@@ -147,8 +147,10 @@ support](docs/design/longread.md).
 
 `fqxv` stands on a large body of prior work. Everything here is a clean-room
 implementation from public specifications and papers — no third-party source is
-vendored — but these projects and their authors made it possible, and we
-cross-checked against several of them for correctness:
+vendored, with one deliberate exception for the cryptographic primitives behind
+optional archive encryption (see [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md))
+— but these projects and their authors made it possible, and we cross-checked
+against several of them for correctness:
 
 - **htscodecs** ([samtools/htscodecs](https://github.com/samtools/htscodecs),
   James Bonfield / Genome Research Ltd) and the [CRAM 3.1 codecs

@@ -193,6 +193,36 @@ pub struct Params {
     /// *non-critical* header extension record, so a reader that predates them skips
     /// it and decodes the archive normally.
     pub member_labels: Vec<String>,
+    /// Encrypt the archive with a passphrase (ChaCha20-Poly1305, per-block AEAD via
+    /// `fqxv_crypt`). `None` (the default) writes a plain archive. See
+    /// `docs/design/encryption.md`. Not supported together with [`Params::reorder`]
+    /// (`--order any`/`shuffle`/`--max`) in this release — [`encode_reordered`]
+    /// refuses that combination.
+    pub encrypt: Option<EncryptSpec>,
+}
+
+/// [`Params::encrypt`]'s payload: the passphrase (raw bytes — the caller decides
+/// the encoding; see `fqxv_crypt::Passphrase`) and the Argon2id cost parameters to
+/// use. `kdf` is not currently exposed as a CLI flag (the CLI always passes
+/// [`fqxv_crypt::KdfParams::DEFAULT`]), but the field exists so a library caller —
+/// or a future flag — can tune it without a signature change; the chosen params
+/// travel with the archive (the header's encryption extension), so decode never
+/// needs to know them independently.
+#[derive(Clone)]
+pub struct EncryptSpec {
+    /// The passphrase's raw bytes.
+    pub passphrase: Vec<u8>,
+    /// Argon2id memory/time/parallelism cost.
+    pub kdf: fqxv_crypt::KdfParams,
+}
+
+impl std::fmt::Debug for EncryptSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptSpec")
+            .field("passphrase", &"<redacted>")
+            .field("kdf", &self.kdf)
+            .finish()
+    }
 }
 
 impl Default for Params {
@@ -214,6 +244,7 @@ impl Default for Params {
             block_seq_bytes: 0,
             quality_chunks: 0,
             member_labels: Vec::new(),
+            encrypt: None,
         }
     }
 }
@@ -847,8 +878,16 @@ pub(crate) fn write_plain_layout<W: Write>(
     precoded_seq: Option<&[Vec<u8>]>,
     precoded_ns: Option<&[(Vec<u8>, Vec<u8>)]>,
 ) -> Result<Stats> {
+    let setup = match &params.encrypt {
+        Some(spec) => Some(setup_encryption(&spec.passphrase, spec.kdf)?),
+        None => None,
+    };
+    let (cipher, enc_header) = match &setup {
+        Some((c, h)) => (Some(c), Some(h)),
+        None => (None, None),
+    };
     let mut w = CrcWriter::new(BufWriter::new(writer));
-    let header_len = write_header(&mut w, params, group_size, platform)?;
+    let header_len = write_header(&mut w, params, group_size, platform, enc_header)?;
     let mut stats = Stats {
         group_size,
         ..Stats::default()
@@ -882,9 +921,9 @@ pub(crate) fn write_plain_layout<W: Write>(
                 })
                 .unzip()
         });
-        write_blocks(&mut w, &blocks, compressed, &mut stats, &mut index)?;
+        write_blocks(&mut w, &blocks, compressed, &mut stats, &mut index, cipher)?;
     }
-    let footer_bytes = write_footer(&mut w, &index, stats.reads)?;
+    let footer_bytes = write_footer(&mut w, &index, stats.reads, cipher)?;
     w.flush()?;
     stats.out_bytes += header_len + footer_bytes;
     Ok(stats)
@@ -1163,8 +1202,22 @@ fn compress_longread_shared_ref<W: Write>(
 
     // Pass 2: write header, the reference frame, then blocks (names + quality coded
     // here, reusing the pass-1 sequence) in order.
+    let setup = match &params.encrypt {
+        Some(spec) => Some(setup_encryption(&spec.passphrase, spec.kdf)?),
+        None => None,
+    };
+    let (cipher, enc_header) = match &setup {
+        Some((c, h)) => (Some(c), Some(h)),
+        None => (None, None),
+    };
     let mut w = CrcWriter::new(BufWriter::new(writer));
     let flags = FLAG_PLUS_NORMALIZED | FLAG_GLOBAL_REFERENCE;
+    let mut required_features = crate::feature::GLOBAL_REFERENCE;
+    let mut ext = encode_member_labels(&params.member_labels, group_size);
+    if let Some(enc) = enc_header {
+        required_features |= crate::feature::ENCRYPTED;
+        ext.extend_from_slice(&encode_encryption_ext(enc));
+    }
     let header_len = write_header_prefix(
         &mut w,
         &HeaderPrefix {
@@ -1173,13 +1226,20 @@ fn compress_longread_shared_ref<W: Write>(
             flags,
             group_size,
             platform,
-            required_features: crate::feature::GLOBAL_REFERENCE,
+            required_features,
         },
-        &encode_member_labels(&params.member_labels, group_size),
+        &ext,
     )?;
-    write_framed(&mut w, &ref_frame)?;
+    // The reference carries real assembled sequence, so it is sealed whenever the
+    // archive is encrypted — the outer [4 len][4 crc] framing covers ciphertext
+    // exactly as it covers plaintext, unchanged either way.
+    let ref_frame_on_disk = match cipher {
+        Some(c) => c.seal_reference_frame(&ref_frame),
+        None => ref_frame,
+    };
+    write_framed(&mut w, &ref_frame_on_disk)?;
     // Framed slice on disk is [4 len][4 crc][bytes]; blocks begin past it.
-    let ref_frame_bytes = (4 + CRC_LEN + ref_frame.len()) as u64;
+    let ref_frame_bytes = (4 + CRC_LEN + ref_frame_on_disk.len()) as u64;
 
     let mut stats = Stats {
         group_size,
@@ -1199,9 +1259,9 @@ fn compress_longread_shared_ref<W: Write>(
                 })
                 .unzip()
         });
-        write_blocks(&mut w, &blocks, compressed, &mut stats, &mut index)?;
+        write_blocks(&mut w, &blocks, compressed, &mut stats, &mut index, cipher)?;
     }
-    let footer_bytes = write_footer(&mut w, &index, stats.reads)?;
+    let footer_bytes = write_footer(&mut w, &index, stats.reads, cipher)?;
     w.flush()?;
     stats.out_bytes += header_len + ref_frame_bytes + footer_bytes;
     Ok(stats)
@@ -1233,8 +1293,16 @@ where
         backend = ?fqxv_rans::Backend::detect(),
         "compress pipeline ready"
     );
+    let setup = match &params.encrypt {
+        Some(spec) => Some(setup_encryption(&spec.passphrase, spec.kdf)?),
+        None => None,
+    };
+    let (cipher, enc_header) = match &setup {
+        Some((c, h)) => (Some(c), Some(h)),
+        None => (None, None),
+    };
     let mut w = CrcWriter::new(BufWriter::new(writer));
-    let header_len = write_header(&mut w, &params, group_size, platform)?;
+    let header_len = write_header(&mut w, &params, group_size, platform, enc_header)?;
 
     let mut stats = Stats {
         group_size,
@@ -1310,8 +1378,14 @@ where
         for (idx, blk, payload) in &done_rx {
             pending.insert(idx, (blk, payload));
             while let Some((blk, payload)) = pending.remove(&next) {
-                if let Err(e) = write_blocks(&mut w, &[blk], vec![payload], &mut stats, &mut index)
-                {
+                if let Err(e) = write_blocks(
+                    &mut w,
+                    &[blk],
+                    vec![payload],
+                    &mut stats,
+                    &mut index,
+                    cipher,
+                ) {
                     result = Err(e);
                     break;
                 }
@@ -1332,7 +1406,7 @@ where
         }
     })?;
 
-    let footer_bytes = write_footer(&mut w, &index, stats.reads)?;
+    let footer_bytes = write_footer(&mut w, &index, stats.reads, cipher)?;
     w.flush()?;
     stats.out_bytes += header_len + footer_bytes;
     Ok(stats)

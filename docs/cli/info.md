@@ -28,7 +28,7 @@ a batch — see [Reporting a batch](#reporting-a-batch).
 
 | Option | Description |
 | --- | --- |
-| `-s, --stats` | Also report content statistics — read-length spread, base composition, GC%, and the quality distribution. This decodes the whole archive, so it costs a full decompress. |
+| `-s, --stats` | Also report content statistics — read-length spread, base composition, GC%, and the quality distribution. This decodes the whole archive, so it costs a full decompress. **Not currently supported on an [encrypted](#encryption) archive** (`info` takes no passphrase flag; it will report a clear "passphrase is required" error rather than the stats). |
 | `--tsv` | Emit a single machine-readable TSV line instead of the human report (a batch prepends a `file` column and prints one row per archive). |
 | `--json` | Emit a JSON object instead of the human report (a batch emits an array of them). |
 | `--threads <N>` | Worker threads (0 = all cores); only relevant with `--stats`. |
@@ -86,7 +86,9 @@ file_size	reads	blocks	group_size	seq_order	quality_binning	reordered	names_byte
 ```
 
 With `--stats`, five more columns are appended
-(`bases min_len max_len gc_fraction mean_quality`).
+(`bases min_len max_len gc_fraction mean_quality`), and `encrypted`/
+`encrypted_bytes` are always appended last (after `--stats`'s columns, so
+their position doesn't shift with or without `--stats`).
 
 `--json` emits a single object with the same facts plus derived fields
 (percentage shares, `bytes_per_read`, and human labels). `spots` and
@@ -127,6 +129,20 @@ fqxv info sample.fqxv --json
 
 With `--stats`, the object gains a nested `stats` block (read/base counts, length
 spread, GC fraction, base composition, mean quality, and a quality histogram).
+
+Every report also carries `"encrypted": false`; on an encrypted archive
+`"encrypted"` is `true`, `"streams"` and `"bytes_per_read"` are omitted (a
+per-stream split can't be known without decrypting every block), and
+`"encrypted_bytes"` gives the total on-disk ciphertext instead. See
+[Encryption](#encryption).
+
+## Encryption
+
+`info` never needs a passphrase — `encrypted`/`encrypted_bytes` come from the
+header and footer alone, the same as every other field here. See
+[`compress --encrypt`](compress.md#encryption) for how to create one and
+[`verify`](verify.md#encryption) for the deeper, password-gated integrity
+check.
 
 ## Content statistics (`--stats`)
 
@@ -173,4 +189,5 @@ archives/sample.fqxv	79192	800	1	2	11	0	0	7488	20669	50840	illumina	256	249666e0
 | `plus line` | Whether the `+` line was normalized. |
 | `format` | On-disk container format version, `vMAJOR.MINOR` (currently `v1.0`). |
 | `whole-file crc` | Stored whole-file CRC-32C (hex); the value `verify` recomputes. Shown as `—` (and omitted from `--json`) for a globally reordered archive, which carries per-frame CRCs instead. |
-| `names` / `sequence` / `quality` | Compressed bytes per stream, with share of the three-stream total. |
+| `names` / `sequence` / `quality` | Compressed bytes per stream, with share of the three-stream total. Omitted for an [encrypted](#encryption) archive — see `encrypted`. |
+| `encrypted` | Whether the archive is [encrypted](#encryption) — readable without a passphrase. When true, the per-stream table is replaced by the total on-disk ciphertext size. |

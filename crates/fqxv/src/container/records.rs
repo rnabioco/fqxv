@@ -132,14 +132,14 @@ impl<F: FnMut(Record) -> io::Result<()>> Write for RecordSink<F> {
 /// ```
 pub fn decompress_records<R: Read>(
     reader: R,
-    threads: usize,
+    opts: impl Into<DecodeOptions>,
     mut on_record: impl FnMut(Record),
 ) -> Result<Stats> {
     let sink = RecordSink::new(move |rec| {
         on_record(rec);
         Ok(())
     });
-    decompress(reader, sink, threads)
+    decompress(reader, sink, opts)
 }
 
 /// A pull [`Iterator`] over an archive's records.
@@ -169,7 +169,8 @@ impl RecordReader {
     /// [`decompress`] (0 = a default pool). The reader is moved into the thread,
     /// hence the `Send + 'static` bound; a `Box<dyn Read + Send>`, [`std::fs::File`],
     /// or `Cursor<Vec<u8>>` all satisfy it.
-    pub fn new<R: Read + Send + 'static>(reader: R, threads: usize) -> Self {
+    pub fn new<R: Read + Send + 'static>(reader: R, opts: impl Into<DecodeOptions>) -> Self {
+        let opts = opts.into();
         let (tx, rx) = sync_channel::<Record>(CHANNEL_CAP);
         let handle = thread::spawn(move || {
             let sink = RecordSink::new(|rec| {
@@ -177,7 +178,7 @@ impl RecordReader {
                     io::Error::new(io::ErrorKind::BrokenPipe, "record receiver dropped")
                 })
             });
-            decompress(reader, sink, threads)
+            decompress(reader, sink, opts)
         });
         RecordReader {
             rx: Some(rx),
@@ -197,12 +198,13 @@ impl RecordReader {
     /// selection semantics and the per-layout caveats.
     pub fn with_selection<R: Read + Send + 'static>(
         reader: R,
-        threads: usize,
+        opts: impl Into<DecodeOptions>,
         selection: StreamSelection,
     ) -> Self {
+        let opts = opts.into();
         let (tx, rx) = sync_channel::<Record>(CHANNEL_CAP);
         let handle = thread::spawn(move || {
-            decompress_select(reader, threads, selection, |rec| {
+            decompress_select(reader, opts, selection, |rec| {
                 tx.send(rec).map_err(|_| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "record receiver dropped")
                 })

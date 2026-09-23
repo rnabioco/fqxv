@@ -66,6 +66,27 @@ pub(crate) const EXT_TAG_MEMBER_LABELS: u8 = 0x01;
 /// slot tokens (`"R1"`, `"I1"`, `"2"`); the cap bounds the header and keeps a
 /// corrupt length from claiming the rest of the extension region.
 pub(crate) const MAX_MEMBER_LABEL_LEN: usize = 15;
+/// Passphrase-encryption parameters (see `fqxv_crypt` and `docs/design/encryption.md`).
+/// Payload is 42 bytes: `[1 crypt_version][16 salt][16 nonce_id][4 argon2_m_cost_kib
+/// LE][4 argon2_t_cost LE][1 argon2_p_cost]`.
+///
+/// **Critical on purpose**, unlike the member-label tag: this is header-shaped,
+/// load-bearing metadata a reader must not guess — without it, no block can be
+/// decrypted at all. The accompanying [`crate::feature::ENCRYPTED`] bit is the
+/// capability gate; this tag is the metadata that travels with it (the second
+/// worked example of `docs/design/container.md`'s evolution policy, alongside
+/// `GLOBAL_REFERENCE`).
+pub(crate) const EXT_TAG_ENCRYPTION: u8 = EXT_CRITICAL_BIT | 0x01;
+/// The only `crypt_version` this build writes or reads: ChaCha20-Poly1305 +
+/// Argon2id (see `fqxv_crypt::ArchiveCipher`). A future scheme change adds a new
+/// value here rather than reusing this one, so an old build refuses cleanly
+/// ([`crate::Error::UnsupportedEncryptionVersion`]) instead of misinterpreting
+/// bytes sealed under a different construction.
+pub(crate) const CRYPT_VERSION_V1: u8 = 1;
+/// On-disk length of the [`EXT_TAG_ENCRYPTION`] payload (excluding the `[tag][len]`
+/// TLV prefix).
+pub(crate) const ENCRYPTION_EXT_LEN: usize =
+    1 + fqxv_crypt::SALT_LEN + fqxv_crypt::NONCE_ID_LEN + 4 + 4 + 1;
 /// Bytes of CRC-32C appended after a frame's length field (plain block frames)
 /// or after a `[u32 len]` framed slice (reorder layout).
 pub(crate) const CRC_LEN: usize = 4;
@@ -180,6 +201,112 @@ pub(crate) fn encode_member_labels(labels: &[String], group_size: u8) -> Vec<u8>
     out
 }
 
+/// Encryption parameters read from (or written to) the [`EXT_TAG_ENCRYPTION`]
+/// header extension: the Argon2id salt and per-archive AEAD nonce identifier
+/// (both random, drawn once per `compress`), plus the KDF cost parameters —
+/// stored on disk, not baked into a build, so a later release can raise the
+/// default without breaking an archive already written (decode always uses
+/// whatever was recorded).
+#[derive(Debug)]
+pub(crate) struct EncryptionHeader {
+    pub(crate) salt: [u8; fqxv_crypt::SALT_LEN],
+    pub(crate) nonce_id: [u8; fqxv_crypt::NONCE_ID_LEN],
+    pub(crate) kdf: fqxv_crypt::KdfParams,
+}
+
+/// Encode the [`EXT_TAG_ENCRYPTION`] extension record. Returns the whole TLV
+/// (`[tag][len][payload]`), ready to concatenate into the extension region.
+pub(crate) fn encode_encryption_ext(enc: &EncryptionHeader) -> Vec<u8> {
+    let mut out = Vec::with_capacity(3 + ENCRYPTION_EXT_LEN);
+    out.push(EXT_TAG_ENCRYPTION);
+    out.extend_from_slice(&(ENCRYPTION_EXT_LEN as u16).to_le_bytes());
+    out.push(CRYPT_VERSION_V1);
+    out.extend_from_slice(&enc.salt);
+    out.extend_from_slice(&enc.nonce_id);
+    out.extend_from_slice(&enc.kdf.m_cost_kib.to_le_bytes());
+    out.extend_from_slice(&enc.kdf.t_cost.to_le_bytes());
+    out.push(enc.kdf.p_cost);
+    out
+}
+
+/// Decode an [`EXT_TAG_ENCRYPTION`] payload (already length-checked by the
+/// caller's TLV walk). Unlike [`decode_member_labels`], a malformed payload here
+/// is fatal ([`Error::Malformed`]), not a silent degrade: this tag is critical,
+/// load-bearing metadata, and a corrupt or truncated record means no block in
+/// the archive can be decrypted — there is no safe fallback to decode "without"
+/// it the way there is for descriptive member labels.
+fn decode_encryption_ext(payload: &[u8]) -> Result<EncryptionHeader> {
+    if payload.len() != ENCRYPTION_EXT_LEN {
+        return Err(Error::Malformed(
+            "encryption header extension has the wrong length",
+        ));
+    }
+    let version = payload[0];
+    if version != CRYPT_VERSION_V1 {
+        return Err(Error::UnsupportedEncryptionVersion(version));
+    }
+    let mut salt = [0u8; fqxv_crypt::SALT_LEN];
+    salt.copy_from_slice(&payload[1..1 + fqxv_crypt::SALT_LEN]);
+    let mut off = 1 + fqxv_crypt::SALT_LEN;
+    let mut nonce_id = [0u8; fqxv_crypt::NONCE_ID_LEN];
+    nonce_id.copy_from_slice(&payload[off..off + fqxv_crypt::NONCE_ID_LEN]);
+    off += fqxv_crypt::NONCE_ID_LEN;
+    let m_cost_kib = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+    off += 4;
+    let t_cost = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+    off += 4;
+    let p_cost = payload[off];
+    Ok(EncryptionHeader {
+        salt,
+        nonce_id,
+        kdf: fqxv_crypt::KdfParams {
+            m_cost_kib,
+            t_cost,
+            p_cost,
+        },
+    })
+}
+
+/// Derive a fresh per-archive key and its header metadata: draw a random salt +
+/// `nonce_id` (32 bytes, one `getrandom` call), derive the key via Argon2id under
+/// `kdf`, and bind both into an [`fqxv_crypt::ArchiveCipher`]. Called once per
+/// `compress` invocation when [`Params::encrypt`] is set — never per block, so
+/// this sits outside the per-block `rayon` hot path (the KDF cost is paid once,
+/// up front). `salt`/`nonce_id` are fresh every call, even for an identical
+/// passphrase and input, so two archives of identical content never produce
+/// comparable ciphertext (see the `fqxv_crypt` crate docs).
+pub(crate) fn setup_encryption(
+    passphrase: &[u8],
+    kdf: fqxv_crypt::KdfParams,
+) -> Result<(fqxv_crypt::ArchiveCipher, EncryptionHeader)> {
+    let material = fqxv_crypt::random_bytes32()?;
+    let salt: [u8; fqxv_crypt::SALT_LEN] = material[..fqxv_crypt::SALT_LEN].try_into().unwrap();
+    let nonce_id: [u8; fqxv_crypt::NONCE_ID_LEN] =
+        material[fqxv_crypt::SALT_LEN..].try_into().unwrap();
+    let pass = fqxv_crypt::Passphrase::from(passphrase.to_vec());
+    let key = fqxv_crypt::derive_key(&pass, &salt, kdf)?;
+    let cipher = fqxv_crypt::ArchiveCipher::new(key, nonce_id);
+    Ok((
+        cipher,
+        EncryptionHeader {
+            salt,
+            nonce_id,
+            kdf,
+        },
+    ))
+}
+
+/// Rebuild an [`fqxv_crypt::ArchiveCipher`] on the decode side from a passphrase
+/// and the archive's own recorded [`EncryptionHeader`].
+pub(crate) fn open_encryption(
+    passphrase: &[u8],
+    enc: &EncryptionHeader,
+) -> Result<fqxv_crypt::ArchiveCipher> {
+    let pass = fqxv_crypt::Passphrase::from(passphrase.to_vec());
+    let key = fqxv_crypt::derive_key(&pass, &enc.salt, enc.kdf)?;
+    Ok(fqxv_crypt::ArchiveCipher::new(key, enc.nonce_id))
+}
+
 /// The header prefix's variable fields, gathered so the writer takes a record
 /// rather than six positional `u8`s that are trivial to transpose at a call site.
 pub(crate) struct HeaderPrefix {
@@ -220,20 +347,29 @@ pub(crate) fn write_header_prefix<W: Write>(
     Ok((hdr.len() + CRC_LEN) as u64)
 }
 
-/// Write the container header (plain layout).
+/// Write the container header (plain layout). `encryption`, when present, ORs
+/// [`crate::feature::ENCRYPTED`] into `required_features` and appends its
+/// [`EXT_TAG_ENCRYPTION`] record — see [`setup_encryption`].
 pub(crate) fn write_header<W: Write>(
     w: &mut W,
     params: &Params,
     group_size: u8,
     platform: Platform,
+    encryption: Option<&EncryptionHeader>,
 ) -> Result<u64> {
     // The block layout is always non-reorder — reorder (both keep-order modes)
     // uses the whole-file path, which writes its own header.
     debug_assert!(!params.reorder);
-    // The plain layout needs nothing beyond the base format for its major: any
-    // per-block codec choice (e.g. the long-read overlap codec) is recorded by the
-    // sequence stream's method byte and rejected per block on decode, not gated
-    // here. So the coarse feature word is empty.
+    // The plain layout needs nothing beyond the base format for its major (unless
+    // encrypted): any per-block codec choice (e.g. the long-read overlap codec) is
+    // recorded by the sequence stream's method byte and rejected per block on
+    // decode, not gated here.
+    let mut ext = encode_member_labels(&params.member_labels, group_size);
+    let mut required_features = 0u64;
+    if let Some(enc) = encryption {
+        required_features |= crate::feature::ENCRYPTED;
+        ext.extend_from_slice(&encode_encryption_ext(enc));
+    }
     write_header_prefix(
         w,
         &HeaderPrefix {
@@ -242,9 +378,9 @@ pub(crate) fn write_header<W: Write>(
             flags: FLAG_PLUS_NORMALIZED,
             group_size,
             platform,
-            required_features: 0,
+            required_features,
         },
-        &encode_member_labels(&params.member_labels, group_size),
+        &ext,
     )
 }
 
@@ -303,10 +439,21 @@ impl FooterIndex {
 /// so far, read from the [`CrcWriter`] tee) and `footer_crc` (over the footer
 /// body itself), so a reader can both trust the index and detect archive-wide
 /// corruption.
+///
+/// `cipher` is `Some` for an encrypted archive: an extra 16-byte
+/// [`fqxv_crypt::ArchiveCipher::mac_footer`] tag is appended between
+/// `whole_file_crc` and `footer_crc`, authenticating the whole footer body
+/// (including the read/block counts) — this is what lets a reader with the
+/// passphrase detect a tail-truncation attack that drops only the trailing
+/// blocks behind a forged terminator+footer (position-bound block AAD alone
+/// catches only *interior* reordering/truncation; see `docs/design/encryption.md`).
+/// `footer_crc` covers the tag too, so the tag's own bytes stay bit-rot-protected
+/// exactly like the rest of the body.
 pub(crate) fn write_footer<W: Write>(
     w: &mut CrcWriter<W>,
     index: &FooterIndex,
     total_reads: u64,
+    cipher: Option<&fqxv_crypt::ArchiveCipher>,
 ) -> Result<u64> {
     // Zero-length terminator block — a full frame (marker + `len == 0`) so the
     // scan-based recovery treats it like any other boundary. Fed through the tee.
@@ -314,8 +461,9 @@ pub(crate) fn write_footer<W: Write>(
     w.write_all(&0u64.to_le_bytes())?;
     let footer_offset = index.offset + BLOCK_MAGIC.len() as u64 + 8;
 
-    let mut body =
-        Vec::with_capacity(4 + index.entries.len() * FOOTER_GROUP_BYTES + 8 + FOOTER_CRC_TAIL);
+    let mut body = Vec::with_capacity(
+        4 + index.entries.len() * FOOTER_GROUP_BYTES + 8 + footer_crc_tail(cipher.is_some()),
+    );
     body.extend_from_slice(&(index.entries.len() as u32).to_le_bytes());
     for (&(off, read_count), streams) in index.entries.iter().zip(&index.streams) {
         body.extend_from_slice(&off.to_le_bytes());
@@ -332,14 +480,22 @@ pub(crate) fn write_footer<W: Write>(
     w.write_all(&body)?;
     let whole_file_crc = w.crc();
     body.extend_from_slice(&whole_file_crc.to_le_bytes());
-    // footer_crc covers the footer body up to but not including itself.
+    let footer_tag = cipher.map(|c| c.mac_footer(&body));
+    if let Some(tag) = &footer_tag {
+        body.extend_from_slice(tag);
+    }
+    // footer_crc covers the footer body (and the tag, if present) up to but not
+    // including itself.
     let footer_crc = crc32c(&body);
     w.write_all(&whole_file_crc.to_le_bytes())?;
+    if let Some(tag) = &footer_tag {
+        w.write_all(tag)?;
+    }
     w.write_all(&footer_crc.to_le_bytes())?;
 
     w.write_all(&footer_offset.to_le_bytes())?;
     w.write_all(&FOOTER_MAGIC)?;
-    // body = n_groups..whole_file_crc; +CRC_LEN footer_crc, + marker+len terminator.
+    // body = n_groups..whole_file_crc[..tag]; +CRC_LEN footer_crc, + marker+len terminator.
     Ok((BLOCK_MAGIC.len() + 8) as u64 + body.len() as u64 + CRC_LEN as u64 + TRAILER_LEN as u64)
 }
 
@@ -361,14 +517,23 @@ pub(crate) fn write_framed<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
 /// reader positioned just past the header consumes it here and threads the decoded
 /// [`fqxv_lroverlap::Reference`] into every block's sequence decode. Returns `None`
 /// when the bit is clear (no frame is present). A corrupt frame fails closed.
+///
+/// `cipher` is `Some` for an encrypted archive (the frame carries real assembled
+/// sequence, so it is sealed whenever [`crate::feature::ENCRYPTED`] is set); the
+/// frame's bytes are opened before decoding.
 pub(crate) fn read_reference_frame<R: Read>(
     r: &mut R,
     flags: u8,
+    cipher: Option<&fqxv_crypt::ArchiveCipher>,
 ) -> Result<Option<fqxv_lroverlap::Reference>> {
     if flags & FLAG_GLOBAL_REFERENCE == 0 {
         return Ok(None);
     }
     let bytes = read_framed(r, "plain-layout global reference")?;
+    let bytes = match cipher {
+        Some(c) => c.open_reference_frame(&bytes)?,
+        None => bytes,
+    };
     Ok(Some(fqxv_lroverlap::Reference::decode(&bytes)?))
 }
 
@@ -435,6 +600,10 @@ pub(crate) struct Header {
     /// and any input whose slots weren't identifiable), in which case consumers
     /// fall back to positional naming.
     pub(crate) member_labels: Vec<String>,
+    /// Passphrase-encryption parameters from the [`EXT_TAG_ENCRYPTION`] record,
+    /// present iff [`crate::feature::ENCRYPTED`] is set (`read_header` refuses any
+    /// archive where the two disagree).
+    pub(crate) encryption: Option<EncryptionHeader>,
 }
 
 pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
@@ -500,7 +669,19 @@ pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
     // Walk the TLV records: an unknown *critical* tag is fatal; unknown
     // non-critical tags are skipped. Known tags are decoded here.
     let group_size = prefix[17].max(1);
-    let member_labels = check_header_extensions(&ext, group_size)?;
+    let extensions = check_header_extensions(&ext, group_size)?;
+
+    // The feature bit is the capability gate (an old reader refuses it above,
+    // before the CRC or extension region are even parsed on that build); this
+    // tag is the accompanying metadata. A well-formed archive from this scheme
+    // always sets both together, so disagreement is a structural error, not
+    // something to silently tolerate (e.g. a build that forgot to set the bit,
+    // or a hand-edited/fuzzed header).
+    if (required_features & crate::feature::ENCRYPTED != 0) != extensions.encryption.is_some() {
+        return Err(Error::Malformed(
+            "encryption feature bit and header extension disagree",
+        ));
+    }
 
     Ok(Header {
         major,
@@ -512,7 +693,8 @@ pub(crate) fn read_header<R: Read>(r: &mut R) -> Result<Header> {
         group_size,
         platform: prefix[18],
         header_len: (HEADER_PREFIX_LEN + ext_len + CRC_LEN) as u64,
-        member_labels,
+        member_labels: extensions.member_labels,
+        encryption: extensions.encryption,
     })
 }
 
@@ -548,12 +730,21 @@ fn decode_member_labels(payload: &[u8], group_size: u8) -> Vec<String> {
     labels
 }
 
+/// Parsed contents of the header's TLV extension region: every tag this build
+/// recognizes, decoded once so [`read_header`] doesn't re-walk the region per
+/// field.
+pub(crate) struct HeaderExtensions {
+    pub(crate) member_labels: Vec<String>,
+    pub(crate) encryption: Option<EncryptionHeader>,
+}
+
 /// Walk the header extension region's `[1 tag][2 len][len bytes]` records,
-/// returning any member labels found. An unknown *critical* tag (high bit set,
-/// [`EXT_CRITICAL_BIT`]) is refused, and an unknown non-critical tag is skipped. A
-/// record that overruns the region is malformed.
-fn check_header_extensions(mut ext: &[u8], group_size: u8) -> Result<Vec<String>> {
-    let mut labels = Vec::new();
+/// decoding every tag this build recognizes. An unknown *critical* tag (high bit
+/// set, [`EXT_CRITICAL_BIT`]) is refused, and an unknown non-critical tag is
+/// skipped. A record that overruns the region is malformed.
+fn check_header_extensions(mut ext: &[u8], group_size: u8) -> Result<HeaderExtensions> {
+    let mut member_labels = Vec::new();
+    let mut encryption = None;
     while !ext.is_empty() {
         if ext.len() < 3 {
             return Err(Error::Malformed("truncated header extension record"));
@@ -565,13 +756,18 @@ fn check_header_extensions(mut ext: &[u8], group_size: u8) -> Result<Vec<String>
             return Err(Error::Malformed("header extension record overruns region"));
         }
         if tag == EXT_TAG_MEMBER_LABELS {
-            labels = decode_member_labels(&ext[3..end], group_size);
+            member_labels = decode_member_labels(&ext[3..end], group_size);
+        } else if tag == EXT_TAG_ENCRYPTION {
+            encryption = Some(decode_encryption_ext(&ext[3..end])?);
         } else if tag & EXT_CRITICAL_BIT != 0 {
             return Err(Error::UnsupportedExtension(tag));
         }
         ext = &ext[end..];
     }
-    Ok(labels)
+    Ok(HeaderExtensions {
+        member_labels,
+        encryption,
+    })
 }
 
 /// The footer index: per row group `(byte_offset, read_count)`, the total read
@@ -603,15 +799,56 @@ pub(crate) struct Footer {
     /// `whole_file_crc` field itself), so a verifier can re-hash exactly that
     /// prefix.
     pub(crate) covered_len: u64,
+    /// The footer-authentication tag ([`write_footer`]'s `cipher` parameter),
+    /// present iff the archive is encrypted. Verify with
+    /// [`fqxv_crypt::ArchiveCipher::verify_footer`] against [`Footer::body_bytes`]
+    /// — checking it (which needs the passphrase) proves both that the
+    /// passphrase is right and that no block was dropped from the archive's
+    /// tail; skipping it (no passphrase supplied) still leaves every other
+    /// check in this struct intact.
+    pub(crate) footer_tag: Option<[u8; fqxv_crypt::TAG_LEN]>,
+}
+
+impl Footer {
+    /// Reconstruct the exact footer-body bytes [`write_footer`] fed to
+    /// [`fqxv_crypt::ArchiveCipher::mac_footer`] (`n_groups .. whole_file_crc`,
+    /// inclusive) from this struct's already-parsed fields, for
+    /// [`fqxv_crypt::ArchiveCipher::verify_footer`]. Byte-identical to the
+    /// original by construction: [`parse_footer_body`] parses exactly this shape,
+    /// so re-serializing it in the same field order reproduces the same bytes.
+    pub(crate) fn body_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(4 + self.groups.len() * FOOTER_GROUP_BYTES + 8 + 4);
+        body.extend_from_slice(&(self.groups.len() as u32).to_le_bytes());
+        for (&(off, read_count), streams) in self.groups.iter().zip(&self.stream_locs) {
+            body.extend_from_slice(&off.to_le_bytes());
+            body.extend_from_slice(&read_count.to_le_bytes());
+            for s in streams {
+                body.extend_from_slice(&s.offset.to_le_bytes());
+                body.extend_from_slice(&s.len.to_le_bytes());
+                body.extend_from_slice(&s.crc.to_le_bytes());
+            }
+        }
+        body.extend_from_slice(&self.total_reads.to_le_bytes());
+        body.extend_from_slice(&self.whole_file_crc.to_le_bytes());
+        body
+    }
 }
 
 /// Bytes appended to the footer body after `total_reads`: `[4 whole_file_crc]
 /// [4 footer_crc]`.
 pub(crate) const FOOTER_CRC_TAIL: usize = 8;
 
+/// [`FOOTER_CRC_TAIL`], widened by the 16-byte [`fqxv_crypt::TAG_LEN`]
+/// footer-authentication tag when `encrypted` — see [`write_footer`].
+pub(crate) fn footer_crc_tail(encrypted: bool) -> usize {
+    FOOTER_CRC_TAIL + if encrypted { fqxv_crypt::TAG_LEN } else { 0 }
+}
+
 /// Read the footer by seeking to the EOF trailer and following its back-pointer,
-/// then verify the footer's own CRC before trusting any offset in it.
-pub(crate) fn read_footer<R: Read + Seek>(r: &mut R) -> Result<Footer> {
+/// then verify the footer's own CRC before trusting any offset in it. `encrypted`
+/// (the header's [`crate::feature::ENCRYPTED`] bit) selects which tail shape to
+/// expect — see [`footer_crc_tail`].
+pub(crate) fn read_footer<R: Read + Seek>(r: &mut R, encrypted: bool) -> Result<Footer> {
     let end = r.seek(SeekFrom::End(0))?;
     if end < (HEADER_LEN + TRAILER_LEN) as u64 {
         return Err(Error::Truncated);
@@ -624,9 +861,9 @@ pub(crate) fn read_footer<R: Read + Seek>(r: &mut R) -> Result<Footer> {
     }
     let footer_offset = u64::from_le_bytes(trailer[..8].try_into().unwrap());
     let body_end = end - TRAILER_LEN as u64;
-    // Body must hold at least n_groups(4) + total_reads(8) + the crc tail(8).
+    // Body must hold at least n_groups(4) + total_reads(8) + the crc tail.
     if footer_offset < HEADER_LEN as u64
-        || footer_offset + (4 + 8 + FOOTER_CRC_TAIL as u64) > body_end
+        || footer_offset + (4 + 8 + footer_crc_tail(encrypted) as u64) > body_end
     {
         return Err(Error::Malformed("footer offset out of range"));
     }
@@ -640,7 +877,7 @@ pub(crate) fn read_footer<R: Read + Seek>(r: &mut R) -> Result<Footer> {
     body.resize(body_len, 0);
     r.seek(SeekFrom::Start(footer_offset))?;
     r.read_exact(&mut body)?;
-    parse_footer_body(&body, footer_offset)
+    parse_footer_body(&body, footer_offset, encrypted)
 }
 
 /// Parse and CRC-check a footer body already in memory. `body` is the bytes from
@@ -648,9 +885,13 @@ pub(crate) fn read_footer<R: Read + Seek>(r: &mut R) -> Result<Footer> {
 /// [8 total_reads] [4 whole_file_crc] [4 footer_crc]` region. Shared by
 /// `read_footer` (seek-based) and the IO-free suffix parser in `random_access`,
 /// so both apply exactly the same validation before any offset is trusted.
-pub(crate) fn parse_footer_body(body: &[u8], footer_offset: u64) -> Result<Footer> {
+pub(crate) fn parse_footer_body(
+    body: &[u8],
+    footer_offset: u64,
+    encrypted: bool,
+) -> Result<Footer> {
     let body_len = body.len();
-    if body_len < 4 + 8 + FOOTER_CRC_TAIL {
+    if body_len < 4 + 8 + footer_crc_tail(encrypted) {
         return Err(Error::Malformed("footer body too short"));
     }
     let (covered, footer_crc_bytes) = body.split_at(body_len - CRC_LEN);
@@ -660,6 +901,16 @@ pub(crate) fn parse_footer_body(body: &[u8], footer_offset: u64) -> Result<Foote
             what: "footer".to_string(),
         });
     }
+    // Split off the trailing footer-authentication tag (present iff `encrypted`)
+    // before walking the row groups — it sits between `whole_file_crc` and
+    // `footer_crc`, covered by the CRC check above but not part of the row-group
+    // stride below.
+    let (covered, footer_tag) = if encrypted {
+        let (rest, tag_bytes) = covered.split_at(covered.len() - fqxv_crypt::TAG_LEN);
+        (rest, Some(tag_bytes.try_into().unwrap()))
+    } else {
+        (covered, None)
+    };
 
     let mut c = Cursor::new(covered);
     let n_groups = c.u32()? as usize;
@@ -716,14 +967,17 @@ pub(crate) fn parse_footer_body(body: &[u8], footer_offset: u64) -> Result<Foote
     let total_reads = u64::from_le_bytes(c.take(8)?.try_into().unwrap());
     let whole_file_crc = c.u32()?;
     // whole_file_crc covers everything up to its own field: the archive prefix
-    // plus the footer body through total_reads.
-    let covered_len = footer_offset + (body_len - FOOTER_CRC_TAIL) as u64;
+    // plus the footer body through total_reads. Stripping the same tail
+    // (whole_file_crc + tag, if any + footer_crc) lands at that field's start
+    // regardless of whether a footer tag follows it.
+    let covered_len = footer_offset + (body_len - footer_crc_tail(encrypted)) as u64;
     Ok(Footer {
         groups,
         stream_locs,
         total_reads,
         whole_file_crc,
         covered_len,
+        footer_tag,
     })
 }
 
@@ -911,11 +1165,13 @@ mod header_tests {
 
     #[test]
     fn refuses_unknown_critical_extension() {
-        let ext = [EXT_CRITICAL_BIT | 0x01, 0x00, 0x00];
+        // 0x82: critical bit set, but not a tag this build defines (0x81 is
+        // EXT_TAG_ENCRYPTION) — stands in for a later minor's critical field.
+        let ext = [EXT_CRITICAL_BIT | 0x02, 0x00, 0x00];
         let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, 0, &ext);
         assert!(matches!(
             read_header(&mut Cursor::new(&buf)),
-            Err(Error::UnsupportedExtension(tag)) if tag == EXT_CRITICAL_BIT | 0x01
+            Err(Error::UnsupportedExtension(tag)) if tag == EXT_CRITICAL_BIT | 0x02
         ));
     }
 
@@ -965,5 +1221,61 @@ mod header_tests {
         write_framed(&mut buf, payload).unwrap();
         let got = read_framed(&mut Cursor::new(&buf), "frame").unwrap();
         assert_eq!(got, payload);
+    }
+
+    fn sample_encryption_header() -> EncryptionHeader {
+        EncryptionHeader {
+            salt: [7u8; fqxv_crypt::SALT_LEN],
+            nonce_id: [9u8; fqxv_crypt::NONCE_ID_LEN],
+            kdf: fqxv_crypt::KdfParams::DEFAULT,
+        }
+    }
+
+    #[test]
+    fn encrypted_header_roundtrips() {
+        let enc = sample_encryption_header();
+        let ext = encode_encryption_ext(&enc);
+        let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, crate::feature::ENCRYPTED, &ext);
+        let h = read_header(&mut Cursor::new(&buf)).unwrap();
+        let got = h.encryption.expect("encryption extension must be parsed");
+        assert_eq!(got.salt, enc.salt);
+        assert_eq!(got.nonce_id, enc.nonce_id);
+        assert_eq!(got.kdf.m_cost_kib, enc.kdf.m_cost_kib);
+        assert_eq!(got.kdf.t_cost, enc.kdf.t_cost);
+        assert_eq!(got.kdf.p_cost, enc.kdf.p_cost);
+    }
+
+    #[test]
+    fn refuses_unrecognized_crypt_version() {
+        let mut ext = encode_encryption_ext(&sample_encryption_header());
+        // Byte 3 is the payload's leading crypt_version field (tag[1] + len[2]
+        // precede it) — corrupt it to a value this build doesn't implement.
+        ext[3] = 0xEE;
+        let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, crate::feature::ENCRYPTED, &ext);
+        assert!(matches!(
+            read_header(&mut Cursor::new(&buf)),
+            Err(Error::UnsupportedEncryptionVersion(0xEE))
+        ));
+    }
+
+    #[test]
+    fn refuses_encryption_feature_bit_without_extension() {
+        // Feature bit set, but no 0x81 extension record present.
+        let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, crate::feature::ENCRYPTED, &[]);
+        assert!(matches!(
+            read_header(&mut Cursor::new(&buf)),
+            Err(Error::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn refuses_encryption_extension_without_feature_bit() {
+        // 0x81 extension present, but the feature bit is clear.
+        let ext = encode_encryption_ext(&sample_encryption_header());
+        let buf = forge(FORMAT_MAJOR, FORMAT_MINOR, 0, &ext);
+        assert!(matches!(
+            read_header(&mut Cursor::new(&buf)),
+            Err(Error::Malformed(_))
+        ));
     }
 }

@@ -1,0 +1,30 @@
+[package]
+name = "fqxv-crypt"
+description = "Passphrase-based AEAD envelope (ChaCha20-Poly1305 + Argon2id) for the fqxv container format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+# Unlike every other leaf crate in this workspace, this one is NOT
+# dependency-free by design: it is the one place that takes real,
+# non-clean-room cryptographic dependencies (see THIRD-PARTY-NOTICES.md and
+# CLAUDE.md's Architecture section). Quarantining them here means no codec
+# crate in the DAG ever gains a transitive crypto dependency.
+[dependencies]
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
+getrandom = { workspace = true }
+zeroize = { workspace = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

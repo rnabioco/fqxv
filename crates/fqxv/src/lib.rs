@@ -16,15 +16,16 @@ mod container;
 mod crc;
 
 pub use container::{
-    BlockContents, ContentStats, Estimate, GroupLoc, Index, Info, Params, Platform, QUAL_MAX,
-    Record, RecordReader, RecordRef, Recovery, Stats, Stream, StreamSelection, SuffixParse,
-    VerifyCheck, VerifyReport, compress, compress_auto, compress_interleaved, compress_multi,
-    content_stats, decode_block_contents, decode_names, decode_quality, decode_quality_with_seq,
-    decode_sequence, decompress, decompress_fasta, decompress_records, decompress_records_par,
-    decompress_records_par_select, decompress_records_select, decompress_recover, decompress_split,
-    estimate, expected_reads, inspect, peek, quality_needs_sequence, verify, verify_quick,
-    verify_report, verify_roundtrip,
+    BlockContents, ContentStats, DecodeOptions, EncryptSpec, Estimate, GroupLoc, Index, Info,
+    Params, Platform, QUAL_MAX, Record, RecordReader, RecordRef, Recovery, Stats, Stream,
+    StreamSelection, SuffixParse, VerifyCheck, VerifyReport, compress, compress_auto,
+    compress_interleaved, compress_multi, content_stats, decode_block_contents, decode_names,
+    decode_quality, decode_quality_with_seq, decode_sequence, decompress, decompress_fasta,
+    decompress_records, decompress_records_par, decompress_records_par_select,
+    decompress_records_select, decompress_recover, decompress_split, estimate, expected_reads,
+    inspect, peek, quality_needs_sequence, verify, verify_quick, verify_report, verify_roundtrip,
 };
+pub use fqxv_crypt::KdfParams;
 pub use fqxv_fqzcomp::QualityBinning;
 
 use thiserror::Error;
@@ -112,12 +113,20 @@ pub mod feature {
     /// (SPRING-style); a reader without that decode path cannot reconstruct the
     /// referenced sequence blocks.
     pub const GLOBAL_REFERENCE: u64 = 1 << 0;
+    /// The archive's blocks (and, if present, the whole-file long-read
+    /// reference frame) are ChaCha20-Poly1305-sealed; a passphrase-derived key
+    /// is required to decode. The critical header extension tag `0x81`
+    /// carries the KDF/nonce metadata a reader needs to derive that key. Gated
+    /// as a feature bit (not merely a flag) because an old reader cannot
+    /// decode even one byte of the block region without it — the textbook
+    /// case this mechanism exists for. See `docs/design/encryption.md`.
+    pub const ENCRYPTED: u64 = 1 << 1;
 }
 
 /// The union of every [`feature`] bit this build understands. A `required_features`
 /// word with any bit outside this mask is rejected by
 /// `read_header`.
-pub const KNOWN_FEATURES: u64 = feature::GLOBAL_REFERENCE;
+pub const KNOWN_FEATURES: u64 = feature::GLOBAL_REFERENCE | feature::ENCRYPTED;
 
 /// Errors returned by the archiver.
 #[derive(Debug, Error)]
@@ -205,6 +214,28 @@ pub enum Error {
     /// rANS coder failure (permutation stream).
     #[error(transparent)]
     Rans(#[from] fqxv_rans::Error),
+    /// Key derivation or AEAD seal/open failure (wrong passphrase, or the
+    /// archive was corrupted or tampered with after it was sealed).
+    #[error(transparent)]
+    Crypt(#[from] fqxv_crypt::Error),
+    /// The archive requires a passphrase ([`feature::ENCRYPTED`]) but none
+    /// was supplied to decode it.
+    #[error("archive is encrypted; a passphrase is required")]
+    PasswordRequired,
+    /// The header's encryption extension (tag `0x81`) carries a
+    /// `crypt_version` this build doesn't implement. Distinct from
+    /// [`Error::UnsupportedExtension`]: the tag itself is recognized, only
+    /// the scheme version inside it is not.
+    #[error("fqxv archive uses an unsupported encryption scheme version {0}; upgrade fqxv")]
+    UnsupportedEncryptionVersion(u8),
+    /// The footer index (random-access column projection) does not support
+    /// encrypted archives: whole-block encryption means a single stream
+    /// can't be decrypted without its whole block. Decode the whole archive
+    /// instead.
+    #[error(
+        "column-projection random access is not supported on encrypted archives; decode the whole archive instead"
+    )]
+    EncryptedArchiveNotSupported,
 }
 
 /// The result type for this crate.

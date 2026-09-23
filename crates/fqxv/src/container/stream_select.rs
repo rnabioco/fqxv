@@ -135,11 +135,11 @@ impl Default for StreamSelection {
 /// ```
 pub fn decompress_records_select<R: Read>(
     reader: R,
-    threads: usize,
+    opts: impl Into<DecodeOptions>,
     selection: StreamSelection,
     mut on_record: impl FnMut(Record),
 ) -> Result<Stats> {
-    decompress_select(reader, threads, selection, move |rec| {
+    decompress_select(reader, opts, selection, move |rec| {
         on_record(rec);
         Ok(())
     })
@@ -165,22 +165,21 @@ pub fn decompress_records_select<R: Read>(
 /// fqxv::decompress_fasta(file, out, 0)?;
 /// # Ok(()) }
 /// ```
-pub fn decompress_fasta<R: Read, W: Write>(reader: R, writer: W, threads: usize) -> Result<Stats> {
+pub fn decompress_fasta<R: Read, W: Write>(
+    reader: R,
+    writer: W,
+    opts: impl Into<DecodeOptions>,
+) -> Result<Stats> {
     let mut w = BufWriter::new(writer);
     let mut fasta_bytes = 0u64;
-    let mut stats = decompress_select(
-        reader,
-        threads,
-        StreamSelection::NAMES_AND_SEQUENCE,
-        |rec| {
-            fasta_bytes += (rec.name.len() + rec.seq.len() + 3) as u64;
-            w.write_all(b">")?;
-            w.write_all(&rec.name)?;
-            w.write_all(b"\n")?;
-            w.write_all(&rec.seq)?;
-            w.write_all(b"\n")
-        },
-    )?;
+    let mut stats = decompress_select(reader, opts, StreamSelection::NAMES_AND_SEQUENCE, |rec| {
+        fasta_bytes += (rec.name.len() + rec.seq.len() + 3) as u64;
+        w.write_all(b">")?;
+        w.write_all(&rec.name)?;
+        w.write_all(b"\n")?;
+        w.write_all(&rec.seq)?;
+        w.write_all(b"\n")
+    })?;
     w.flush()?;
     stats.out_bytes = fasta_bytes;
     Ok(stats)
@@ -193,10 +192,11 @@ pub fn decompress_fasta<R: Read, W: Write>(reader: R, writer: W, threads: usize)
 /// exactly as strong there. `emit` errors abort the decode as [`Error::Io`].
 pub(crate) fn decompress_select<R: Read>(
     reader: R,
-    threads: usize,
+    opts: impl Into<DecodeOptions>,
     sel: StreamSelection,
     mut emit: impl FnMut(Record) -> io::Result<()>,
 ) -> Result<Stats> {
+    let opts = opts.into();
     if sel == StreamSelection::ALL {
         // Full selection: ride the canonical full-decode path (all layouts, all
         // digest checks), reassembling records from its text output.
@@ -205,12 +205,12 @@ pub(crate) fn decompress_select<R: Read>(
             field_bytes += (rec.name.len() + rec.seq.len() + rec.qual.len()) as u64;
             emit(rec)
         });
-        let mut stats = decompress(reader, sink, threads)?;
+        let mut stats = decompress(reader, sink, opts)?;
         stats.out_bytes = field_bytes;
         return Ok(stats);
     }
 
-    let pool = build_pool(threads)?;
+    let pool = build_pool(opts.threads)?;
     let batch = pool.current_num_threads().max(1);
     let mut r = BufReader::new(reader);
     let header = read_header(&mut r)?;
@@ -235,6 +235,7 @@ pub(crate) fn decompress_select<R: Read>(
                 &mut emit2,
             )?;
         } else {
+            let cipher = cipher_for_header(&header, &opts)?;
             // Whole-file shared reference frame (plain layout): only the
             // sequence decoder (and, transitively, sequence-conditioned
             // quality) indexes it, so a names-only pass skips its decode too.
@@ -243,15 +244,22 @@ pub(crate) fn decompress_select<R: Read>(
                     skip_framed(&mut r)?;
                     None
                 } else {
-                    read_reference_frame(&mut r, header.flags)?
+                    read_reference_frame(&mut r, header.flags, cipher.as_ref())?
                 };
             let reference = reference.as_ref();
             stats = Stats::default();
-            for_each_block_batch(&mut r, batch, |raw_blocks| {
+            for_each_block_batch(&mut r, batch, |base, raw_blocks| {
                 let decoded: Vec<Result<(u64, Vec<Record>)>> = pool.install(|| {
                     raw_blocks
                         .par_iter()
-                        .map(|b| decode_block_records_select(b, reference, sel))
+                        .enumerate()
+                        .map(|(i, b)| {
+                            let buf = open_block_payload(
+                                b,
+                                cipher.as_ref().map(|c| (c, base + i as u64)),
+                            )?;
+                            decode_block_records_select(&buf, reference, sel)
+                        })
                         .collect()
                 });
                 for d in decoded {
