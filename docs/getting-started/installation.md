@@ -25,7 +25,7 @@ conda install -c conda-forge -c bioconda fqxv
 Pin the version for reproducibility:
 
 ```bash
-pixi add "bioconda::fqxv==0.7.0"
+pixi add "bioconda::fqxv==0.8.0"
 ```
 
 Or declare it in a `pixi.toml` / `environment.yml`:
@@ -33,14 +33,14 @@ Or declare it in a `pixi.toml` / `environment.yml`:
 ```toml
 # pixi.toml
 [dependencies]
-fqxv = { version = "==0.7.0", channel = "bioconda" }
+fqxv = { version = "==0.8.0", channel = "bioconda" }
 ```
 
 ```yaml
 # environment.yml
 channels: [conda-forge, bioconda]
 dependencies:
-  - fqxv=0.7.0
+  - fqxv=0.8.0
 ```
 
 The recipe carries a `run_exports` pin on the minor version, so while `fqxv` is
@@ -57,11 +57,11 @@ build required.
 ```bash
 # Docker / Podman
 docker run --rm -v "$PWD:/data" -w /data \
-  quay.io/biocontainers/fqxv:0.7.0--hfa8f182_0 fqxv compress reads.fastq.gz
+  quay.io/biocontainers/fqxv:0.8.0--hfa8f182_0 fqxv compress reads.fastq.gz
 
 # Singularity / Apptainer
 singularity run \
-  https://depot.galaxyproject.org/singularity/fqxv:0.7.0--hfa8f182_0 fqxv --help
+  https://depot.galaxyproject.org/singularity/fqxv:0.8.0--hfa8f182_0 fqxv --help
 ```
 
 quay.io publishes no `latest` tag for Bioconda-derived images, so a tag has to
@@ -84,8 +84,8 @@ or let the `conda` directive resolve it:
 
 ```groovy
 process FQXV_COMPRESS {
-    container 'quay.io/biocontainers/fqxv:0.7.0--hfa8f182_0'
-    // or: conda 'bioconda::fqxv=0.7.0'
+    container 'quay.io/biocontainers/fqxv:0.8.0--hfa8f182_0'
+    // or: conda 'bioconda::fqxv=0.8.0'
 
     input:
     tuple val(meta), path(reads)
