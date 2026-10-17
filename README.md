@@ -93,11 +93,11 @@ local build required.
 
 ```bash
 # Docker / Podman
-docker run --rm quay.io/biocontainers/fqxv:0.7.0--hfa8f182_0 fqxv --help
+docker run --rm quay.io/biocontainers/fqxv:0.8.0--hfa8f182_0 fqxv --help
 
 # Singularity / Apptainer
 singularity run \
-  https://depot.galaxyproject.org/singularity/fqxv:0.7.0--hfa8f182_0 fqxv --help
+  https://depot.galaxyproject.org/singularity/fqxv:0.8.0--hfa8f182_0 fqxv --help
 ```
 
 quay.io publishes no `latest` tag for Bioconda-derived images, so a tag has to
