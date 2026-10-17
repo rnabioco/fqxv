@@ -248,30 +248,24 @@ pub(crate) fn decompress_select<R: Read>(
                 };
             let reference = reference.as_ref();
             stats = Stats::default();
-            for_each_block_batch(&mut r, batch, |base, raw_blocks| {
-                let decoded: Vec<Result<(u64, Vec<Record>)>> = pool.install(|| {
-                    raw_blocks
-                        .par_iter()
-                        .enumerate()
-                        .map(|(i, b)| {
-                            let buf = open_block_payload(
-                                b,
-                                cipher.as_ref().map(|c| (c, base + i as u64)),
-                            )?;
-                            decode_block_records_select(&buf, reference, sel)
-                        })
-                        .collect()
-                });
-                for d in decoded {
-                    let (reads, recs) = d?;
+            decode_ordered(
+                &mut r,
+                &pool,
+                batch,
+                |i, raw| Ok((i, raw)),
+                |(i, raw)| {
+                    let buf = open_block_payload(&raw, cipher.as_ref().map(|c| (c, i)))?;
+                    decode_block_records_select(&buf, reference, sel)
+                },
+                |(reads, recs)| {
                     for rec in recs {
                         emit2(rec)?;
                     }
                     stats.reads += reads;
                     stats.blocks += 1;
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                },
+            )?;
         }
     }
     stats.out_bytes = out_bytes;
