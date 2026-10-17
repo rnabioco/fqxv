@@ -16,6 +16,27 @@ misreading. Compatibility fails loudly, never silently. A format major bump woul
 be announced as a breaking change; see the
 [evolution policy](docs/design/container.md#versioning-and-evolution-policy).
 
+## [0.8.1] - 2026-10-17
+
+Patch: performance and memory only. There are no format changes — the on-disk
+format stays 1.0 and archives are byte-identical to v0.8.0.
+
+### Performance
+
+- **Ordered streaming decode writer** (#309, refs #297): decode writes blocks
+  to the output in order as they complete instead of staging them. 6-10%
+  faster decode on 5-6 block short-read files; neutral on ONT.
+
+### Changed
+
+- **Auto-detected ONT now streams** (#308, refs #225): content-detected
+  Nanopore input streams from the peek like `--platform nanopore` does,
+  rather than buffering the whole input. Saves about the input size in peak
+  RSS at low thread counts.
+- **Lower reorder memory** (#310, refs #303): `--max` / `--order any` now cut
+  the plain gate candidate from the buffered reads instead of re-serializing
+  them to text. About 15% lower peak RSS.
+
 ## [0.8.0] - 2026-09-23
 
 Minor: native passphrase encryption. Purely additive — an unencrypted archive
