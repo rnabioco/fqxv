@@ -1,7 +1,6 @@
 //! Public decompression entry points and content-stats folding.
 
 use super::*;
-use rayon::prelude::*;
 use tracing::{debug, info, instrument, trace, warn};
 
 /// Options for a decode entry point: worker threads and, for an encrypted
@@ -92,28 +91,24 @@ pub fn decompress<R: Read, W: Write>(
         "decompress pool ready"
     );
     let mut stats = Stats::default();
-    for_each_block_batch(&mut r, batch, |base, raw_blocks| {
-        debug!(blocks = raw_blocks.len(), "decoding batch");
-        let decoded: Vec<Result<(u64, Vec<u8>)>> = pool.install(|| {
-            raw_blocks
-                .par_iter()
-                .enumerate()
-                .map(|(i, b)| {
-                    let buf = open_block_payload(b, cipher.as_ref().map(|c| (c, base + i as u64)))?;
-                    decode_block(&buf, reference)
-                })
-                .collect()
-        });
-        for d in decoded {
-            let (reads, fastq) = d?;
+    decode_ordered(
+        &mut r,
+        &pool,
+        batch,
+        |i, raw| Ok((i, raw)),
+        |(i, raw)| {
+            let buf = open_block_payload(&raw, cipher.as_ref().map(|c| (c, i)))?;
+            decode_block(&buf, reference)
+        },
+        |(reads, fastq)| {
             w.write_all(&fastq)?;
             trace!(reads, bytes = fastq.len(), "block decoded");
             stats.reads += reads;
             stats.blocks += 1;
             stats.out_bytes += fastq.len() as u64;
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
     w.flush()?;
     Ok(stats)
 }
@@ -263,29 +258,25 @@ pub fn decompress_split<R: Read, W: Write>(
         "decompress-split pool ready"
     );
     let mut stats = Stats::default();
-    for_each_block_batch(&mut r, batch, |base, raw_blocks| {
-        debug!(blocks = raw_blocks.len(), "decoding batch");
-        let decoded: Vec<Result<(u64, Vec<Vec<u8>>)>> = pool.install(|| {
-            raw_blocks
-                .par_iter()
-                .enumerate()
-                .map(|(i, b)| {
-                    let buf = open_block_payload(b, cipher.as_ref().map(|c| (c, base + i as u64)))?;
-                    decode_block_group(&buf, g, reference)
-                })
-                .collect()
-        });
-        for d in decoded {
-            let (reads, parts) = d?;
+    decode_ordered(
+        &mut r,
+        &pool,
+        batch,
+        |i, raw| Ok((i, raw)),
+        |(i, raw)| {
+            let buf = open_block_payload(&raw, cipher.as_ref().map(|c| (c, i)))?;
+            decode_block_group(&buf, g, reference)
+        },
+        |(reads, parts)| {
             for (w, part) in writers.iter_mut().zip(&parts) {
                 w.write_all(part)?;
             }
             stats.reads += reads;
             stats.blocks += 1;
             stats.out_bytes += parts.iter().map(|p| p.len() as u64).sum::<u64>();
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
     for w in writers.iter_mut() {
         w.flush()?;
     }
