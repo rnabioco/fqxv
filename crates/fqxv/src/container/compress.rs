@@ -432,7 +432,7 @@ pub(crate) fn detect_group_size(peeked: &[noodles_fastq::Record], saw_stream_end
 pub fn compress_auto<'a, R: Read + Send + 'a, W: Write>(
     mut reader: R,
     writer: W,
-    params: Params,
+    mut params: Params,
 ) -> Result<Stats> {
     // Read only enough to peek the leading records for layout detection. FASTQ is
     // strictly four lines per record, so `AUTODETECT_PEEK` records is exactly
@@ -485,7 +485,14 @@ pub fn compress_auto<'a, R: Read + Send + 'a, W: Write>(
     // *explicit* Nanopore: the streaming path detects platform from read names,
     // which is `Unknown` for SRA-style names, so an auto-detected ONT set still
     // takes the buffered path that content-classifies it.
-    let stream_ok = !long_read || params.platform == Some(Platform::Nanopore);
+    //
+    // An auto-detected ONT set streams too: the peek already holds the leading
+    // records `resolve_platform_buf` consults (`PLATFORM_PEEK == AUTODETECT_PEEK`),
+    // so classifying it here yields exactly the verdict the buffered path would
+    // reach, and pinning that verdict as the explicit platform makes the streaming
+    // path record and code it identically. Anything not classified Nanopore keeps
+    // the buffered route.
+    let stream_ok = auto_stream_ok(&prefix, long_read, &mut params);
     if g == 1 && !params.reorder && stream_ok {
         return compress(prefix.as_slice().chain(reader), writer, params);
     }
@@ -499,6 +506,29 @@ pub fn compress_auto<'a, R: Read + Send + 'a, W: Write>(
         return encode_reordered(buffer_records(&prefix)?, writer, params, g);
     }
     compress_buffered(&prefix, writer, params, g)
+}
+
+/// Decide whether a long-read single-end input may take the streaming path.
+/// Explicit Nanopore always may. With no explicit platform, the peeked prefix is
+/// classified exactly as the buffered path would (names, then read content); a
+/// Nanopore verdict is pinned into `params.platform` so the streaming path does
+/// not re-detect from names alone (SRA names -> `Unknown`). Any other verdict, or
+/// an explicit non-Nanopore platform, requires buffering.
+pub(crate) fn auto_stream_ok(prefix: &[u8], long_read: bool, params: &mut Params) -> bool {
+    if !long_read {
+        return true;
+    }
+    match params.platform {
+        Some(p) => p == Platform::Nanopore,
+        None => {
+            if resolve_platform_buf(None, prefix) == Platform::Nanopore {
+                params.platform = Some(Platform::Nanopore);
+                true
+            } else {
+                false
+            }
+        }
+    }
 }
 
 /// The base name shared by every member of one spot: the definition line up to
