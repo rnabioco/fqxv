@@ -283,20 +283,34 @@ pub(crate) fn block_ranges(
     max_bytes: usize,
     g: usize,
 ) -> Vec<(usize, usize)> {
+    block_ranges_from_lens(
+        chunks.iter().flat_map(|c| c.recs.iter().map(|r| r.seq_len)),
+        block_reads,
+        max_bytes,
+        g,
+    )
+}
+
+/// [`block_ranges`] over a bare sequence of per-read lengths, for callers that
+/// hold the reads as a [`RawBlock`] rather than parsed chunks.
+pub(crate) fn block_ranges_from_lens(
+    seq_lens: impl Iterator<Item = u32>,
+    block_reads: usize,
+    max_bytes: usize,
+    g: usize,
+) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut gs = 0usize; // current row group's first global read index
     let mut gi = 0usize; // reads seen so far
     let mut bytes = 0usize; // raw sequence bytes in the current row group
-    for chunk in chunks {
-        for rec in &chunk.recs {
-            gi += 1;
-            bytes += rec.seq_len as usize;
-            let in_block = gi - gs;
-            if in_block.is_multiple_of(g) && (in_block >= block_reads || bytes >= max_bytes) {
-                ranges.push((gs, gi));
-                gs = gi;
-                bytes = 0;
-            }
+    for seq_len in seq_lens {
+        gi += 1;
+        bytes += seq_len as usize;
+        let in_block = gi - gs;
+        if in_block.is_multiple_of(g) && (in_block >= block_reads || bytes >= max_bytes) {
+            ranges.push((gs, gi));
+            gs = gi;
+            bytes = 0;
         }
     }
     if gs < gi {

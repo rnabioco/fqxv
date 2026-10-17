@@ -876,8 +876,13 @@ pub(crate) fn compress_buffered_plain<W: Write>(
         resolve_block_seq_bytes(&params, platform),
         g,
     );
+    let source = BlockSource::Parsed {
+        buf,
+        chunks: &chunks,
+        gstart: &gstart,
+    };
     write_plain_layout(
-        writer, buf, &chunks, &gstart, &ranges, &params, group_size, platform, &pool, None, None,
+        writer, &source, &ranges, &params, group_size, platform, &pool, None, None,
     )
 }
 
@@ -897,9 +902,7 @@ pub(crate) fn compress_buffered_plain<W: Write>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write_plain_layout<W: Write>(
     writer: W,
-    buf: &[u8],
-    chunks: &[ChunkParse],
-    gstart: &[usize],
+    source: &BlockSource<'_>,
     ranges: &[(usize, usize)],
     params: &Params,
     group_size: u8,
@@ -937,7 +940,7 @@ pub(crate) fn write_plain_layout<W: Write>(
                 .into_par_iter()
                 .map(|bi| {
                     let (gs, ge) = ranges[bi];
-                    let blk = build_block(buf, chunks, gstart, gs, ge);
+                    let blk = source.build(gs, ge);
                     let payload = match (precoded_ns, precoded_seq) {
                         (Some(ns), _) => {
                             compress_block_with_names_seq(&blk, params, &ns[bi].0, &ns[bi].1)
@@ -1203,11 +1206,14 @@ fn compress_longread_shared_ref<W: Write>(
             let mut plain_seq = Vec::with_capacity(num_blocks);
             plain_seq.push(plain_0);
             plain_seq.extend(rest.into_iter().map(|(_, p)| p));
+            let source = BlockSource::Parsed {
+                buf,
+                chunks: &chunks,
+                gstart: &gstart,
+            };
             return write_plain_layout(
                 writer,
-                buf,
-                &chunks,
-                &gstart,
+                &source,
                 &ranges,
                 &params,
                 group_size,
