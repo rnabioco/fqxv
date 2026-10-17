@@ -4020,3 +4020,91 @@ fn footer_auth_tag_catches_a_forged_but_crc_consistent_footer() {
         "expected a Crypt error, got {err:?}"
     );
 }
+
+/// Synthetic single-end reads with SRA-style bare names (no platform grammar).
+fn synth_reads(n: usize, len: usize, q: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in 0..n {
+        out.extend_from_slice(format!("@SRR9.{}\n", i + 1).as_bytes());
+        let seq: Vec<u8> = (0..len)
+            .map(|j| b"ACGT"[(i * 7 + j * j + j / 3) % 4])
+            .collect();
+        out.extend_from_slice(&seq);
+        out.extend_from_slice(b"\n+\n");
+        out.extend(std::iter::repeat_n(q, len));
+        out.push(b'\n');
+    }
+    out
+}
+
+#[test]
+fn peek_classification_agrees_with_full() {
+    // (reads, length, quality byte): ONT-like, HiFi-like, short, ambiguous Q.
+    let cases: [(usize, usize, u8); 4] = [
+        (40, 1000, b'5'),
+        (40, 1000, b'I'),
+        (40, 100, b'5'),
+        (40, 1000, b'?'),
+    ];
+    for (n, len, q) in cases {
+        let input = synth_reads(n, len, q);
+        let full = resolve_platform_buf(None, &input);
+        // The compress_auto peek holds AUTODETECT_PEEK records.
+        let mut end = 0;
+        for _ in 0..AUTODETECT_PEEK * 4 {
+            end += input[end..].iter().position(|&b| b == b'\n').unwrap() + 1;
+        }
+        let peek = resolve_platform_buf(None, &input[..end]);
+        assert_eq!(full, peek, "peek vs full verdict, len={len} q={q}");
+        let mut params = Params::default();
+        let long = len > 500;
+        let ok = auto_stream_ok(&input[..end], long, &mut params);
+        assert_eq!(ok, !long || full == Platform::Nanopore);
+        assert_eq!(
+            params.platform,
+            (long && full == Platform::Nanopore).then_some(Platform::Nanopore)
+        );
+    }
+    // Explicit non-Nanopore stays buffered; explicit Nanopore streams.
+    let input = synth_reads(40, 1000, b'5');
+    let mut p = Params {
+        platform: Some(Platform::PacBio),
+        ..Params::default()
+    };
+    assert!(!auto_stream_ok(&input, true, &mut p));
+    let mut p = Params {
+        platform: Some(Platform::Nanopore),
+        ..Params::default()
+    };
+    assert!(auto_stream_ok(&input, true, &mut p));
+}
+
+#[test]
+fn auto_ont_streams_and_matches_explicit_platform() {
+    let input = synth_reads(60, 1000, b'5');
+    let mut params = Params::default();
+    assert!(auto_stream_ok(&input, true, &mut params));
+    assert_eq!(params.platform, Some(Platform::Nanopore));
+
+    let mut auto = Vec::new();
+    compress_auto(&input[..], &mut auto, Params::default()).unwrap();
+    let explicit = compress_bytes(
+        &input,
+        Params {
+            platform: Some(Platform::Nanopore),
+            ..Params::default()
+        },
+    );
+    assert_eq!(auto, explicit, "auto ONT must equal --platform nanopore");
+    // And equal to the buffered route.
+    let mut buffered = Vec::new();
+    compress_buffered(&input, &mut buffered, Params::default(), 1).unwrap();
+    assert_eq!(auto, buffered, "auto ONT must equal the buffered archive");
+    assert_eq!(peek(&auto[..]).unwrap().platform, Platform::Nanopore);
+
+    // HiFi-like input falls back to buffering and is unchanged.
+    let hifi = synth_reads(60, 1000, b'I');
+    let mut p = Params::default();
+    assert!(!auto_stream_ok(&hifi, true, &mut p));
+    assert_eq!(p.platform, None);
+}
