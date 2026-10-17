@@ -377,35 +377,26 @@ where
         ..Stats::default()
     };
     let mut base = 0u64;
-    for_each_block_batch(&mut r, batch, |batch_base, raw_blocks| {
-        // Record index base of each block in the batch, from the payloads'
-        // n_reads fields (verified against the decode inside the task). Blocks
-        // must be opened (decrypted, if encrypted) before their n_reads field is
-        // readable.
-        let opened: Vec<Cow<'_, [u8]>> = raw_blocks
-            .iter()
-            .enumerate()
-            .map(|(i, b)| open_block_payload(b, cipher.map(|c| (c, batch_base + i as u64))))
-            .collect::<Result<_>>()?;
-        let mut bases = Vec::with_capacity(opened.len());
-        for b in &opened {
-            bases.push(base);
-            base += u64::from(peek_block_reads(b)?);
-        }
-        let decoded: Vec<Result<(u64, u64)>> = pool.install(|| {
-            (0..opened.len())
-                .into_par_iter()
-                .map(|k| visit_block(&opened[k], bases[k], reference, sel, states, visit))
-                .collect()
-        });
-        for d in decoded {
-            let (reads, bytes) = d?;
+    decode_ordered(
+        &mut r,
+        pool,
+        batch,
+        // Serial, in block order: open (decrypt, if encrypted) so the payload's
+        // n_reads field is readable, and assign the block's record-index base.
+        |i, raw| {
+            let opened = open_block_payload(&raw, cipher.map(|c| (c, i)))?.into_owned();
+            let block_base = base;
+            base += u64::from(peek_block_reads(&opened)?);
+            Ok((opened, block_base))
+        },
+        |(opened, block_base)| visit_block(&opened, block_base, reference, sel, states, visit),
+        |(reads, bytes)| {
             stats.reads += reads;
             stats.blocks += 1;
             stats.out_bytes += bytes;
-        }
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
     Ok(stats)
 }
 

@@ -965,37 +965,81 @@ fn assemble_block_payload(
     Ok(out)
 }
 
-/// Read blocks in batches of `batch`, invoking `f` on each batch with the
-/// 0-based index of the batch's first block (each block in `raw_blocks` is at
-/// `base + i`) — the same ordinal [`write_blocks`] sealed it under, for an
-/// encrypted archive's decrypt step.
-pub(crate) fn for_each_block_batch<R: Read, F>(r: &mut R, batch: usize, mut f: F) -> Result<()>
+/// Streaming ordered decode pipeline shared by every plain-layout decoder.
+///
+/// Mirrors the compress side's `drive`: blocks are read serially from `r` on the
+/// calling thread, handed to `pool` for decoding, and their results are handed
+/// to `sink` strictly in block order on the calling thread. At most `cap` blocks
+/// are in flight (read, decoding, or decoded and waiting for the sink) at once,
+/// so resident decoded text is bounded by `cap` blocks rather than a whole
+/// batch, and the sink's writes overlap the decoding of the following blocks
+/// instead of idling every worker.
+///
+/// `prep(index, raw)` runs serially on the calling thread, in block order (the
+/// place for anything order-dependent, e.g. record-index bases); `decode` runs on
+/// the pool and is where per-block work (including decryption) belongs. `index`
+/// is the 0-based ordinal [`write_blocks`] sealed the block under.
+///
+/// A read error is reported only after every block read before it has been
+/// decoded and delivered to `sink`. A decode or sink error returns immediately;
+/// blocks already in flight finish (they are bounded by `cap`) and are dropped.
+pub(crate) fn decode_ordered<R, P, T, Pr, D, S>(
+    r: &mut R,
+    pool: &rayon::ThreadPool,
+    cap: usize,
+    mut prep: Pr,
+    decode: D,
+    mut sink: S,
+) -> Result<()>
 where
-    F: FnMut(u64, &[Vec<u8>]) -> Result<()>,
+    R: Read,
+    P: Send,
+    T: Send,
+    Pr: FnMut(u64, Vec<u8>) -> Result<P>,
+    D: Fn(P) -> Result<T> + Sync,
+    S: FnMut(T) -> Result<()>,
 {
-    let mut block_index = 0u64;
-    loop {
-        let base = block_index;
-        let mut raw_blocks: Vec<Vec<u8>> = Vec::with_capacity(batch);
-        for _ in 0..batch {
-            match read_block(r, block_index)? {
-                Some(block) => {
-                    raw_blocks.push(block);
-                    block_index += 1;
+    use std::collections::VecDeque;
+    use std::sync::mpsc;
+    let cap = cap.max(1);
+    let decode = &decode;
+    pool.in_place_scope(|scope| {
+        let mut inflight: VecDeque<mpsc::Receiver<Result<T>>> = VecDeque::with_capacity(cap);
+        let mut next = 0u64;
+        let mut read_err: Option<Error> = None;
+        let mut eof = false;
+        loop {
+            while !eof && read_err.is_none() && inflight.len() < cap {
+                match read_block(r, next) {
+                    Ok(Some(raw)) => {
+                        let p = match prep(next, raw) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                read_err = Some(e);
+                                break;
+                            }
+                        };
+                        next += 1;
+                        let (tx, rx) = mpsc::sync_channel(1);
+                        scope.spawn(move |_| {
+                            let _ = tx.send(decode(p));
+                        });
+                        inflight.push_back(rx);
+                    }
+                    Ok(None) => eof = true,
+                    Err(e) => read_err = Some(e),
                 }
-                None => break,
             }
+            let Some(rx) = inflight.pop_front() else {
+                break;
+            };
+            let out = rx
+                .recv()
+                .map_err(|_| Error::Malformed("decode worker terminated"))??;
+            sink(out)?;
         }
-        if raw_blocks.is_empty() {
-            break;
-        }
-        let full = raw_blocks.len() == batch;
-        f(base, &raw_blocks)?;
-        if !full {
-            break;
-        }
-    }
-    Ok(())
+        read_err.map_or(Ok(()), Err)
+    })
 }
 
 /// Locate a block's three coded streams (names, sequence, quality) as absolute
