@@ -2441,6 +2441,64 @@ fn block_ranges_cuts_on_reads_bytes_and_spots() {
 }
 
 #[test]
+fn plain_candidate_from_slices_matches_serialized() {
+    // Variable-length reads and mixed headers (with/without description).
+    let mut fq = Vec::new();
+    for i in 0..37usize {
+        let l = 1 + (i * 7) % 23;
+        let hdr = if i % 3 == 0 {
+            format!("r.{i}")
+        } else {
+            format!("r.{i} len={l}")
+        };
+        fq.extend_from_slice(
+            format!(
+                "@{hdr}\n{}\n+\n{}\n",
+                &"ACGTN".repeat(8)[..l],
+                "I".repeat(l)
+            )
+            .as_bytes(),
+        );
+    }
+    let all = buffer_records(&fq).unwrap();
+    let serialized = serialize_block(&all);
+    let pool = build_pool(2).unwrap();
+    let (chunks, gstart, n) = parse_chunks(&serialized, 1, &pool).unwrap();
+    assert_eq!(n, all.n_reads());
+    let mut offs = vec![0usize];
+    for &l in &all.lens {
+        offs.push(offs.last().unwrap() + l as usize);
+    }
+    let parsed = BlockSource::Parsed {
+        buf: &serialized,
+        chunks: &chunks,
+        gstart: &gstart,
+    };
+    let buffered = BlockSource::Buffered {
+        all: &all,
+        offs: &offs,
+    };
+    for (br, mb) in [(4usize, usize::MAX), (1000, 40), (5, 1000)] {
+        let r1 = block_ranges(&chunks, br, mb, 1);
+        let r2 = block_ranges_from_lens(all.lens.iter().copied(), br, mb, 1);
+        assert_eq!(r1, r2);
+        for &(gs, ge) in &r1 {
+            let a = parsed.build(gs, ge);
+            let b = buffered.build(gs, ge);
+            assert_eq!(a.header_buf, b.header_buf);
+            assert_eq!(a.header_ends, b.header_ends);
+            assert_eq!(a.lens, b.lens);
+            assert_eq!(a.seq, b.seq);
+            assert_eq!(a.qual, b.qual);
+        }
+    }
+    assert_eq!(
+        resolve_platform_buf(None, &serialized),
+        resolve_platform_block(None, &all)
+    );
+}
+
+#[test]
 fn archive_is_deterministic_across_threads() {
     let input = make_reads("y", 500);
     let mk = |threads| {

@@ -105,6 +105,59 @@ pub(crate) fn build_block(
     blk
 }
 
+/// Where [`write_plain_layout`] materializes its blocks from: parsed FASTQ text,
+/// or reads already buffered as a [`RawBlock`] (the reorder path), which avoids
+/// re-serializing the whole input to text just to parse it again.
+pub(crate) enum BlockSource<'a> {
+    /// A FASTQ text buffer plus its parse (see [`parse_chunks`]).
+    Parsed {
+        buf: &'a [u8],
+        chunks: &'a [ChunkParse],
+        gstart: &'a [usize],
+    },
+    /// Buffered reads with `offs[i]..offs[i + 1]` the `i`th read's span in
+    /// `seq`/`qual` (`offs.len() == n_reads + 1`).
+    Buffered {
+        all: &'a RawBlock,
+        offs: &'a [usize],
+    },
+}
+
+impl BlockSource<'_> {
+    /// Assemble the block holding global records `[gs, ge)`.
+    pub(crate) fn build(&self, gs: usize, ge: usize) -> RawBlock {
+        match self {
+            BlockSource::Parsed {
+                buf,
+                chunks,
+                gstart,
+            } => build_block(buf, chunks, gstart, gs, ge),
+            BlockSource::Buffered { all, offs } => {
+                let h0 = if gs == 0 {
+                    0
+                } else {
+                    all.header_ends[gs - 1] as usize
+                };
+                let h1 = if ge == 0 {
+                    0
+                } else {
+                    all.header_ends[ge - 1] as usize
+                };
+                RawBlock {
+                    header_buf: all.header_buf[h0..h1].to_vec(),
+                    header_ends: all.header_ends[gs..ge]
+                        .iter()
+                        .map(|&e| e - h0 as u32)
+                        .collect(),
+                    lens: all.lens[gs..ge].to_vec(),
+                    seq: all.seq[offs[gs]..offs[ge]].to_vec(),
+                    qual: all.qual[offs[gs]..offs[ge]].to_vec(),
+                }
+            }
+        }
+    }
+}
+
 /// Write a batch's compressed payloads in order, updating `stats` and recording
 /// each row group in `index` for the footer.
 ///

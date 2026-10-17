@@ -198,8 +198,6 @@ pub(crate) fn encode_reordered<W: Write>(
     // winner codes quality — once, in the order it emits. This drops the whole-file
     // quality re-encode the loser used to pay: the bulk of the gate's cost, since
     // it coded every stream of both layouts and threw one away.
-    let serialized = serialize_block(&all);
-
     // Reorder candidate: cluster + code sequence/names/permutation, quality
     // deferred. Owns the buffered reads and the thread pool both candidates share.
     let prepared = prepare_reordered_clustered(all, params.clone(), group_size)?;
@@ -213,14 +211,25 @@ pub(crate) fn encode_reordered<W: Write>(
     plain_params.reorder = false;
     let g = group_size.max(1) as usize;
     let block_reads = (plain_params.block_reads.max(1) / g).max(1) * g;
-    let (chunks, gstart, _n) = parse_chunks(&serialized, g, &prepared.pool)?;
-    let plain_platform = resolve_platform_buf(plain_params.platform, &serialized);
-    let ranges = block_ranges(&chunks, block_reads, MAX_BLOCK_SEQ_BYTES, g);
+    // Blocks are cut straight from the buffered reads (`prepared.all`, indexed by
+    // `prepared.offs`) rather than re-serializing the whole input to FASTQ text
+    // only to parse it back: same reads, same lengths, same ranges.
+    let source = BlockSource::Buffered {
+        all: &prepared.all,
+        offs: &prepared.offs,
+    };
+    let plain_platform = resolve_platform_block(plain_params.platform, &prepared.all);
+    let ranges = block_ranges_from_lens(
+        prepared.all.lens.iter().copied(),
+        block_reads,
+        MAX_BLOCK_SEQ_BYTES,
+        g,
+    );
     let plain_ns: Vec<(Vec<u8>, Vec<u8>)> = prepared.pool.install(|| {
         ranges
             .par_iter()
             .map(|&(gs, ge)| -> Result<(Vec<u8>, Vec<u8>)> {
-                let blk = build_block(&serialized, &chunks, &gstart, gs, ge);
+                let blk = source.build(gs, ge);
                 let names_c = fqxv_tokenizer::encode(&blk.header_refs())?;
                 let seq_c =
                     encode_sequence_stream(&blk.lens, &blk.seq, &plain_params, plain_platform)?;
@@ -244,9 +253,7 @@ pub(crate) fn encode_reordered<W: Write>(
         );
         return write_plain_layout(
             writer,
-            &serialized,
-            &chunks,
-            &gstart,
+            &source,
             &ranges,
             &plain_params,
             group_size,
@@ -263,8 +270,6 @@ pub(crate) fn encode_reordered<W: Write>(
     );
     // Free the plain candidate's streams before quality is coded for the winner.
     drop(plain_ns);
-    drop(chunks);
-    drop(serialized);
     finish_reordered_clustered(prepared, writer)
 }
 
