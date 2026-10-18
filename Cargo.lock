@@ -921,9 +921,9 @@ dependencies = [
 
 [[package]]
 name = "noodles-fastq"
-version = "0.23.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1bd7ca5f1595f089e7373da29fbcda325e05f02ca130424b09e9a877f9de9f9"
+checksum = "b749d3b5ce244ad38790b0d1193f199244bada983fd5316fb1d3bcda162b3e97"
 dependencies = [
  "bstr",
  "memchr",
