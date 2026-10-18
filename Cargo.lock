@@ -909,9 +909,9 @@ dependencies = [
 
 [[package]]
 name = "noodles-bgzf"
-version = "0.51.0"
+version = "0.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "280d401d0358893ad706fb6094a18e7f9e8f3002630f4960889cb702b6e2714e"
+checksum = "950a8570bb43a68697bb34ba39a44f1171faacceb852104d4a35701b86d7ef29"
 dependencies = [
  "bytes",
  "crossbeam-channel",
